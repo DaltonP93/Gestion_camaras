@@ -36,6 +36,8 @@ model User {
   permissions  UserPermission[]
   // Log de auditoría
   auditLogs    AuditLog[]
+  // Acceso a vistas de cámaras
+  viewAccess   CameraViewAccess[]
 
   @@map("users")
 }
@@ -166,4 +168,51 @@ enum AlertSeverity {
   MEDIUM
   HIGH
   CRITICAL
+}
+
+// ─── Vistas personalizadas de cámaras ────────────────────────
+model CameraView {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  layout      String   @default("3x3") // "1x1","2x2","3x3","4x4","featured","custom"
+  cameraSlots Json     // Array de { slotIndex, cameraId, size: "normal"|"large" }
+  slideshowEnabled Boolean @default(false)
+  slideshowInterval Int  @default(10) // segundos entre páginas
+  isPublic    Boolean  @default(false) // visible para todos o solo asignados
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  access      CameraViewAccess[]
+
+  @@map("camera_views")
+}
+
+model CameraViewAccess {
+  id           String     @id @default(cuid())
+  viewId       String
+  view         CameraView @relation(fields: [viewId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
+  @@unique([viewId, userId])
+  @@map("camera_view_access")
+}
+
+// ─── Configuración de apariencia ─────────────────────────────
+model AppearanceSettings {
+  id              String  @id @default("singleton")
+  siteName        String  @default("VisionCore")
+  logoText        String  @default("VisionCore")
+  primaryColor    String  @default("#e51d1d")
+  accentColor     String  @default("#c41616")
+  theme           String  @default("dark") // "dark" | "darker" | "midnight"
+  sidebarWidth    String  @default("normal") // "compact" | "normal"
+  showNVRsInSidebar Boolean @default(true)
+  customCss       String? @db.Text
+  updatedAt       DateTime @updatedAt
+
+  @@map("appearance_settings")
 }

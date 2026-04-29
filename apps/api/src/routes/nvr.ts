@@ -6,6 +6,13 @@ import { publishAllStreams } from '../services/stream'
 import { AuditAction } from '../services/audit'
 import CryptoJS from 'crypto-js'
 
+const connectionTestSchema = z.object({
+  ipAddress: z.string().min(1),
+  port: z.number().int().min(1).max(65535).default(80),
+  username: z.string().min(1),
+  password: z.string().min(1),
+})
+
 const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
 
 function encryptPassword(password: string): string {
@@ -31,6 +38,79 @@ const nvrSchema = z.object({
 })
 
 export const nvrRoutes: FastifyPluginAsync = async (server) => {
+  // POST /api/nvrs/test-connection — Probar conexión antes de guardar (ADMIN)
+  server.post('/test-connection', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const data = connectionTestSchema.parse(request.body)
+
+    const fakeNvr = {
+      id: 'test',
+      ipAddress: data.ipAddress,
+      port: data.port,
+      username: data.username,
+      password: data.password,
+      rtspPort: 554,
+      channels: 0,
+      hddCount: 0,
+      firmware: null,
+    } as any
+
+    const status = await getNVRStatus(fakeNvr)
+
+    if (!status.online) {
+      return reply.status(503).send({
+        success: false,
+        message: 'No se pudo conectar al NVR. Verifica IP, puerto y credenciales.',
+      })
+    }
+
+    return reply.send({
+      success: true,
+      firmware: status.firmware,
+      diskUsage: status.diskUsage,
+    })
+  })
+
+  // POST /api/nvrs/detect — Auto-detectar info del NVR a partir de IP + credenciales (ADMIN)
+  server.post('/detect', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const data = connectionTestSchema.parse(request.body)
+    const axios = (await import('axios')).default
+
+    const client = axios.create({
+      baseURL: `http://${data.ipAddress}:${data.port}`,
+      timeout: 8000,
+      auth: { username: data.username, password: data.password },
+    })
+
+    try {
+      const sysRes = await client.get('/ISAPI/System/deviceInfo')
+      const info = sysRes.data?.DeviceInfo || {}
+
+      let channels = 0
+      try {
+        const chRes = await client.get('/ISAPI/System/Video/inputs/channels')
+        const chData = chRes.data?.VideoInputChannelList?.VideoInputChannel
+        channels = Array.isArray(chData) ? chData.length : chData ? 1 : 0
+      } catch { channels = 0 }
+
+      return reply.send({
+        success: true,
+        model: info.model || info.deviceType || '',
+        serialNumber: info.serialNumber || '',
+        firmware: info.firmwareVersion || '',
+        channels,
+      })
+    } catch {
+      return reply.status(503).send({
+        success: false,
+        message: 'No se pudo conectar. Verifica IP, puerto y credenciales.',
+      })
+    }
+  })
+
   // GET /api/nvrs — Listar todos los NVRs
   server.get('/', {
     preHandler: [server.authenticate],

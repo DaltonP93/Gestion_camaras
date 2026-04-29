@@ -1,6 +1,7 @@
 // apps/api/src/routes/websocket.ts
 import type { FastifyPluginAsync } from 'fastify'
 import type { WebSocket } from 'ws'
+import type { JWTPayload } from '../plugins/auth'
 
 // Mapa global de conexiones WebSocket por userId
 export const wsClients = new Map<string, Set<WebSocket>>()
@@ -24,12 +25,23 @@ export function broadcastToUser(userId: string, payload: object) {
 }
 
 export const wsHandler: FastifyPluginAsync = async (server) => {
+  // Sin preHandler: el token viene en query param ?token=JWT
+  // porque los browsers no pueden enviar headers custom en WebSocket
   server.get('/alerts', {
     websocket: true,
-    preHandler: [server.authenticate],
   }, (connection, request) => {
-    const userId = request.user.sub
+    const { token } = request.query as { token?: string }
     const ws = connection.socket
+
+    let userPayload: JWTPayload
+    try {
+      userPayload = server.jwt.verify<JWTPayload>(token || '')
+    } catch {
+      ws.close(4001, 'Unauthorized')
+      return
+    }
+
+    const userId = userPayload.sub
 
     // Registrar cliente
     if (!wsClients.has(userId)) {
@@ -37,7 +49,7 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
     }
     wsClients.get(userId)!.add(ws)
 
-    server.log.info(`WS conectado: usuario ${request.user.username}`)
+    server.log.info(`WS conectado: usuario ${userPayload.username}`)
 
     // Enviar ping cada 30s para mantener conexión
     const pingInterval = setInterval(() => {
@@ -66,7 +78,7 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
       if (wsClients.get(userId)?.size === 0) {
         wsClients.delete(userId)
       }
-      server.log.info(`WS desconectado: usuario ${request.user.username}`)
+      server.log.info(`WS desconectado: usuario ${userPayload.username}`)
     })
 
     ws.on('error', (err) => {

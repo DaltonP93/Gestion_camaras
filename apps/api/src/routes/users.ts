@@ -29,6 +29,32 @@ const permissionSchema = z.object({
 })
 
 export const userRoutes: FastifyPluginAsync = async (server) => {
+  // GET /api/users/audit/activity — Log de actividad (registrado antes de /:id)
+  server.get('/audit/activity', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { page = '1', limit = '50', userId } = request.query as {
+      page?: string; limit?: string; userId?: string
+    }
+
+    const where = userId ? { userId } : {}
+    const skip = (parseInt(page) - 1) * parseInt(limit)
+    const take = parseInt(limit)
+
+    const [logs, total] = await Promise.all([
+      server.prisma.auditLog.findMany({
+        where,
+        include: { user: { select: { username: true, fullName: true, role: true } } },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take,
+      }),
+      server.prisma.auditLog.count({ where }),
+    ])
+
+    return reply.send({ logs, total })
+  })
+
   // GET /api/users — Listar usuarios (solo ADMIN)
   server.get('/', {
     preHandler: [server.authorize(['ADMIN'])],
@@ -198,22 +224,4 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({ message: 'Permisos actualizados', count: created.count })
   })
 
-  // GET /api/users/activity — Log de actividad general (solo ADMIN)
-  server.get('/audit/activity', {
-    preHandler: [server.authorize(['ADMIN'])],
-  }, async (request, reply) => {
-    const { page = '1', limit = '50', userId } = request.query as {
-      page?: string; limit?: string; userId?: string
-    }
-
-    const logs = await server.prisma.auditLog.findMany({
-      where: userId ? { userId } : {},
-      include: { user: { select: { username: true, fullName: true, role: true } } },
-      orderBy: { createdAt: 'desc' },
-      skip: (parseInt(page) - 1) * parseInt(limit),
-      take: parseInt(limit),
-    })
-
-    return reply.send(logs)
-  })
 }

@@ -2,7 +2,7 @@
 import { NavLink } from 'react-router-dom'
 import {
   LayoutDashboard, Video, Clock, Bell, Server, Users,
-  Activity, ChevronRight, Shield
+  Activity, ChevronRight, Shield, Settings, LayoutGrid, Palette
 } from 'lucide-react'
 import { useAuthStore } from '@/stores/authStore'
 import { useAlertStore } from '@/stores/alertStore'
@@ -83,6 +83,7 @@ export function Sidebar() {
 
         {navItem('/', <LayoutDashboard size={14} />, 'Dashboard')}
         {navItem('/live', <Video size={14} />, 'Vista en vivo')}
+        {navItem('/views', <LayoutGrid size={14} />, 'Visores')}
         {navItem('/recordings', <Clock size={14} />, 'Grabaciones', undefined, ['ADMIN', 'SUPERVISOR', 'AUDITOR'])}
         {navItem('/alerts', <Bell size={14} />, 'Alertas', unreadCount)}
 
@@ -127,6 +128,8 @@ export function Sidebar() {
             {navItem('/nvrs', <Server size={14} />, 'NVRs', undefined, ['ADMIN'])}
             {navItem('/users', <Users size={14} />, 'Usuarios', undefined, ['ADMIN'])}
             {navItem('/activity', <Activity size={14} />, 'Actividad', undefined, ['ADMIN'])}
+            {navItem('/appearance', <Palette size={14} />, 'Apariencia', undefined, ['ADMIN'])}
+            {navItem('/settings', <Settings size={14} />, 'Configuración', undefined, ['ADMIN'])}
           </>
         )}
       </nav>

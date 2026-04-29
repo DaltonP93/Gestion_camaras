@@ -9,8 +9,8 @@ export function connectWebSocket() {
   const token = localStorage.getItem('accessToken')
   if (!token) return
 
-  const wsBase = import.meta.env.VITE_WS_URL || window.location.origin.replace('http', 'ws')
-  const url = `${wsBase}/ws/alerts`
+  const wsBase = window.location.origin.replace(/^http/, 'ws')
+  const url = `${wsBase}/ws/alerts?token=${encodeURIComponent(token)}`
 
   try {
     ws = new WebSocket(url)

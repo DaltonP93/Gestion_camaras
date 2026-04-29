@@ -14,16 +14,14 @@ export function getStreamPath(nvr: NVR, camera: Camera): string {
   return `nvr_${nvr.id}_ch${String(camera.channel).padStart(2, '0')}`
 }
 
-// URL HLS pública para el frontend
+// URL HLS relativa para el frontend (pasa por Nginx /hls/ → mediamtx:8888)
 export function getHlsUrl(streamPath: string): string {
-  const baseUrl = process.env.VITE_STREAM_URL || 'http://localhost:8888'
-  return `${baseUrl}/${streamPath}/index.m3u8`
+  return `/hls/${streamPath}/index.m3u8`
 }
 
-// URL WebRTC para el frontend
+// URL WebRTC relativa para el frontend (pasa por Nginx /webrtc/ → mediamtx:8889)
 export function getWebRtcUrl(streamPath: string): string {
-  const baseUrl = (process.env.VITE_STREAM_URL || 'http://localhost:8888').replace('8888', '8889')
-  return `${baseUrl}/${streamPath}/whep`
+  return `/webrtc/${streamPath}/whep`
 }
 
 // ─── Publicar stream desde NVR a MediaMTX ───────────────────

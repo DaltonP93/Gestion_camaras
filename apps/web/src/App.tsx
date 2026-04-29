@@ -11,6 +11,10 @@ import { UsersPage } from '@/pages/UsersPage'
 import { NVRsPage } from '@/pages/NVRsPage'
 import { AlertsPage } from '@/pages/AlertsPage'
 import { ActivityPage } from '@/pages/ActivityPage'
+import { SettingsPage } from '@/pages/SettingsPage'
+import { ViewsPage } from '@/pages/ViewsPage'
+import { ViewPlayerPage } from '@/pages/ViewPlayerPage'
+import { AppearancePage } from '@/pages/AppearancePage'
 import { ProtectedRoute } from '@/components/layout/ProtectedRoute'
 
 export default function App() {
@@ -30,6 +34,8 @@ export default function App() {
         <Route element={<Layout />}>
           <Route index element={<DashboardPage />} />
           <Route path="live" element={<LiveViewPage />} />
+          <Route path="views" element={<ViewsPage />} />
+          <Route path="views/:id" element={<ViewPlayerPage />} />
           <Route path="recordings" element={
             <ProtectedRoute roles={['ADMIN', 'SUPERVISOR', 'AUDITOR']}>
               <RecordingsPage />
@@ -49,6 +55,16 @@ export default function App() {
           <Route path="activity" element={
             <ProtectedRoute roles={['ADMIN']}>
               <ActivityPage />
+            </ProtectedRoute>
+          } />
+          <Route path="appearance" element={
+            <ProtectedRoute roles={['ADMIN']}>
+              <AppearancePage />
+            </ProtectedRoute>
+          } />
+          <Route path="settings" element={
+            <ProtectedRoute roles={['ADMIN']}>
+              <SettingsPage />
             </ProtectedRoute>
           } />
         </Route>
