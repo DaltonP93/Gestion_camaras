@@ -2,7 +2,7 @@
 import { NavLink } from 'react-router-dom'
 import {
   LayoutDashboard, Video, Clock, Bell, Server, Users,
-  Activity, ChevronRight, Shield
+  Activity, ChevronRight, Shield, Settings
 } from 'lucide-react'
 import { useAuthStore } from '@/stores/authStore'
 import { useAlertStore } from '@/stores/alertStore'
@@ -127,6 +127,7 @@ export function Sidebar() {
             {navItem('/nvrs', <Server size={14} />, 'NVRs', undefined, ['ADMIN'])}
             {navItem('/users', <Users size={14} />, 'Usuarios', undefined, ['ADMIN'])}
             {navItem('/activity', <Activity size={14} />, 'Actividad', undefined, ['ADMIN'])}
+            {navItem('/settings', <Settings size={14} />, 'Configuración', undefined, ['ADMIN'])}
           </>
         )}
       </nav>

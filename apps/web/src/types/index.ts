@@ -32,6 +32,7 @@ export interface NVR {
   ipAddress: string
   port: number
   rtspPort: number
+  username: string
   channels: number
   hddCount: number
   firmware?: string

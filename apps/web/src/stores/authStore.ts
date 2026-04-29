@@ -1,7 +1,7 @@
 // src/stores/authStore.ts
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { api, apiPost } from '@/lib/api'
+import { api, apiGet, apiPost } from '@/lib/api'
 import { connectWebSocket, disconnectWebSocket } from '@/lib/websocket'
 import type { User, LoginResponse } from '@/types'
 
@@ -73,7 +73,7 @@ export const useAuthStore = create<AuthState>()(
         if (!token) return
 
         try {
-          const user = await apiPost<User>('/auth/me')
+          const user = await apiGet<User>('/auth/me')
           set({ user, isAuthenticated: true })
           connectWebSocket()
         } catch {

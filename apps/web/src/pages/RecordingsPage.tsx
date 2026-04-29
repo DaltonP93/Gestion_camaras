@@ -32,8 +32,9 @@ export function RecordingsPage() {
         startTime: new Date(startDate).toISOString(),
         endTime: new Date(endDate).toISOString(),
       })
-      setRecordings(result.recordings)
-      if (result.recordings.length === 0) toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
+      const recs = result?.recordings ?? []
+      setRecordings(recs)
+      if (recs.length === 0) toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
     } finally {
       setIsSearching(false)
     }

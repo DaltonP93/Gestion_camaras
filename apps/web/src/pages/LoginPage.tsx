@@ -97,28 +97,30 @@ export function LoginPage() {
             </button>
           </form>
 
-          {/* Hint credenciales de demo */}
-          <div className="mt-6 pt-5 border-t border-surface-600">
-            <p className="text-xs text-surface-500 text-center mb-3">Credenciales de demo</p>
-            <div className="grid grid-cols-2 gap-2">
-              {[
-                { u: 'admin', r: 'Admin' },
-                { u: 'supervisor', r: 'Supervisor' },
-                { u: 'operador1', r: 'Operador' },
-                { u: 'auditor', r: 'Auditor' },
-              ].map(({ u, r }) => (
-                <button
-                  key={u}
-                  type="button"
-                  onClick={() => { setUsername(u); setPassword(u.charAt(0).toUpperCase() + u.slice(1) + '123!') }}
-                  className="text-xs px-2 py-1.5 rounded-md bg-surface-700 text-surface-300 hover:text-surface-100 hover:bg-surface-600 transition-colors text-left"
-                >
-                  <span className="font-medium">{u}</span>
-                  <span className="block text-surface-500">{r}</span>
-                </button>
-              ))}
+          {/* Credenciales de demo — solo en desarrollo */}
+          {import.meta.env.DEV && (
+            <div className="mt-6 pt-5 border-t border-surface-600">
+              <p className="text-xs text-surface-500 text-center mb-3">Credenciales de demo</p>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  { u: 'admin', r: 'Admin' },
+                  { u: 'supervisor', r: 'Supervisor' },
+                  { u: 'operador1', r: 'Operador' },
+                  { u: 'auditor', r: 'Auditor' },
+                ].map(({ u, r }) => (
+                  <button
+                    key={u}
+                    type="button"
+                    onClick={() => { setUsername(u); setPassword(u.charAt(0).toUpperCase() + u.slice(1) + '123!') }}
+                    className="text-xs px-2 py-1.5 rounded-md bg-surface-700 text-surface-300 hover:text-surface-100 hover:bg-surface-600 transition-colors text-left"
+                  >
+                    <span className="font-medium">{u}</span>
+                    <span className="block text-surface-500">{r}</span>
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
         <p className="text-center text-xs text-surface-600 mt-6">

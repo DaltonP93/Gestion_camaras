@@ -11,6 +11,7 @@ import { UsersPage } from '@/pages/UsersPage'
 import { NVRsPage } from '@/pages/NVRsPage'
 import { AlertsPage } from '@/pages/AlertsPage'
 import { ActivityPage } from '@/pages/ActivityPage'
+import { SettingsPage } from '@/pages/SettingsPage'
 import { ProtectedRoute } from '@/components/layout/ProtectedRoute'
 
 export default function App() {
@@ -49,6 +50,11 @@ export default function App() {
           <Route path="activity" element={
             <ProtectedRoute roles={['ADMIN']}>
               <ActivityPage />
+            </ProtectedRoute>
+          } />
+          <Route path="settings" element={
+            <ProtectedRoute roles={['ADMIN']}>
+              <SettingsPage />
             </ProtectedRoute>
           } />
         </Route>
