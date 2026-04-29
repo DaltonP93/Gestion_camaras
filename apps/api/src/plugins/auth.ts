@@ -12,13 +12,17 @@ export interface JWTPayload {
   exp?: number
 }
 
+declare module '@fastify/jwt' {
+  interface FastifyJWT {
+    payload: JWTPayload
+    user: JWTPayload
+  }
+}
+
 declare module 'fastify' {
   interface FastifyInstance {
     authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>
     authorize: (roles: Role[]) => (request: FastifyRequest, reply: FastifyReply) => Promise<void>
-  }
-  interface FastifyRequest {
-    user: JWTPayload
   }
 }
 
