@@ -6,10 +6,10 @@ Sistema web completo para gestión centralizada de múltiples NVRs Hikvision con
 
 | NVR | Modelo | Canales | HDDs |
 |-----|--------|---------|------|
-| NVR UTI | DS-7616NI-K2/16P | 16 | 2 |
-| NVR_32_SAA_2023 | DS-7732NI-K4 | 32 | 4 |
-| NVR Torre Vieja | DS-7732NI-K4 | 31 | 2 |
-| NVR SAA Nueva Torre | DS-9664NI-I8 | 62 | 4 |
+| NVR 1 | DS-7xxxxx/16P | 16 | 2 |
+| NVR2 | DS-xxxxx | 32 | 4 |
+| NVR3 | DS-xxxxx| 31 | 2 |
+| NVR4 | DS-xxxxxxx | 62 | 4 |
 
 ## Stack tecnológico
 
@@ -48,10 +48,10 @@ cp .env.example .env
 ### 2. Editar `.env` con tus IPs de NVR
 
 ```env
-NVR_UTI_IP=192.168.1.100
-NVR_SAA_2023_IP=192.168.1.101
-NVR_TORRE_VIEJA_IP=192.168.1.102
-NVR_NUEVA_TORRE_IP=192.168.1.103
+NVR_1_IP=192.x.x.x
+NVR_2_IP=192.x.x.x
+NVR_3_IP=192.x.x.x
+NVR_4_IP=192.x.x.x
 ```
 
 ### 3. Levantar todo
