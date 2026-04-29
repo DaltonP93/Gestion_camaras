@@ -1,0 +1,76 @@
+# infra/mediamtx/mediamtx.yml
+# Configuración de MediaMTX — Proxy RTSP → HLS/WebRTC
+
+###############################################
+# General
+###############################################
+logLevel: info
+logDestinations: [stdout]
+logFile: ""
+
+readTimeout: 10s
+writeTimeout: 10s
+readBufferCount: 4096
+
+###############################################
+# API de administración (usada por el backend)
+###############################################
+api: yes
+apiAddress: :9997
+metrics: yes
+metricsAddress: :9998
+
+###############################################
+# Protocolos de entrada
+###############################################
+protocols: [tcp]  # Forzar TCP para mayor estabilidad en redes LAN
+
+rtspAddress: :8554
+rtspsAddress: :8322
+rtpAddress: :8000
+rtcpAddress: :8001
+
+###############################################
+# HLS (para el frontend web)
+###############################################
+hls: yes
+hlsAddress: :8888
+hlsAlwaysRemux: no
+hlsVariant: lowLatency      # lowLatency = menor latencia, mpegts = mayor compatibilidad
+hlsSegmentCount: 3
+hlsSegmentDuration: 2s      # Segmentos de 2s = ~4-6s de latencia total
+hlsPartDuration: 200ms
+hlsSegmentMaxSize: 50MB
+hlsEncryption: no
+hlsAllowOrigin: "*"         # CORS para el frontend
+
+###############################################
+# WebRTC (latencia ultra baja ~500ms)
+###############################################
+webrtc: yes
+webrtcAddress: :8889
+webrtcICEServers2: []
+webrtcAllowOrigin: "*"
+
+###############################################
+# Rutas base (las rutas NVR se crean dinámicamente via API)
+###############################################
+paths:
+  # Ruta de prueba para verificar que MediaMTX funciona
+  ~^test.*:
+    source: publisher
+
+  # Template para todos los streams de NVR
+  # Formato: nvr_{nvrId}_ch{channel}
+  # El backend registra cada cámara vía POST /v3/config/paths/add/{path}
+  ~^nvr_.*:
+    source: publisher
+    sourceOnDemand: yes
+    sourceOnDemandStartTimeout: 15s
+    sourceOnDemandCloseAfter: 30s    # Cerrar stream si no hay viewers por 30s
+    record: no
+    overridePublisher: yes           # Permitir re-publicar si se cae
+
+  # Catch-all
+  "~.*":
+    source: publisher

@@ -1,0 +1,122 @@
+version: '3.9'
+
+services:
+  # ─── Base de datos PostgreSQL ───────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: visioncore_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: visioncore_db
+      POSTGRES_USER: visioncore
+      POSTGRES_PASSWORD: visioncore_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - visioncore_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U visioncore -d visioncore_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis (sesiones y caché) ───────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: visioncore_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - visioncore_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── MediaMTX (proxy RTSP → HLS/WebRTC) ────────────────────
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: visioncore_mediamtx
+    restart: unless-stopped
+    environment:
+      MTX_PROTOCOLS: tcp
+    volumes:
+      - ./infra/mediamtx/mediamtx.yml:/mediamtx.yml:ro
+    ports:
+      - "8554:8554"   # RTSP
+      - "8888:8888"   # HLS
+      - "8889:8889"   # WebRTC
+      - "9997:9997"   # API REST de MediaMTX
+    networks:
+      - visioncore_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ─── API Backend (Fastify) ──────────────────────────────────
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: visioncore_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://visioncore:visioncore_pass@postgres:5432/visioncore_db
+      REDIS_URL: redis://redis:6379
+      MEDIAMTX_URL: http://mediamtx:9997
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    networks:
+      - visioncore_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ─── Frontend (React + Nginx) ───────────────────────────────
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    container_name: visioncore_web
+    restart: unless-stopped
+    depends_on:
+      - api
+    networks:
+      - visioncore_net
+
+  # ─── Nginx (reverse proxy + SSL) ───────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: visioncore_nginx
+    restart: unless-stopped
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+      - web
+      - mediamtx
+    networks:
+      - visioncore_net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  visioncore_net:
+    driver: bridge

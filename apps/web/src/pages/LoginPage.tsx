@@ -1,0 +1,130 @@
+// src/pages/LoginPage.tsx
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Shield, Eye, EyeOff, Loader2 } from 'lucide-react'
+import { useAuthStore } from '@/stores/authStore'
+import toast from 'react-hot-toast'
+
+export function LoginPage() {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPass, setShowPass] = useState(false)
+  const { login, isLoading } = useAuthStore()
+  const navigate = useNavigate()
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!username || !password) {
+      toast.error('Ingresa usuario y contraseña')
+      return
+    }
+    try {
+      await login(username, password)
+      navigate('/')
+    } catch {
+      // Error manejado por interceptor de axios
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-surface-900 flex items-center justify-center p-4">
+      {/* Fondo con patrón de grilla */}
+      <div className="absolute inset-0 bg-[linear-gradient(rgba(48,54,61,0.3)_1px,transparent_1px),linear-gradient(90deg,rgba(48,54,61,0.3)_1px,transparent_1px)] bg-[size:32px_32px]" />
+
+      <div className="relative w-full max-w-sm">
+        {/* Card */}
+        <div className="card p-8 shadow-2xl">
+          {/* Logo */}
+          <div className="flex flex-col items-center mb-8">
+            <div className="w-14 h-14 rounded-2xl bg-brand-600 flex items-center justify-center mb-4 shadow-lg shadow-brand-900/50">
+              <Shield size={28} className="text-white" />
+            </div>
+            <h1 className="text-xl font-semibold text-surface-50">VisionCore</h1>
+            <p className="text-sm text-surface-400 mt-1">Sistema de gestión NVR</p>
+          </div>
+
+          {/* Form */}
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label className="label">Usuario</label>
+              <input
+                className="input"
+                type="text"
+                placeholder="tu_usuario"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoComplete="username"
+                autoFocus
+                disabled={isLoading}
+              />
+            </div>
+
+            <div>
+              <label className="label">Contraseña</label>
+              <div className="relative">
+                <input
+                  className="input pr-10"
+                  type={showPass ? 'text' : 'password'}
+                  placeholder="••••••••"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="current-password"
+                  disabled={isLoading}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPass(!showPass)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200"
+                >
+                  {showPass ? <EyeOff size={14} /> : <Eye size={14} />}
+                </button>
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="btn-primary w-full justify-center py-2.5 mt-2"
+            >
+              {isLoading ? (
+                <>
+                  <Loader2 size={14} className="animate-spin" />
+                  Ingresando...
+                </>
+              ) : (
+                'Iniciar sesión'
+              )}
+            </button>
+          </form>
+
+          {/* Hint credenciales de demo */}
+          <div className="mt-6 pt-5 border-t border-surface-600">
+            <p className="text-xs text-surface-500 text-center mb-3">Credenciales de demo</p>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { u: 'admin', r: 'Admin' },
+                { u: 'supervisor', r: 'Supervisor' },
+                { u: 'operador1', r: 'Operador' },
+                { u: 'auditor', r: 'Auditor' },
+              ].map(({ u, r }) => (
+                <button
+                  key={u}
+                  type="button"
+                  onClick={() => { setUsername(u); setPassword(u.charAt(0).toUpperCase() + u.slice(1) + '123!') }}
+                  className="text-xs px-2 py-1.5 rounded-md bg-surface-700 text-surface-300 hover:text-surface-100 hover:bg-surface-600 transition-colors text-left"
+                >
+                  <span className="font-medium">{u}</span>
+                  <span className="block text-surface-500">{r}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <p className="text-center text-xs text-surface-600 mt-6">
+          VisionCore VMS v1.0 — Hikvision ISAPI
+        </p>
+      </div>
+    </div>
+  )
+}

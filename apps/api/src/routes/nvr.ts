@@ -1,0 +1,186 @@
+// apps/api/src/routes/nvr.ts
+import type { FastifyPluginAsync } from 'fastify'
+import { z } from 'zod'
+import { getNVRStatus, getNVRChannels } from '../services/hikvision'
+import { publishAllStreams } from '../services/stream'
+import { AuditAction } from '../services/audit'
+import CryptoJS from 'crypto-js'
+
+const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
+
+function encryptPassword(password: string): string {
+  return CryptoJS.AES.encrypt(password, ENCRYPTION_KEY).toString()
+}
+
+function decryptPassword(encrypted: string): string {
+  const bytes = CryptoJS.AES.decrypt(encrypted, ENCRYPTION_KEY)
+  return bytes.toString(CryptoJS.enc.Utf8)
+}
+
+const nvrSchema = z.object({
+  name: z.string().min(1).max(100),
+  model: z.string().min(1),
+  ipAddress: z.string().ip(),
+  port: z.number().int().min(1).max(65535).default(80),
+  rtspPort: z.number().int().min(1).max(65535).default(554),
+  username: z.string().min(1),
+  password: z.string().min(1),
+  channels: z.number().int().min(1).max(128),
+  hddCount: z.number().int().min(1).max(16).default(1),
+  location: z.string().optional(),
+})
+
+export const nvrRoutes: FastifyPluginAsync = async (server) => {
+  // GET /api/nvrs — Listar todos los NVRs
+  server.get('/', {
+    preHandler: [server.authenticate],
+  }, async (request, reply) => {
+    const user = request.user
+
+    let nvrs
+    if (['ADMIN', 'SUPERVISOR'].includes(user.role)) {
+      nvrs = await server.prisma.nVR.findMany({
+        include: { cameras: { select: { id: true, channel: true, name: true, online: true, active: true } } },
+        orderBy: { name: 'asc' },
+      })
+    } else {
+      // Operador/Auditor: solo NVRs con permisos
+      const permissions = await server.prisma.userPermission.findMany({
+        where: { userId: user.sub, nvrId: { not: null } },
+        select: { nvrId: true },
+      })
+      const nvrIds = permissions.map((p) => p.nvrId!).filter(Boolean)
+
+      nvrs = await server.prisma.nVR.findMany({
+        where: { id: { in: nvrIds } },
+        include: { cameras: { select: { id: true, channel: true, name: true, online: true, active: true } } },
+        orderBy: { name: 'asc' },
+      })
+    }
+
+    // Ocultar contraseñas
+    return reply.send(nvrs.map((nvr) => ({ ...nvr, password: undefined })))
+  })
+
+  // GET /api/nvrs/:id — Detalle de NVR
+  server.get('/:id', {
+    preHandler: [server.authenticate],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({
+      where: { id },
+      include: { cameras: true },
+    })
+
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    return reply.send({ ...nvr, password: undefined })
+  })
+
+  // GET /api/nvrs/:id/status — Estado en tiempo real del NVR
+  server.get('/:id/status', {
+    preHandler: [server.authenticate],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const nvrWithDecryptedPass = { ...nvr, password: decryptPassword(nvr.password) }
+    const status = await getNVRStatus(nvrWithDecryptedPass as any)
+
+    // Actualizar lastSeen si está online
+    if (status.online) {
+      await server.prisma.nVR.update({
+        where: { id },
+        data: { lastSeen: new Date(), firmware: status.firmware },
+      })
+    }
+
+    return reply.send(status)
+  })
+
+  // GET /api/nvrs/:id/channels — Canales del NVR desde ISAPI
+  server.get('/:id/channels', {
+    preHandler: [server.authenticate],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const nvrDecrypted = { ...nvr, password: decryptPassword(nvr.password) }
+    const channels = await getNVRChannels(nvrDecrypted as any)
+
+    return reply.send(channels)
+  })
+
+  // POST /api/nvrs — Crear NVR (solo ADMIN)
+  server.post('/', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const data = nvrSchema.parse(request.body)
+
+    const nvr = await server.prisma.nVR.create({
+      data: {
+        ...data,
+        password: encryptPassword(data.password),
+        location: data.location || null,
+      },
+    })
+
+    // Crear cámaras automáticamente basadas en el número de canales
+    const cameraData = Array.from({ length: data.channels }, (_, i) => ({
+      nvrId: nvr.id,
+      channel: i + 1,
+      name: `Canal ${i + 1}`,
+    }))
+
+    await server.prisma.camera.createMany({ data: cameraData })
+
+    // Publicar streams en MediaMTX
+    const cameras = await server.prisma.camera.findMany({ where: { nvrId: nvr.id } })
+    const nvrDecrypted = { ...nvr, password: data.password }
+    publishAllStreams(nvrDecrypted as any, cameras).catch(() => {})
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_CREATED', nvr.id, request)
+
+    return reply.status(201).send({ ...nvr, password: undefined })
+  })
+
+  // PUT /api/nvrs/:id — Actualizar NVR (solo ADMIN)
+  server.put('/:id', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const data = nvrSchema.partial().parse(request.body)
+
+    const updateData: any = { ...data }
+    if (data.password) {
+      updateData.password = encryptPassword(data.password)
+    }
+
+    const nvr = await server.prisma.nVR.update({
+      where: { id },
+      data: updateData,
+    })
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_UPDATED', nvr.id, request)
+
+    return reply.send({ ...nvr, password: undefined })
+  })
+
+  // DELETE /api/nvrs/:id — Eliminar NVR (solo ADMIN)
+  server.delete('/:id', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    await server.prisma.nVR.delete({ where: { id } })
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_DELETED', id, request)
+
+    return reply.send({ message: 'NVR eliminado' })
+  })
+}

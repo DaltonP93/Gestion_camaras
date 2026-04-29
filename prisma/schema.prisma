@@ -1,0 +1,169 @@
+// prisma/schema.prisma
+// VisionCore — Schema de base de datos
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Roles del sistema ───────────────────────────────────────
+enum Role {
+  ADMIN      // Acceso total
+  SUPERVISOR // Ver todo + grabaciones
+  OPERATOR   // Solo cámaras asignadas en vivo
+  AUDITOR    // Solo grabaciones asignadas
+}
+
+// ─── Usuarios ────────────────────────────────────────────────
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  role         Role     @default(OPERATOR)
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Sesiones activas
+  sessions     Session[]
+  // Permisos granulares por NVR/cámara
+  permissions  UserPermission[]
+  // Log de auditoría
+  auditLogs    AuditLog[]
+
+  @@map("users")
+}
+
+// ─── Sesiones JWT ────────────────────────────────────────────
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken String   @unique
+  userAgent    String?
+  ipAddress    String?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  @@map("sessions")
+}
+
+// ─── NVRs Hikvision ──────────────────────────────────────────
+model NVR {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  model       String
+  serialNumber String?
+  ipAddress   String
+  port        Int      @default(80)
+  rtspPort    Int      @default(554)
+  username    String
+  password    String   // Encriptado con AES
+  channels    Int      @default(16)
+  hddCount    Int      @default(1)
+  firmware    String?
+  location    String?
+  active      Boolean  @default(true)
+  lastSeen    DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  cameras     Camera[]
+  permissions UserPermission[]
+
+  @@map("nvrs")
+}
+
+// ─── Cámaras ─────────────────────────────────────────────────
+model Camera {
+  id          String   @id @default(cuid())
+  nvrId       String
+  nvr         NVR      @relation(fields: [nvrId], references: [id], onDelete: Cascade)
+  channel     Int      // Canal en el NVR (1-64)
+  name        String
+  location    String?
+  rtspUrl     String?  // URL RTSP directa
+  hlsPath     String?  // Path en MediaMTX
+  ptzEnabled  Boolean  @default(false)
+  active      Boolean  @default(true)
+  online      Boolean  @default(false)
+  lastCheck   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  permissions UserPermission[]
+
+  @@unique([nvrId, channel])
+  @@map("cameras")
+}
+
+// ─── Permisos por usuario ────────────────────────────────────
+model UserPermission {
+  id         String  @id @default(cuid())
+  userId     String
+  user       User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nvrId      String?
+  nvr        NVR?    @relation(fields: [nvrId], references: [id], onDelete: Cascade)
+  cameraId   String?
+  camera     Camera? @relation(fields: [cameraId], references: [id], onDelete: Cascade)
+  canView    Boolean @default(true)
+  canPlayback Boolean @default(false)
+  canPtz     Boolean @default(false)
+
+  @@unique([userId, nvrId, cameraId])
+  @@map("user_permissions")
+}
+
+// ─── Log de auditoría ────────────────────────────────────────
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String   // LOGIN, LOGOUT, VIEW_CAMERA, VIEW_RECORDING, etc.
+  resource  String?  // ID del recurso afectado
+  detail    Json?    // Detalles adicionales
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@map("audit_logs")
+}
+
+// ─── Alertas ─────────────────────────────────────────────────
+model Alert {
+  id        String      @id @default(cuid())
+  nvrId     String?
+  cameraId  String?
+  type      AlertType
+  severity  AlertSeverity @default(LOW)
+  message   String
+  detail    Json?
+  resolved  Boolean     @default(false)
+  resolvedAt DateTime?
+  createdAt DateTime    @default(now())
+
+  @@map("alerts")
+}
+
+enum AlertType {
+  CAMERA_OFFLINE
+  NVR_OFFLINE
+  HDD_FULL
+  HDD_ERROR
+  MOTION_DETECTED
+  RECORDING_ERROR
+  AUTH_FAILED
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
