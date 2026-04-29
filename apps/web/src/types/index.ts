@@ -135,3 +135,39 @@ export interface ApiError {
 
 // Layouts de grilla de cámaras disponibles
 export type GridLayout = 1 | 4 | 9 | 16 | 25
+
+export type ViewLayout = '1x1' | '2x2' | '3x3' | '4x4' | 'featured' | 'custom'
+
+export interface CameraSlot {
+  slotIndex: number
+  cameraId: string | null
+  size: 'normal' | 'large'
+}
+
+export interface CameraView {
+  id: string
+  name: string
+  description?: string
+  layout: ViewLayout
+  cameraSlots: CameraSlot[]
+  slideshowEnabled: boolean
+  slideshowInterval: number
+  isPublic: boolean
+  createdById: string
+  createdAt: string
+  updatedAt: string
+  access?: { userId: string; user?: { fullName: string; username: string } }[]
+}
+
+export interface AppearanceSettings {
+  id: string
+  siteName: string
+  logoText: string
+  primaryColor: string
+  accentColor: string
+  theme: 'dark' | 'darker' | 'midnight'
+  sidebarWidth: 'compact' | 'normal'
+  showNVRsInSidebar: boolean
+  customCss?: string
+  updatedAt: string
+}
