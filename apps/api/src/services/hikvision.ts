@@ -1,6 +1,7 @@
 // apps/api/src/services/hikvision.ts
 // Integración completa con la API ISAPI de Hikvision
-import axios, { type AxiosInstance } from 'axios'
+import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios'
+import crypto from 'crypto'
 import type { NVR } from '@prisma/client'
 
 export interface HikChannel {
@@ -32,19 +33,70 @@ export interface HikPlaybackUrl {
   expiresAt: string
 }
 
-// Crea cliente HTTP con autenticación digest para Hikvision
+// Build Digest Authorization header from a WWW-Authenticate challenge
+function buildDigestAuth(
+  username: string, password: string,
+  method: string, uri: string,
+  wwwAuth: string,
+): string {
+  const realm = (wwwAuth.match(/realm="([^"]+)"/) || [])[1] ?? ''
+  const nonce = (wwwAuth.match(/nonce="([^"]+)"/) || [])[1] ?? ''
+  const qop   = (wwwAuth.match(/qop="?([^",]+)"?/) || [])[1]
+  const nc    = '00000001'
+  const cnonce = crypto.randomBytes(8).toString('hex')
+
+  const md5 = (s: string) => crypto.createHash('md5').update(s).digest('hex')
+  const ha1 = md5(`${username}:${realm}:${password}`)
+  const ha2 = md5(`${method}:${uri}`)
+
+  let response: string
+  if (qop) {
+    response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`)
+  } else {
+    response = md5(`${ha1}:${nonce}:${ha2}`)
+  }
+
+  let header = `Digest username="${username}", realm="${realm}", nonce="${nonce}", uri="${uri}", response="${response}"`
+  if (qop) header += `, qop=${qop}, nc=${nc}, cnonce="${cnonce}"`
+  return header
+}
+
+// Crea cliente HTTP con soporte Basic + Digest automático para Hikvision
 function createHikClient(nvr: NVR): AxiosInstance {
+  const { username, password } = nvr
+
   const client = axios.create({
     baseURL: `http://${nvr.ipAddress}:${nvr.port}`,
     timeout: 10000,
-    auth: {
-      username: nvr.username,
-      password: nvr.password,
-    },
     headers: {
       'Content-Type': 'application/json',
       'Accept': 'application/json',
     },
+  })
+
+  // Interceptor: on 401 Digest challenge, retry once with Digest auth
+  client.interceptors.response.use(undefined, async (err) => {
+    const res = err.response
+    if (res?.status === 401 && !err.config._digestRetried) {
+      const wwwAuth: string = res.headers['www-authenticate'] ?? ''
+      if (wwwAuth.toLowerCase().startsWith('digest')) {
+        err.config._digestRetried = true
+        const cfg: AxiosRequestConfig & { _digestRetried?: boolean } = err.config
+        const method = (cfg.method ?? 'GET').toUpperCase()
+        const url = new URL(cfg.url ?? '/', `http://${nvr.ipAddress}`)
+        const uri = url.pathname + url.search
+        cfg.headers = cfg.headers ?? {}
+        cfg.headers['Authorization'] = buildDigestAuth(username, password, method, uri, wwwAuth)
+        return client.request(cfg)
+      }
+      // Basic auth fallback (some NVRs accept it when configured)
+      if (!err.config._basicRetried) {
+        err.config._basicRetried = true
+        err.config.auth = { username, password }
+        return client.request(err.config)
+      }
+    }
+    return Promise.reject(err)
   })
 
   return client
@@ -61,7 +113,17 @@ export async function getNVRStatus(nvr: NVR): Promise<HikNVRStatus> {
       client.get('/ISAPI/ContentMgmt/Storage'),
     ])
 
-    const sysData = sysResponse.status === 'fulfilled' ? sysResponse.value.data : null
+    // If the primary call failed the NVR is unreachable or credentials are wrong
+    if (sysResponse.status === 'rejected') {
+      return {
+        online: false,
+        firmware: nvr.firmware || 'Desconocido',
+        diskUsage: 0,
+        cpuUsage: 0,
+      }
+    }
+
+    const sysData = sysResponse.value.data
     const diskData = diskResponse.status === 'fulfilled' ? diskResponse.value.data : null
 
     // Calcular uso de disco

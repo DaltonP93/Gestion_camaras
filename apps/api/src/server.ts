@@ -34,9 +34,8 @@ async function main() {
   })
 
   await server.register(cors, {
-    origin: process.env.NODE_ENV === 'production'
-      ? ['http://localhost', 'https://localhost']
-      : true,
+    // Behind nginx reverse proxy — allow any origin; nginx controls public access
+    origin: true,
     credentials: true,
   })
 
