@@ -183,10 +183,11 @@ export async function getNVRChannels(nvr: NVR): Promise<HikChannel[]> {
 
 // ─── Construir URL RTSP para una cámara ──────────────────────
 export function buildRtspUrl(nvr: NVR, channel: number, subStream = false): string {
-  // Formato estándar Hikvision: rtsp://user:pass@ip:554/Streaming/Channels/CH01
-  const channelStr = String(channel).padStart(2, '0')
+  // Formato estándar Hikvision: rtsp://user:pass@ip:554/Streaming/Channels/[ch][stream]
+  // Canal 1 main = 101, Canal 2 main = 201, Canal 16 main = 1601
   const streamType = subStream ? '02' : '01'
-  return `rtsp://${nvr.username}:${nvr.password}@${nvr.ipAddress}:${nvr.rtspPort}/Streaming/Channels/${channelStr}${streamType}`
+  const encodedPass = encodeURIComponent(nvr.password)
+  return `rtsp://${nvr.username}:${encodedPass}@${nvr.ipAddress}:${nvr.rtspPort}/Streaming/Channels/${channel}${streamType}`
 }
 
 // ─── Buscar grabaciones ───────────────────────────────────────
