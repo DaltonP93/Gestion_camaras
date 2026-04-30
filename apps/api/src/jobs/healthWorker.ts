@@ -4,6 +4,7 @@ import cron from 'node-cron'
 import type { FastifyInstance } from 'fastify'
 import { getNVRStatus, getNVRChannels } from '../services/hikvision'
 import { broadcastAlert } from '../routes/websocket'
+import { publishAllStreams } from '../services/stream'
 import CryptoJS from 'crypto-js'
 
 const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
@@ -135,6 +136,22 @@ export function startHealthWorker(server: FastifyInstance) {
       }
     } catch (err) {
       server.log.error(`Health worker error: ${err}`)
+    }
+  })
+
+  // Re-registrar paths en MediaMTX cada 5 minutos (recupera reinicios de mediamtx)
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      const nvrs = await server.prisma.nVR.findMany({
+        where: { active: true },
+        include: { cameras: { where: { active: true } } },
+      })
+      for (const nvr of nvrs) {
+        const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
+        await publishAllStreams(nvrDecrypted as any, nvr.cameras)
+      }
+    } catch {
+      // Silencioso — mediamtx puede estar temporalmente caído
     }
   })
 

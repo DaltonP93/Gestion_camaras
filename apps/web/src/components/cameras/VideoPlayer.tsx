@@ -56,14 +56,15 @@ export function VideoPlayer({ hlsUrl, cameraName, isRecording, onFullscreen, cla
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            setTimeout(() => {
-              if (retryCount < 5) {
-                hls.startLoad()
-                setRetryCount((r) => r + 1)
-              } else {
+            setRetryCount((r) => {
+              if (r >= 5) {
                 setStatus('offline')
+                return r
               }
-            }, 3000)
+              // Destruir y reiniciar completamente tras un delay
+              setTimeout(() => initPlayer(), 4000)
+              return r + 1
+            })
           } else {
             setStatus('error')
           }
@@ -92,8 +93,10 @@ export function VideoPlayer({ hlsUrl, cameraName, isRecording, onFullscreen, cla
       setStatus('loading')
       return
     }
-    initPlayer()
+    // Esperar a que MediaMTX conecte RTSP y bufferee el primer segmento (~2s)
+    const timer = setTimeout(() => initPlayer(), 3000)
     return () => {
+      clearTimeout(timer)
       hlsRef.current?.destroy()
     }
   }, [hlsUrl, error])

@@ -19,6 +19,11 @@ import appearancePlugin from './routes/appearance'
 import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { startHealthWorker } from './jobs/healthWorker'
+import { publishStream } from './services/stream'
+import CryptoJS from 'crypto-js'
+
+const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
+const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
 const server = Fastify({
   logger: {
@@ -86,6 +91,28 @@ async function main() {
 
   await server.listen({ host, port })
   server.log.info(`VisionCore API corriendo en http://${host}:${port}`)
+
+  // Re-registrar todos los streams en MediaMTX al arrancar
+  // MediaMTX pierde los paths dinámicos al reiniciarse; este bloque los restaura
+  setTimeout(async () => {
+    try {
+      const nvrs = await server.prisma.nVR.findMany({
+        where: { active: true },
+        include: { cameras: { where: { active: true } } },
+      })
+      let count = 0
+      for (const nvr of nvrs) {
+        const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
+        for (const camera of nvr.cameras) {
+          await publishStream(nvrDecrypted as any, camera)
+          count++
+        }
+      }
+      server.log.info(`[startup] ${count} paths de stream registrados en MediaMTX`)
+    } catch (err) {
+      server.log.warn(`[startup] Error registrando streams en MediaMTX: ${err}`)
+    }
+  }, 5000)
 }
 
 main().catch((err) => {

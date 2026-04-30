@@ -54,7 +54,7 @@ hlsSegmentDuration: 2s
 hlsSegmentMaxSize: 50MB
 hlsEncryption: no
 hlsAllowOrigin: "*"
-hlsAlwaysRemux: no
+hlsAlwaysRemux: yes
 
 ###############################################
 # WebRTC (latencia ultra baja ~500ms)
