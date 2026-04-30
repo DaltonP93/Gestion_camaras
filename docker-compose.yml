@@ -62,8 +62,8 @@ services:
   # ─── API Backend (Fastify) ──────────────────────────────────
   api:
     build:
-      context: ./apps/api
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: apps/api/Dockerfile
     container_name: visioncore_api
     restart: unless-stopped
     env_file:

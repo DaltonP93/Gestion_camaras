@@ -64,7 +64,7 @@ const viewsPlugin: FastifyPluginAsync = async (server) => {
       role === 'ADMIN' ||
       view.isPublic ||
       view.createdById === userId ||
-      view.access.some((a) => a.userId === userId)
+      view.access.some((a: { userId: string }) => a.userId === userId)
 
     if (!hasAccess) return reply.status(403).send({ message: 'Sin acceso a esta vista' })
 

@@ -131,7 +131,6 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     const user = await server.prisma.user.create({
       data: {
         ...data,
-        password: undefined,
         passwordHash,
       },
       select: {

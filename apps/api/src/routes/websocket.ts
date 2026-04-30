@@ -29,9 +29,9 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
   // porque los browsers no pueden enviar headers custom en WebSocket
   server.get('/alerts', {
     websocket: true,
-  }, (connection, request) => {
+  }, (socket: WebSocket, request) => {
     const { token } = request.query as { token?: string }
-    const ws = connection.socket
+    const ws = socket
 
     let userPayload: JWTPayload
     try {
@@ -58,7 +58,7 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
       }
     }, 30000)
 
-    ws.on('message', (data) => {
+    ws.on('message', (data: Buffer) => {
       try {
         const msg = JSON.parse(data.toString())
         if (msg.type === 'pong') return
@@ -81,7 +81,7 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
       server.log.info(`WS desconectado: usuario ${userPayload.username}`)
     })
 
-    ws.on('error', (err) => {
+    ws.on('error', (err: Error) => {
       server.log.error(`WS error: ${err.message}`)
     })
   })
