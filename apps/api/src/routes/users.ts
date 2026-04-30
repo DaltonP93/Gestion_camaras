@@ -127,10 +127,11 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const passwordHash = await bcrypt.hash(data.password, 12)
+    const { password: _, ...userData } = data
 
     const user = await server.prisma.user.create({
       data: {
-        ...data,
+        ...userData,
         passwordHash,
       },
       select: {
