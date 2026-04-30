@@ -134,6 +134,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         email: true,
         role: true,
         active: true,
+        avatarUrl: true,
+        phone: true,
         createdAt: true,
         permissions: {
           include: { nvr: true, camera: true },

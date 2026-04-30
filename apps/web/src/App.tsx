@@ -15,6 +15,7 @@ import { SettingsPage } from '@/pages/SettingsPage'
 import { ViewsPage } from '@/pages/ViewsPage'
 import { ViewPlayerPage } from '@/pages/ViewPlayerPage'
 import { AppearancePage } from '@/pages/AppearancePage'
+import { ProfilePage } from '@/pages/ProfilePage'
 import { ProtectedRoute } from '@/components/layout/ProtectedRoute'
 
 export default function App() {
@@ -67,6 +68,7 @@ export default function App() {
               <SettingsPage />
             </ProtectedRoute>
           } />
+          <Route path="profile" element={<ProfilePage />} />
         </Route>
       </Route>
 

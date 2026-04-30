@@ -9,8 +9,26 @@ export interface User {
   fullName: string
   role: Role
   active: boolean
+  avatarUrl?: string | null
+  phone?: string | null
   createdAt: string
   permissions?: UserPermission[]
+}
+
+export interface AlertSettings {
+  id: string
+  emailEnabled: boolean
+  smtpHost: string
+  smtpPort: number
+  smtpSecure: boolean
+  smtpUser: string
+  smtpPassword: string
+  smtpFromEmail: string
+  smtpFromName: string
+  recipientEmails: string
+  alertTypes: Record<string, boolean>
+  minSeverity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  updatedAt: string
 }
 
 export interface UserPermission {

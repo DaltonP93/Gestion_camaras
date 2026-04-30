@@ -28,6 +28,8 @@ model User {
   fullName     String
   role         Role     @default(OPERATOR)
   active       Boolean  @default(true)
+  avatarUrl    String?  @db.Text
+  phone        String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -216,4 +218,23 @@ model AppearanceSettings {
   updatedAt       DateTime @updatedAt
 
   @@map("appearance_settings")
+}
+
+// ─── Configuración de alertas y correo ───────────────────────
+model AlertSettings {
+  id              String  @id @default("singleton")
+  emailEnabled    Boolean @default(false)
+  smtpHost        String  @default("")
+  smtpPort        Int     @default(587)
+  smtpSecure      Boolean @default(false)
+  smtpUser        String  @default("")
+  smtpPassword    String  @default("")
+  smtpFromEmail   String  @default("")
+  smtpFromName    String  @default("VisionCore Alertas")
+  recipientEmails String  @default("") // comma-separated
+  alertTypes      Json    @default("{\"CAMERA_OFFLINE\":true,\"NVR_OFFLINE\":true,\"HDD_FULL\":true,\"HDD_ERROR\":true,\"MOTION_DETECTED\":false,\"RECORDING_ERROR\":true,\"AUTH_FAILED\":false}")
+  minSeverity     String  @default("HIGH")
+  updatedAt       DateTime @updatedAt
+
+  @@map("alert_settings")
 }

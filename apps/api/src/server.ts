@@ -16,6 +16,8 @@ import { alertRoutes } from './routes/alerts'
 import { wsHandler } from './routes/websocket'
 import viewsPlugin from './routes/views'
 import appearancePlugin from './routes/appearance'
+import profileRoutes from './routes/profile'
+import alertSettingsRoutes from './routes/alertSettings'
 import { startHealthWorker } from './jobs/healthWorker'
 
 const server = Fastify({
@@ -64,6 +66,8 @@ async function main() {
   await server.register(alertRoutes, { prefix: '/api/alerts' })
   await server.register(viewsPlugin, { prefix: '/api/views' })
   await server.register(appearancePlugin, { prefix: '/api/appearance' })
+  await server.register(profileRoutes, { prefix: '/api/profile' })
+  await server.register(alertSettingsRoutes, { prefix: '/api/alerts' })
   await server.register(wsHandler, { prefix: '/ws' })
 
   // ─── Health check ─────────────────────────────────────────

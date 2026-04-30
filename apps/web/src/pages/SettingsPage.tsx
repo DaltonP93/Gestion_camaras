@@ -1,11 +1,13 @@
 // src/pages/SettingsPage.tsx
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Bell, Video, Shield, Server, Globe, Save, RefreshCw,
-  Mail, Webhook, CheckCircle2
+  Mail, Webhook, CheckCircle2, Send, Lock, Eye, EyeOff
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
+import { apiGet, apiPut, apiPost } from '@/lib/api'
+import type { AlertSettings } from '@/types'
 
 type Tab = 'alertas' | 'streaming' | 'seguridad' | 'sistema' | 'integraciones'
 
@@ -17,38 +19,113 @@ const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: 'integraciones', label: 'Integraciones', icon: <Globe size={14} /> },
 ]
 
+const ALERT_TYPE_LABELS: Record<string, string> = {
+  CAMERA_OFFLINE:   'Cámara offline',
+  NVR_OFFLINE:      'NVR desconectado',
+  HDD_FULL:         'HDD casi lleno',
+  HDD_ERROR:        'Error de disco',
+  MOTION_DETECTED:  'Movimiento detectado',
+  RECORDING_ERROR:  'Error de grabación',
+  AUTH_FAILED:      'Fallo de autenticación',
+}
+
+const SEVERITY_OPTIONS = [
+  { value: 'LOW',      label: 'Baja y superior' },
+  { value: 'MEDIUM',   label: 'Media y superior' },
+  { value: 'HIGH',     label: 'Alta y superior' },
+  { value: 'CRITICAL', label: 'Solo críticas' },
+]
+
 export function SettingsPage() {
   const [tab, setTab] = useState<Tab>('alertas')
   const [saving, setSaving] = useState(false)
 
-  // Estado de alertas
-  const [alertEmail, setAlertEmail] = useState('')
-  const [alertWebhook, setAlertWebhook] = useState('')
-  const [alertNVROff, setAlertNVROff] = useState(true)
-  const [alertCamOff, setAlertCamOff] = useState(true)
-  const [alertHDDFull, setAlertHDDFull] = useState(true)
-  const [hddThreshold, setHddThreshold] = useState(90)
+  // ── Alert settings (loaded from API) ──────────────────────────
+  const [alertSettings, setAlertSettings] = useState<AlertSettings | null>(null)
+  const [loadingAlerts, setLoadingAlerts] = useState(true)
+  const [emailEnabled, setEmailEnabled] = useState(false)
+  const [smtpHost, setSmtpHost] = useState('')
+  const [smtpPort, setSmtpPort] = useState(587)
+  const [smtpSecure, setSmtpSecure] = useState(false)
+  const [smtpUser, setSmtpUser] = useState('')
+  const [smtpPassword, setSmtpPassword] = useState('')
+  const [showSmtpPass, setShowSmtpPass] = useState(false)
+  const [smtpFromEmail, setSmtpFromEmail] = useState('')
+  const [smtpFromName, setSmtpFromName] = useState('VisionCore Alertas')
+  const [recipientEmails, setRecipientEmails] = useState('')
+  const [alertTypes, setAlertTypes] = useState<Record<string, boolean>>({
+    CAMERA_OFFLINE: true, NVR_OFFLINE: true, HDD_FULL: true,
+    HDD_ERROR: true, MOTION_DETECTED: false, RECORDING_ERROR: true, AUTH_FAILED: false,
+  })
+  const [minSeverity, setMinSeverity] = useState<AlertSettings['minSeverity']>('HIGH')
+  const [testEmail, setTestEmail] = useState('')
+  const [sendingTest, setSendingTest] = useState(false)
 
-  // Estado streaming
+  // ── Other tab state ────────────────────────────────────────────
   const [hlsLatency, setHlsLatency] = useState('low')
   const [streamQuality, setStreamQuality] = useState('main')
   const [onDemandTimeout, setOnDemandTimeout] = useState(30)
-
-  // Estado seguridad
   const [sessionTimeout, setSessionTimeout] = useState(15)
   const [maxSessions, setMaxSessions] = useState(5)
   const [requireStrongPassword, setRequireStrongPassword] = useState(true)
-
-  // Estado sistema
   const [timezone, setTimezone] = useState('America/Asuncion')
   const [dateFormat, setDateFormat] = useState('dd/MM/yyyy')
-  const [language, setLanguage] = useState('es')
+
+  useEffect(() => {
+    apiGet<AlertSettings>('/alerts/settings')
+      .then((s) => {
+        setAlertSettings(s)
+        setEmailEnabled(s.emailEnabled)
+        setSmtpHost(s.smtpHost)
+        setSmtpPort(s.smtpPort)
+        setSmtpSecure(s.smtpSecure)
+        setSmtpUser(s.smtpUser)
+        setSmtpPassword(s.smtpPassword)
+        setSmtpFromEmail(s.smtpFromEmail)
+        setSmtpFromName(s.smtpFromName)
+        setRecipientEmails(s.recipientEmails)
+        setAlertTypes(s.alertTypes as Record<string, boolean>)
+        setMinSeverity(s.minSeverity)
+      })
+      .catch(() => {}) // non-admin will get 403, ignore
+      .finally(() => setLoadingAlerts(false))
+  }, [])
+
+  const handleSaveAlerts = async () => {
+    setSaving(true)
+    try {
+      const updated = await apiPut<AlertSettings>('/alerts/settings', {
+        emailEnabled, smtpHost, smtpPort, smtpSecure, smtpUser,
+        smtpPassword, smtpFromEmail, smtpFromName, recipientEmails,
+        alertTypes, minSeverity,
+      })
+      setAlertSettings(updated)
+      toast.success('Configuración de alertas guardada')
+    } catch {
+      // error toast shown by api interceptor
+    } finally {
+      setSaving(false)
+    }
+  }
 
   const handleSave = async () => {
+    if (tab === 'alertas') return handleSaveAlerts()
     setSaving(true)
-    await new Promise((r) => setTimeout(r, 800))
+    await new Promise((r) => setTimeout(r, 600))
     setSaving(false)
     toast.success('Configuración guardada')
+  }
+
+  const handleTestEmail = async () => {
+    setSendingTest(true)
+    try {
+      const res = await apiPost<{ success: boolean; message: string }>('/alerts/settings/test-email', { testEmail: testEmail || undefined })
+      toast.success(res.message)
+    } catch {
+      // error toast shown by interceptor
+    } finally {
+      setSendingTest(false)
+    }
   }
 
   const Toggle = ({ value, onChange, label }: { value: boolean; onChange: (v: boolean) => void; label: string }) => (
@@ -58,7 +135,7 @@ export function SettingsPage() {
         type="button"
         onClick={() => onChange(!value)}
         className={clsx(
-          'relative inline-flex h-5 w-9 items-center rounded-full transition-colors',
+          'relative inline-flex h-5 w-9 items-center rounded-full transition-colors flex-shrink-0',
           value ? 'bg-brand-600' : 'bg-surface-600'
         )}
       >
@@ -101,70 +178,140 @@ export function SettingsPage() {
 
         {/* Contenido */}
         <div className="flex-1 card p-5 space-y-5">
+
           {/* ── ALERTAS ── */}
           {tab === 'alertas' && (
             <>
-              <div>
-                <h3 className="text-sm font-semibold text-surface-100 mb-4">Notificaciones de alertas</h3>
-                <div className="space-y-4">
+              {loadingAlerts ? (
+                <div className="flex items-center justify-center py-10">
+                  <RefreshCw size={18} className="animate-spin text-surface-400" />
+                </div>
+              ) : (
+                <>
+                  {/* Email habilitado */}
                   <div>
-                    <label className="label">Email para notificaciones</label>
-                    <div className="relative">
-                      <Mail size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
-                      <input
-                        className="input pl-9"
-                        type="email"
-                        placeholder="alertas@empresa.com"
-                        value={alertEmail}
-                        onChange={(e) => setAlertEmail(e.target.value)}
-                      />
-                    </div>
-                    <p className="text-xs text-surface-500 mt-1">Las alertas críticas se enviarán a este email.</p>
+                    <h3 className="text-sm font-semibold text-surface-100 mb-3">Notificaciones por correo</h3>
+                    <Toggle value={emailEnabled} onChange={setEmailEnabled} label="Enviar alertas por email" />
                   </div>
 
-                  <div>
-                    <label className="label">Webhook URL</label>
-                    <div className="relative">
-                      <Webhook size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
-                      <input
-                        className="input pl-9"
-                        type="url"
-                        placeholder="https://hooks.slack.com/..."
-                        value={alertWebhook}
-                        onChange={(e) => setAlertWebhook(e.target.value)}
-                      />
+                  {/* SMTP config */}
+                  <div className={clsx('space-y-4 border-t border-surface-600 pt-4', !emailEnabled && 'opacity-50 pointer-events-none')}>
+                    <h4 className="text-xs font-medium text-surface-400 uppercase tracking-wider flex items-center gap-1.5">
+                      <Mail size={12} /> Servidor SMTP
+                    </h4>
+
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="col-span-2">
+                        <label className="label">Host SMTP</label>
+                        <input className="input" placeholder="smtp.gmail.com" value={smtpHost} onChange={(e) => setSmtpHost(e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="label">Puerto</label>
+                        <input className="input" type="number" min={1} max={65535} value={smtpPort} onChange={(e) => setSmtpPort(Number(e.target.value))} />
+                      </div>
                     </div>
-                    <p className="text-xs text-surface-500 mt-1">Compatible con Slack, Teams, Discord, n8n, etc.</p>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="label">Usuario SMTP</label>
+                        <input className="input" placeholder="usuario@gmail.com" value={smtpUser} onChange={(e) => setSmtpUser(e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="label">Contraseña SMTP</label>
+                        <div className="relative">
+                          <input
+                            className="input pr-9"
+                            type={showSmtpPass ? 'text' : 'password'}
+                            placeholder="••••••••"
+                            value={smtpPassword}
+                            onChange={(e) => setSmtpPassword(e.target.value)}
+                          />
+                          <button type="button" onClick={() => setShowSmtpPass(!showSmtpPass)} className="absolute right-3 top-1/2 -translate-y-1/2 text-surface-400">
+                            {showSmtpPass ? <EyeOff size={13} /> : <Eye size={13} />}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="label">Email remitente</label>
+                        <input className="input" type="email" placeholder="alertas@empresa.com" value={smtpFromEmail} onChange={(e) => setSmtpFromEmail(e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="label">Nombre remitente</label>
+                        <input className="input" placeholder="VisionCore Alertas" value={smtpFromName} onChange={(e) => setSmtpFromName(e.target.value)} />
+                      </div>
+                    </div>
+
+                    <Toggle value={smtpSecure} onChange={setSmtpSecure} label="Usar TLS/SSL (puerto 465)" />
+
+                    <div>
+                      <label className="label">Destinatarios (separados por coma)</label>
+                      <div className="relative">
+                        <Mail size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
+                        <input
+                          className="input pl-9"
+                          placeholder="admin@empresa.com, seguridad@empresa.com"
+                          value={recipientEmails}
+                          onChange={(e) => setRecipientEmails(e.target.value)}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Test email */}
+                    <div className="p-3 bg-surface-900 rounded-lg space-y-2">
+                      <p className="text-xs font-medium text-surface-400">Probar configuración</p>
+                      <div className="flex gap-2">
+                        <input
+                          className="input flex-1 text-xs"
+                          placeholder="email-prueba@empresa.com (opcional)"
+                          value={testEmail}
+                          onChange={(e) => setTestEmail(e.target.value)}
+                        />
+                        <button
+                          onClick={handleTestEmail}
+                          disabled={sendingTest || !smtpHost}
+                          className="btn-secondary flex items-center gap-1.5 text-xs whitespace-nowrap"
+                        >
+                          {sendingTest ? <RefreshCw size={12} className="animate-spin" /> : <Send size={12} />}
+                          Enviar prueba
+                        </button>
+                      </div>
+                      <p className="text-xs text-surface-500">Guarda primero y luego envía el email de prueba.</p>
+                    </div>
                   </div>
-                </div>
-              </div>
 
-              <div className="border-t border-surface-600 pt-4">
-                <h4 className="text-xs font-medium text-surface-400 uppercase tracking-wider mb-3">Tipos de alerta activos</h4>
-                <div className="divide-y divide-surface-700">
-                  <Toggle value={alertNVROff} onChange={setAlertNVROff} label="NVR desconectado" />
-                  <Toggle value={alertCamOff} onChange={setAlertCamOff} label="Cámara offline" />
-                  <Toggle value={alertHDDFull} onChange={setAlertHDDFull} label="HDD casi lleno" />
-                </div>
-              </div>
+                  {/* Tipos de alerta */}
+                  <div className="border-t border-surface-600 pt-4">
+                    <h4 className="text-xs font-medium text-surface-400 uppercase tracking-wider mb-3">Tipos de alerta activos</h4>
+                    <div className="divide-y divide-surface-700">
+                      {Object.entries(ALERT_TYPE_LABELS).map(([key, label]) => (
+                        <Toggle
+                          key={key}
+                          value={!!alertTypes[key]}
+                          onChange={(v) => setAlertTypes((prev) => ({ ...prev, [key]: v }))}
+                          label={label}
+                        />
+                      ))}
+                    </div>
+                  </div>
 
-              <div className="border-t border-surface-600 pt-4">
-                <label className="label">Umbral de HDD lleno (%)</label>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="range"
-                    min={50}
-                    max={99}
-                    value={hddThreshold}
-                    onChange={(e) => setHddThreshold(Number(e.target.value))}
-                    className="flex-1"
-                  />
-                  <span className={clsx(
-                    'text-sm font-medium w-10 text-right',
-                    hddThreshold >= 90 ? 'text-red-400' : hddThreshold >= 75 ? 'text-amber-400' : 'text-green-400'
-                  )}>{hddThreshold}%</span>
-                </div>
-              </div>
+                  {/* Severidad mínima */}
+                  <div className="border-t border-surface-600 pt-4">
+                    <label className="label">Severidad mínima para notificar</label>
+                    <select
+                      className="input max-w-xs"
+                      value={minSeverity}
+                      onChange={(e) => setMinSeverity(e.target.value as AlertSettings['minSeverity'])}
+                    >
+                      {SEVERITY_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>{o.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                </>
+              )}
             </>
           )}
 
@@ -175,11 +322,7 @@ export function SettingsPage() {
               <div className="space-y-4">
                 <div>
                   <label className="label">Modo de latencia HLS</label>
-                  <select
-                    value={hlsLatency}
-                    onChange={(e) => setHlsLatency(e.target.value)}
-                    className="input"
-                  >
+                  <select value={hlsLatency} onChange={(e) => setHlsLatency(e.target.value)} className="input">
                     <option value="low">Baja latencia (2-4 seg) — recomendado</option>
                     <option value="normal">Normal (6-10 seg)</option>
                     <option value="high">Alta (15-30 seg) — mejor estabilidad</option>
@@ -188,11 +331,7 @@ export function SettingsPage() {
 
                 <div>
                   <label className="label">Calidad de stream por defecto</label>
-                  <select
-                    value={streamQuality}
-                    onChange={(e) => setStreamQuality(e.target.value)}
-                    className="input"
-                  >
+                  <select value={streamQuality} onChange={(e) => setStreamQuality(e.target.value)} className="input">
                     <option value="main">Principal (alta calidad)</option>
                     <option value="sub">Sub-stream (menor ancho de banda)</option>
                   </select>
@@ -201,16 +340,11 @@ export function SettingsPage() {
                 <div>
                   <label className="label">Timeout sin viewers (segundos)</label>
                   <input
-                    type="number"
-                    min={10}
-                    max={300}
-                    value={onDemandTimeout}
+                    type="number" min={10} max={300} value={onDemandTimeout}
                     onChange={(e) => setOnDemandTimeout(Number(e.target.value))}
                     className="input max-w-xs"
                   />
-                  <p className="text-xs text-surface-500 mt-1">
-                    Tiempo antes de cerrar un stream si nadie lo está viendo.
-                  </p>
+                  <p className="text-xs text-surface-500 mt-1">Tiempo antes de cerrar un stream si nadie lo está viendo.</p>
                 </div>
 
                 <div className="p-3 bg-surface-900 rounded-lg">
@@ -219,9 +353,7 @@ export function SettingsPage() {
                     <CheckCircle2 size={13} className="text-green-400" />
                     <span className="text-xs text-green-400">Proxy de video activo (puerto 8888/8889)</span>
                   </div>
-                  <p className="text-xs text-surface-500 mt-1">
-                    Los streams RTSP se convierten a HLS automáticamente bajo demanda.
-                  </p>
+                  <p className="text-xs text-surface-500 mt-1">Los streams RTSP se convierten a HLS automáticamente bajo demanda.</p>
                 </div>
               </div>
             </>
@@ -235,25 +367,17 @@ export function SettingsPage() {
                 <div>
                   <label className="label">Tiempo de expiración de token (minutos)</label>
                   <input
-                    type="number"
-                    min={5}
-                    max={1440}
-                    value={sessionTimeout}
+                    type="number" min={5} max={1440} value={sessionTimeout}
                     onChange={(e) => setSessionTimeout(Number(e.target.value))}
                     className="input max-w-xs"
                   />
-                  <p className="text-xs text-surface-500 mt-1">
-                    El token de acceso expira pasado este tiempo. Requiere rebuild del API para aplicar.
-                  </p>
+                  <p className="text-xs text-surface-500 mt-1">El token de acceso expira pasado este tiempo. Requiere rebuild del API para aplicar.</p>
                 </div>
 
                 <div>
                   <label className="label">Máximo de sesiones simultáneas por usuario</label>
                   <input
-                    type="number"
-                    min={1}
-                    max={20}
-                    value={maxSessions}
+                    type="number" min={1} max={20} value={maxSessions}
                     onChange={(e) => setMaxSessions(Number(e.target.value))}
                     className="input max-w-xs"
                   />
@@ -270,7 +394,7 @@ export function SettingsPage() {
                 </div>
 
                 <div className="p-3 bg-amber-900/20 border border-amber-800/40 rounded-lg">
-                  <p className="text-xs text-amber-400 font-medium mb-1">Importante</p>
+                  <p className="text-xs text-amber-400 font-medium mb-1 flex items-center gap-1"><Lock size={12} /> Importante</p>
                   <p className="text-xs text-surface-400">
                     Las contraseñas de NVR se almacenan cifradas con AES usando el JWT_SECRET del servidor.
                     Si rotas el JWT_SECRET, deberás re-ingresar las contraseñas de cada NVR.
@@ -377,11 +501,7 @@ export function SettingsPage() {
 
           {/* Botón guardar */}
           <div className="border-t border-surface-600 pt-4 flex justify-end">
-            <button
-              onClick={handleSave}
-              disabled={saving}
-              className="btn-primary"
-            >
+            <button onClick={handleSave} disabled={saving || (tab === 'alertas' && loadingAlerts)} className="btn-primary">
               {saving ? (
                 <><RefreshCw size={13} className="animate-spin" /> Guardando...</>
               ) : (

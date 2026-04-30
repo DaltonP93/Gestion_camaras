@@ -1,8 +1,10 @@
 // src/components/layout/Sidebar.tsx
-import { NavLink } from 'react-router-dom'
+import { NavLink, useNavigate } from 'react-router-dom'
+import { useRef, useState, useEffect } from 'react'
 import {
   LayoutDashboard, Video, Clock, Bell, Server, Users,
-  Activity, ChevronRight, Shield, Settings, LayoutGrid, Palette
+  Activity, Shield, Settings, LayoutGrid, Palette,
+  LogOut, UserCircle, ChevronUp
 } from 'lucide-react'
 import { useAuthStore } from '@/stores/authStore'
 import { useAlertStore } from '@/stores/alertStore'
@@ -27,6 +29,19 @@ export function Sidebar() {
   const { user, logout } = useAuthStore()
   const { unreadCount } = useAlertStore()
   const { nvrs } = useCameraStore()
+  const navigate = useNavigate()
+  const [menuOpen, setMenuOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
 
   const navItem = (
     to: string,
@@ -134,26 +149,55 @@ export function Sidebar() {
         )}
       </nav>
 
-      {/* Usuario */}
-      <div className="px-3 py-3 border-t border-surface-600">
-        <div className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-surface-700 transition-colors cursor-pointer group">
-          <div className="w-7 h-7 rounded-full bg-brand-600 flex items-center justify-center flex-shrink-0 text-white text-xs font-semibold">
-            {user?.fullName?.charAt(0).toUpperCase() || 'U'}
+      {/* Usuario — perfil con dropdown */}
+      <div className="px-3 py-3 border-t border-surface-600 relative" ref={menuRef}>
+        {/* Dropdown menu */}
+        {menuOpen && (
+          <div className="absolute bottom-full left-3 right-3 mb-1 bg-surface-700 border border-surface-600 rounded-lg shadow-xl overflow-hidden z-50">
+            <div className="px-3 py-2.5 border-b border-surface-600">
+              <div className="text-xs font-medium text-surface-100 truncate">{user?.fullName}</div>
+              <div className="text-xs text-surface-400 truncate">{user?.email}</div>
+            </div>
+            <button
+              onClick={() => { setMenuOpen(false); navigate('/profile') }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors"
+            >
+              <UserCircle size={14} />
+              Mi perfil
+            </button>
+            <button
+              onClick={() => { setMenuOpen(false); logout() }}
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-400 hover:bg-red-900/20 hover:text-red-300 transition-colors"
+            >
+              <LogOut size={14} />
+              Cerrar sesión
+            </button>
           </div>
-          <div className="flex-1 min-w-0">
+        )}
+
+        {/* User row */}
+        <button
+          onClick={() => setMenuOpen(!menuOpen)}
+          className="w-full flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-surface-700 transition-colors cursor-pointer"
+        >
+          {user?.avatarUrl ? (
+            <img src={user.avatarUrl} alt="" className="w-7 h-7 rounded-full object-cover flex-shrink-0" />
+          ) : (
+            <div className="w-7 h-7 rounded-full bg-brand-600 flex items-center justify-center flex-shrink-0 text-white text-xs font-semibold">
+              {user?.fullName?.charAt(0).toUpperCase() || 'U'}
+            </div>
+          )}
+          <div className="flex-1 min-w-0 text-left">
             <div className="text-xs font-medium text-surface-100 truncate">{user?.fullName}</div>
             <div className={clsx('text-xs', ROLE_COLOR[user?.role || ''])}>
               {ROLE_LABEL[user?.role || '']}
             </div>
           </div>
-          <button
-            onClick={logout}
-            className="opacity-0 group-hover:opacity-100 transition-opacity text-surface-500 hover:text-brand-400"
-            title="Cerrar sesión"
-          >
-            <ChevronRight size={14} />
-          </button>
-        </div>
+          <ChevronUp
+            size={13}
+            className={clsx('text-surface-500 transition-transform flex-shrink-0', menuOpen ? 'rotate-180' : '')}
+          />
+        </button>
       </div>
     </aside>
   )
