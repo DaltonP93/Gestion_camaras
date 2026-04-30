@@ -26,23 +26,42 @@ export function getWebRtcUrl(streamPath: string): string {
 
 // ─── Publicar stream desde NVR a MediaMTX ───────────────────
 export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> {
+  const streamPath = getStreamPath(nvr, camera)
+  const rtspUrl = buildRtspUrl(nvr, camera.channel)
+
+  const pathConfig = {
+    source: rtspUrl,
+    sourceOnDemand: true,
+    sourceOnDemandStartTimeout: '15s',
+    sourceOnDemandCloseAfter: '30s',
+    record: false,
+    overridePublisher: true,
+  }
+
   try {
-    const streamPath = getStreamPath(nvr, camera)
-    const rtspUrl = buildRtspUrl(nvr, camera.channel)
-
-    // Crear path en MediaMTX con pull desde el NVR
-    await mediamtxApi.post('/v3/config/paths/add/' + streamPath, {
-      source: rtspUrl,
-      sourceOnDemand: true,           // Solo conectar cuando haya viewers
-      sourceOnDemandStartTimeout: '10s',
-      sourceOnDemandCloseAfter: '10s',
-      record: false,
-    })
-
+    // Intentar crear primero
+    await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
     return true
   } catch (err: any) {
-    // Path ya existe, no es error
-    if (err.response?.status === 400) return true
+    const status = err.response?.status
+
+    // 400 = path ya existe con este nombre exacto → actualizar con PATCH
+    if (status === 400) {
+      try {
+        await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
+        return true
+      } catch {
+        return true // Si PATCH falla, el path existe y probablemente ya funciona
+      }
+    }
+
+    // 401 o 403 = problema de auth con MediaMTX API
+    if (status === 401 || status === 403) {
+      console.error(`[stream] MediaMTX auth error (${status}) para ${streamPath}. Verificar configuración de auth en mediamtx.yml`)
+      return false
+    }
+
+    console.error(`[stream] Error registrando path ${streamPath}:`, status, err.message)
     return false
   }
 }
