@@ -27,7 +27,8 @@ export function getWebRtcUrl(streamPath: string): string {
 // ─── Publicar stream desde NVR a MediaMTX ───────────────────
 export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> {
   const streamPath = getStreamPath(nvr, camera)
-  const rtspUrl = buildRtspUrl(nvr, camera.channel)
+  // Usar substream (H264) en lugar del main stream (que suele ser H265 incompatible con browsers)
+  const rtspUrl = buildRtspUrl(nvr, camera.channel, true)
 
   const pathConfig = {
     source: rtspUrl,
