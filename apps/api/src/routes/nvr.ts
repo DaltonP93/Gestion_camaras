@@ -72,6 +72,109 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     })
   })
 
+  // POST /api/nvrs/scan — Escanear subnet en busca de dispositivos Hikvision (ADMIN)
+  server.post('/scan', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const scanSchema = z.object({
+      subnet: z.string().regex(/^\d{1,3}\.\d{1,3}\.\d{1,3}$/, 'Formato: 192.168.1'),
+      port: z.number().int().min(1).max(65535).default(80),
+      start: z.number().int().min(1).max(254).default(1),
+      end: z.number().int().min(1).max(254).default(254),
+      username: z.string().optional(),
+      password: z.string().optional(),
+    })
+    const { subnet, port, start, end, username, password } = scanSchema.parse(request.body)
+
+    const axios = (await import('axios')).default
+    const range = Math.max(0, end - start) + 1
+    const ips = Array.from({ length: range }, (_, i) => `${subnet}.${start + i}`)
+
+    const probe = async (ip: string) => {
+      try {
+        const cfg: any = {
+          timeout: 2000,
+          validateStatus: (s: number) => s < 500,
+        }
+        if (username && password) {
+          cfg.auth = { username, password }
+        }
+        const res = await axios.get(`http://${ip}:${port}/ISAPI/System/deviceInfo`, cfg)
+
+        // 401 = dispositivo presente pero sin credenciales correctas
+        if (res.status === 401) {
+          const realm = (res.headers['www-authenticate'] || '').match(/realm="([^"]+)"/)?.[1]
+          return {
+            ip, port,
+            requiresAuth: true,
+            model: realm || '',
+            serialNumber: '',
+            firmware: '',
+            channels: 0,
+          }
+        }
+
+        // 200 = dispositivo respondió con info
+        if (res.status === 200 && typeof res.data === 'string' && res.data.includes('DeviceInfo')) {
+          // XML response - parse simple fields
+          const xml = res.data as string
+          const get = (tag: string) => xml.match(new RegExp(`<${tag}>([^<]+)</${tag}>`))?.[1] || ''
+
+          let channels = 0
+          if (username && password) {
+            try {
+              const chRes = await axios.get(`http://${ip}:${port}/ISAPI/System/Video/inputs/channels`, {
+                timeout: 2000,
+                auth: { username, password },
+              })
+              const chXml = typeof chRes.data === 'string' ? chRes.data : ''
+              channels = (chXml.match(/<VideoInputChannel>/g) || []).length
+            } catch {}
+          }
+
+          return {
+            ip, port,
+            requiresAuth: false,
+            model: get('model') || get('deviceType') || '',
+            serialNumber: get('serialNumber') || '',
+            firmware: get('firmwareVersion') || '',
+            macAddress: get('macAddress') || '',
+            deviceName: get('deviceName') || '',
+            channels,
+          }
+        }
+
+        if (res.status === 200 && res.data?.DeviceInfo) {
+          const info = res.data.DeviceInfo
+          return {
+            ip, port,
+            requiresAuth: false,
+            model: info.model || info.deviceType || '',
+            serialNumber: info.serialNumber || '',
+            firmware: info.firmwareVersion || '',
+            macAddress: info.macAddress || '',
+            deviceName: info.deviceName || '',
+            channels: 0,
+          }
+        }
+      } catch {
+        // No respondió o timeout
+      }
+      return null
+    }
+
+    // Ejecutar en lotes para no saturar la red
+    const BATCH_SIZE = 50
+    const discovered: any[] = []
+    for (let i = 0; i < ips.length; i += BATCH_SIZE) {
+      const batch = ips.slice(i, i + BATCH_SIZE)
+      const results = await Promise.all(batch.map(probe))
+      results.forEach((r) => { if (r) discovered.push(r) })
+    }
+
+    return reply.send({ scanned: ips.length, discovered })
+  })
+
   // POST /api/nvrs/detect — Auto-detectar info del NVR a partir de IP + credenciales (ADMIN)
   server.post('/detect', {
     preHandler: [server.authorize(['ADMIN'])],

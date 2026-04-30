@@ -13,11 +13,12 @@ interface Props {
   isRecording?: boolean
   onFullscreen?: () => void
   className?: string
+  error?: boolean
 }
 
 type Status = 'loading' | 'playing' | 'error' | 'offline'
 
-export function VideoPlayer({ hlsUrl, cameraName, isRecording, onFullscreen, className }: Props) {
+export function VideoPlayer({ hlsUrl, cameraName, isRecording, onFullscreen, className, error }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const [status, setStatus] = useState<Status>('loading')
@@ -82,11 +83,20 @@ export function VideoPlayer({ hlsUrl, cameraName, isRecording, onFullscreen, cla
   }, [hlsUrl, retryCount])
 
   useEffect(() => {
+    if (error) {
+      hlsRef.current?.destroy()
+      setStatus('offline')
+      return
+    }
+    if (!hlsUrl) {
+      setStatus('loading')
+      return
+    }
     initPlayer()
     return () => {
       hlsRef.current?.destroy()
     }
-  }, [hlsUrl])
+  }, [hlsUrl, error])
 
   const handleRetry = () => {
     setRetryCount(0)

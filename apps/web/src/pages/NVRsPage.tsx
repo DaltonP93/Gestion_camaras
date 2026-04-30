@@ -1,6 +1,6 @@
 // src/pages/NVRsPage.tsx
 import { useEffect, useState } from 'react'
-import { Plus, Pencil, Trash2, RefreshCw, Server, Wifi, WifiOff, Zap, Search, CheckCircle2, XCircle } from 'lucide-react'
+import { Plus, Pencil, Trash2, RefreshCw, Server, Wifi, WifiOff, Zap, Search, CheckCircle2, XCircle, Radar, Lock } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiPut, apiDelete, apiGet } from '@/lib/api'
 import { clsx } from 'clsx'
@@ -19,6 +19,18 @@ const EMPTY: NVRFormData = {
 
 type TestStatus = 'idle' | 'testing' | 'ok' | 'fail'
 
+interface DiscoveredDevice {
+  ip: string
+  port: number
+  requiresAuth: boolean
+  model?: string
+  serialNumber?: string
+  firmware?: string
+  macAddress?: string
+  deviceName?: string
+  channels?: number
+}
+
 export function NVRsPage() {
   const { nvrs, nvrStatuses, loadNVRs, loadNVRStatus } = useCameraStore()
   const [showModal, setShowModal] = useState(false)
@@ -30,6 +42,17 @@ export function NVRsPage() {
   const [testMsg, setTestMsg] = useState('')
   const [detecting, setDetecting] = useState(false)
   const [search, setSearch] = useState('')
+
+  // ── Discovery (escaneo de red) ──────────────────────────────
+  const [showScan, setShowScan] = useState(false)
+  const [scanSubnet, setScanSubnet] = useState('192.168.1')
+  const [scanStart, setScanStart] = useState(1)
+  const [scanEnd, setScanEnd] = useState(254)
+  const [scanUser, setScanUser] = useState('admin')
+  const [scanPass, setScanPass] = useState('')
+  const [scanning, setScanning] = useState(false)
+  const [discovered, setDiscovered] = useState<DiscoveredDevice[]>([])
+  const [scanInfo, setScanInfo] = useState<string>('')
 
   useEffect(() => { loadNVRs() }, [])
   useEffect(() => { nvrs.forEach((n) => loadNVRStatus(n.id)) }, [nvrs.length])
@@ -161,6 +184,55 @@ export function NVRsPage() {
     setRefreshing(null)
   }
 
+  const handleScan = async () => {
+    if (!scanSubnet.match(/^\d{1,3}\.\d{1,3}\.\d{1,3}$/)) {
+      toast.error('Subnet inválida. Formato: 192.168.1')
+      return
+    }
+    setScanning(true)
+    setDiscovered([])
+    setScanInfo('')
+    try {
+      const res = await apiPost<{ scanned: number; discovered: DiscoveredDevice[] }>('/nvrs/scan', {
+        subnet: scanSubnet,
+        port: 80,
+        start: scanStart,
+        end: scanEnd,
+        username: scanUser || undefined,
+        password: scanPass || undefined,
+      })
+      setDiscovered(res.discovered)
+      setScanInfo(`Escaneadas ${res.scanned} IPs · ${res.discovered.length} dispositivos encontrados`)
+      if (res.discovered.length === 0) {
+        toast('No se encontraron dispositivos en el rango', { icon: 'ℹ️' })
+      } else {
+        toast.success(`${res.discovered.length} dispositivos encontrados`)
+      }
+    } catch {
+      // toast por interceptor
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  const handleAddDiscovered = (dev: DiscoveredDevice) => {
+    setEditingNVR(null)
+    setForm({
+      ...EMPTY,
+      ipAddress: dev.ip,
+      port: dev.port,
+      model: dev.model || '',
+      channels: dev.channels && dev.channels > 0 ? dev.channels : 16,
+      name: dev.deviceName || `NVR ${dev.ip}`,
+      username: scanUser || 'admin',
+      password: scanPass || '',
+    })
+    setTestStatus('idle')
+    setTestMsg('')
+    setShowScan(false)
+    setShowModal(true)
+  }
+
   const f = (key: keyof NVRFormData) => (e: React.ChangeEvent<HTMLInputElement>) => {
     setTestStatus('idle')
     setForm({ ...form, [key]: e.target.type === 'number' ? Number(e.target.value) : e.target.value })
@@ -182,8 +254,142 @@ export function NVRsPage() {
           <h2 className="text-base font-semibold text-surface-100">Gestión de NVRs</h2>
           <p className="text-xs text-surface-400 mt-0.5">{nvrs.length} dispositivos</p>
         </div>
-        <button onClick={openCreate} className="btn-primary"><Plus size={14} /> Agregar NVR</button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowScan(!showScan)}
+            className={clsx('btn-secondary', showScan && 'bg-brand-600 text-white border-brand-600')}
+          >
+            <Radar size={14} /> Buscar en red
+          </button>
+          <button onClick={openCreate} className="btn-primary"><Plus size={14} /> Agregar NVR</button>
+        </div>
       </div>
+
+      {/* ── Panel de descubrimiento ── */}
+      {showScan && (
+        <div className="card p-4 space-y-3 border-brand-600/30">
+          <div className="flex items-center gap-2">
+            <Radar size={14} className="text-brand-400" />
+            <h3 className="text-sm font-semibold text-surface-100">Buscar dispositivos en la red</h3>
+          </div>
+          <p className="text-xs text-surface-400">
+            Escanea un rango de IPs para encontrar NVRs y cámaras Hikvision compatibles con ISAPI.
+            Las credenciales son opcionales (sin ellas solo se detecta presencia).
+          </p>
+
+          <div className="grid grid-cols-12 gap-3">
+            <div className="col-span-4">
+              <label className="label">Subnet (sin último octeto)</label>
+              <input
+                className="input text-xs font-mono"
+                placeholder="192.168.1"
+                value={scanSubnet}
+                onChange={(e) => setScanSubnet(e.target.value)}
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="label">Desde</label>
+              <input
+                className="input text-xs" type="number" min={1} max={254}
+                value={scanStart} onChange={(e) => setScanStart(Number(e.target.value))}
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="label">Hasta</label>
+              <input
+                className="input text-xs" type="number" min={1} max={254}
+                value={scanEnd} onChange={(e) => setScanEnd(Number(e.target.value))}
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="label">Usuario (opc.)</label>
+              <input
+                className="input text-xs" placeholder="admin"
+                value={scanUser} onChange={(e) => setScanUser(e.target.value)}
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="label">Contraseña (opc.)</label>
+              <input
+                className="input text-xs" type="password" placeholder="••••••••"
+                value={scanPass} onChange={(e) => setScanPass(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button onClick={handleScan} disabled={scanning} className="btn-primary text-xs">
+              {scanning ? (
+                <><RefreshCw size={12} className="animate-spin" /> Escaneando {scanEnd - scanStart + 1} IPs...</>
+              ) : (
+                <><Radar size={12} /> Iniciar escaneo</>
+              )}
+            </button>
+            {scanInfo && <span className="text-xs text-surface-400">{scanInfo}</span>}
+          </div>
+
+          {/* Resultados */}
+          {discovered.length > 0 && (
+            <div className="border-t border-surface-700 pt-3">
+              <p className="text-xs font-medium text-surface-400 uppercase tracking-wider mb-2">
+                Dispositivos encontrados
+              </p>
+              <div className="overflow-auto max-h-80">
+                <table className="w-full text-xs">
+                  <thead className="text-surface-500 sticky top-0 bg-surface-800">
+                    <tr className="border-b border-surface-700">
+                      <th className="text-left py-2 px-2 font-medium">IP</th>
+                      <th className="text-left py-2 px-2 font-medium">Modelo</th>
+                      <th className="text-left py-2 px-2 font-medium">Serie</th>
+                      <th className="text-left py-2 px-2 font-medium">Firmware</th>
+                      <th className="text-left py-2 px-2 font-medium">Canales</th>
+                      <th className="text-left py-2 px-2 font-medium">Estado</th>
+                      <th className="text-right py-2 px-2 font-medium">Acción</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-surface-200">
+                    {discovered.map((dev) => {
+                      const alreadyAdded = nvrs.some((n) => n.ipAddress === dev.ip)
+                      return (
+                        <tr key={dev.ip} className="border-b border-surface-700/50 hover:bg-surface-700/30">
+                          <td className="py-2 px-2 font-mono">{dev.ip}:{dev.port}</td>
+                          <td className="py-2 px-2 truncate max-w-[160px]" title={dev.model}>{dev.model || '—'}</td>
+                          <td className="py-2 px-2 font-mono text-surface-400 truncate max-w-[140px]" title={dev.serialNumber}>{dev.serialNumber || '—'}</td>
+                          <td className="py-2 px-2 text-surface-400">{dev.firmware || '—'}</td>
+                          <td className="py-2 px-2">{dev.channels || '—'}</td>
+                          <td className="py-2 px-2">
+                            {dev.requiresAuth ? (
+                              <span className="inline-flex items-center gap-1 text-amber-400">
+                                <Lock size={10} /> Requiere clave
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 text-green-400">
+                                <CheckCircle2 size={10} /> Detectado
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-2 text-right">
+                            {alreadyAdded ? (
+                              <span className="text-xs text-surface-500">Ya agregado</span>
+                            ) : (
+                              <button
+                                onClick={() => handleAddDiscovered(dev)}
+                                className="btn-primary text-xs px-2 py-1"
+                              >
+                                <Plus size={10} /> Agregar
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Búsqueda */}
       <div className="relative max-w-xs">

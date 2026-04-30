@@ -28,6 +28,7 @@ export function LiveViewPage() {
   const [selectedNVR, setSelectedNVR] = useState<string>(nvrFilter || 'all')
   const [streams, setStreams] = useState<Record<string, StreamInfo>>({})
   const [loadingStreams, setLoadingStreams] = useState<Record<string, boolean>>({})
+  const [failedStreams, setFailedStreams] = useState<Set<string>>(new Set())
   const [focusCamera, setFocusCamera] = useState<string | null>(null)
 
   useEffect(() => {
@@ -52,8 +53,12 @@ export function LiveViewPage() {
     try {
       const info = await apiGet<StreamInfo>(`/cameras/${camera.id}/stream`)
       setStreams((prev) => ({ ...prev, [camera.id]: info }))
+      setFailedStreams((prev) => {
+        if (!prev.has(camera.id)) return prev
+        const next = new Set(prev); next.delete(camera.id); return next
+      })
     } catch {
-      // Si falla, la cámara mostrará estado de error
+      setFailedStreams((prev) => new Set(prev).add(camera.id))
     } finally {
       setLoadingStreams((prev) => ({ ...prev, [camera.id]: false }))
     }
@@ -137,6 +142,7 @@ export function LiveViewPage() {
                     isRecording={cam.online}
                     onFullscreen={() => handleFullscreen(focusCamera)}
                     className="flex-1 h-full"
+                    error={failedStreams.has(focusCamera)}
                   />
                   {(user?.role === 'ADMIN' || user?.role === 'SUPERVISOR') && cam.ptzEnabled && (
                     <PTZControls cameraId={cam.id} />
@@ -158,6 +164,7 @@ export function LiveViewPage() {
                     isRecording={camera.online}
                     onFullscreen={() => handleFullscreen(camera.id)}
                     className="w-full h-full"
+                    error={failedStreams.has(camera.id)}
                   />
                 </div>
               )
