@@ -14,11 +14,9 @@ writeQueueSize: 4096
 
 ###############################################
 # Auth — permitir todo sin credenciales
-# Compatible con MediaMTX v0.x y v1.x
 ###############################################
 authInternalUsers:
   - user: any
-    pass: any
     permissions:
       - action: api
       - action: read
