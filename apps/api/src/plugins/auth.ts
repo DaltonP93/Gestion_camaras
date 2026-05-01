@@ -27,10 +27,18 @@ declare module 'fastify' {
 }
 
 const authPlugin: FastifyPluginAsync = fp(async (server) => {
+  const jwtSecret = process.env.JWT_SECRET
+  if (!jwtSecret || jwtSecret.length < 32) {
+    throw new Error(
+      'JWT_SECRET no está definido o tiene menos de 32 caracteres. ' +
+      'Generá uno seguro: openssl rand -hex 64'
+    )
+  }
+
   await server.register(fastifyJwt, {
-    secret: process.env.JWT_SECRET || 'fallback_secret_cambiar_en_produccion',
+    secret: jwtSecret,
     sign: {
-      expiresIn: process.env.JWT_EXPIRES_IN || '15m',
+      expiresIn: process.env.JWT_EXPIRES_IN || '60m',
     },
   })
 

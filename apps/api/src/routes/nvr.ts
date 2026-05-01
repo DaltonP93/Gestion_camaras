@@ -77,7 +77,10 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     preHandler: [server.authorize(['ADMIN'])],
   }, async (request, reply) => {
     const scanSchema = z.object({
-      subnet: z.string().regex(/^\d{1,3}\.\d{1,3}\.\d{1,3}$/, 'Formato: 192.168.1'),
+      subnet: z.string().regex(/^\d{1,3}\.\d{1,3}\.\d{1,3}$/, 'Formato: 192.168.1').refine(
+        (v) => v.split('.').every((o) => Number(o) >= 0 && Number(o) <= 255),
+        'Cada octeto debe estar entre 0 y 255',
+      ),
       port: z.number().int().min(1).max(65535).default(80),
       start: z.number().int().min(1).max(254).default(1),
       end: z.number().int().min(1).max(254).default(254),
@@ -180,33 +183,39 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     preHandler: [server.authorize(['ADMIN'])],
   }, async (request, reply) => {
     const data = connectionTestSchema.parse(request.body)
-    const axios = (await import('axios')).default
 
-    const client = axios.create({
-      baseURL: `http://${data.ipAddress}:${data.port}`,
-      timeout: 8000,
-      auth: { username: data.username, password: data.password },
-    })
+    const fakeNvr = {
+      id: 'detect',
+      ipAddress: data.ipAddress,
+      port: data.port,
+      username: data.username,
+      password: data.password,
+      rtspPort: 554,
+      channels: 0,
+      hddCount: 0,
+      firmware: null,
+    } as any
 
     try {
-      const sysRes = await client.get('/ISAPI/System/deviceInfo')
-      const info = sysRes.data?.DeviceInfo || {}
+      const status = await getNVRStatus(fakeNvr)
+      if (!status.online) {
+        return reply.status(503).send({
+          success: false,
+          message: 'No se pudo conectar. Verifica IP, puerto y credenciales.',
+        })
+      }
 
-      let channels = 0
-      try {
-        const chRes = await client.get('/ISAPI/System/Video/inputs/channels')
-        const chData = chRes.data?.VideoInputChannelList?.VideoInputChannel
-        channels = Array.isArray(chData) ? chData.length : chData ? 1 : 0
-      } catch { channels = 0 }
+      const channels = await getNVRChannels(fakeNvr)
 
       return reply.send({
         success: true,
-        model: info.model || info.deviceType || '',
-        serialNumber: info.serialNumber || '',
-        firmware: info.firmwareVersion || '',
-        channels,
+        model: '',
+        serialNumber: '',
+        firmware: status.firmware,
+        channels: channels.length,
       })
-    } catch {
+    } catch (err: any) {
+      server.log.warn(`[detect] ${data.ipAddress}: ${err.message}`)
       return reply.status(503).send({
         success: false,
         message: 'No se pudo conectar. Verifica IP, puerto y credenciales.',
@@ -245,11 +254,31 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     return reply.send(nvrs.map((nvr) => ({ ...nvr, password: undefined })))
   })
 
+  // Helper: verificar que el usuario puede acceder a este NVR
+  async function userCanAccessNvr(userId: string, role: string, nvrId: string): Promise<boolean> {
+    if (role === 'ADMIN' || role === 'SUPERVISOR') return true
+    const perm = await server.prisma.userPermission.findFirst({
+      where: {
+        userId,
+        OR: [
+          { nvrId },
+          { camera: { nvrId } },
+        ],
+      },
+      select: { id: true },
+    })
+    return !!perm
+  }
+
   // GET /api/nvrs/:id — Detalle de NVR
   server.get('/:id', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
     const { id } = request.params as { id: string }
+    const u = request.user
+    if (!(await userCanAccessNvr(u.sub, u.role, id))) {
+      return reply.status(403).send({ message: 'Sin permiso para este NVR' })
+    }
 
     const nvr = await server.prisma.nVR.findUnique({
       where: { id },
@@ -266,6 +295,10 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
     const { id } = request.params as { id: string }
+    const u = request.user
+    if (!(await userCanAccessNvr(u.sub, u.role, id))) {
+      return reply.status(403).send({ message: 'Sin permiso para este NVR' })
+    }
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -289,6 +322,10 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
     const { id } = request.params as { id: string }
+    const u = request.user
+    if (!(await userCanAccessNvr(u.sub, u.role, id))) {
+      return reply.status(403).send({ message: 'Sin permiso para este NVR' })
+    }
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })

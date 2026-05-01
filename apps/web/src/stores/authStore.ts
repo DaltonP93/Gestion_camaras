@@ -72,6 +72,9 @@ export const useAuthStore = create<AuthState>()(
         const token = localStorage.getItem('accessToken')
         if (!token) return
 
+        // Restaurar el header Authorization después de hidratar
+        api.defaults.headers.common['Authorization'] = `Bearer ${token}`
+
         try {
           const user = await apiGet<User>('/auth/me')
           set({ user, isAuthenticated: true })
@@ -79,6 +82,7 @@ export const useAuthStore = create<AuthState>()(
         } catch {
           localStorage.removeItem('accessToken')
           localStorage.removeItem('refreshToken')
+          delete api.defaults.headers.common['Authorization']
           set({ user: null, isAuthenticated: false })
         }
       },

@@ -1,6 +1,7 @@
 // apps/api/src/routes/auth.ts
 import type { FastifyPluginAsync } from 'fastify'
 import bcrypt from 'bcryptjs'
+import crypto from 'crypto'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 
@@ -13,9 +14,19 @@ const refreshSchema = z.object({
   refreshToken: z.string().min(1),
 })
 
+const hashToken = (t: string) => crypto.createHash('sha256').update(t).digest('hex')
+
 export const authRoutes: FastifyPluginAsync = async (server) => {
-  // POST /api/auth/login
-  server.post('/login', async (request, reply) => {
+  // POST /api/auth/login (rate limit estricto: brute force protection)
+  server.post('/login', {
+    config: {
+      rateLimit: {
+        max: 8,
+        timeWindow: '15 minutes',
+        keyGenerator: (req: any) => `${req.ip}:${(req.body as any)?.username ?? ''}`,
+      },
+    },
+  }, async (request, reply) => {
     const body = loginSchema.parse(request.body)
 
     const user = await server.prisma.user.findUnique({
@@ -52,11 +63,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
     })
 
-    // Guardar sesión en DB
+    // Guardar sesión en DB (refresh token guardado como SHA-256)
     await server.prisma.session.create({
       data: {
         userId: user.id,
-        refreshToken,
+        refreshToken: hashToken(refreshToken),
         userAgent: request.headers['user-agent'] || null,
         ipAddress: request.ip,
         expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
@@ -83,7 +94,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     const { refreshToken } = refreshSchema.parse(request.body)
 
     const session = await server.prisma.session.findUnique({
-      where: { refreshToken },
+      where: { refreshToken: hashToken(refreshToken) },
       include: { user: true },
     })
 
@@ -113,7 +124,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     const { refreshToken } = refreshSchema.parse(request.body)
 
     await server.prisma.session.deleteMany({
-      where: { refreshToken },
+      where: { refreshToken: hashToken(refreshToken) },
     })
 
     await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request)

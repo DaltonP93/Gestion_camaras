@@ -37,17 +37,32 @@ const server = Fastify({
 async function main() {
   // ─── Plugins de seguridad ──────────────────────────────────
   await server.register(helmet, {
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'data:', 'blob:'],
+        mediaSrc: ["'self'", 'blob:'],
+        connectSrc: ["'self'", 'ws:', 'wss:'],
+        frameAncestors: ["'self'"],
+      },
+    },
+    crossOriginResourcePolicy: { policy: 'same-site' },
   })
 
+  // CORS: lista blanca por env var (CORS_ORIGINS=https://camaras.example.com,https://otro.com)
+  // Si no está definida, refleja el origin (compatibilidad con dev / detrás de nginx)
+  const corsOrigins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
+    : null
   await server.register(cors, {
-    // Behind nginx reverse proxy — allow any origin; nginx controls public access
-    origin: true,
+    origin: corsOrigins ?? true,
     credentials: true,
   })
 
   await server.register(rateLimit, {
-    max: 200,
+    max: 300,
     timeWindow: '1 minute',
     errorResponseBuilder: () => ({
       statusCode: 429,

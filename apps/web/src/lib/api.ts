@@ -18,36 +18,53 @@ api.interceptors.request.use((config) => {
   return config
 })
 
+// ─── Refresh mutex: evita múltiples refreshes en paralelo ────
+let refreshPromise: Promise<string> | null = null
+
+async function refreshAccessToken(): Promise<string> {
+  if (refreshPromise) return refreshPromise
+  const refreshToken = localStorage.getItem('refreshToken')
+  if (!refreshToken) throw new Error('No refresh token')
+
+  refreshPromise = (async () => {
+    try {
+      const { data } = await axios.post(`${BASE_URL}/api/auth/refresh`, { refreshToken })
+      localStorage.setItem('accessToken', data.accessToken)
+      return data.accessToken as string
+    } finally {
+      refreshPromise = null
+    }
+  })()
+  return refreshPromise
+}
+
 // ─── Response interceptor: manejo de errores y refresh ───────
 api.interceptors.response.use(
   (response) => response,
   async (error: AxiosError<{ message?: string }>) => {
     const originalRequest = error.config as any
+    const url = originalRequest?.url || ''
 
-    // Token expirado → intentar refresh automático
-    if (error.response?.status === 401 && !originalRequest._retry) {
+    // No intentar refresh sobre /auth/login o /auth/refresh
+    const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh')
+
+    if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint) {
       originalRequest._retry = true
-
-      const refreshToken = localStorage.getItem('refreshToken')
-      if (refreshToken) {
-        try {
-          const { data } = await axios.post(`${BASE_URL}/api/auth/refresh`, { refreshToken })
-          localStorage.setItem('accessToken', data.accessToken)
-          originalRequest.headers.Authorization = `Bearer ${data.accessToken}`
-          return api(originalRequest)
-        } catch {
-          // Refresh falló → limpiar sesión
-          localStorage.removeItem('accessToken')
-          localStorage.removeItem('refreshToken')
+      try {
+        const newToken = await refreshAccessToken()
+        originalRequest.headers.Authorization = `Bearer ${newToken}`
+        return api(originalRequest)
+      } catch {
+        localStorage.removeItem('accessToken')
+        localStorage.removeItem('refreshToken')
+        if (window.location.pathname !== '/login') {
           window.location.href = '/login'
-          return Promise.reject(error)
         }
-      } else {
-        window.location.href = '/login'
+        return Promise.reject(error)
       }
     }
 
-    // Mostrar toast de error para errores 4xx/5xx (excepto 401 que se maneja arriba)
+    // Mostrar toast de error para errores 4xx/5xx (excepto 401 manejado arriba)
     if (error.response?.status !== 401) {
       const msg = error.response?.data?.message || 'Error de conexión'
       toast.error(msg)
