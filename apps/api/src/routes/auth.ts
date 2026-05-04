@@ -5,6 +5,10 @@ import crypto from 'crypto'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 
+const IS_PROD = process.env.NODE_ENV === 'production'
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000           // 1 hora
+const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7 días
+
 const loginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -15,6 +19,17 @@ const refreshSchema = z.object({
 })
 
 const hashToken = (t: string) => crypto.createHash('sha256').update(t).digest('hex')
+
+function setCookies(reply: any, accessToken: string, refreshToken: string) {
+  const cookieBase = {
+    httpOnly: true,
+    sameSite: 'strict' as const,
+    secure: IS_PROD,
+    path: '/',
+  }
+  reply.setCookie('at', accessToken, { ...cookieBase, maxAge: ACCESS_TOKEN_TTL_MS / 1000 })
+  reply.setCookie('rt', refreshToken, { ...cookieBase, maxAge: REFRESH_TOKEN_TTL_MS / 1000 })
+}
 
 export const authRoutes: FastifyPluginAsync = async (server) => {
   // POST /api/auth/login (rate limit estricto: brute force protection — por IP)
@@ -69,15 +84,15 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         refreshToken: hashToken(refreshToken),
         userAgent: request.headers['user-agent'] || null,
         ipAddress: request.ip,
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
       },
     })
 
     await AuditAction(server.prisma, user.id, 'LOGIN', null, request)
 
+    setCookies(reply, accessToken, refreshToken)
+
     return reply.send({
-      accessToken,
-      refreshToken,
       user: {
         id: user.id,
         username: user.username,
@@ -88,9 +103,17 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     })
   })
 
-  // POST /api/auth/refresh
+  // POST /api/auth/refresh — renueva access token usando cookie rt
   server.post('/refresh', async (request, reply) => {
-    const { refreshToken } = refreshSchema.parse(request.body)
+    const refreshToken = (request.cookies as any)?.rt
+
+    if (!refreshToken) {
+      return reply.status(401).send({
+        statusCode: 401,
+        error: 'Unauthorized',
+        message: 'Refresh token inválido o expirado',
+      })
+    }
 
     const session = await server.prisma.session.findUnique({
       where: { refreshToken: hashToken(refreshToken) },
@@ -98,6 +121,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     })
 
     if (!session || session.expiresAt < new Date() || !session.user.active) {
+      reply.clearCookie('at', { path: '/' })
+      reply.clearCookie('rt', { path: '/' })
       return reply.status(401).send({
         statusCode: 401,
         error: 'Unauthorized',
@@ -112,19 +137,31 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const newAccessToken = server.jwt.sign(payload)
+    reply.setCookie('at', newAccessToken, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: IS_PROD,
+      path: '/',
+      maxAge: ACCESS_TOKEN_TTL_MS / 1000,
+    })
 
-    return reply.send({ accessToken: newAccessToken })
+    return reply.send({ ok: true })
   })
 
   // POST /api/auth/logout
   server.post('/logout', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
-    const { refreshToken } = refreshSchema.parse(request.body)
+    const refreshToken = (request.cookies as any)?.rt
 
-    await server.prisma.session.deleteMany({
-      where: { refreshToken: hashToken(refreshToken) },
-    })
+    if (refreshToken) {
+      await server.prisma.session.deleteMany({
+        where: { refreshToken: hashToken(refreshToken) },
+      })
+    }
+
+    reply.clearCookie('at', { path: '/' })
+    reply.clearCookie('rt', { path: '/' })
 
     await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request)
 

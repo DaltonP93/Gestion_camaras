@@ -9,32 +9,19 @@ export const api = axios.create({
   baseURL: `${BASE_URL}/api`,
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' },
-})
-
-// ─── Request interceptor: inyectar token ─────────────────────
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('accessToken')
-  if (token) config.headers.Authorization = `Bearer ${token}`
-  return config
+  // Las cookies httpOnly se envían automáticamente en same-origin
+  withCredentials: true,
 })
 
 // ─── Refresh mutex: evita múltiples refreshes en paralelo ────
-let refreshPromise: Promise<string> | null = null
+let refreshPromise: Promise<void> | null = null
 
-async function refreshAccessToken(): Promise<string> {
+async function refreshAccessToken(): Promise<void> {
   if (refreshPromise) return refreshPromise
-  const refreshToken = localStorage.getItem('refreshToken')
-  if (!refreshToken) throw new Error('No refresh token')
-
-  refreshPromise = (async () => {
-    try {
-      const { data } = await axios.post(`${BASE_URL}/api/auth/refresh`, { refreshToken })
-      localStorage.setItem('accessToken', data.accessToken)
-      return data.accessToken as string
-    } finally {
-      refreshPromise = null
-    }
-  })()
+  refreshPromise = axios
+    .post(`${BASE_URL}/api/auth/refresh`, {}, { withCredentials: true })
+    .then(() => { /* nueva cookie 'at' seteada automáticamente */ })
+    .finally(() => { refreshPromise = null })
   return refreshPromise
 }
 
@@ -45,18 +32,14 @@ api.interceptors.response.use(
     const originalRequest = error.config as any
     const url = originalRequest?.url || ''
 
-    // No intentar refresh sobre /auth/login o /auth/refresh
     const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh')
 
     if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint) {
       originalRequest._retry = true
       try {
-        const newToken = await refreshAccessToken()
-        originalRequest.headers.Authorization = `Bearer ${newToken}`
+        await refreshAccessToken()
         return api(originalRequest)
       } catch {
-        localStorage.removeItem('accessToken')
-        localStorage.removeItem('refreshToken')
         if (window.location.pathname !== '/login') {
           window.location.href = '/login'
         }
@@ -64,7 +47,6 @@ api.interceptors.response.use(
       }
     }
 
-    // Mostrar toast de error para errores 4xx/5xx (excepto 401 manejado arriba)
     if (error.response?.status !== 401) {
       const msg = error.response?.data?.message || 'Error de conexión'
       toast.error(msg)

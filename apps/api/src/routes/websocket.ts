@@ -25,17 +25,21 @@ export function broadcastToUser(userId: string, payload: object) {
 }
 
 export const wsHandler: FastifyPluginAsync = async (server) => {
-  // Sin preHandler: el token viene en query param ?token=JWT
-  // porque los browsers no pueden enviar headers custom en WebSocket
+  // El browser envía automáticamente la cookie httpOnly 'at' en el upgrade WS
+  // (mismo origen). Como fallback, también se acepta ?token= para clientes no-browser.
   server.get('/alerts', {
     websocket: true,
   }, (socket: WebSocket, request) => {
-    const { token } = request.query as { token?: string }
     const ws = socket
+
+    // Preferir cookie httpOnly; fallback a query param para clientes API
+    const cookieToken = (request.cookies as any)?.at
+    const { token: queryToken } = request.query as { token?: string }
+    const rawToken = cookieToken || queryToken || ''
 
     let userPayload: JWTPayload
     try {
-      userPayload = server.jwt.verify<JWTPayload>(token || '')
+      userPayload = server.jwt.verify<JWTPayload>(rawToken)
     } catch {
       ws.close(4001, 'Unauthorized')
       return
@@ -43,7 +47,6 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
 
     const userId = userPayload.sub
 
-    // Registrar cliente
     if (!wsClients.has(userId)) {
       wsClients.set(userId, new Set())
     }
@@ -51,7 +54,6 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
 
     server.log.info(`WS conectado: usuario ${userPayload.username}`)
 
-    // Enviar ping cada 30s para mantener conexión
     const pingInterval = setInterval(() => {
       if (ws.readyState === 1) {
         ws.send(JSON.stringify({ type: 'ping', timestamp: new Date().toISOString() }))
@@ -62,8 +64,6 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
       try {
         const msg = JSON.parse(data.toString())
         if (msg.type === 'pong') return
-
-        // Suscribir a updates de cámaras específicas
         if (msg.type === 'subscribe' && msg.cameras) {
           ws.send(JSON.stringify({ type: 'subscribed', cameras: msg.cameras }))
         }

@@ -6,17 +6,14 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectDelay = 2000
 
 export function connectWebSocket() {
-  const token = localStorage.getItem('accessToken')
-  if (!token) return
-
   const wsBase = window.location.origin.replace(/^http/, 'ws')
-  const url = `${wsBase}/ws/alerts?token=${encodeURIComponent(token)}`
+  // La cookie httpOnly 'at' se envía automáticamente en el upgrade WS (mismo origen)
+  const url = `${wsBase}/ws/alerts`
 
   try {
     ws = new WebSocket(url)
 
     ws.onopen = () => {
-      console.log('[WS] Conectado al servidor de alertas')
       reconnectDelay = 2000
     }
 
@@ -35,15 +32,16 @@ export function connectWebSocket() {
       }
     }
 
-    ws.onclose = () => {
-      console.log('[WS] Desconectado, reconectando en', reconnectDelay, 'ms')
+    ws.onclose = (event) => {
+      // 4001 = unauthorized — no reconectar
+      if (event.code === 4001) return
       scheduleReconnect()
     }
 
     ws.onerror = () => {
       ws?.close()
     }
-  } catch (err) {
+  } catch {
     scheduleReconnect()
   }
 }
