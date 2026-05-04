@@ -24,14 +24,13 @@ async function refreshAccessToken(): Promise<void> {
   return refreshPromise
 }
 
-// ─── Redirect seguro: limpia el estado persistido primero ────
-// Si no se limpia, Zustand rehidrata user → ProtectedRoute redirige al
-// dashboard → API falla otra vez → redirect → bucle infinito.
-function redirectToLogin() {
-  localStorage.removeItem('visioncore-auth')
-  if (window.location.pathname !== '/login') {
-    window.location.href = '/login'
-  }
+// ─── Señal de sesión expirada ─────────────────────────────────
+// Usamos un evento en vez de window.location.href para evitar un reload
+// completo que cause el bucle: reload → Zustand rehidrata user → ProtectedRoute
+// redirige al dashboard → API falla → reload → bucle infinito.
+// App.tsx escucha este evento y limpia el estado sin recargar la página.
+export function dispatchAuthExpired() {
+  window.dispatchEvent(new CustomEvent('visioncore:auth-expired'))
 }
 
 // ─── Response interceptor: manejo de errores y refresh ───────
@@ -49,12 +48,11 @@ api.interceptors.response.use(
         await refreshAccessToken()
         return api(originalRequest)
       } catch {
-        redirectToLogin()
+        dispatchAuthExpired()
         return Promise.reject(error)
       }
     }
 
-    // No mostrar toast para 401 (manejado arriba) ni 429 en endpoints de auth
     if (error.response?.status !== 401 && !(error.response?.status === 429 && isAuthEndpoint)) {
       const msg = error.response?.data?.message || 'Error de conexión'
       toast.error(msg)
