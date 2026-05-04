@@ -67,11 +67,16 @@ services:
     container_name: visioncore_api
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql://visioncore:visioncore_pass@postgres:5432/visioncore_db
       REDIS_URL: redis://redis:6379
       MEDIAMTX_URL: http://mediamtx:9997
+      # Fallback: generate a real key with `openssl rand -hex 64` and set in .env
+      JWT_SECRET: ${JWT_SECRET:-visioncore_default_dev_secret_change_in_production_32c}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-60m}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
     depends_on:
       postgres:
         condition: service_healthy

@@ -17,13 +17,12 @@ const refreshSchema = z.object({
 const hashToken = (t: string) => crypto.createHash('sha256').update(t).digest('hex')
 
 export const authRoutes: FastifyPluginAsync = async (server) => {
-  // POST /api/auth/login (rate limit estricto: brute force protection)
+  // POST /api/auth/login (rate limit estricto: brute force protection — por IP)
   server.post('/login', {
     config: {
       rateLimit: {
         max: 8,
         timeWindow: '15 minutes',
-        keyGenerator: (req: any) => `${req.ip}:${(req.body as any)?.username ?? ''}`,
       },
     },
   }, async (request, reply) => {
