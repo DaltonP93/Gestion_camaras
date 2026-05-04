@@ -13,7 +13,7 @@ const connectionTestSchema = z.object({
   password: z.string().min(1),
 })
 
-const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
+const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 
 function encryptPassword(password: string): string {
   return CryptoJS.AES.encrypt(password, ENCRYPTION_KEY).toString()

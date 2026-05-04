@@ -5,7 +5,7 @@ import { searchRecordings, getPlaybackUrl } from '../services/hikvision'
 import { AuditAction } from '../services/audit'
 import CryptoJS from 'crypto-js'
 
-const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
+const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
 const searchSchema = z.object({

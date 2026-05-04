@@ -6,7 +6,7 @@ import { captureSnapshot, sendPTZCommand, type PTZCommand } from '../services/hi
 import { AuditAction } from '../services/audit'
 import CryptoJS from 'crypto-js'
 
-const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
+const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
 const cameraUpdateSchema = z.object({
@@ -20,6 +20,21 @@ const ptzSchema = z.object({
   command: z.enum(['UP', 'DOWN', 'LEFT', 'RIGHT', 'ZOOM_IN', 'ZOOM_OUT', 'STOP']),
   speed: z.number().min(1).max(100).default(50),
 })
+
+async function userCanAccessCamera(
+  prisma: any,
+  userId: string,
+  role: string,
+  cameraId: string,
+  permission: 'canView' | 'canPtz' | 'canPlayback' = 'canView'
+): Promise<boolean> {
+  if (role === 'ADMIN' || role === 'SUPERVISOR') return true
+  const perm = await prisma.userPermission.findFirst({
+    where: { userId, cameraId, [permission]: true },
+    select: { id: true },
+  })
+  return !!perm
+}
 
 export const cameraRoutes: FastifyPluginAsync = async (server) => {
   // GET /api/cameras — Listar cámaras (filtradas por permisos)
@@ -75,12 +90,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).send({ message: 'Acceso denegado: rol auditor no puede ver streams en vivo' })
     }
 
-    // Verificar permiso para operador
-    if (user.role === 'OPERATOR') {
-      const perm = await server.prisma.userPermission.findFirst({
-        where: { userId: user.sub, cameraId: id, canView: true },
-      })
-      if (!perm) return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id, 'canView')) {
+      return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
     }
 
     // Publicar el stream en MediaMTX si no existe
@@ -109,6 +120,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
     const { id } = request.params as { id: string }
+    const user = request.user
 
     const camera = await server.prisma.camera.findUnique({
       where: { id },
@@ -116,6 +128,10 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     })
 
     if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id, 'canView')) {
+      return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
+    }
 
     const streamPath = getStreamPath(camera.nvr, camera)
     const status = await getStreamStatus(streamPath)
@@ -128,6 +144,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
     const { id } = request.params as { id: string }
+    const user = request.user
 
     const camera = await server.prisma.camera.findUnique({
       where: { id },
@@ -136,12 +153,26 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
 
+    // Auditor no puede capturar snapshots en vivo
+    if (user.role === 'AUDITOR') {
+      return reply.status(403).send({ message: 'Acceso denegado: rol auditor no puede capturar snapshots' })
+    }
+
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id, 'canView')) {
+      return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
+    }
+
     const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
     const snapshot = await captureSnapshot(nvr as any, camera.channel)
 
     if (!snapshot) {
       return reply.status(503).send({ message: 'No se pudo capturar imagen' })
     }
+
+    await AuditAction(server.prisma, user.sub, 'SNAPSHOT', id, request, {
+      cameraName: camera.name,
+      nvrName: camera.nvr.name,
+    })
 
     reply.header('Content-Type', 'image/jpeg')
     return reply.send(snapshot)
@@ -163,12 +194,13 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
     if (!camera.ptzEnabled) return reply.status(400).send({ message: 'PTZ no habilitado en esta cámara' })
 
-    // Verificar permiso PTZ para operador
-    if (user.role === 'OPERATOR') {
-      const perm = await server.prisma.userPermission.findFirst({
-        where: { userId: user.sub, cameraId: id, canPtz: true },
-      })
-      if (!perm) return reply.status(403).send({ message: 'Sin permiso PTZ para esta cámara' })
+    // Auditor no puede controlar PTZ
+    if (user.role === 'AUDITOR') {
+      return reply.status(403).send({ message: 'Acceso denegado: rol auditor no puede controlar PTZ' })
+    }
+
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id, 'canPtz')) {
+      return reply.status(403).send({ message: 'Sin permiso PTZ para esta cámara' })
     }
 
     const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
