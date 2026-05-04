@@ -9,7 +9,6 @@ export const api = axios.create({
   baseURL: `${BASE_URL}/api`,
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' },
-  // Las cookies httpOnly se envían automáticamente en same-origin
   withCredentials: true,
 })
 
@@ -23,6 +22,16 @@ async function refreshAccessToken(): Promise<void> {
     .then(() => { /* nueva cookie 'at' seteada automáticamente */ })
     .finally(() => { refreshPromise = null })
   return refreshPromise
+}
+
+// ─── Redirect seguro: limpia el estado persistido primero ────
+// Si no se limpia, Zustand rehidrata user → ProtectedRoute redirige al
+// dashboard → API falla otra vez → redirect → bucle infinito.
+function redirectToLogin() {
+  localStorage.removeItem('visioncore-auth')
+  if (window.location.pathname !== '/login') {
+    window.location.href = '/login'
+  }
 }
 
 // ─── Response interceptor: manejo de errores y refresh ───────
@@ -40,14 +49,13 @@ api.interceptors.response.use(
         await refreshAccessToken()
         return api(originalRequest)
       } catch {
-        if (window.location.pathname !== '/login') {
-          window.location.href = '/login'
-        }
+        redirectToLogin()
         return Promise.reject(error)
       }
     }
 
-    if (error.response?.status !== 401) {
+    // No mostrar toast para 401 (manejado arriba) ni 429 en endpoints de auth
+    if (error.response?.status !== 401 && !(error.response?.status === 429 && isAuthEndpoint)) {
       const msg = error.response?.data?.message || 'Error de conexión'
       toast.error(msg)
     }

@@ -62,7 +62,7 @@ async function main() {
   })
 
   await server.register(rateLimit, {
-    max: 300,
+    max: 600,
     timeWindow: '1 minute',
     errorResponseBuilder: () => ({
       statusCode: 429,
