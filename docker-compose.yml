@@ -79,6 +79,8 @@ services:
       JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
       NVR_CREDENTIAL_KEY: ${NVR_CREDENTIAL_KEY:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # Poner true solo si el sitio tiene HTTPS — false en HTTP o las cookies no se envían
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
     depends_on:
       postgres:
         condition: service_healthy

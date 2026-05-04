@@ -5,7 +5,9 @@ import crypto from 'crypto'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 
-const IS_PROD = process.env.NODE_ENV === 'production'
+// COOKIE_SECURE=true solo si el sitio tiene HTTPS. En HTTP debe ser false
+// o el browser descarta las cookies silenciosamente (Secure flag over HTTP).
+const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000           // 1 hora
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7 días
 
@@ -24,7 +26,7 @@ function setCookies(reply: any, accessToken: string, refreshToken: string) {
   const cookieBase = {
     httpOnly: true,
     sameSite: 'strict' as const,
-    secure: IS_PROD,
+    secure: COOKIE_SECURE,
     path: '/',
   }
   reply.setCookie('at', accessToken, { ...cookieBase, maxAge: ACCESS_TOKEN_TTL_MS / 1000 })
@@ -140,7 +142,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     reply.setCookie('at', newAccessToken, {
       httpOnly: true,
       sameSite: 'strict',
-      secure: IS_PROD,
+      secure: COOKIE_SECURE,
       path: '/',
       maxAge: ACCESS_TOKEN_TTL_MS / 1000,
     })

@@ -85,8 +85,12 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: 'visioncore-auth',
-      // Persistir solo el flag; al recargar, loadUser() verifica con el servidor
-      partialize: (state) => ({ isAuthenticated: state.isAuthenticated }),
+      // Persistir user para que el sidebar se muestre correctamente al recargar
+      // antes de que loadUser() complete. La sesión real vive en la cookie httpOnly.
+      partialize: (state) => ({
+        user: state.user,
+        isAuthenticated: state.isAuthenticated,
+      }),
     }
   )
 )
