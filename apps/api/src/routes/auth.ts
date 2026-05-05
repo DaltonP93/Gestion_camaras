@@ -5,9 +5,6 @@ import crypto from 'crypto'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 
-// COOKIE_SECURE=true solo si el sitio tiene HTTPS. En HTTP debe ser false
-// o el browser descarta las cookies silenciosamente (Secure flag over HTTP).
-const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000           // 1 hora
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7 días
 
@@ -22,19 +19,8 @@ const refreshSchema = z.object({
 
 const hashToken = (t: string) => crypto.createHash('sha256').update(t).digest('hex')
 
-function setCookies(reply: any, accessToken: string, refreshToken: string) {
-  const cookieBase = {
-    httpOnly: true,
-    sameSite: 'strict' as const,
-    secure: COOKIE_SECURE,
-    path: '/',
-  }
-  reply.setCookie('at', accessToken, { ...cookieBase, maxAge: ACCESS_TOKEN_TTL_MS / 1000 })
-  reply.setCookie('rt', refreshToken, { ...cookieBase, maxAge: REFRESH_TOKEN_TTL_MS / 1000 })
-}
-
 export const authRoutes: FastifyPluginAsync = async (server) => {
-  // POST /api/auth/login (rate limit estricto: brute force protection — por IP)
+  // POST /api/auth/login (rate limit: 8 intentos / 15 min por IP)
   server.post('/login', {
     config: {
       rateLimit: {
@@ -68,18 +54,12 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       })
     }
 
-    const payload = {
-      sub: user.id,
-      username: user.username,
-      role: user.role,
-    }
-
+    const payload = { sub: user.id, username: user.username, role: user.role }
     const accessToken = server.jwt.sign(payload)
     const refreshToken = server.jwt.sign(payload, {
       expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
     })
 
-    // Guardar sesión en DB (refresh token guardado como SHA-256)
     await server.prisma.session.create({
       data: {
         userId: user.id,
@@ -92,9 +72,9 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
     await AuditAction(server.prisma, user.id, 'LOGIN', null, request)
 
-    setCookies(reply, accessToken, refreshToken)
-
     return reply.send({
+      accessToken,
+      refreshToken,
       user: {
         id: user.id,
         username: user.username,
@@ -105,17 +85,9 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     })
   })
 
-  // POST /api/auth/refresh — renueva access token usando cookie rt
+  // POST /api/auth/refresh
   server.post('/refresh', async (request, reply) => {
-    const refreshToken = (request.cookies as any)?.rt
-
-    if (!refreshToken) {
-      return reply.status(401).send({
-        statusCode: 401,
-        error: 'Unauthorized',
-        message: 'Refresh token inválido o expirado',
-      })
-    }
+    const { refreshToken } = refreshSchema.parse(request.body)
 
     const session = await server.prisma.session.findUnique({
       where: { refreshToken: hashToken(refreshToken) },
@@ -123,8 +95,6 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     })
 
     if (!session || session.expiresAt < new Date() || !session.user.active) {
-      reply.clearCookie('at', { path: '/' })
-      reply.clearCookie('rt', { path: '/' })
       return reply.status(401).send({
         statusCode: 401,
         error: 'Unauthorized',
@@ -139,34 +109,20 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const newAccessToken = server.jwt.sign(payload)
-    reply.setCookie('at', newAccessToken, {
-      httpOnly: true,
-      sameSite: 'strict',
-      secure: COOKIE_SECURE,
-      path: '/',
-      maxAge: ACCESS_TOKEN_TTL_MS / 1000,
-    })
-
-    return reply.send({ ok: true })
+    return reply.send({ accessToken: newAccessToken })
   })
 
   // POST /api/auth/logout
   server.post('/logout', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
-    const refreshToken = (request.cookies as any)?.rt
+    const { refreshToken } = refreshSchema.parse(request.body)
 
-    if (refreshToken) {
-      await server.prisma.session.deleteMany({
-        where: { refreshToken: hashToken(refreshToken) },
-      })
-    }
-
-    reply.clearCookie('at', { path: '/' })
-    reply.clearCookie('rt', { path: '/' })
+    await server.prisma.session.deleteMany({
+      where: { refreshToken: hashToken(refreshToken) },
+    })
 
     await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request)
-
     return reply.send({ message: 'Sesión cerrada' })
   })
 

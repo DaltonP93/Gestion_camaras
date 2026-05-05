@@ -9,7 +9,13 @@ export const api = axios.create({
   baseURL: `${BASE_URL}/api`,
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' },
-  withCredentials: true,
+})
+
+// ─── Request interceptor: inyectar token desde localStorage ──
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('accessToken')
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
 })
 
 // ─── Refresh mutex: evita múltiples refreshes en paralelo ────
@@ -17,18 +23,19 @@ let refreshPromise: Promise<void> | null = null
 
 async function refreshAccessToken(): Promise<void> {
   if (refreshPromise) return refreshPromise
-  refreshPromise = axios
-    .post(`${BASE_URL}/api/auth/refresh`, {}, { withCredentials: true })
-    .then(() => { /* nueva cookie 'at' seteada automáticamente */ })
-    .finally(() => { refreshPromise = null })
+  refreshPromise = (async () => {
+    const refreshToken = localStorage.getItem('refreshToken')
+    if (!refreshToken) throw new Error('No refresh token')
+    const res = await axios.post<{ accessToken: string }>(
+      `${BASE_URL}/api/auth/refresh`,
+      { refreshToken }
+    )
+    localStorage.setItem('accessToken', res.data.accessToken)
+  })().finally(() => { refreshPromise = null })
   return refreshPromise
 }
 
 // ─── Señal de sesión expirada ─────────────────────────────────
-// Usamos un evento en vez de window.location.href para evitar un reload
-// completo que cause el bucle: reload → Zustand rehidrata user → ProtectedRoute
-// redirige al dashboard → API falla → reload → bucle infinito.
-// App.tsx escucha este evento y limpia el estado sin recargar la página.
 export function dispatchAuthExpired() {
   window.dispatchEvent(new CustomEvent('visioncore:auth-expired'))
 }
@@ -46,8 +53,12 @@ api.interceptors.response.use(
       originalRequest._retry = true
       try {
         await refreshAccessToken()
+        const token = localStorage.getItem('accessToken')
+        if (token) originalRequest.headers.Authorization = `Bearer ${token}`
         return api(originalRequest)
       } catch {
+        localStorage.removeItem('accessToken')
+        localStorage.removeItem('refreshToken')
         dispatchAuthExpired()
         return Promise.reject(error)
       }

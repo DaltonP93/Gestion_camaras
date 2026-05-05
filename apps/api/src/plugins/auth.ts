@@ -1,7 +1,6 @@
 // apps/api/src/plugins/auth.ts
 import fp from 'fastify-plugin'
 import fastifyJwt from '@fastify/jwt'
-import fastifyCookie from '@fastify/cookie'
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
 import type { Role } from '@prisma/client'
 
@@ -36,17 +35,10 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
     )
   }
 
-  await server.register(fastifyCookie)
-
   await server.register(fastifyJwt, {
     secret: jwtSecret,
     sign: {
       expiresIn: process.env.JWT_EXPIRES_IN || '60m',
-    },
-    // Leer token desde cookie httpOnly 'at' si no hay header Authorization
-    cookie: {
-      cookieName: 'at',
-      signed: false,
     },
   })
 

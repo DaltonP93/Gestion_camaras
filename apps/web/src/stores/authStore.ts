@@ -1,13 +1,9 @@
 // src/stores/authStore.ts
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { apiGet, apiPost } from '@/lib/api'
+import { api, apiGet, apiPost } from '@/lib/api'
 import { connectWebSocket, disconnectWebSocket } from '@/lib/websocket'
-import type { User } from '@/types'
-
-interface LoginResponse {
-  user: User
-}
+import type { User, LoginResponse } from '@/types'
 
 interface AuthState {
   user: User | null
@@ -33,8 +29,10 @@ export const useAuthStore = create<AuthState>()(
       login: async (username, password) => {
         set({ isLoading: true })
         try {
-          // Las cookies httpOnly 'at' y 'rt' son seteadas por el servidor automáticamente
           const data = await apiPost<LoginResponse>('/auth/login', { username, password })
+          localStorage.setItem('accessToken', data.accessToken)
+          localStorage.setItem('refreshToken', data.refreshToken)
+          api.defaults.headers.common.Authorization = `Bearer ${data.accessToken}`
           set({ user: data.user, isAuthenticated: true, isLoading: false })
           connectWebSocket()
         } catch (err) {
@@ -44,16 +42,25 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: async () => {
+        const refreshToken = localStorage.getItem('refreshToken')
         try {
-          await apiPost('/auth/logout')
+          if (refreshToken) await apiPost('/auth/logout', { refreshToken })
         } finally {
+          localStorage.removeItem('accessToken')
+          localStorage.removeItem('refreshToken')
+          delete api.defaults.headers.common.Authorization
           disconnectWebSocket()
           set({ user: null, isAuthenticated: false })
         }
       },
 
       loadUser: async () => {
-        // No hay token en localStorage; la cookie httpOnly se envía automáticamente
+        const token = localStorage.getItem('accessToken')
+        if (!token) {
+          set({ user: null, isAuthenticated: false })
+          return
+        }
+        api.defaults.headers.common.Authorization = `Bearer ${token}`
         try {
           const user = await apiGet<User>('/auth/me')
           set({ user, isAuthenticated: true })
@@ -85,8 +92,6 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: 'visioncore-auth',
-      // Persistir user para que el sidebar se muestre correctamente al recargar
-      // antes de que loadUser() complete. La sesión real vive en la cookie httpOnly.
       partialize: (state) => ({
         user: state.user,
         isAuthenticated: state.isAuthenticated,

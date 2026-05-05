@@ -6,9 +6,11 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectDelay = 2000
 
 export function connectWebSocket() {
+  const token = localStorage.getItem('accessToken')
+  if (!token) return
+
   const wsBase = window.location.origin.replace(/^http/, 'ws')
-  // La cookie httpOnly 'at' se envía automáticamente en el upgrade WS (mismo origen)
-  const url = `${wsBase}/ws/alerts`
+  const url = `${wsBase}/ws/alerts?token=${encodeURIComponent(token)}`
 
   try {
     ws = new WebSocket(url)

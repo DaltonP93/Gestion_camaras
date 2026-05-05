@@ -25,17 +25,12 @@ export function broadcastToUser(userId: string, payload: object) {
 }
 
 export const wsHandler: FastifyPluginAsync = async (server) => {
-  // El browser envía automáticamente la cookie httpOnly 'at' en el upgrade WS
-  // (mismo origen). Como fallback, también se acepta ?token= para clientes no-browser.
   server.get('/alerts', {
     websocket: true,
   }, (socket: WebSocket, request) => {
     const ws = socket
 
-    // Preferir cookie httpOnly; fallback a query param para clientes API
-    const cookieToken = (request.cookies as any)?.at
-    const { token: queryToken } = request.query as { token?: string }
-    const rawToken = cookieToken || queryToken || ''
+    const { token: rawToken = '' } = request.query as { token?: string }
 
     let userPayload: JWTPayload
     try {
