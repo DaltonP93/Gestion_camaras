@@ -111,6 +111,7 @@ export function VideoPlayer({ hlsUrl, cameraName, isRecording, onFullscreen, cla
       className={clsx('relative bg-black overflow-hidden group rounded-lg', className)}
       onMouseEnter={() => setShowControls(true)}
       onMouseLeave={() => setShowControls(false)}
+      onDoubleClick={() => onFullscreen?.()}
     >
       {/* Video */}
       <video

@@ -1,50 +1,123 @@
 // src/pages/RecordingsPage.tsx
-import { useEffect, useState } from 'react'
-import { Search, Play, Download, Calendar, Clock, ChevronDown } from 'lucide-react'
+import { useEffect, useState, useMemo } from 'react'
+import { Search, Play, Download, Calendar, Clock, ChevronDown, CheckSquare, Square } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet } from '@/lib/api'
-import { format, subDays, startOfDay, endOfDay } from 'date-fns'
+import { format, subDays } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
 import toast from 'react-hot-toast'
 
+interface RecordingWithCamera extends Recording {
+  cameraId: string
+  cameraName: string
+  nvrName: string
+}
+
 export function RecordingsPage() {
-  const { cameras, loadCameras } = useCameraStore()
-  const [selectedCamera, setSelectedCamera] = useState<string>('')
+  const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
+  const [selectedNVR, setSelectedNVR] = useState<string>('all')
+  const [selectedCameras, setSelectedCameras] = useState<Set<string>>(new Set())
   const [startDate, setStartDate] = useState(format(subDays(new Date(), 1), "yyyy-MM-dd'T'HH:mm"))
   const [endDate, setEndDate]     = useState(format(new Date(), "yyyy-MM-dd'T'HH:mm"))
-  const [recordings, setRecordings] = useState<Recording[]>([])
+  const [recordings, setRecordings] = useState<RecordingWithCamera[]>([])
   const [isSearching, setIsSearching] = useState(false)
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
-  const [selectedRec, setSelectedRec] = useState<Recording | null>(null)
+  const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
+  const [showCameraList, setShowCameraList] = useState(false)
 
   useEffect(() => {
+    loadNVRs()
     loadCameras()
   }, [])
 
+  // Cámaras filtradas por NVR
+  const filteredCameras = useMemo(() =>
+    cameras.filter(c => selectedNVR === 'all' ? true : c.nvrId === selectedNVR),
+    [cameras, selectedNVR]
+  )
+
+  // Cámaras agrupadas por NVR
+  const camerasByNVR = useMemo(() => {
+    const map = new Map<string, { nvrName: string; cameras: Camera[] }>()
+    filteredCameras.forEach((cam) => {
+      const nvrName = cam.nvr?.name || 'Sin NVR'
+      if (!map.has(cam.nvrId)) map.set(cam.nvrId, { nvrName, cameras: [] })
+      map.get(cam.nvrId)!.cameras.push(cam)
+    })
+    return map
+  }, [filteredCameras])
+
+  // Reset selection when NVR filter changes
+  useEffect(() => { setSelectedCameras(new Set()) }, [selectedNVR])
+
+  const toggleCamera = (cameraId: string) => {
+    setSelectedCameras(prev => {
+      const next = new Set(prev)
+      next.has(cameraId) ? next.delete(cameraId) : next.add(cameraId)
+      return next
+    })
+  }
+
+  const toggleAllInNVR = (nvrId: string) => {
+    const group = camerasByNVR.get(nvrId)
+    if (!group) return
+    const allIds = group.cameras.map(c => c.id)
+    const allSelected = allIds.every(id => selectedCameras.has(id))
+    setSelectedCameras(prev => {
+      const next = new Set(prev)
+      if (allSelected) allIds.forEach(id => next.delete(id))
+      else allIds.forEach(id => next.add(id))
+      return next
+    })
+  }
+
+  const selectAll = () => setSelectedCameras(new Set(filteredCameras.map(c => c.id)))
+  const clearAll  = () => setSelectedCameras(new Set())
+
   const handleSearch = async () => {
-    if (!selectedCamera) { toast.error('Selecciona una cámara'); return }
+    if (selectedCameras.size === 0) { toast.error('Selecciona al menos una cámara'); return }
     setIsSearching(true)
     setPlaybackUrl(null)
+    setRecordings([])
+
+    const cameraIds = [...selectedCameras]
     try {
-      const result = await apiGet<{ recordings: Recording[] }>('/recordings/search', {
-        cameraId: selectedCamera,
-        startTime: new Date(startDate).toISOString(),
-        endTime: new Date(endDate).toISOString(),
-      })
-      const recs = result?.recordings ?? []
-      setRecordings(recs)
-      if (recs.length === 0) toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
+      const results = await Promise.allSettled(
+        cameraIds.map((cameraId) =>
+          apiGet<{ recordings: Recording[] }>('/recordings/search', {
+            cameraId,
+            startTime: new Date(startDate).toISOString(),
+            endTime: new Date(endDate).toISOString(),
+          }).then((res) => {
+            const cam = cameras.find(c => c.id === cameraId)
+            return (res?.recordings ?? []).map((r): RecordingWithCamera => ({
+              ...r,
+              cameraId,
+              cameraName: cam?.name || 'Desconocida',
+              nvrName: cam?.nvr?.name || '',
+            }))
+          })
+        )
+      )
+
+      const all: RecordingWithCamera[] = results
+        .filter((r): r is PromiseFulfilledResult<RecordingWithCamera[]> => r.status === 'fulfilled')
+        .flatMap(r => r.value)
+        .sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
+
+      setRecordings(all)
+      if (all.length === 0) toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
     } finally {
       setIsSearching(false)
     }
   }
 
-  const handlePlay = async (rec: Recording) => {
+  const handlePlay = async (rec: RecordingWithCamera) => {
     setSelectedRec(rec)
     try {
       const result = await apiPost<{ url: string }>('/recordings/playback', {
-        cameraId: selectedCamera,
+        cameraId: rec.cameraId,
         startTime: rec.startTime,
         endTime: rec.endTime,
       })
@@ -67,30 +140,110 @@ export function RecordingsPage() {
     return `${(bytes / 1048576).toFixed(0)} MB`
   }
 
+  const selectedLabel = selectedCameras.size === 0
+    ? 'Seleccionar cámaras'
+    : `${selectedCameras.size} cámara${selectedCameras.size > 1 ? 's' : ''} seleccionada${selectedCameras.size > 1 ? 's' : ''}`
+
   return (
     <div className="p-5 space-y-4 animate-fade-in">
       <h2 className="text-base font-semibold text-surface-100">Grabaciones</h2>
 
       {/* Filtros */}
-      <div className="card p-4">
+      <div className="card p-4 space-y-3">
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-          {/* Cámara */}
-          <div className="sm:col-span-1">
-            <label className="label">Cámara</label>
+
+          {/* Filtro NVR */}
+          <div>
+            <label className="label">NVR</label>
             <div className="relative">
               <select
-                value={selectedCamera}
-                onChange={(e) => setSelectedCamera(e.target.value)}
+                value={selectedNVR}
+                onChange={(e) => setSelectedNVR(e.target.value)}
                 className="input appearance-none pr-8"
               >
-                <option value="">Seleccionar cámara</option>
-                {cameras.map((cam) => (
-                  <option key={cam.id} value={cam.id}>
-                    {cam.nvr?.name} — {cam.name}
-                  </option>
+                <option value="all">Todos los NVRs</option>
+                {nvrs.map((nvr) => (
+                  <option key={nvr.id} value={nvr.id}>{nvr.name}</option>
                 ))}
               </select>
               <ChevronDown size={12} className="absolute right-3 top-1/2 -translate-y-1/2 text-surface-400 pointer-events-none" />
+            </div>
+          </div>
+
+          {/* Selector cámaras (dropdown con checkboxes) */}
+          <div>
+            <label className="label">Cámaras</label>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowCameraList(v => !v)}
+                className="input text-left flex items-center justify-between w-full"
+              >
+                <span className={clsx('truncate', selectedCameras.size === 0 && 'text-surface-500')}>
+                  {selectedLabel}
+                </span>
+                <ChevronDown size={12} className="text-surface-400 flex-shrink-0 ml-2" />
+              </button>
+
+              {showCameraList && (
+                <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-surface-800 border border-surface-600 rounded-lg shadow-xl max-h-72 overflow-y-auto">
+                  {/* Controles rápidos */}
+                  <div className="sticky top-0 bg-surface-800 border-b border-surface-700 px-3 py-2 flex items-center gap-2">
+                    <button onClick={selectAll} className="text-xs text-brand-400 hover:text-brand-300">
+                      Seleccionar todo
+                    </button>
+                    <span className="text-surface-600">·</span>
+                    <button onClick={clearAll} className="text-xs text-surface-400 hover:text-surface-200">
+                      Limpiar
+                    </button>
+                    <span className="ml-auto text-xs text-surface-500">{selectedCameras.size} sel.</span>
+                  </div>
+
+                  {/* Lista por NVR */}
+                  {[...camerasByNVR.entries()].map(([nvrId, { nvrName, cameras: cams }]) => {
+                    const allSel = cams.every(c => selectedCameras.has(c.id))
+                    const someSel = cams.some(c => selectedCameras.has(c.id))
+                    return (
+                      <div key={nvrId}>
+                        {/* Header NVR */}
+                        <button
+                          onClick={() => toggleAllInNVR(nvrId)}
+                          className="w-full flex items-center gap-2 px-3 py-2 bg-surface-750 hover:bg-surface-700 transition-colors text-left"
+                        >
+                          {allSel
+                            ? <CheckSquare size={13} className="text-brand-400 flex-shrink-0" />
+                            : someSel
+                              ? <CheckSquare size={13} className="text-brand-400/50 flex-shrink-0" />
+                              : <Square size={13} className="text-surface-500 flex-shrink-0" />
+                          }
+                          <span className="text-xs font-medium text-surface-200 uppercase tracking-wide">{nvrName}</span>
+                          <span className="ml-auto text-xs text-surface-500">{cams.length}ch</span>
+                        </button>
+                        {/* Cámaras del NVR */}
+                        {cams.map((cam) => (
+                          <button
+                            key={cam.id}
+                            onClick={() => toggleCamera(cam.id)}
+                            className="w-full flex items-center gap-2 pl-6 pr-3 py-1.5 hover:bg-surface-700/50 transition-colors text-left"
+                          >
+                            {selectedCameras.has(cam.id)
+                              ? <CheckSquare size={12} className="text-brand-400 flex-shrink-0" />
+                              : <Square size={12} className="text-surface-600 flex-shrink-0" />
+                            }
+                            <span className="text-xs text-surface-300 truncate">{cam.name}</span>
+                            <span className={clsx(
+                              'ml-auto text-xs flex-shrink-0',
+                              cam.online ? 'text-green-500' : 'text-surface-600'
+                            )}>
+                              {cam.online ? '●' : '○'}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           </div>
 
@@ -115,45 +268,45 @@ export function RecordingsPage() {
               className="input"
             />
           </div>
-
-          {/* Botón buscar */}
-          <div className="flex items-end">
-            <button
-              onClick={handleSearch}
-              disabled={isSearching}
-              className="btn-primary w-full justify-center"
-            >
-              {isSearching ? (
-                <span className="animate-spin">⟳</span>
-              ) : (
-                <Search size={14} />
-              )}
-              {isSearching ? 'Buscando...' : 'Buscar'}
-            </button>
-          </div>
         </div>
 
-        {/* Shortcuts de fechas */}
-        <div className="flex gap-2 mt-3 flex-wrap">
-          {[
-            { label: 'Última hora', hours: 1 },
-            { label: 'Hoy', hours: 24 },
-            { label: 'Ayer', hours: 48 },
-            { label: 'Últimos 7 días', hours: 168 },
-          ].map(({ label, hours }) => (
-            <button
-              key={label}
-              onClick={() => {
-                setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm"))
-                setStartDate(format(subDays(new Date(), hours / 24), "yyyy-MM-dd'T'HH:mm"))
-              }}
-              className="text-xs px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors"
-            >
-              {label}
-            </button>
-          ))}
+        <div className="flex items-center gap-3 flex-wrap">
+          {/* Shortcuts de fechas */}
+          <div className="flex gap-2 flex-wrap flex-1">
+            {[
+              { label: 'Última hora', hours: 1 },
+              { label: 'Hoy', hours: 24 },
+              { label: 'Ayer', hours: 48 },
+              { label: 'Últimos 7 días', hours: 168 },
+            ].map(({ label, hours }) => (
+              <button
+                key={label}
+                onClick={() => {
+                  setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm"))
+                  setStartDate(format(subDays(new Date(), hours / 24), "yyyy-MM-dd'T'HH:mm"))
+                }}
+                className="text-xs px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={handleSearch}
+            disabled={isSearching || selectedCameras.size === 0}
+            className="btn-primary justify-center min-w-[120px]"
+          >
+            {isSearching ? <span className="animate-spin">⟳</span> : <Search size={14} />}
+            {isSearching ? 'Buscando...' : 'Buscar'}
+          </button>
         </div>
       </div>
+
+      {/* Cerrar dropdown al hacer click fuera */}
+      {showCameraList && (
+        <div className="fixed inset-0 z-40" onClick={() => setShowCameraList(false)} />
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Lista de grabaciones */}
@@ -166,7 +319,7 @@ export function RecordingsPage() {
               )}
             </h3>
           </div>
-          <div className="divide-y divide-surface-700 max-h-96 overflow-auto">
+          <div className="divide-y divide-surface-700 max-h-[500px] overflow-auto">
             {recordings.length === 0 ? (
               <div className="py-12 text-center">
                 <Calendar size={24} className="text-surface-600 mx-auto mb-2" />
@@ -177,10 +330,10 @@ export function RecordingsPage() {
             ) : (
               recordings.map((rec) => (
                 <div
-                  key={rec.id}
+                  key={`${rec.cameraId}-${rec.id}`}
                   className={clsx(
                     'px-4 py-3 flex items-center gap-3 cursor-pointer hover:bg-surface-700/50 transition-colors',
-                    selectedRec?.id === rec.id && 'bg-surface-700/80'
+                    selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId && 'bg-surface-700/80'
                   )}
                   onClick={() => handlePlay(rec)}
                 >
@@ -188,7 +341,10 @@ export function RecordingsPage() {
                     <Play size={12} className="text-brand-400 fill-brand-400" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="text-xs text-surface-100">
+                    <div className="text-xs text-surface-300 font-medium truncate">
+                      {rec.nvrName} · {rec.cameraName}
+                    </div>
+                    <div className="text-xs text-surface-100 mt-0.5">
                       {format(new Date(rec.startTime), 'dd/MM/yyyy HH:mm:ss')}
                     </div>
                     <div className="text-xs text-surface-400 flex items-center gap-2 mt-0.5">
@@ -199,7 +355,7 @@ export function RecordingsPage() {
                     </div>
                   </div>
                   <button
-                    className="p-1.5 rounded text-surface-500 hover:text-surface-200 hover:bg-surface-600 transition-colors"
+                    className="p-1.5 rounded text-surface-500 hover:text-surface-200 hover:bg-surface-600 transition-colors flex-shrink-0"
                     title="Descargar"
                     onClick={(e) => { e.stopPropagation(); toast('Descarga no disponible en demo', { icon: 'ℹ️' }) }}
                   >
@@ -216,7 +372,7 @@ export function RecordingsPage() {
           <div className="px-4 py-3 border-b border-surface-600">
             <h3 className="text-sm font-medium text-surface-100">
               {selectedRec
-                ? `Reproduciendo: ${format(new Date(selectedRec.startTime), 'dd/MM HH:mm')}`
+                ? `${selectedRec.nvrName} · ${selectedRec.cameraName} — ${format(new Date(selectedRec.startTime), 'dd/MM HH:mm')}`
                 : 'Reproductor'}
             </h3>
           </div>
@@ -234,7 +390,7 @@ export function RecordingsPage() {
                 <Play size={32} className="text-surface-700 mx-auto mb-2" />
                 <p className="text-xs text-surface-500">
                   {recordings.length > 0
-                    ? 'Selecciona una grabación'
+                    ? 'Selecciona una grabación para reproducir'
                     : 'Busca grabaciones primero'}
                 </p>
               </div>

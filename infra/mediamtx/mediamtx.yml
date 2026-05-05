@@ -48,7 +48,7 @@ rtcpAddress: :8001
 ###############################################
 hls: yes
 hlsAddress: :8888
-hlsVariant: fmp4
+hlsVariant: mpegts
 hlsSegmentCount: 3
 hlsSegmentDuration: 2s
 hlsSegmentMaxSize: 50MB
