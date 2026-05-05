@@ -405,15 +405,17 @@ export function NVRsPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {filtered.map((nvr) => {
           const status = nvrStatuses[nvr.id]
+          // Usar live status si disponible, fallback a estado guardado en DB (health worker)
+          const isOnline = status?.online ?? nvr.online
           return (
             <div key={nvr.id} className="card p-4">
               <div className="flex items-start justify-between mb-3">
                 <div className="flex items-center gap-2.5">
                   <div className={clsx(
                     'w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0',
-                    status?.online ? 'bg-green-900/40' : 'bg-surface-700'
+                    isOnline ? 'bg-green-900/40' : 'bg-surface-700'
                   )}>
-                    <Server size={16} className={status?.online ? 'text-green-400' : 'text-surface-500'} />
+                    <Server size={16} className={isOnline ? 'text-green-400' : 'text-surface-500'} />
                   </div>
                   <div>
                     <div className="text-sm font-medium text-surface-100">{nvr.name}</div>
@@ -448,9 +450,9 @@ export function NVRsPage() {
 
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-1.5">
-                  {status?.online
+                  {isOnline
                     ? <><Wifi size={12} className="text-green-400" /><span className="text-xs text-green-400">Online</span></>
-                    : <><WifiOff size={12} className="text-surface-500" /><span className="text-xs text-surface-500">Offline</span></>
+                    : <><WifiOff size={12} className="text-red-400" /><span className="text-xs text-red-400">Offline</span></>
                   }
                 </div>
                 {status && (

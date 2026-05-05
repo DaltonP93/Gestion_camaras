@@ -7,7 +7,7 @@ import { broadcastAlert } from '../routes/websocket'
 import { publishAllStreams } from '../services/stream'
 import CryptoJS from 'crypto-js'
 
-const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
+const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
 export function startHealthWorker(server: FastifyInstance) {
@@ -54,7 +54,11 @@ export function startHealthWorker(server: FastifyInstance) {
               })
             }
 
-            // Marcar cámaras del NVR como offline
+            // Marcar NVR y sus cámaras como offline
+            await server.prisma.nVR.update({
+              where: { id: nvr.id },
+              data: { online: false },
+            })
             await server.prisma.camera.updateMany({
               where: { nvrId: nvr.id },
               data: { online: false },
@@ -127,7 +131,7 @@ export function startHealthWorker(server: FastifyInstance) {
 
             await server.prisma.nVR.update({
               where: { id: nvr.id },
-              data: { lastSeen: new Date(), firmware: status.firmware },
+              data: { online: true, lastSeen: new Date(), firmware: status.firmware },
             })
           }
         } catch (err) {
