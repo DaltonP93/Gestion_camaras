@@ -59,10 +59,12 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const status = await getNVRStatus(fakeNvr)
 
     if (!status.online) {
-      return reply.status(503).send({
-        success: false,
-        message: 'No se pudo conectar al NVR. Verifica IP, puerto y credenciales.',
-      })
+      const message = status.errorReason === 'auth'
+        ? 'Credenciales incorrectas (usuario o contraseña)'
+        : status.errorReason === 'network'
+          ? `No se pudo alcanzar ${data.ipAddress}:${data.port} — verifica IP, puerto y que el NVR esté encendido`
+          : 'No se pudo conectar al NVR. Verifica IP, puerto y credenciales.'
+      return reply.status(503).send({ success: false, message })
     }
 
     return reply.send({

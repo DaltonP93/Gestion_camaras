@@ -48,6 +48,8 @@ api.interceptors.response.use(
     const url = originalRequest?.url || ''
 
     const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh')
+    // Estos endpoints manejan sus propios errores — no mostrar toast global
+    const isSilentEndpoint = url.includes('/nvrs/test-connection') || url.includes('/nvrs/detect')
 
     if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint) {
       originalRequest._retry = true
@@ -64,7 +66,7 @@ api.interceptors.response.use(
       }
     }
 
-    if (error.response?.status !== 401 && !(error.response?.status === 429 && isAuthEndpoint)) {
+    if (error.response?.status !== 401 && !(error.response?.status === 429 && isAuthEndpoint) && !isSilentEndpoint) {
       const msg = error.response?.data?.message || 'Error de conexión'
       toast.error(msg)
     }

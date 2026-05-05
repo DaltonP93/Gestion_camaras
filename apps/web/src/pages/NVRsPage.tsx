@@ -97,9 +97,10 @@ export function NVRsPage() {
         setTestStatus('fail')
         setTestMsg('Sin respuesta del NVR')
       }
-    } catch {
+    } catch (err: any) {
       setTestStatus('fail')
-      setTestMsg('No se pudo conectar. Verifica IP, puerto y credenciales.')
+      const msg = err?.response?.data?.message || 'No se pudo conectar. Verifica IP, puerto y credenciales.'
+      setTestMsg(msg)
     }
   }
 

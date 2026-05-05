@@ -17,6 +17,7 @@ export interface HikNVRStatus {
   diskUsage: number
   cpuUsage: number
   temperature?: number
+  errorReason?: 'network' | 'auth' | 'unknown'
 }
 
 export interface HikRecording {
@@ -113,13 +114,24 @@ export async function getNVRStatus(nvr: NVR): Promise<HikNVRStatus> {
       client.get('/ISAPI/ContentMgmt/Storage'),
     ])
 
-    // If the primary call failed the NVR is unreachable or credentials are wrong
     if (sysResponse.status === 'rejected') {
+      const err = sysResponse.reason as any
+      let errorReason: HikNVRStatus['errorReason'] = 'unknown'
+      if (err?.response?.status === 401) {
+        errorReason = 'auth'
+      } else if (
+        err?.code === 'ECONNREFUSED' || err?.code === 'ETIMEDOUT' ||
+        err?.code === 'ECONNABORTED' || err?.code === 'EHOSTUNREACH' ||
+        err?.code === 'ENOTFOUND' || !err?.response
+      ) {
+        errorReason = 'network'
+      }
       return {
         online: false,
         firmware: nvr.firmware || 'Desconocido',
         diskUsage: 0,
         cpuUsage: 0,
+        errorReason,
       }
     }
 
