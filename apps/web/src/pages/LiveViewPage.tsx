@@ -1,7 +1,10 @@
 // src/pages/LiveViewPage.tsx
 import { useEffect, useState, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Grid2x2, Grid3x3, LayoutGrid, Maximize2, ChevronDown } from 'lucide-react'
+import {
+  Grid2x2, Grid3x3, LayoutGrid, Maximize2, ChevronDown,
+  ChevronLeft, ChevronRight,
+} from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
 import { PTZControls } from '@/components/cameras/PTZControls'
@@ -26,6 +29,7 @@ export function LiveViewPage() {
 
   const [gridLayout, setGridLayout] = useState<GridLayout>(9)
   const [selectedNVR, setSelectedNVR] = useState<string>(nvrFilter || 'all')
+  const [page, setPage] = useState(0)
   const [streams, setStreams] = useState<Record<string, StreamInfo>>({})
   const [loadingStreams, setLoadingStreams] = useState<Record<string, boolean>>({})
   const [failedStreams, setFailedStreams] = useState<Set<string>>(new Set())
@@ -40,10 +44,19 @@ export function LiveViewPage() {
     if (nvrFilter) setSelectedNVR(nvrFilter)
   }, [nvrFilter])
 
-  // Cámaras filtradas por NVR seleccionado
-  const filteredCameras = cameras.filter((c) =>
+  // Resetear página al cambiar NVR o layout
+  useEffect(() => { setPage(0) }, [selectedNVR, gridLayout])
+
+  // Todas las cámaras filtradas por NVR (sin paginar)
+  const allFiltered = cameras.filter((c) =>
     selectedNVR === 'all' ? true : c.nvrId === selectedNVR
-  ).slice(0, gridLayout)
+  )
+
+  const totalPages = Math.max(1, Math.ceil(allFiltered.length / gridLayout))
+  const safePage = Math.min(page, totalPages - 1)
+
+  // Cámaras de la página actual
+  const filteredCameras = allFiltered.slice(safePage * gridLayout, (safePage + 1) * gridLayout)
 
   // Cargar stream de una cámara
   const loadStream = useCallback(async (camera: Camera) => {
@@ -70,10 +83,11 @@ export function LiveViewPage() {
 
   const currentGrid = GRID_OPTIONS.find((g) => g.value === gridLayout) || GRID_OPTIONS[2]
 
-  // Pantalla completa de una cámara
   const handleFullscreen = (cameraId: string) => {
     setFocusCamera(focusCamera === cameraId ? null : cameraId)
   }
+
+  const totalForFilter = allFiltered.length
 
   return (
     <div className="flex flex-col h-full">
@@ -120,8 +134,33 @@ export function LiveViewPage() {
 
         <div className="flex-1" />
 
+        {/* Paginación */}
+        {totalPages > 1 && (
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={safePage === 0}
+              className="p-1 rounded-lg bg-surface-700 text-surface-300 hover:bg-surface-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              title="Página anterior"
+            >
+              <ChevronLeft size={14} />
+            </button>
+            <span className="text-xs text-surface-400 tabular-nums min-w-[4rem] text-center">
+              {safePage + 1} / {totalPages}
+            </span>
+            <button
+              onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+              disabled={safePage === totalPages - 1}
+              className="p-1 rounded-lg bg-surface-700 text-surface-300 hover:bg-surface-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              title="Página siguiente"
+            >
+              <ChevronRight size={14} />
+            </button>
+          </div>
+        )}
+
         <span className="text-xs text-surface-500">
-          Mostrando {Math.min(filteredCameras.length, gridLayout)} de {cameras.filter(c => selectedNVR === 'all' || c.nvrId === selectedNVR).length} cámaras
+          {safePage * gridLayout + 1}–{Math.min((safePage + 1) * gridLayout, totalForFilter)} de {totalForFilter} cámaras
         </span>
       </div>
 
