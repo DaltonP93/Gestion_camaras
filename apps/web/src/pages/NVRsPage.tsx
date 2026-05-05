@@ -38,6 +38,7 @@ export function NVRsPage() {
   const [form, setForm] = useState<NVRFormData>(EMPTY)
   const [isSaving, setIsSaving] = useState(false)
   const [refreshing, setRefreshing] = useState<string | null>(null)
+  const [syncing, setSyncing] = useState<string | null>(null)
   const [testStatus, setTestStatus] = useState<TestStatus>('idle')
   const [testMsg, setTestMsg] = useState('')
   const [detecting, setDetecting] = useState(false)
@@ -183,6 +184,18 @@ export function NVRsPage() {
     setRefreshing(nvrId)
     await loadNVRStatus(nvrId)
     setRefreshing(null)
+  }
+
+  const handleSyncStreams = async (nvrId: string) => {
+    setSyncing(nvrId)
+    try {
+      const res = await apiPost<{ synced: number; failed: number; total: number }>(`/nvrs/${nvrId}/sync-streams`)
+      toast.success(`Streams sincronizados: ${res.synced}/${res.total}`)
+    } catch {
+      toast.error('Error al sincronizar streams')
+    } finally {
+      setSyncing(null)
+    }
   }
 
   const handleScan = async () => {
@@ -430,6 +443,13 @@ export function NVRsPage() {
                     title="Actualizar estado"
                   >
                     <RefreshCw size={12} />
+                  </button>
+                  <button
+                    onClick={() => handleSyncStreams(nvr.id)}
+                    className={clsx('btn-ghost p-1.5', syncing === nvr.id && 'animate-pulse text-brand-400')}
+                    title="Re-sincronizar streams con MediaMTX"
+                  >
+                    <Zap size={12} />
                   </button>
                   <button onClick={() => openEdit(nvr)} className="btn-ghost p-1.5" title="Editar"><Pencil size={12} /></button>
                   <button onClick={() => handleDelete(nvr)} className="btn-ghost p-1.5 hover:text-red-400" title="Eliminar"><Trash2 size={12} /></button>

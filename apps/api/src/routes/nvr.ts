@@ -390,7 +390,37 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     await AuditAction(server.prisma, request.user.sub, 'NVR_UPDATED', nvr.id, request)
 
+    // Re-registrar streams en MediaMTX con las nuevas credenciales
+    const cameras = await server.prisma.camera.findMany({
+      where: { nvrId: id, active: true },
+    })
+    const plainPass = data.password ? data.password : decryptPassword(nvr.password)
+    publishAllStreams({ ...nvr, password: plainPass } as any, cameras).catch(() => {})
+
     return reply.send({ ...nvr, password: undefined })
+  })
+
+  // POST /api/nvrs/:id/sync-streams — Forzar re-registro de streams en MediaMTX (ADMIN)
+  server.post('/:id/sync-streams', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const cameras = await server.prisma.camera.findMany({
+      where: { nvrId: id, active: true },
+    })
+    const nvrDecrypted = { ...nvr, password: decryptPassword(nvr.password) }
+    const result = await publishAllStreams(nvrDecrypted as any, cameras)
+
+    return reply.send({
+      success: true,
+      synced: result.success,
+      failed: result.failed,
+      total: cameras.length,
+    })
   })
 
   // DELETE /api/nvrs/:id — Eliminar NVR (solo ADMIN)
