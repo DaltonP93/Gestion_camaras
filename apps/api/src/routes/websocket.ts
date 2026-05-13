@@ -25,17 +25,16 @@ export function broadcastToUser(userId: string, payload: object) {
 }
 
 export const wsHandler: FastifyPluginAsync = async (server) => {
-  // Sin preHandler: el token viene en query param ?token=JWT
-  // porque los browsers no pueden enviar headers custom en WebSocket
   server.get('/alerts', {
     websocket: true,
   }, (socket: WebSocket, request) => {
-    const { token } = request.query as { token?: string }
     const ws = socket
+
+    const { token: rawToken = '' } = request.query as { token?: string }
 
     let userPayload: JWTPayload
     try {
-      userPayload = server.jwt.verify<JWTPayload>(token || '')
+      userPayload = server.jwt.verify<JWTPayload>(rawToken)
     } catch {
       ws.close(4001, 'Unauthorized')
       return
@@ -43,7 +42,6 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
 
     const userId = userPayload.sub
 
-    // Registrar cliente
     if (!wsClients.has(userId)) {
       wsClients.set(userId, new Set())
     }
@@ -51,7 +49,6 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
 
     server.log.info(`WS conectado: usuario ${userPayload.username}`)
 
-    // Enviar ping cada 30s para mantener conexión
     const pingInterval = setInterval(() => {
       if (ws.readyState === 1) {
         ws.send(JSON.stringify({ type: 'ping', timestamp: new Date().toISOString() }))
@@ -62,8 +59,6 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
       try {
         const msg = JSON.parse(data.toString())
         if (msg.type === 'pong') return
-
-        // Suscribir a updates de cámaras específicas
         if (msg.type === 'subscribe' && msg.cameras) {
           ws.send(JSON.stringify({ type: 'subscribed', cameras: msg.cameras }))
         }

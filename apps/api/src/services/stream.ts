@@ -33,8 +33,8 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
   const pathConfig = {
     source: rtspUrl,
     sourceOnDemand: true,
-    sourceOnDemandStartTimeout: '15s',
-    sourceOnDemandCloseAfter: '30s',
+    sourceOnDemandStartTimeout: '8s',
+    sourceOnDemandCloseAfter: '60s',
     record: false,
     overridePublisher: true,
   }

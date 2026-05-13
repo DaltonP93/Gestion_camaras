@@ -124,7 +124,7 @@ export function Sidebar() {
                 <span
                   className={clsx(
                     'w-1.5 h-1.5 rounded-full flex-shrink-0',
-                    nvr.active ? 'bg-green-400' : 'bg-surface-500'
+                    nvr.online ? 'bg-green-400' : 'bg-red-500'
                   )}
                 />
                 <span className="truncate">{nvr.name}</span>

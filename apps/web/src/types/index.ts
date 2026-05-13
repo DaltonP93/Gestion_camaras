@@ -56,6 +56,7 @@ export interface NVR {
   firmware?: string
   location?: string
   active: boolean
+  online: boolean
   lastSeen?: string
   createdAt: string
   cameras?: Camera[]

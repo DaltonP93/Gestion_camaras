@@ -5,6 +5,9 @@ import crypto from 'crypto'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000           // 1 hora
+const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7 días
+
 const loginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -17,13 +20,12 @@ const refreshSchema = z.object({
 const hashToken = (t: string) => crypto.createHash('sha256').update(t).digest('hex')
 
 export const authRoutes: FastifyPluginAsync = async (server) => {
-  // POST /api/auth/login (rate limit estricto: brute force protection)
+  // POST /api/auth/login (rate limit: 8 intentos / 15 min por IP)
   server.post('/login', {
     config: {
       rateLimit: {
         max: 8,
         timeWindow: '15 minutes',
-        keyGenerator: (req: any) => `${req.ip}:${(req.body as any)?.username ?? ''}`,
       },
     },
   }, async (request, reply) => {
@@ -52,25 +54,19 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       })
     }
 
-    const payload = {
-      sub: user.id,
-      username: user.username,
-      role: user.role,
-    }
-
+    const payload = { sub: user.id, username: user.username, role: user.role }
     const accessToken = server.jwt.sign(payload)
     const refreshToken = server.jwt.sign(payload, {
       expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
     })
 
-    // Guardar sesión en DB (refresh token guardado como SHA-256)
     await server.prisma.session.create({
       data: {
         userId: user.id,
         refreshToken: hashToken(refreshToken),
         userAgent: request.headers['user-agent'] || null,
         ipAddress: request.ip,
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
       },
     })
 
@@ -113,7 +109,6 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const newAccessToken = server.jwt.sign(payload)
-
     return reply.send({ accessToken: newAccessToken })
   })
 
@@ -128,7 +123,6 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     })
 
     await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request)
-
     return reply.send({ message: 'Sesión cerrada' })
   })
 

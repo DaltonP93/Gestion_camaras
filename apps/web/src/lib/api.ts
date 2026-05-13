@@ -11,7 +11,7 @@ export const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-// ─── Request interceptor: inyectar token ─────────────────────
+// ─── Request interceptor: inyectar token desde localStorage ──
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('accessToken')
   if (token) config.headers.Authorization = `Bearer ${token}`
@@ -19,23 +19,25 @@ api.interceptors.request.use((config) => {
 })
 
 // ─── Refresh mutex: evita múltiples refreshes en paralelo ────
-let refreshPromise: Promise<string> | null = null
+let refreshPromise: Promise<void> | null = null
 
-async function refreshAccessToken(): Promise<string> {
+async function refreshAccessToken(): Promise<void> {
   if (refreshPromise) return refreshPromise
-  const refreshToken = localStorage.getItem('refreshToken')
-  if (!refreshToken) throw new Error('No refresh token')
-
   refreshPromise = (async () => {
-    try {
-      const { data } = await axios.post(`${BASE_URL}/api/auth/refresh`, { refreshToken })
-      localStorage.setItem('accessToken', data.accessToken)
-      return data.accessToken as string
-    } finally {
-      refreshPromise = null
-    }
-  })()
+    const refreshToken = localStorage.getItem('refreshToken')
+    if (!refreshToken) throw new Error('No refresh token')
+    const res = await axios.post<{ accessToken: string }>(
+      `${BASE_URL}/api/auth/refresh`,
+      { refreshToken }
+    )
+    localStorage.setItem('accessToken', res.data.accessToken)
+  })().finally(() => { refreshPromise = null })
   return refreshPromise
+}
+
+// ─── Señal de sesión expirada ─────────────────────────────────
+export function dispatchAuthExpired() {
+  window.dispatchEvent(new CustomEvent('visioncore:auth-expired'))
 }
 
 // ─── Response interceptor: manejo de errores y refresh ───────
@@ -45,27 +47,26 @@ api.interceptors.response.use(
     const originalRequest = error.config as any
     const url = originalRequest?.url || ''
 
-    // No intentar refresh sobre /auth/login o /auth/refresh
     const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh')
+    // Estos endpoints manejan sus propios errores — no mostrar toast global
+    const isSilentEndpoint = url.includes('/nvrs/test-connection') || url.includes('/nvrs/detect')
 
     if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint) {
       originalRequest._retry = true
       try {
-        const newToken = await refreshAccessToken()
-        originalRequest.headers.Authorization = `Bearer ${newToken}`
+        await refreshAccessToken()
+        const token = localStorage.getItem('accessToken')
+        if (token) originalRequest.headers.Authorization = `Bearer ${token}`
         return api(originalRequest)
       } catch {
         localStorage.removeItem('accessToken')
         localStorage.removeItem('refreshToken')
-        if (window.location.pathname !== '/login') {
-          window.location.href = '/login'
-        }
+        dispatchAuthExpired()
         return Promise.reject(error)
       }
     }
 
-    // Mostrar toast de error para errores 4xx/5xx (excepto 401 manejado arriba)
-    if (error.response?.status !== 401) {
+    if (error.response?.status !== 401 && !(error.response?.status === 429 && isAuthEndpoint) && !isSilentEndpoint) {
       const msg = error.response?.data?.message || 'Error de conexión'
       toast.error(msg)
     }

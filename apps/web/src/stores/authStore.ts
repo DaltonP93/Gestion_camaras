@@ -7,8 +7,6 @@ import type { User, LoginResponse } from '@/types'
 
 interface AuthState {
   user: User | null
-  accessToken: string | null
-  refreshToken: string | null
   isAuthenticated: boolean
   isLoading: boolean
 
@@ -25,8 +23,6 @@ export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({
       user: null,
-      accessToken: null,
-      refreshToken: null,
       isAuthenticated: false,
       isLoading: false,
 
@@ -36,16 +32,8 @@ export const useAuthStore = create<AuthState>()(
           const data = await apiPost<LoginResponse>('/auth/login', { username, password })
           localStorage.setItem('accessToken', data.accessToken)
           localStorage.setItem('refreshToken', data.refreshToken)
-          api.defaults.headers.common['Authorization'] = `Bearer ${data.accessToken}`
-
-          set({
-            user: data.user,
-            accessToken: data.accessToken,
-            refreshToken: data.refreshToken,
-            isAuthenticated: true,
-            isLoading: false,
-          })
-
+          api.defaults.headers.common.Authorization = `Bearer ${data.accessToken}`
+          set({ user: data.user, isAuthenticated: true, isLoading: false })
           connectWebSocket()
         } catch (err) {
           set({ isLoading: false })
@@ -54,35 +42,30 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: async () => {
+        const refreshToken = localStorage.getItem('refreshToken')
         try {
-          const refreshToken = localStorage.getItem('refreshToken')
-          if (refreshToken) {
-            await apiPost('/auth/logout', { refreshToken })
-          }
+          if (refreshToken) await apiPost('/auth/logout', { refreshToken })
         } finally {
           localStorage.removeItem('accessToken')
           localStorage.removeItem('refreshToken')
-          delete api.defaults.headers.common['Authorization']
+          delete api.defaults.headers.common.Authorization
           disconnectWebSocket()
-          set({ user: null, accessToken: null, refreshToken: null, isAuthenticated: false })
+          set({ user: null, isAuthenticated: false })
         }
       },
 
       loadUser: async () => {
         const token = localStorage.getItem('accessToken')
-        if (!token) return
-
-        // Restaurar el header Authorization después de hidratar
-        api.defaults.headers.common['Authorization'] = `Bearer ${token}`
-
+        if (!token) {
+          set({ user: null, isAuthenticated: false })
+          return
+        }
+        api.defaults.headers.common.Authorization = `Bearer ${token}`
         try {
           const user = await apiGet<User>('/auth/me')
           set({ user, isAuthenticated: true })
           connectWebSocket()
         } catch {
-          localStorage.removeItem('accessToken')
-          localStorage.removeItem('refreshToken')
-          delete api.defaults.headers.common['Authorization']
           set({ user: null, isAuthenticated: false })
         }
       },
@@ -110,8 +93,7 @@ export const useAuthStore = create<AuthState>()(
     {
       name: 'visioncore-auth',
       partialize: (state) => ({
-        accessToken: state.accessToken,
-        refreshToken: state.refreshToken,
+        user: state.user,
         isAuthenticated: state.isAuthenticated,
       }),
     }

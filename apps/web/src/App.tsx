@@ -25,6 +25,17 @@ export default function App() {
     if (isAuthenticated) loadUser()
   }, [])
 
+  // Limpiar sesión sin recargar la página cuando el refresh falla.
+  // window.location.href causaba: reload → Zustand rehidrata user → dashboard
+  // → API 401 → reload → bucle infinito.
+  useEffect(() => {
+    const handler = () => {
+      useAuthStore.setState({ user: null, isAuthenticated: false })
+    }
+    window.addEventListener('visioncore:auth-expired', handler)
+    return () => window.removeEventListener('visioncore:auth-expired', handler)
+  }, [])
+
   return (
     <Routes>
       <Route path="/login" element={

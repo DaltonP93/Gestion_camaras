@@ -42,7 +42,7 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
     },
   })
 
-  // Decorator: verificar que el request tiene token válido
+  // Decorator: verificar que el request tiene token válido (header o cookie)
   server.decorate('authenticate', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       await request.jwtVerify()

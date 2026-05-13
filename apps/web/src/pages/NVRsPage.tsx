@@ -38,6 +38,7 @@ export function NVRsPage() {
   const [form, setForm] = useState<NVRFormData>(EMPTY)
   const [isSaving, setIsSaving] = useState(false)
   const [refreshing, setRefreshing] = useState<string | null>(null)
+  const [syncing, setSyncing] = useState<string | null>(null)
   const [testStatus, setTestStatus] = useState<TestStatus>('idle')
   const [testMsg, setTestMsg] = useState('')
   const [detecting, setDetecting] = useState(false)
@@ -97,9 +98,10 @@ export function NVRsPage() {
         setTestStatus('fail')
         setTestMsg('Sin respuesta del NVR')
       }
-    } catch {
+    } catch (err: any) {
       setTestStatus('fail')
-      setTestMsg('No se pudo conectar. Verifica IP, puerto y credenciales.')
+      const msg = err?.response?.data?.message || 'No se pudo conectar. Verifica IP, puerto y credenciales.'
+      setTestMsg(msg)
     }
   }
 
@@ -182,6 +184,18 @@ export function NVRsPage() {
     setRefreshing(nvrId)
     await loadNVRStatus(nvrId)
     setRefreshing(null)
+  }
+
+  const handleSyncStreams = async (nvrId: string) => {
+    setSyncing(nvrId)
+    try {
+      const res = await apiPost<{ synced: number; failed: number; total: number }>(`/nvrs/${nvrId}/sync-streams`)
+      toast.success(`Streams sincronizados: ${res.synced}/${res.total}`)
+    } catch {
+      toast.error('Error al sincronizar streams')
+    } finally {
+      setSyncing(null)
+    }
   }
 
   const handleScan = async () => {
@@ -405,15 +419,17 @@ export function NVRsPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {filtered.map((nvr) => {
           const status = nvrStatuses[nvr.id]
+          // Usar live status si disponible, fallback a estado guardado en DB (health worker)
+          const isOnline = status?.online ?? nvr.online
           return (
             <div key={nvr.id} className="card p-4">
               <div className="flex items-start justify-between mb-3">
                 <div className="flex items-center gap-2.5">
                   <div className={clsx(
                     'w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0',
-                    status?.online ? 'bg-green-900/40' : 'bg-surface-700'
+                    isOnline ? 'bg-green-900/40' : 'bg-surface-700'
                   )}>
-                    <Server size={16} className={status?.online ? 'text-green-400' : 'text-surface-500'} />
+                    <Server size={16} className={isOnline ? 'text-green-400' : 'text-surface-500'} />
                   </div>
                   <div>
                     <div className="text-sm font-medium text-surface-100">{nvr.name}</div>
@@ -427,6 +443,13 @@ export function NVRsPage() {
                     title="Actualizar estado"
                   >
                     <RefreshCw size={12} />
+                  </button>
+                  <button
+                    onClick={() => handleSyncStreams(nvr.id)}
+                    className={clsx('btn-ghost p-1.5', syncing === nvr.id && 'animate-pulse text-brand-400')}
+                    title="Re-sincronizar streams con MediaMTX"
+                  >
+                    <Zap size={12} />
                   </button>
                   <button onClick={() => openEdit(nvr)} className="btn-ghost p-1.5" title="Editar"><Pencil size={12} /></button>
                   <button onClick={() => handleDelete(nvr)} className="btn-ghost p-1.5 hover:text-red-400" title="Eliminar"><Trash2 size={12} /></button>
@@ -448,9 +471,9 @@ export function NVRsPage() {
 
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-1.5">
-                  {status?.online
+                  {isOnline
                     ? <><Wifi size={12} className="text-green-400" /><span className="text-xs text-green-400">Online</span></>
-                    : <><WifiOff size={12} className="text-surface-500" /><span className="text-xs text-surface-500">Offline</span></>
+                    : <><WifiOff size={12} className="text-red-400" /><span className="text-xs text-red-400">Offline</span></>
                   }
                 </div>
                 {status && (

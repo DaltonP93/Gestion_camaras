@@ -16,7 +16,6 @@ export function connectWebSocket() {
     ws = new WebSocket(url)
 
     ws.onopen = () => {
-      console.log('[WS] Conectado al servidor de alertas')
       reconnectDelay = 2000
     }
 
@@ -35,15 +34,16 @@ export function connectWebSocket() {
       }
     }
 
-    ws.onclose = () => {
-      console.log('[WS] Desconectado, reconectando en', reconnectDelay, 'ms')
+    ws.onclose = (event) => {
+      // 4001 = unauthorized — no reconectar
+      if (event.code === 4001) return
       scheduleReconnect()
     }
 
     ws.onerror = () => {
       ws?.close()
     }
-  } catch (err) {
+  } catch {
     scheduleReconnect()
   }
 }

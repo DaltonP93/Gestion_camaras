@@ -93,8 +93,8 @@ export function VideoPlayer({ hlsUrl, cameraName, isRecording, onFullscreen, cla
       setStatus('loading')
       return
     }
-    // Esperar a que MediaMTX conecte RTSP y bufferee el primer segmento (~2s)
-    const timer = setTimeout(() => initPlayer(), 3000)
+    // Esperar a que MediaMTX conecte RTSP y bufferee el primer segmento
+    const timer = setTimeout(() => initPlayer(), 1500)
     return () => {
       clearTimeout(timer)
       hlsRef.current?.destroy()
@@ -111,6 +111,7 @@ export function VideoPlayer({ hlsUrl, cameraName, isRecording, onFullscreen, cla
       className={clsx('relative bg-black overflow-hidden group rounded-lg', className)}
       onMouseEnter={() => setShowControls(true)}
       onMouseLeave={() => setShowControls(false)}
+      onDoubleClick={() => onFullscreen?.()}
     >
       {/* Video */}
       <video

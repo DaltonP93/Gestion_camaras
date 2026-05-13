@@ -75,6 +75,7 @@ model NVR {
   firmware    String?
   location    String?
   active      Boolean  @default(true)
+  online      Boolean  @default(false)
   lastSeen    DateTime?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

@@ -13,7 +13,7 @@ const connectionTestSchema = z.object({
   password: z.string().min(1),
 })
 
-const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
+const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 
 function encryptPassword(password: string): string {
   return CryptoJS.AES.encrypt(password, ENCRYPTION_KEY).toString()
@@ -59,10 +59,12 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const status = await getNVRStatus(fakeNvr)
 
     if (!status.online) {
-      return reply.status(503).send({
-        success: false,
-        message: 'No se pudo conectar al NVR. Verifica IP, puerto y credenciales.',
-      })
+      const message = status.errorReason === 'auth'
+        ? 'Credenciales incorrectas (usuario o contraseña)'
+        : status.errorReason === 'network'
+          ? `No se pudo alcanzar ${data.ipAddress}:${data.port} — verifica IP, puerto y que el NVR esté encendido`
+          : 'No se pudo conectar al NVR. Verifica IP, puerto y credenciales.'
+      return reply.status(503).send({ success: false, message })
     }
 
     return reply.send({
@@ -388,7 +390,37 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     await AuditAction(server.prisma, request.user.sub, 'NVR_UPDATED', nvr.id, request)
 
+    // Re-registrar streams en MediaMTX con las nuevas credenciales
+    const cameras = await server.prisma.camera.findMany({
+      where: { nvrId: id, active: true },
+    })
+    const plainPass = data.password ? data.password : decryptPassword(nvr.password)
+    publishAllStreams({ ...nvr, password: plainPass } as any, cameras).catch(() => {})
+
     return reply.send({ ...nvr, password: undefined })
+  })
+
+  // POST /api/nvrs/:id/sync-streams — Forzar re-registro de streams en MediaMTX (ADMIN)
+  server.post('/:id/sync-streams', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const cameras = await server.prisma.camera.findMany({
+      where: { nvrId: id, active: true },
+    })
+    const nvrDecrypted = { ...nvr, password: decryptPassword(nvr.password) }
+    const result = await publishAllStreams(nvrDecrypted as any, cameras)
+
+    return reply.send({
+      success: true,
+      synced: result.success,
+      failed: result.failed,
+      total: cameras.length,
+    })
   })
 
   // DELETE /api/nvrs/:id — Eliminar NVR (solo ADMIN)

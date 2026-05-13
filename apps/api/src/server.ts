@@ -22,7 +22,7 @@ import { startHealthWorker } from './jobs/healthWorker'
 import { publishStream } from './services/stream'
 import CryptoJS from 'crypto-js'
 
-const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
+const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
 const server = Fastify({
@@ -62,7 +62,7 @@ async function main() {
   })
 
   await server.register(rateLimit, {
-    max: 300,
+    max: 600,
     timeWindow: '1 minute',
     errorResponseBuilder: () => ({
       statusCode: 429,
