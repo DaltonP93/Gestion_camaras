@@ -1,8 +1,9 @@
 // apps/api/src/routes/cameras.ts
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { publishStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus } from '../services/stream'
-import { captureSnapshot, sendPTZCommand, type PTZCommand } from '../services/hikvision'
+import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus } from '../services/stream'
+import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
+import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
 import { AuditAction } from '../services/audit'
 import CryptoJS from 'crypto-js'
 
@@ -10,22 +11,20 @@ const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET 
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
 const cameraUpdateSchema = z.object({
-  name: z.string().min(1).max(100).optional(),
-  location: z.string().optional(),
-  ptzEnabled: z.boolean().optional(),
-  active: z.boolean().optional(),
+  name:          z.string().min(1).max(100).optional(),
+  location:      z.string().optional(),
+  ptzEnabled:    z.boolean().optional(),
+  active:        z.boolean().optional(),
+  preferredStream: z.enum(['main', 'sub']).optional(),
 })
 
 const ptzSchema = z.object({
   command: z.enum(['UP', 'DOWN', 'LEFT', 'RIGHT', 'ZOOM_IN', 'ZOOM_OUT', 'STOP']),
-  speed: z.number().min(1).max(100).default(50),
+  speed:   z.number().min(1).max(100).default(50),
 })
 
 async function userCanAccessCamera(
-  prisma: any,
-  userId: string,
-  role: string,
-  cameraId: string,
+  prisma: any, userId: string, role: string, cameraId: string,
   permission: 'canView' | 'canPtz' | 'canPlayback' = 'canView'
 ): Promise<boolean> {
   if (role === 'ADMIN' || role === 'SUPERVISOR') return true
@@ -37,10 +36,8 @@ async function userCanAccessCamera(
 }
 
 export const cameraRoutes: FastifyPluginAsync = async (server) => {
-  // GET /api/cameras — Listar cámaras (filtradas por permisos)
-  server.get('/', {
-    preHandler: [server.authenticate],
-  }, async (request, reply) => {
+  // GET /api/cameras — Listar cámaras
+  server.get('/', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user = request.user
     const { nvrId } = request.query as { nvrId?: string }
 
@@ -56,13 +53,9 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         where: { userId: user.sub, cameraId: { not: null }, canView: true },
         select: { cameraId: true },
       })
-      const cameraIds = perms.map((p) => p.cameraId!).filter(Boolean)
-
+      const cameraIds = perms.map((p: any) => p.cameraId!).filter(Boolean)
       cameras = await server.prisma.camera.findMany({
-        where: {
-          id: { in: cameraIds },
-          ...(nvrId ? { nvrId } : {}),
-        },
+        where: { id: { in: cameraIds }, ...(nvrId ? { nvrId } : {}) },
         include: { nvr: { select: { id: true, name: true, ipAddress: true } } },
         orderBy: [{ nvrId: 'asc' }, { channel: 'asc' }],
       })
@@ -72,157 +65,225 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // GET /api/cameras/:id/stream — Obtener URLs de streaming
-  server.get('/:id/stream', {
-    preHandler: [server.authenticate],
-  }, async (request, reply) => {
+  server.get('/:id/stream', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const user = request.user
 
-    const camera = await server.prisma.camera.findUnique({
-      where: { id },
-      include: { nvr: true },
-    })
-
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
     if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
-
-    // Auditor no puede ver streams en vivo
-    if (user.role === 'AUDITOR') {
-      return reply.status(403).send({ message: 'Acceso denegado: rol auditor no puede ver streams en vivo' })
-    }
-
-    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id, 'canView')) {
+    if (user.role === 'AUDITOR') return reply.status(403).send({ message: 'Acceso denegado' })
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
       return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
     }
 
-    // Publicar el stream en MediaMTX si no existe
     const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
     await publishStream(nvr as any, camera)
 
     const streamPath = getStreamPath(camera.nvr, camera)
 
     await AuditAction(server.prisma, user.sub, 'VIEW_CAMERA', id, request, {
-      cameraName: camera.name,
-      nvrName: camera.nvr.name,
+      cameraName: camera.name, nvrName: camera.nvr.name,
     })
 
     return reply.send({
-      cameraId: id,
+      cameraId:   id,
       streamPath,
-      hls: getHlsUrl(streamPath),
-      webrtc: getWebRtcUrl(streamPath),
-      channel: camera.channel,
-      nvrName: camera.nvr.name,
+      hls:        getHlsUrl(streamPath),
+      webrtc:     getWebRtcUrl(streamPath),
+      channel:    camera.channel,
+      nvrName:    camera.nvr.name,
     })
   })
 
-  // GET /api/cameras/:id/stream/status — Estado del stream
-  server.get('/:id/stream/status', {
-    preHandler: [server.authenticate],
-  }, async (request, reply) => {
+  // GET /api/cameras/:id/stream/status
+  server.get('/:id/stream/status', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
-    const user = request.user
-
-    const camera = await server.prisma.camera.findUnique({
-      where: { id },
-      include: { nvr: true },
-    })
-
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
     if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
-
-    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id, 'canView')) {
-      return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
+    if (!await userCanAccessCamera(server.prisma, user(request).sub, user(request).role, id)) {
+      return reply.status(403).send({ message: 'Sin permiso' })
     }
-
     const streamPath = getStreamPath(camera.nvr, camera)
     const status = await getStreamStatus(streamPath)
-
     return reply.send({ ...status, streamPath })
   })
 
-  // GET /api/cameras/:id/snapshot — Capturar imagen
-  server.get('/:id/snapshot', {
-    preHandler: [server.authenticate],
-  }, async (request, reply) => {
+  // GET /api/cameras/:id/diagnostics — Diagnóstico completo por capas
+  server.get('/:id/diagnostics', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const user = request.user
 
-    const camera = await server.prisma.camera.findUnique({
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
+
+    const nvr = camera.nvr
+    const plainPass = decryptPass(nvr.password)
+    const nvrDecrypted = { ...nvr, password: plainPass }
+
+    const streamPath = getStreamPath(nvr, camera)
+    const hlsUrl     = getHlsUrl(streamPath)
+
+    // 1. Estado HTTP del NVR (ya lo tenemos en DB)
+    const nvrOnlineHttp = nvr.online
+
+    // 2. Estado del stream en MediaMTX
+    const mediamtxStatus = await getStreamStatus(streamPath)
+
+    // 3. Probe RTSP (ambos streams)
+    const rtsp = await probeBothStreams(nvrDecrypted, camera.channel)
+
+    // 4. Guardar resultado en DB
+    await server.prisma.camera.update({
       where: { id },
-      include: { nvr: true },
+      data: {
+        rtspMainOk:     rtsp.main.ok,
+        rtspSubOk:      rtsp.sub.ok,
+        lastRtspCheckAt: new Date(),
+        lastRtspError:  rtsp.sub.ok ? null : (rtsp.sub.error || rtsp.main.error || null),
+        mainCodec:      rtsp.main.codec || camera.mainCodec,
+        subCodec:       rtsp.sub.codec  || camera.subCodec,
+        mainResolution: rtsp.main.width ? `${rtsp.main.width}x${rtsp.main.height}` : camera.mainResolution,
+        subResolution:  rtsp.sub.width  ? `${rtsp.sub.width}x${rtsp.sub.height}`   : camera.subResolution,
+        mainFps:        rtsp.main.fps || camera.mainFps,
+        subFps:         rtsp.sub.fps  || camera.subFps,
+      },
     })
 
+    return reply.send({
+      cameraId:  id,
+      cameraName: camera.name,
+      channelCode: camera.channelCode || `D${camera.channel}`,
+      nvr: {
+        id:         nvr.id,
+        name:       nvr.name,
+        onlineHttp: nvrOnlineHttp,
+        lastSeen:   nvr.lastSeen,
+      },
+      camera: {
+        channelNumber:    camera.channel,
+        name:             camera.name,
+        ipAddress:        camera.ipAddress,
+        protocol:         camera.protocol,
+        onlineInNvr:      camera.online,
+        preferredStream:  camera.preferredStream,
+      },
+      rtsp: {
+        mainUrlMasked:  buildRtspUrlMasked(nvrDecrypted, camera.channel, false),
+        subUrlMasked:   buildRtspUrlMasked(nvrDecrypted, camera.channel, true),
+        mainOk:         rtsp.main.ok,
+        subOk:          rtsp.sub.ok,
+        mainError:      rtsp.main.error,
+        subError:       rtsp.sub.error,
+        preferred:      camera.preferredStream || 'sub',
+        mainCodec:      rtsp.main.codec,
+        subCodec:       rtsp.sub.codec,
+        mainResolution: rtsp.main.width ? `${rtsp.main.width}x${rtsp.main.height}` : null,
+        subResolution:  rtsp.sub.width  ? `${rtsp.sub.width}x${rtsp.sub.height}`   : null,
+        mainFps:        rtsp.main.fps,
+        subFps:         rtsp.sub.fps,
+        mainLatencyMs:  rtsp.main.latencyMs,
+        subLatencyMs:   rtsp.sub.latencyMs,
+      },
+      mediaServer: {
+        provider:   'mediamtx',
+        route:      streamPath,
+        routeExists: true,
+        ready:      mediamtxStatus.active,
+        readers:    mediamtxStatus.readers,
+      },
+      frontend: {
+        hlsUrl,
+        webrtcUrl: getWebRtcUrl(streamPath),
+      },
+    })
+  })
+
+  // POST /api/cameras/:id/restart-stream — Reiniciar stream en MediaMTX
+  server.post('/:id/restart-stream', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
     if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
 
-    // Auditor no puede capturar snapshots en vivo
-    if (user.role === 'AUDITOR') {
-      return reply.status(403).send({ message: 'Acceso denegado: rol auditor no puede capturar snapshots' })
-    }
+    const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
 
-    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id, 'canView')) {
-      return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
-    }
+    // Eliminar y re-crear el path en MediaMTX
+    await removeStream(camera.nvr, camera)
+    await new Promise(r => setTimeout(r, 500))
+    const ok = await publishStream(nvr as any, camera)
+
+    return reply.send({ success: ok, streamPath: getStreamPath(camera.nvr, camera) })
+  })
+
+  // POST /api/cameras/:id/test-rtsp — Probar RTSP de una cámara específica
+  server.post('/:id/test-rtsp', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const { stream = 'sub' } = request.body as { stream?: 'main' | 'sub' }
+
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
 
     const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
-    const snapshot = await captureSnapshot(nvr as any, camera.channel)
+    const rtspUrl = buildRtspUrl(nvr as any, camera.channel, stream === 'sub')
+    const result  = await probeRtspStream(rtspUrl)
 
-    if (!snapshot) {
-      return reply.status(503).send({ message: 'No se pudo capturar imagen' })
+    return reply.send({
+      ...result,
+      stream,
+      urlMasked: buildRtspUrlMasked(nvr as any, camera.channel, stream === 'sub'),
+    })
+  })
+
+  // GET /api/cameras/:id/snapshot
+  server.get('/:id/snapshot', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const user = request.user
+
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+    if (user.role === 'AUDITOR') return reply.status(403).send({ message: 'Acceso denegado' })
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
+      return reply.status(403).send({ message: 'Sin permiso' })
     }
 
-    await AuditAction(server.prisma, user.sub, 'SNAPSHOT', id, request, {
-      cameraName: camera.name,
-      nvrName: camera.nvr.name,
-    })
+    const nvr      = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
+    const snapshot = await captureSnapshot(nvr as any, camera.channel)
+    if (!snapshot) return reply.status(503).send({ message: 'No se pudo capturar imagen' })
 
+    await AuditAction(server.prisma, user.sub, 'SNAPSHOT', id, request, { cameraName: camera.name })
     reply.header('Content-Type', 'image/jpeg')
     return reply.send(snapshot)
   })
 
-  // POST /api/cameras/:id/ptz — Control PTZ
-  server.post('/:id/ptz', {
-    preHandler: [server.authenticate],
-  }, async (request, reply) => {
+  // POST /api/cameras/:id/ptz
+  server.post('/:id/ptz', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const { command, speed } = ptzSchema.parse(request.body)
     const user = request.user
 
-    const camera = await server.prisma.camera.findUnique({
-      where: { id },
-      include: { nvr: true },
-    })
-
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
     if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
-    if (!camera.ptzEnabled) return reply.status(400).send({ message: 'PTZ no habilitado en esta cámara' })
-
-    // Auditor no puede controlar PTZ
-    if (user.role === 'AUDITOR') {
-      return reply.status(403).send({ message: 'Acceso denegado: rol auditor no puede controlar PTZ' })
-    }
-
+    if (!camera.ptzEnabled) return reply.status(400).send({ message: 'PTZ no habilitado' })
+    if (user.role === 'AUDITOR') return reply.status(403).send({ message: 'Acceso denegado' })
     if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id, 'canPtz')) {
-      return reply.status(403).send({ message: 'Sin permiso PTZ para esta cámara' })
+      return reply.status(403).send({ message: 'Sin permiso PTZ' })
     }
 
     const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
-    const ok = await sendPTZCommand(nvr as any, camera.channel, command as PTZCommand, speed)
-
+    const ok  = await sendPTZCommand(nvr as any, camera.channel, command as PTZCommand, speed)
     await AuditAction(server.prisma, user.sub, 'PTZ_COMMAND', id, request, { command, speed })
-
     return reply.send({ success: ok, command })
   })
 
-  // PUT /api/cameras/:id — Actualizar datos de cámara (ADMIN/SUPERVISOR)
-  server.put('/:id', {
-    preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])],
-  }, async (request, reply) => {
+  // PUT /api/cameras/:id — Actualizar cámara
+  server.put('/:id', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const data = cameraUpdateSchema.parse(request.body)
-
-    const camera = await server.prisma.camera.update({
-      where: { id },
-      data,
-    })
-
+    const camera = await server.prisma.camera.update({ where: { id }, data })
     return reply.send(camera)
   })
 }
+
+function user(request: any) { return request.user }

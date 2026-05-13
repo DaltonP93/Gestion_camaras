@@ -1,6 +1,7 @@
 // src/pages/NVRsPage.tsx
 import { useEffect, useState } from 'react'
-import { Plus, Pencil, Trash2, RefreshCw, Server, Wifi, WifiOff, Zap, Search, CheckCircle2, XCircle, Radar, Lock } from 'lucide-react'
+import { Plus, Pencil, Trash2, RefreshCw, Server, Wifi, WifiOff, Zap, Search, CheckCircle2, XCircle, Radar, Lock, ChevronRight } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiPut, apiDelete, apiGet } from '@/lib/api'
 import { clsx } from 'clsx'
@@ -491,6 +492,15 @@ export function NVRsPage() {
                   Última conexión: {format(new Date(nvr.lastSeen), 'dd/MM HH:mm')}
                 </div>
               )}
+
+              <div className="mt-3 pt-3 border-t border-surface-700">
+                <Link
+                  to={`/nvrs/${nvr.id}`}
+                  className="btn-secondary w-full flex items-center justify-center gap-1.5 text-xs"
+                >
+                  <ChevronRight size={12} /> Ver detalle
+                </Link>
+              </div>
             </div>
           )
         })}
