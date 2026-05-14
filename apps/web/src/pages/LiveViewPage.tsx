@@ -123,6 +123,8 @@ export function LiveViewPage() {
     activeSessions.current.delete(cameraId)
     setStreams((prev) => { const next = { ...prev }; delete next[cameraId]; return next })
     setStreamErrors((prev) => { const next = { ...prev }; delete next[cameraId]; return next })
+    // Eliminar y re-registrar path en MediaMTX para forzar nueva conexión RTSP
+    await apiPost(`/cameras/${cameraId}/restart-stream`, {}).catch(() => {})
     const cam = cameras.find(c => c.id === cameraId)
     if (cam) setTimeout(() => loadStream(cam), 3000)
   }, [cameras, loadStream])
