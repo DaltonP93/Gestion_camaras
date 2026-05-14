@@ -33,13 +33,9 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  // Sesiones activas
   sessions     Session[]
-  // Permisos granulares por NVR/cámara
   permissions  UserPermission[]
-  // Log de auditoría
   auditLogs    AuditLog[]
-  // Acceso a vistas de cámaras
   viewAccess   CameraViewAccess[]
 
   @@map("users")
@@ -61,45 +57,106 @@ model Session {
 
 // ─── NVRs Hikvision ──────────────────────────────────────────
 model NVR {
-  id          String   @id @default(cuid())
-  name        String   @unique
-  model       String
-  serialNumber String?
-  ipAddress   String
-  port        Int      @default(80)
-  rtspPort    Int      @default(554)
-  username    String
-  password    String   // Encriptado con AES
-  channels    Int      @default(16)
-  hddCount    Int      @default(1)
-  firmware    String?
-  location    String?
-  active      Boolean  @default(true)
-  online      Boolean  @default(false)
-  lastSeen    DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id             String    @id @default(cuid())
+  name           String    @unique
+  model          String
+  serialNumber   String?
+  ipAddress      String
+  port           Int       @default(80)
+  rtspPort       Int       @default(554)
+  sdkPort        Int?      @default(8000)
+  username       String
+  password       String    // Encriptado con AES
+  channels       Int       @default(16)
+  hddCount       Int       @default(1)
+  firmware       String?
+  encodingVersion String?
+  webVersion     String?
+  location       String?
+  active         Boolean   @default(true)
+  online         Boolean   @default(false)
+  lastSeen       DateTime?
+  lastRtspOkAt   DateTime?
+  lastSyncAt     DateTime?
+  lastErrorCode  String?
+  lastError      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  cameras     Camera[]
-  permissions UserPermission[]
+  cameras        Camera[]
+  hdds           NvrHdd[]
+  permissions    UserPermission[]
 
   @@map("nvrs")
 }
 
-// ─── Cámaras ─────────────────────────────────────────────────
-model Camera {
+// ─── HDDs del NVR ─────────────────────────────────────────────
+model NvrHdd {
   id          String   @id @default(cuid())
   nvrId       String
   nvr         NVR      @relation(fields: [nvrId], references: [id], onDelete: Cascade)
-  channel     Int      // Canal en el NVR (1-64)
-  name        String
-  location    String?
-  rtspUrl     String?  // URL RTSP directa
-  hlsPath     String?  // Path en MediaMTX
+  diskNumber  Int
+  capacityGb  Float?
+  freeGb      Float?
+  usedPercent Float?
+  status      String?
+  type        String?
+  property    String?
+  process     String?
+  lastSyncAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([nvrId, diskNumber])
+  @@map("nvr_hdds")
+}
+
+// ─── Cámaras ─────────────────────────────────────────────────
+model Camera {
+  id                  String    @id @default(cuid())
+  nvrId               String
+  nvr                 NVR       @relation(fields: [nvrId], references: [id], onDelete: Cascade)
+  channel             Int       // Canal en el NVR (1-64)
+  channelCode         String?   // D1, D2, D3... código visual del NVR
+  name                String
+  location            String?
+
+  // Info de la cámara IP dentro del NVR
+  ipAddress           String?   // IP de la cámara IP
+  protocol            String?   // HIKVISION, ONVIF, RTSP, etc.
+  managementPort      Int?      // Puerto de gestión (8000)
+  securityStatus      String?   // Secure, Non-Secure, etc.
+
+  // Stream config
+  preferredStream     String    @default("sub") // main | sub
+  mainRtspPath        String?   // /Streaming/Channels/101
+  subRtspPath         String?   // /Streaming/Channels/102
+
+  // Video encoding
+  mainCodec           String?
+  subCodec            String?
+  mainResolution      String?
+  subResolution       String?
+  mainFps             Int?
+  subFps              Int?
+  mainBitrate         Int?
+  subBitrate          Int?
+
+  // Diagnóstico RTSP
+  rtspMainOk          Boolean?
+  rtspSubOk           Boolean?
+  lastRtspCheckAt     DateTime?
+  lastRtspError       String?
+  consecutiveFailures Int       @default(0)
+
+  // Legado / compatibilidad
+  rtspUrl     String?
+  hlsPath     String?
   ptzEnabled  Boolean  @default(false)
   active      Boolean  @default(true)
   online      Boolean  @default(false)
   lastCheck   DateTime?
+  lastSyncAt  DateTime?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -111,16 +168,16 @@ model Camera {
 
 // ─── Permisos por usuario ────────────────────────────────────
 model UserPermission {
-  id         String  @id @default(cuid())
-  userId     String
-  user       User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  nvrId      String?
-  nvr        NVR?    @relation(fields: [nvrId], references: [id], onDelete: Cascade)
-  cameraId   String?
-  camera     Camera? @relation(fields: [cameraId], references: [id], onDelete: Cascade)
-  canView    Boolean @default(true)
+  id          String  @id @default(cuid())
+  userId      String
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nvrId       String?
+  nvr         NVR?    @relation(fields: [nvrId], references: [id], onDelete: Cascade)
+  cameraId    String?
+  camera      Camera? @relation(fields: [cameraId], references: [id], onDelete: Cascade)
+  canView     Boolean @default(true)
   canPlayback Boolean @default(false)
-  canPtz     Boolean @default(false)
+  canPtz      Boolean @default(false)
 
   @@unique([userId, nvrId, cameraId])
   @@map("user_permissions")
@@ -131,9 +188,9 @@ model AuditLog {
   id        String   @id @default(cuid())
   userId    String?
   user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
-  action    String   // LOGIN, LOGOUT, VIEW_CAMERA, VIEW_RECORDING, etc.
-  resource  String?  // ID del recurso afectado
-  detail    Json?    // Detalles adicionales
+  action    String
+  resource  String?
+  detail    Json?
   ipAddress String?
   userAgent String?
   createdAt DateTime @default(now())
@@ -143,16 +200,16 @@ model AuditLog {
 
 // ─── Alertas ─────────────────────────────────────────────────
 model Alert {
-  id        String      @id @default(cuid())
-  nvrId     String?
-  cameraId  String?
-  type      AlertType
-  severity  AlertSeverity @default(LOW)
-  message   String
-  detail    Json?
-  resolved  Boolean     @default(false)
+  id         String        @id @default(cuid())
+  nvrId      String?
+  cameraId   String?
+  type       AlertType
+  severity   AlertSeverity @default(LOW)
+  message    String
+  detail     Json?
+  resolved   Boolean       @default(false)
   resolvedAt DateTime?
-  createdAt DateTime    @default(now())
+  createdAt  DateTime      @default(now())
 
   @@map("alerts")
 }
@@ -176,17 +233,17 @@ enum AlertSeverity {
 
 // ─── Vistas personalizadas de cámaras ────────────────────────
 model CameraView {
-  id          String   @id @default(cuid())
-  name        String
-  description String?
-  layout      String   @default("3x3") // "1x1","2x2","3x3","4x4","featured","custom"
-  cameraSlots Json     // Array de { slotIndex, cameraId, size: "normal"|"large" }
-  slideshowEnabled Boolean @default(false)
-  slideshowInterval Int  @default(10) // segundos entre páginas
-  isPublic    Boolean  @default(false) // visible para todos o solo asignados
-  createdById String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id               String   @id @default(cuid())
+  name             String
+  description      String?
+  layout           String   @default("3x3")
+  cameraSlots      Json
+  slideshowEnabled Boolean  @default(false)
+  slideshowInterval Int     @default(10)
+  isPublic         Boolean  @default(false)
+  createdById      String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   access      CameraViewAccess[]
 
@@ -194,12 +251,12 @@ model CameraView {
 }
 
 model CameraViewAccess {
-  id           String     @id @default(cuid())
-  viewId       String
-  view         CameraView @relation(fields: [viewId], references: [id], onDelete: Cascade)
-  userId       String
-  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  createdAt    DateTime   @default(now())
+  id        String     @id @default(cuid())
+  viewId    String
+  view      CameraView @relation(fields: [viewId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime   @default(now())
 
   @@unique([viewId, userId])
   @@map("camera_view_access")
@@ -207,18 +264,35 @@ model CameraViewAccess {
 
 // ─── Configuración de apariencia ─────────────────────────────
 model AppearanceSettings {
-  id              String  @id @default("singleton")
-  siteName        String  @default("VisionCore")
-  logoText        String  @default("VisionCore")
-  primaryColor    String  @default("#e51d1d")
-  accentColor     String  @default("#c41616")
-  theme           String  @default("dark") // "dark" | "darker" | "midnight"
-  sidebarWidth    String  @default("normal") // "compact" | "normal"
+  id                String  @id @default("singleton")
+  siteName          String  @default("VisionCore")
+  logoText          String  @default("VisionCore")
+  primaryColor      String  @default("#e51d1d")
+  accentColor       String  @default("#c41616")
+  theme             String  @default("dark")
+  sidebarWidth      String  @default("normal")
   showNVRsInSidebar Boolean @default(true)
-  customCss       String? @db.Text
-  updatedAt       DateTime @updatedAt
+  customCss         String? @db.Text
+  updatedAt         DateTime @updatedAt
 
   @@map("appearance_settings")
+}
+
+// ─── Entregas de notificaciones ──────────────────────────────
+model NotificationDelivery {
+  id        String    @id @default(cuid())
+  alertId   String
+  channel   String    // email | websocket | telegram | whatsapp
+  status    String    // sent | failed | skipped | pending
+  recipient String?
+  error     String?   @db.Text
+  attempts  Int       @default(1)
+  sentAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([alertId])
+  @@map("notification_deliveries")
 }
 
 // ─── Configuración de alertas y correo ───────────────────────
@@ -232,7 +306,7 @@ model AlertSettings {
   smtpPassword    String  @default("")
   smtpFromEmail   String  @default("")
   smtpFromName    String  @default("VisionCore Alertas")
-  recipientEmails String  @default("") // comma-separated
+  recipientEmails String  @default("")
   alertTypes      Json    @default("{\"CAMERA_OFFLINE\":true,\"NVR_OFFLINE\":true,\"HDD_FULL\":true,\"HDD_ERROR\":true,\"MOTION_DETECTED\":false,\"RECORDING_ERROR\":true,\"AUTH_FAILED\":false}")
   minSeverity     String  @default("HIGH")
   updatedAt       DateTime @updatedAt

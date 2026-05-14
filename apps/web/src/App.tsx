@@ -9,6 +9,7 @@ import { LiveViewPage } from '@/pages/LiveViewPage'
 import { RecordingsPage } from '@/pages/RecordingsPage'
 import { UsersPage } from '@/pages/UsersPage'
 import { NVRsPage } from '@/pages/NVRsPage'
+import { NVRDetailPage } from '@/pages/NVRDetailPage'
 import { AlertsPage } from '@/pages/AlertsPage'
 import { ActivityPage } from '@/pages/ActivityPage'
 import { SettingsPage } from '@/pages/SettingsPage'
@@ -55,8 +56,13 @@ export default function App() {
           } />
           <Route path="alerts" element={<AlertsPage />} />
           <Route path="nvrs" element={
-            <ProtectedRoute roles={['ADMIN']}>
+            <ProtectedRoute roles={['ADMIN', 'SUPERVISOR']}>
               <NVRsPage />
+            </ProtectedRoute>
+          } />
+          <Route path="nvrs/:id" element={
+            <ProtectedRoute roles={['ADMIN', 'SUPERVISOR']}>
+              <NVRDetailPage />
             </ProtectedRoute>
           } />
           <Route path="users" element={

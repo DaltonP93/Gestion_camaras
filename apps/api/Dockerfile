@@ -22,7 +22,7 @@ FROM node:20-alpine AS production
 
 WORKDIR /app
 
-RUN apk add --no-cache dumb-init openssl
+RUN apk add --no-cache dumb-init openssl ffmpeg
 
 COPY apps/api/package*.json ./
 RUN npm install --only=production

@@ -60,6 +60,8 @@ export function SettingsPage() {
   const [minSeverity, setMinSeverity] = useState<AlertSettings['minSeverity']>('HIGH')
   const [testEmail, setTestEmail] = useState('')
   const [sendingTest, setSendingTest] = useState(false)
+  const [deliveries, setDeliveries] = useState<any[]>([])
+  const [loadingDeliveries, setLoadingDeliveries] = useState(false)
 
   // ── Other tab state ────────────────────────────────────────────
   const [hlsLatency, setHlsLatency] = useState('low')
@@ -125,6 +127,18 @@ export function SettingsPage() {
       // error toast shown by interceptor
     } finally {
       setSendingTest(false)
+    }
+  }
+
+  const loadDeliveries = async () => {
+    setLoadingDeliveries(true)
+    try {
+      const res = await apiGet<{ deliveries: any[] }>('/alerts/settings/deliveries?limit=10')
+      setDeliveries(res.deliveries || [])
+    } catch {
+      // non-admin: ignore
+    } finally {
+      setLoadingDeliveries(false)
     }
   }
 
@@ -280,6 +294,45 @@ export function SettingsPage() {
                       </div>
                       <p className="text-xs text-surface-500">Guarda primero y luego envía el email de prueba.</p>
                     </div>
+                  </div>
+
+                  {/* Historial de entregas */}
+                  <div className="border-t border-surface-600 pt-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="text-xs font-medium text-surface-400 uppercase tracking-wider flex items-center gap-1.5">
+                        <Webhook size={12} /> Historial de entregas
+                      </h4>
+                      <button
+                        onClick={loadDeliveries}
+                        disabled={loadingDeliveries}
+                        className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1"
+                      >
+                        {loadingDeliveries ? <RefreshCw size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+                        Cargar
+                      </button>
+                    </div>
+                    {deliveries.length === 0 && !loadingDeliveries && (
+                      <p className="text-xs text-surface-500 py-2">Presiona "Cargar" para ver las últimas 10 entregas.</p>
+                    )}
+                    {deliveries.length > 0 && (
+                      <div className="space-y-1">
+                        {deliveries.map((d: any) => (
+                          <div key={d.id} className="flex items-center gap-2 py-1.5 text-xs border-b border-surface-700">
+                            <span className={clsx(
+                              'w-12 text-center rounded px-1 py-0.5 font-mono text-[10px]',
+                              d.status === 'sent' ? 'bg-green-900/40 text-green-400' :
+                              d.status === 'failed' ? 'bg-red-900/40 text-red-400' :
+                              'bg-surface-700 text-surface-400'
+                            )}>{d.status}</span>
+                            <span className="text-surface-300 flex-1 truncate">{d.recipient || d.channel}</span>
+                            {d.error && <span className="text-red-400 truncate max-w-[200px]" title={d.error}>{d.error}</span>}
+                            <span className="text-surface-500 flex-shrink-0">
+                              {d.sentAt ? new Date(d.sentAt).toLocaleTimeString('es-PY') : '—'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   {/* Tipos de alerta */}
