@@ -1,129 +1,160 @@
-# HIKVISION_ISAPI.md — Integración con API ISAPI de Hikvision
+# VisionCore VMS — Integración Hikvision ISAPI
 
 ## Autenticación
 
-VisionCore usa **HTTP Digest Authentication** para conectarse a NVRs Hikvision. Las credenciales del NVR se almacenan **encriptadas** en PostgreSQL con AES.
+Todos los endpoints ISAPI utilizan **HTTP Digest Authentication**. VisionCore implementa el handshake completo en `apps/api/src/services/hikvision.ts`:
 
-```typescript
-// La contraseña del NVR se encripta al guardar
-const encrypted = CryptoJS.AES.encrypt(password, ENCRYPTION_KEY).toString()
+1. Primera request al NVR → responde `401` con `WWW-Authenticate: Digest realm=..., nonce=...`
+2. VisionCore calcula el hash MD5 y reintenta con `Authorization: Digest username=..., response=...`
 
-// Y se desencripta antes de usar
-const plain = CryptoJS.AES.decrypt(encrypted, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+El interceptor de Axios maneja esto automáticamente en cada llamada. No se requiere preautenticación.
+
+```bash
+# Prueba manual desde terminal
+curl -v --digest -u admin:Password http://192.168.1.10/ISAPI/System/deviceInfo
 ```
 
-## Endpoints ISAPI utilizados
+---
+
+## Endpoints utilizados por VisionCore
 
 ### Información del dispositivo
 ```
 GET /ISAPI/System/deviceInfo
 ```
-Retorna: modelo, serie, firmware, versión de codificación, web, canales, HDDs.
+Retorna: modelo, firmware, número de serie, versión de encoding/web, cantidad de canales, HDDs y MAC.
 
-### Lista de cámaras IP conectadas al NVR
+---
+
+### Canales de video (NVR legacy / analógico)
+```
+GET /ISAPI/System/Video/inputs/channels
+```
+Lista canales de video locales/analógicos del NVR.
+
+---
+
+### Cámaras IP conectadas al NVR
 ```
 GET /ISAPI/ContentMgmt/InputProxy/channels
 ```
-Retorna: canal, nombre real, IP de cámara, puerto de gestión, protocolo, estado de seguridad, estado online.
+Lista las cámaras IP gestionadas: IP, protocolo (HIKVISION, ONVIF, RTSP), estado (online/offline), nombre de canal, puerto de gestión (8000), estado de seguridad.
+
+```
+POST /ISAPI/ContentMgmt/InputProxy/channels        # Agregar cámara IP al NVR
+PUT  /ISAPI/ContentMgmt/InputProxy/channels/{ch}   # Actualizar configuración de cámara IP
+```
+
+---
 
 ### Almacenamiento (HDDs)
 ```
 GET /ISAPI/ContentMgmt/Storage
 ```
-Retorna: número de disco, capacidad, espacio libre, porcentaje usado, estado, tipo, propiedad.
+Estado de discos: capacidad total, espacio libre, porcentaje de uso, tipo (local, NAS), estado (Normal, Error, Uninitialized, Formatting).
 
-### Usuarios configurados en el NVR
+---
+
+### Usuarios del NVR
 ```
 GET /ISAPI/Security/users
 ```
-Retorna: nombre de usuario, rol, permisos.
+Lista usuarios configurados con nivel: `Administrator`, `Operator`, `User`.
 
-### Estado del dispositivo
-```
-GET /ISAPI/System/status
-```
-Retorna: uso de CPU, uso de HDD, temperatura.
+---
 
-### Reiniciar dispositivo
+### Encoding de video (información de stream)
+```
+GET /ISAPI/Streaming/channels/{canal}01   # Stream principal
+GET /ISAPI/Streaming/channels/{canal}02   # Substream
+```
+Retorna codec (H.264/H.265), resolución, FPS y bitrate configurados para cada stream.
+
+---
+
+### PTZ — Control de cámara
+```
+PUT /ISAPI/PTZCtrl/channels/{canal}/continuous
+```
+Body: `{ PTZData: { pan: N, tilt: N, zoom: N } }` con valores entre -100 y 100.
+Para detener: enviar `{ pan: 0, tilt: 0, zoom: 0 }`.
+
+---
+
+### Captura de imagen (snapshot)
+```
+GET /ISAPI/Streaming/channels/{canal}01/picture
+```
+Retorna imagen JPEG del frame actual. Requiere que el canal esté activo y la cámara online.
+
+---
+
+### Reinicio del dispositivo
 ```
 PUT /ISAPI/System/reboot
 ```
+El NVR se reinicia; la conexión puede cerrarse sin respuesta (comportamiento normal).
 
-### Adoptar cámara IP
-```
-POST /ISAPI/ContentMgmt/InputProxy/channels
-PUT  /ISAPI/ContentMgmt/InputProxy/channels/{id}
-```
-
-### Configuración de codificación de video
-```
-GET /ISAPI/Streaming/channels/{ch}01  # Main stream config
-GET /ISAPI/Streaming/channels/{ch}02  # Sub stream config
-```
-
-### PTZ
-```
-PUT /ISAPI/PTZCtrl/channels/{ch}/continuous
-```
-
-### Snapshot
-```
-GET /ISAPI/Streaming/channels/{ch}01/picture
-```
+---
 
 ### Búsqueda de grabaciones
 ```
 POST /ISAPI/ContentMgmt/search
 ```
+Body XML con rango de fechas (`startTime`, `endTime`) y número de canal. Retorna lista de clips con timestamps y tamaño.
 
-## RTSP paths
+---
+
+## Rutas RTSP de Hikvision
 
 ```
-Main stream: rtsp://USER:PASS@IP:554/Streaming/Channels/{channel}01
-Sub stream:  rtsp://USER:PASS@IP:554/Streaming/Channels/{channel}02
-Grabación:   rtsp://USER:PASS@IP:554/Streaming/tracks/{ch}00?starttime=...&endtime=...
+# Stream principal (main) — alta resolución
+rtsp://<usuario>:<contraseña>@<ip_nvr>:554/Streaming/Channels/<canal>01
+
+# Substream — resolución reducida, recomendado para web
+rtsp://<usuario>:<contraseña>@<ip_nvr>:554/Streaming/Channels/<canal>02
 ```
 
-Donde `{channel}` es el número de canal con padding (ej: canal 1 → `101`, canal 10 → `1001`).
+Los números de canal son base-1. Canal 3 → `301` (main), `302` (sub). Canal 10 → `1001`, `1002`.
 
-## Respuestas XML/JSON
+---
 
-Los NVRs Hikvision responden en **XML** (más común) o **JSON** según el modelo y versión de firmware.
+## NVRs configurados
 
-VisionCore intenta JSON primero y hace fallback a XML:
-```typescript
-// Parser XML helpers en hikvision.ts
-function xmlGet(xml: string, tag: string): string | undefined
-function xmlGetAll(xml: string, tag: string): string[]
+| IP | Canales | Notas |
+|---|---|---|
+| 192.168.1.10 | 62 | NVR principal |
+| 192.168.1.110 | 16 | NVR secundario A |
+| 192.168.1.111 | 32 | NVR secundario B |
+| 192.168.1.112 | 31 | NVR secundario C |
+
+Puerto HTTP ISAPI: 80 (default). Puerto RTSP: 554. Puerto SDK: 8000.
+
+---
+
+## Errores comunes ISAPI
+
+| Código / Error | Causa | Solución |
+|---|---|---|
+| HTTP 401 | Credenciales incorrectas o expiradas | Verificar usuario/contraseña en UI → NVRs → Editar |
+| HTTP 403 | Usuario sin nivel suficiente | Usar usuario con nivel Operator o Administrator |
+| HTTP 404 | Endpoint no soportado por el firmware | Actualizar firmware (requiere V4.x+) |
+| Timeout / connection refused | NVR inaccesible o firewall en puerto 80 | `ping <ip>`, verificar rutas de red |
+| XML parse error | Firmware antiguo con formato de respuesta diferente | Revisar versión; puede requerir adaptación del parser |
+
+---
+
+## Diagnóstico
+
+```bash
+# Verificar conectividad ISAPI y RTSP con todos los NVRs
+bash scripts/check-nvrs.sh
+
+# Probar RTSP de una cámara específica (main + sub)
+bash scripts/probe-camera.sh 192.168.1.10 1 admin MiClave
+
+# Llamadas ISAPI manuales
+curl --digest -u admin:Pass http://192.168.1.10/ISAPI/System/deviceInfo
+curl --digest -u admin:Pass http://192.168.1.10/ISAPI/ContentMgmt/InputProxy/channels
+curl --digest -u admin:Pass http://192.168.1.10/ISAPI/ContentMgmt/Storage
 ```
-
-## Errores frecuentes
-
-| Error HTTP | Causa | Solución |
-|-----------|-------|----------|
-| 401 Unauthorized | Credenciales incorrectas | Verificar usuario/contraseña en la UI del NVR |
-| 403 Forbidden | Usuario sin permisos | El usuario debe tener permisos de administración en el NVR |
-| 404 Not Found | Endpoint no disponible en ese modelo | Verificar firmware/modelo. Algunos modelos más viejos no soportan ISAPI completa |
-| 406 Not Acceptable | Formato de respuesta incompatible | El NVR puede necesitar header `Accept: application/xml` |
-| ECONNREFUSED | Puerto HTTP cerrado o firewall | Verificar: `nc -vz 192.168.1.10 80` |
-| ETIMEDOUT | NVR no alcanzable en la red | Verificar conectividad entre contenedor Docker y la red de los NVRs |
-
-## NVRs reales del entorno
-
-| NVR | IP | Modelo | Canales | Puerto HTTP | Puerto RTSP |
-|-----|-----|--------|---------|------------|-------------|
-| SAA Nueva Torre | 192.168.1.10 | DS-9664NI-I8 | 62 | 80 | 554 |
-| Torre Vieja | 192.168.1.112 | DS-7732NI-K4 | 31 | 80 | 554 |
-| UTI | 192.168.1.110 | DS-7616NI-K2/16P | 16 | 80 | 554 |
-| SAA 2023 | 192.168.1.111 | DS-7732NI-K4 | 32 | 80 | 554 |
-
-## Sincronización completa (POST /api/nvrs/:id/sync)
-
-El endpoint `/sync` hace:
-1. `getNVRStatus()` — actualiza online/firmware/lastSeen
-2. `getDeviceInfo()` — actualiza encodingVersion/webVersion
-3. `getIpCameraList()` — upsert cámaras con nombres reales (por `nvrId + channel`)
-4. `getStorageInfo()` — upsert HDDs en tabla `nvr_hdds`
-5. `publishAllStreams()` — registra todas las rutas en MediaMTX
-
-No duplica cámaras: la clave única es `(nvrId, channel)`.

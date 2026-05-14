@@ -1,109 +1,166 @@
-# NOTIFICATIONS.md — Sistema de Notificaciones VisionCore
+# VisionCore VMS — Sistema de Notificaciones y Alertas
 
 ## Arquitectura
 
 ```
-Health Worker (cada 60s)
-  └─ Detecta evento (NVR offline, cámara offline, HDD lleno)
-       ├─ Crea alerta en DB (tabla alerts)
-       ├─ Broadcast WebSocket → navegador en tiempo real
-       └─ sendAlertNotification() → NotificationService
-            ├─ Verifica reglas (emailEnabled, minSeverity, alertTypes)
-            ├─ Verifica duplicados (< 30 min)
-            └─ EmailProvider → nodemailer → SMTP
-                 └─ Registra resultado en NotificationDelivery
+healthWorker (background job)
+  └─ Detecta: NVR offline, cámara offline, HDD lleno, error de auth
+       └─ Crea Alert en DB (tabla alerts)
+            └─ NotificationService (notification.service.ts)
+                 ├─ Email (SMTP) → NotificationDelivery {status: sent/failed}
+                 └─ WebSocket → broadcast a clientes conectados en tiempo real
 ```
 
-## Configuración SMTP (UI → Configuración → Alertas)
+---
 
-| Campo | Descripción |
-|-------|-------------|
-| Email habilitado | Activa/desactiva el envío automático |
-| SMTP Host | Servidor de correo (ej: smtp.gmail.com) |
-| Puerto SMTP | 587 (TLS), 465 (SSL), 25 (sin cifrado) |
-| SMTP Seguro | TLS/SSL habilitado |
-| Usuario / Contraseña | Credenciales SMTP |
-| Email remitente | dirección From |
-| Destinatarios | Emails separados por coma |
-| Severidad mínima | Solo enviar alertas de severidad >= X |
-| Tipos de alerta | Habilitar/deshabilitar por tipo |
+## Modelos de base de datos
 
-## Tipos de alertas y severidades
+### `AlertSettings` (singleton — `id = "singleton"`)
 
-| Tipo | Severidad | ¿Email por defecto? |
-|------|-----------|---------------------|
-| NVR_OFFLINE | HIGH | ✅ |
-| CAMERA_OFFLINE | MEDIUM | ✅ |
-| HDD_FULL (≥90%) | HIGH | ✅ |
-| HDD_FULL (≥95%) | CRITICAL | ✅ |
-| HDD_ERROR | HIGH | ✅ |
-| RECORDING_ERROR | HIGH | ✅ |
-| MOTION_DETECTED | LOW | ❌ (deshabilitado) |
-| AUTH_FAILED | MEDIUM | ❌ (deshabilitado) |
+Configuración global de notificaciones. Un solo registro compartido por toda la instalación.
 
-## API de notificaciones
+| Campo | Tipo | Descripción |
+|---|---|---|
+| `emailEnabled` | Boolean | Habilita/deshabilita el envío de emails |
+| `smtpHost` | String | Servidor SMTP |
+| `smtpPort` | Int | Puerto SMTP (587 STARTTLS / 465 SSL directo) |
+| `smtpSecure` | Boolean | `true` para SSL/TLS en puerto 465 |
+| `smtpUser` | String | Usuario SMTP |
+| `smtpPassword` | String | Contraseña SMTP |
+| `smtpFromEmail` | String | Dirección del remitente |
+| `smtpFromName` | String | Nombre visible (default: "VisionCore Alertas") |
+| `recipientEmails` | String | Destinatarios separados por coma |
+| `alertTypes` | Json | Tipos de alerta habilitados (ver abajo) |
+| `minSeverity` | String | Severidad mínima: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` |
 
-```http
-# Obtener configuración SMTP
-GET /api/alerts/settings
-Authorization: Bearer <token>
+### `NotificationDelivery`
 
-# Actualizar configuración SMTP
-PUT /api/alerts/settings
-Authorization: Bearer <token>
-Content-Type: application/json
-{"emailEnabled": true, "smtpHost": "smtp.example.com", ...}
+Registro de cada intento de envío.
 
-# Enviar email de prueba
-POST /api/alerts/settings/test-email
-Authorization: Bearer <token>
-{"testEmail": "admin@ejemplo.com"}
+| Campo | Valores posibles |
+|---|---|
+| `channel` | `email`, `websocket`, `telegram`, `whatsapp` |
+| `status` | `sent`, `failed`, `skipped`, `pending` |
+| `error` | Mensaje de error si `status = failed` |
+| `attempts` | Número de intentos realizados |
 
-# Historial de notificaciones enviadas
-GET /api/alerts/settings/deliveries?page=0&limit=50
-Authorization: Bearer <token>
+---
+
+## Tipos de alerta
+
+```json
+{
+  "CAMERA_OFFLINE":  true,
+  "NVR_OFFLINE":     true,
+  "HDD_FULL":        true,
+  "HDD_ERROR":       true,
+  "MOTION_DETECTED": false,
+  "RECORDING_ERROR": true,
+  "AUTH_FAILED":     false
+}
 ```
 
-## Tabla NotificationDelivery
+Configurables individualmente desde la UI en **Configuración → Alertas**.
 
-```sql
-SELECT * FROM notification_deliveries
-ORDER BY created_at DESC LIMIT 20;
+---
+
+## Severidades
+
+| Nivel | Color | Uso típico |
+|---|---|---|
+| `LOW` | Gris | Eventos informativos |
+| `MEDIUM` | Amarillo | Advertencias no críticas |
+| `HIGH` | Naranja | Cámara offline, NVR offline |
+| `CRITICAL` | Rojo | Error de HDD, fallo de auth masivo |
+
+---
+
+## Configurar SMTP desde la UI
+
+1. **Configuración → Alertas → Email**
+2. Ingresar host, puerto, usuario y contraseña SMTP
+3. Completar el campo "Destinatarios" (separados por coma)
+4. Activar el switch "Email habilitado"
+5. Presionar **"Enviar email de prueba"** para verificar
+
+### Ejemplos de servidores SMTP
+
+```
+Gmail (App Password):   smtp.gmail.com  puerto 587  secure: false
+Office 365:             smtp.office365.com  puerto 587  secure: false
+SSL directo (port 465): smtp.ejemplo.com  puerto 465  secure: true
+Relay interno sin auth: 192.168.1.50  puerto 25  secure: false
 ```
 
-Campos: `id, alertId, channel, status (sent/failed/skipped/pending), recipient, error, attempts, sentAt, createdAt`
+> Para Gmail con 2FA, generar una "Contraseña de aplicación" en la configuración de la cuenta Google.
 
-## Reglas de no-duplicado
+---
 
-No se envía email si:
-- `emailEnabled = false`
-- Severidad de la alerta < `minSeverity` configurado
-- El tipo de alerta está deshabilitado en `alertTypes`
-- Ya existe un `NotificationDelivery` con `status = sent` para la misma alerta en los últimos 30 minutos
+## Endpoints de la API
 
-## Verificar sistema de notificaciones
+```
+GET  /api/alerts/settings                # Obtener configuración actual
+PUT  /api/alerts/settings                # Actualizar configuración SMTP y tipos
+POST /api/alerts/settings/test-email     # Enviar email de prueba
+GET  /api/alerts/settings/deliveries     # Historial de notificaciones enviadas
+
+GET  /api/alerts                         # Listar alertas (con filtros)
+PUT  /api/alerts/:id/resolve             # Marcar alerta como resuelta
+```
+
+### Consultar historial de entregas
 
 ```bash
-# Verificar configuración SMTP y enviar email de prueba
-bash scripts/check-smtp.sh admin@ejemplo.com
+TOKEN=<jwt_token_admin>
 
-# Ver últimas notificaciones en DB
-docker compose exec postgres psql -U visioncore -c \
-  "SELECT channel, status, recipient, error, created_at FROM notification_deliveries ORDER BY created_at DESC LIMIT 10;"
+# Últimas 20 entregas
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost/api/alerts/settings/deliveries?limit=20"
 
-# Ver logs del worker (incluye errores de email)
-docker compose logs -f api | grep -i "email\|notification\|health"
+# Solo las fallidas
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost/api/alerts/settings/deliveries?status=failed"
 ```
 
-## Extender con otros canales (futuro)
+---
 
-El diseño permite agregar canales sin modificar el healthWorker:
+## Script de diagnóstico SMTP
 
-```typescript
-// apps/api/src/services/notification.service.ts
-// Agregar después de sendAlertEmail():
-await sendTelegramAlert(prisma, alert)   // futuro
-await sendWhatsAppAlert(prisma, alert)   // futuro
+```bash
+export VISIONCORE_TOKEN=<token_de_admin>
+
+# Verificar configuración + enviar email de prueba
+bash scripts/check-smtp.sh destinatario@ejemplo.com
 ```
 
-Canales preparados (no implementados): WhatsApp, Telegram, SMS, webhook.
+El script realiza:
+1. Obtiene la configuración SMTP actual vía `GET /api/alerts/settings`
+2. Muestra problemas detectados: host vacío, sin destinatarios, email deshabilitado
+3. Envía un email de prueba a la dirección indicada vía `POST /api/alerts/settings/test-email`
+4. Lista las últimas 5 entregas registradas en la DB
+
+---
+
+## WebSocket — Alertas en tiempo real
+
+El frontend se conecta a:
+```
+ws://servidor/ws/alerts    (HTTP)
+wss://servidor/ws/alerts   (HTTPS)
+```
+
+El token JWT se valida al establecer la conexión. Si el token expira, el frontend reconecta automáticamente con uno nuevo. nginx debe tener `proxy_read_timeout 3600s` en el bloque `/ws/`.
+
+---
+
+## healthWorker — Lógica de detección
+
+El worker de salud verifica periódicamente cada NVR y cámara:
+
+1. **NVR offline:** `GET /ISAPI/System/deviceInfo` falla → crea alerta `NVR_OFFLINE` (HIGH)
+2. **Cámara offline:** Estado en `InputProxy/channels` = offline → alerta `CAMERA_OFFLINE` (HIGH)
+3. **HDD lleno:** Uso en `ContentMgmt/Storage` > 90% → alerta `HDD_FULL` (CRITICAL)
+4. **HDD error:** Estado de disco = Error → alerta `HDD_ERROR` (CRITICAL)
+5. **Auth fallida:** HTTP 401 repetido → alerta `AUTH_FAILED` (MEDIUM)
+
+Al crear cada alerta, `NotificationService` evalúa si cumple los filtros de `AlertSettings` (tipo habilitado + severidad >= minSeverity) antes de intentar el envío.

@@ -1,113 +1,166 @@
-# SECURITY.md — Seguridad VisionCore VMS
+# VisionCore VMS — Seguridad
 
-## Principios aplicados
+## Almacenamiento de contraseñas
 
-1. **Sin contraseñas en texto plano** — NVR passwords encriptados con AES en DB
-2. **Sin contraseñas en logs** — URLs RTSP siempre con `***` en lugar de contraseña
-3. **Sin contraseñas en API** — El campo `password` nunca se retorna en respuestas
-4. **JWT Bearer auth** — Token en localStorage, refresh automático
-5. **Roles de acceso** — 4 niveles con permisos diferenciados
-6. **Auditoría** — Toda acción crítica queda registrada
+### Contraseñas de usuarios del sistema
+Las contraseñas de los usuarios de VisionCore se almacenan como **hash bcrypt** en el campo `passwordHash` de la tabla `users`. Nunca se almacena ni transmite la contraseña en texto plano.
 
-## Encriptación de credenciales NVR
+### Contraseñas de NVRs Hikvision
+Las credenciales de los NVRs se cifran con **AES (crypto-js)** antes de guardarse en la columna `password` de la tabla `nvrs`:
 
 ```typescript
-// Variable de entorno (apps/api/.env)
-NVR_CREDENTIAL_KEY=clave_secreta_muy_larga_y_aleatoria
+// Cifrado al guardar el NVR
+CryptoJS.AES.encrypt(plainPassword, ENCRYPTION_KEY).toString()
 
-// Al guardar NVR
-const encrypted = CryptoJS.AES.encrypt(password, ENCRYPTION_KEY).toString()
-
-// Al usar NVR (dentro del API, nunca expuesto al frontend)
-const plain = CryptoJS.AES.decrypt(encrypted, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+// Descifrado al construir la URL RTSP o llamar ISAPI
+CryptoJS.AES.decrypt(encryptedPassword, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 ```
 
-**IMPORTANTE:** Rotar `NVR_CREDENTIAL_KEY` requiere re-ingresar todas las contraseñas de NVRs.
+La clave de cifrado proviene de `NVR_CREDENTIAL_KEY`. Si no está definida, se usa `JWT_SECRET` como fallback.
 
-## URLs RTSP enmascaradas
+> **IMPORTANTE:** Si `NVR_CREDENTIAL_KEY` cambia en una instalación existente, las contraseñas cifradas quedan ilegibles. Deben re-ingresarse manualmente desde la UI.
 
-Nunca exponer la contraseña del NVR en logs, respuestas de API o UI:
-```
-❌ rtsp://admin:MiClave123@192.168.1.10:554/Streaming/Channels/101
-✅ rtsp://admin:***@192.168.1.10:554/Streaming/Channels/101
-```
+---
 
-La función `buildRtspUrlMasked()` en `hikvision.ts` siempre retorna la URL con `***`.
+## Autenticación JWT
 
-## Roles del sistema
+VisionCore usa **Bearer Tokens JWT** almacenados en `localStorage` del navegador.
 
-| Rol | Acceso |
-|-----|--------|
-| ADMIN | Todo: NVRs, usuarios, configuración, auditoría |
-| SUPERVISOR | Ver todo, grabaciones, sincronizar NVR, diagnóstico |
-| OPERATOR | Solo cámaras asignadas, live view |
-| AUDITOR | Solo grabaciones asignadas |
+| Parámetro | Valor por defecto | Variable |
+|---|---|---|
+| Algoritmo | HS256 | — |
+| Expiración access token | 60 minutos | `JWT_EXPIRES_IN` |
+| Expiración refresh token | 7 días | `JWT_REFRESH_EXPIRES_IN` |
+| Clave de firma | — | `JWT_SECRET` (mín. 32 chars) |
 
-Las rutas críticas verifican rol en `preHandler`:
-```typescript
-server.post('/nvrs/:id/reboot', { preHandler: [server.authorize(['ADMIN'])] }, ...)
-server.post('/nvrs/:id/sync',   { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, ...)
-```
-
-## Permisos granulares por cámara
-
-Para usuarios OPERATOR/AUDITOR, acceso definido en tabla `user_permissions`:
-```sql
--- Ver qué cámaras puede ver un usuario
-SELECT camera_id, can_view, can_playback, can_ptz
-FROM user_permissions
-WHERE user_id = '...';
-```
-
-## Auditoría
-
-Toda acción crítica se registra en tabla `audit_logs`:
-- Usuario que realizó la acción
-- IP de origen
-- Acción (`NVR_CREATED`, `NVR_DELETED`, `PTZ_COMMAND`, `LOGIN`, etc.)
-- Recurso afectado (ID del NVR/cámara)
-- Timestamp
-
-**Lo que NO se guarda en auditoría:** contraseñas, tokens JWT, RTSP completo.
-
-## Variables de entorno sensibles (.env)
+Los refresh tokens se almacenan en la tabla `sessions` con IP, User-Agent y fecha de expiración. Al hacer logout se elimina la sesión de la DB, invalidando el refresh token.
 
 ```bash
-# Rotar periódicamente
-JWT_SECRET=secret_muy_largo_aleatorio
-NVR_CREDENTIAL_KEY=otra_clave_larga_aleatoria
-
-# No exponer en logs de Docker
-DATABASE_URL=postgresql://visioncore:PASS@postgres:5432/visioncore
+# Generar claves seguras
+openssl rand -hex 64   # JWT_SECRET
+openssl rand -hex 32   # NVR_CREDENTIAL_KEY
 ```
 
-## HTTPS
+---
 
-Activar HTTPS después de obtener certificado SSL:
+## Enmascaramiento de URLs RTSP
+
+Las URLs RTSP contienen usuario y contraseña del NVR. VisionCore garantiza que **nunca se expongan** en:
+- Respuestas JSON de la API al frontend
+- Logs de la aplicación
+- Registros de auditoría
+- Salida de scripts de diagnóstico
+
+```
+# Salida enmascarada en probe-camera.sh y logs:
+rtsp://admin:***@192.168.1.10:554/Streaming/Channels/101
+```
+
+---
+
+## Control de acceso por roles (RBAC)
+
+Cuatro roles con permisos incrementales definidos en `schema.prisma`:
+
+| Rol | Ver cámaras | Grabaciones | PTZ | Usuarios | Config. sistema |
+|---|---|---|---|---|---|
+| `AUDITOR` | Solo asignadas | Solo asignadas | No | No | No |
+| `OPERATOR` | Solo asignadas | No | Si (si habilitado) | No | No |
+| `SUPERVISOR` | Todas | Todas | Si | No | Lectura |
+| `ADMIN` | Todas | Todas | Si | Si | Total |
+
+### Permisos granulares por recurso
+
+La tabla `user_permissions` permite control fino independiente del rol:
+
+```
+canView     — ver stream en vivo de una cámara o NVR específico
+canPlayback — acceder a grabaciones
+canPtz      — controlar PTZ
+```
+
+Un `OPERATOR` solo puede ver las cámaras o NVRs a los que tenga `canView = true` asignado explícitamente.
+
+---
+
+## Log de auditoría
+
+Todas las acciones relevantes se registran en la tabla `audit_logs`:
+
+| Campo | Descripción |
+|---|---|
+| `userId` | Quién realizó la acción (`null` si es el sistema) |
+| `action` | Qué acción (LOGIN, LOGOUT, NVR_EDIT, CAMERA_VIEW, USER_CREATE...) |
+| `resource` | ID del recurso afectado (NVR, cámara, usuario) |
+| `detail` | JSON con detalles adicionales (campos modificados, etc.) |
+| `ipAddress` | IP del cliente |
+| `userAgent` | Navegador/cliente |
+| `createdAt` | Timestamp UTC |
+
 ```bash
-# Obtener certificado (primera vez)
-bash infra/certbot/init-ssl.sh camaras.ejemplo.com admin@ejemplo.com
+# Consultar audit log (requiere rol ADMIN)
+curl -H "Authorization: Bearer <token>" \
+  "http://localhost/api/audit?limit=50&action=LOGIN"
+```
 
-# Activar HTTPS en nginx
+---
+
+## HTTPS y cookies seguras
+
+### Activar HTTPS
+
+```bash
+# 1. Obtener certificado Let's Encrypt
+bash infra/certbot/init-ssl.sh
+
+# 2. Actualizar nginx a HTTPS (reemplaza nginx.conf)
 bash infra/certbot/upgrade-to-https.sh
+
+# 3. Recargar nginx
+docker compose exec nginx nginx -s reload
+
+# 4. Activar flag de cookie segura en .env
+COOKIE_SECURE=true
+docker compose restart api
 ```
 
-El sistema funciona en HTTP hasta activar HTTPS. En producción, HTTPS es obligatorio.
+> Si `COOKIE_SECURE=true` con el sitio en HTTP, las cookies de sesión no se envían y el login falla. Establecer `true` **solo después** de que HTTPS esté activo.
 
-## Endpoints que requieren ADMIN
+### Cabeceras de seguridad recomendadas para producción
 
-- `DELETE /api/nvrs/:id` — eliminar NVR
-- `POST /api/nvrs/:id/reboot` — reiniciar NVR
-- `POST /api/nvrs/:id/cameras/adopt` — adoptar cámara
-- `POST /api/users` — crear usuario
-- `PUT /api/alerts/settings` — cambiar SMTP
-- `DELETE /api/cameras/:id` — eliminar cámara
+Agregar en el bloque `server` de `nginx.conf`:
+```nginx
+add_header X-Frame-Options "SAMEORIGIN";
+add_header X-Content-Type-Options "nosniff";
+add_header Referrer-Policy "strict-origin-when-cross-origin";
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+```
 
-## Recomendaciones operativas
+---
 
-1. Cambiar contraseña por defecto del usuario `admin` de VisionCore
-2. Usar contraseñas fuertes en los NVRs Hikvision
-3. Mantener NVRs en VLAN separada, solo accesibles desde el servidor VisionCore
-4. Revisar `audit_logs` periódicamente desde la UI (Actividad)
-5. Rotar `JWT_SECRET` y `NVR_CREDENTIAL_KEY` periódicamente
-6. No exponer el puerto 9997 (MediaMTX API) a redes externas
+## CORS
+
+Controlado en la API Fastify mediante `CORS_ORIGINS` en `.env`:
+
+```env
+# Origen único
+CORS_ORIGINS=https://camaras.saa.com.py
+
+# Múltiples orígenes (coma-separados)
+CORS_ORIGINS=https://camaras.saa.com.py,https://admin.saa.com.py
+
+# Vacío = permite cualquier origen (SOLO en desarrollo)
+CORS_ORIGINS=
+```
+
+---
+
+## MediaMTX — Acceso a streams
+
+MediaMTX está configurado sin autenticación propia (`authInternalUsers: any`). El control de acceso real se realiza en la capa del API de VisionCore:
+
+- El frontend obtiene las URLs HLS/WebRTC **solo tras autenticarse** con JWT válido
+- Las URLs expuestas al frontend contienen el `streamPath` pero **no las credenciales del NVR**
+- nginx expone `/hls/` al exterior pero no la API de administración de MediaMTX (puerto 9997)
+
+> En producción, no exponer el puerto 9997 de MediaMTX en el firewall del servidor.

@@ -1,136 +1,142 @@
 # VisionCore VMS — Guía de Despliegue
 
-## Prerequisitos
+## Prerrequisitos
 
-- Docker Engine 24+ y Docker Compose v2
+- Docker Engine 24+ y Docker Compose v2 (`docker compose version`)
 - Git
-- Puerto 80 y 443 abiertos en firewall
-- Acceso de red a los NVRs (192.168.1.10, .110, .111, .112)
+- Dominio con DNS apuntando al servidor (para HTTPS)
+- Puertos abiertos: 80, 443, 554 (RTSP), 8888 (HLS), 8889 (WebRTC)
+- Acceso de red a los NVRs: 192.168.1.10, .110, .111, .112
+
+---
+
+## 1. Clonar y configurar variables de entorno
 
 ```bash
-docker compose version   # debe mostrar v2.x
-```
-
-## Variables de entorno
-
-Copiar y editar antes de levantar:
-
-```bash
+git clone <repo> /opt/visioncore
+cd /opt/visioncore
 cp .env.example .env
 ```
 
-Variables obligatorias en `.env`:
+Editar `.env` con valores reales:
 
+| Variable | Descripción | Cómo generar |
+|---|---|---|
+| `JWT_SECRET` | Clave JWT (mín. 32 chars) | `openssl rand -hex 64` |
+| `NVR_CREDENTIAL_KEY` | Clave AES para contraseñas NVR | `openssl rand -hex 32` |
+| `CORS_ORIGINS` | Orígenes permitidos (coma-separados) | `https://camaras.saa.com.py` |
+| `COOKIE_SECURE` | `true` solo con HTTPS activo | `false` (HTTP) / `true` (HTTPS) |
+
+> **IMPORTANTE:** Si `COOKIE_SECURE=true` y el sitio es HTTP, el login falla silenciosamente porque las cookies no se envían.
+
+Variables opcionales para ajustar límites de streaming:
 ```env
-# Claves de seguridad (generar con los comandos indicados)
-JWT_SECRET=<64 bytes hex>          # openssl rand -hex 64
-NVR_CREDENTIAL_KEY=<32 bytes hex>  # openssl rand -hex 32
-
-# JWT expiry (defaults: 60m / 7d)
-JWT_EXPIRES_IN=60m
-JWT_REFRESH_EXPIRES_IN=7d
-
-# CORS — dominio(s) del frontend separados por coma
-CORS_ORIGINS=https://camaras.saa.com.py
-
-# Solo true si el sitio ya tiene HTTPS activo
-COOKIE_SECURE=false
-
-# Límites de streaming (opcionales)
 MAX_STREAMS_PER_USER=16
 MAX_STREAMS_GLOBAL=50
 STREAM_IDLE_TIMEOUT=90
 ```
 
-La variable `DATABASE_URL` y `REDIS_URL` se inyectan directamente desde `docker-compose.yml`; no es necesario definirlas en `.env` salvo entornos externos.
+---
 
-## Primer despliegue
+## 2. Despliegue inicial
 
 ```bash
-# 1. Clonar o actualizar el repositorio
-git clone <repo> && cd Gestion_camaras
+# Despliegue completo automatizado (build + migraciones + verificación)
+bash scripts/deploy.sh main
 
-# 2. Levantar todos los servicios
+# O paso a paso manualmente:
+docker compose build --no-cache api web
 docker compose up -d
-
-# 3. Esperar a que PostgreSQL esté healthy
-docker compose ps
-
-# 4. Aplicar migraciones y seed inicial
-docker compose exec api npx prisma migrate deploy
-docker compose exec api npx ts-node prisma/seed.ts   # crea usuario admin por defecto
+docker compose exec -T api npx prisma migrate deploy
+docker compose exec -T api npx tsx apps/api/src/seed.ts   # crea usuario admin
 ```
 
-## Script de despliegue automatizado
+El script `deploy.sh` realiza backup automático de la DB en `backups/` antes de cada deploy.
+
+---
+
+## 3. Migraciones de base de datos
 
 ```bash
-bash scripts/deploy.sh [rama]   # default: main
-```
-
-El script realiza: verificación de prerequisitos → git pull → backup de DB → build → `docker compose up -d` → migraciones → verificación de salud.
-
-## SSL / HTTPS
-
-```bash
-# Paso 1: obtener certificado Let's Encrypt (nginx debe estar corriendo en HTTP)
-bash infra/certbot/init-ssl.sh
-
-# Paso 2: reemplazar nginx.conf con la versión HTTPS
-bash infra/certbot/upgrade-to-https.sh
-
-# Paso 3: recargar nginx
-docker compose exec nginx nginx -s reload
-
-# Renovación automática: el servicio certbot hace certbot renew cada 12 horas
-```
-
-Dominio configurado: `camaras.saa.com.py`. Para cambiar, editar `infra/certbot/init-ssl.sh` y `infra/certbot/upgrade-to-https.sh`.
-
-## Migraciones de base de datos
-
-```bash
-# Aplicar migraciones pendientes (safe, no destructivo)
+# Aplicar migraciones pendientes (seguro, no destructivo)
 docker compose exec api npx prisma migrate deploy
 
-# Crear nueva migración tras cambios en schema.prisma
-docker compose exec api npx prisma migrate dev --name <nombre>
+# Crear nueva migración tras cambiar schema.prisma
+docker compose exec api npx prisma migrate dev --name nombre_cambio
 
 # Ver estado de migraciones
 docker compose exec api npx prisma migrate status
 ```
 
-## Rollback
+---
+
+## 4. Habilitar HTTPS (Let's Encrypt)
 
 ```bash
-# Ver commits disponibles
-bash scripts/rollback.sh
+# 1. Editar server_name en infra/nginx/nginx.conf con el dominio real
+# 2. Obtener certificado (nginx debe estar en HTTP en este momento)
+bash infra/certbot/init-ssl.sh
 
-# Rollback a un commit específico
-bash scripts/rollback.sh <commit_hash>
+# 3. Actualizar nginx a HTTPS
+bash infra/certbot/upgrade-to-https.sh
+
+# 4. Recargar nginx
+docker compose exec nginx nginx -s reload
+
+# 5. Activar cookies seguras
+# En .env: COOKIE_SECURE=true
+docker compose restart api
 ```
 
-El script pide confirmación, hace checkout del código, rebuild y redeploy. Para rollback de DB, los backups están en `backups/db_backup_YYYYMMDD_HHMMSS.sql`:
+La renovación automática está configurada en el servicio `certbot` del compose (cada 12 horas).
+
+Dominio configurado: `camaras.saa.com.py`. Para cambiarlo, editar `infra/certbot/init-ssl.sh` y `upgrade-to-https.sh`.
+
+---
+
+## 5. Verificar servicios post-deploy
 
 ```bash
-docker compose exec -T postgres psql -U visioncore visioncore_db < backups/db_backup_<fecha>.sql
-```
-
-## Verificación post-deploy
-
-```bash
-docker compose ps                          # todos los servicios en estado "running"
+docker compose ps                          # todos en estado "running"
 curl http://localhost/api/health           # debe responder 200
-bash scripts/check-nvrs.sh                # estado de los 4 NVRs
+bash scripts/check-nvrs.sh                # conectividad con los 4 NVRs
 docker compose logs -f api --tail 50      # logs del backend
 ```
 
-## Servicios y puertos internos
+Servicios esperados activos: `postgres`, `redis`, `mediamtx`, `api`, `web`, `nginx`, `certbot`.
 
-| Servicio   | Puerto interno | Expuesto    |
-|------------|---------------|-------------|
-| postgres   | 5432          | 5432        |
-| redis      | 6379          | 6379        |
-| mediamtx   | 8554/8888/8889/9997 | idem |
-| api        | 4000          | 4000        |
-| web        | 80 (interno)  | vía nginx   |
-| nginx      | —             | 80, 443     |
+---
+
+## 6. Rollback
+
+```bash
+# Ver commits disponibles para revertir
+bash scripts/rollback.sh
+
+# Revertir a un commit específico (pide confirmación)
+bash scripts/rollback.sh abc1234
+```
+
+El script hace checkout del código, rebuild de imágenes y redeploy automático. Para rollback de DB:
+
+```bash
+# Los backups están en backups/db_backup_YYYYMMDD_HHMMSS.sql
+docker compose exec -T postgres psql -U visioncore visioncore_db \
+  < backups/db_backup_<fecha>.sql
+```
+
+---
+
+## Servicios y puertos
+
+| Servicio | Puerto interno | Expuesto al host |
+|---|---|---|
+| postgres | 5432 | 5432 |
+| redis | 6379 | 6379 |
+| mediamtx | 8554/8888/8889 | idem |
+| mediamtx API | 9997 | 9997 (restringir en prod) |
+| api | 4000 | 4000 |
+| web | 80 (interno) | vía nginx |
+| nginx | — | 80, 443 |
+
+> En producción, considerar no exponer los puertos 5432, 6379 y 9997 al exterior.
