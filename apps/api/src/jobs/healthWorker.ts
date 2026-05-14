@@ -5,6 +5,8 @@ import type { FastifyInstance } from 'fastify'
 import { getNVRStatus, getNVRChannels } from '../services/hikvision'
 import { broadcastAlert } from '../routes/websocket'
 import { publishAllStreams } from '../services/stream'
+import { sendAlertNotification } from '../services/notification.service'
+import { cleanupIdleSessions } from '../services/stream-manager'
 import CryptoJS from 'crypto-js'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
@@ -52,6 +54,16 @@ export function startHealthWorker(server: FastifyInstance) {
                   createdAt: alert.createdAt,
                 },
               })
+
+              // Enviar email automático (no bloquea el worker)
+              sendAlertNotification(server.prisma, {
+                id: alert.id,
+                type: alert.type,
+                severity: alert.severity,
+                message: alert.message,
+                detail: alert.detail,
+                nvrId: alert.nvrId,
+              }).catch((e) => server.log.error(`Email NVR_OFFLINE: ${e}`))
             }
 
             // Marcar NVR y sus cámaras como offline
@@ -91,6 +103,15 @@ export function startHealthWorker(server: FastifyInstance) {
                   type: 'alert',
                   alert: { ...alert, nvrName: nvr.name },
                 })
+
+                sendAlertNotification(server.prisma, {
+                  id: alert.id,
+                  type: alert.type,
+                  severity: alert.severity,
+                  message: alert.message,
+                  detail: alert.detail,
+                  nvrId: alert.nvrId,
+                }).catch((e) => server.log.error(`Email HDD_FULL: ${e}`))
               }
             }
 
@@ -110,7 +131,7 @@ export function startHealthWorker(server: FastifyInstance) {
                   })
 
                   if (!existingCamAlert) {
-                    await server.prisma.alert.create({
+                    const camAlert = await server.prisma.alert.create({
                       data: {
                         nvrId: nvr.id,
                         cameraId: camera.id,
@@ -119,6 +140,15 @@ export function startHealthWorker(server: FastifyInstance) {
                         message: `Cámara "${camera.name}" offline en ${nvr.name}`,
                       },
                     })
+
+                    sendAlertNotification(server.prisma, {
+                      id: camAlert.id,
+                      type: camAlert.type,
+                      severity: camAlert.severity,
+                      message: camAlert.message,
+                      nvrId: camAlert.nvrId,
+                      cameraId: camAlert.cameraId,
+                    }).catch((e) => server.log.error(`Email CAMERA_OFFLINE: ${e}`))
                   }
                 } else {
                   await server.prisma.alert.updateMany({
@@ -157,6 +187,12 @@ export function startHealthWorker(server: FastifyInstance) {
     } catch {
       // Silencioso — mediamtx puede estar temporalmente caído
     }
+  })
+
+  // Limpiar sesiones de stream idle cada 2 minutos
+  cron.schedule('*/2 * * * *', async () => {
+    const removed = await cleanupIdleSessions(server)
+    if (removed > 0) server.log.info(`[stream-manager] ${removed} sesiones idle eliminadas`)
   })
 
   // Limpiar sesiones expiradas cada hora

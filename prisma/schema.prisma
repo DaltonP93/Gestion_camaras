@@ -278,6 +278,23 @@ model AppearanceSettings {
   @@map("appearance_settings")
 }
 
+// ─── Entregas de notificaciones ──────────────────────────────
+model NotificationDelivery {
+  id        String    @id @default(cuid())
+  alertId   String
+  channel   String    // email | websocket | telegram | whatsapp
+  status    String    // sent | failed | skipped | pending
+  recipient String?
+  error     String?   @db.Text
+  attempts  Int       @default(1)
+  sentAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([alertId])
+  @@map("notification_deliveries")
+}
+
 // ─── Configuración de alertas y correo ───────────────────────
 model AlertSettings {
   id              String  @id @default("singleton")

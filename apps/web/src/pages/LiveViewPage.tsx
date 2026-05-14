@@ -6,10 +6,11 @@ import {
   ChevronLeft, ChevronRight,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
-import { VideoPlayer } from '@/components/cameras/VideoPlayer'
+import { VideoPlayer, type CameraPlaybackError } from '@/components/cameras/VideoPlayer'
 import { PTZControls } from '@/components/cameras/PTZControls'
+import { CameraDiagnosticModal } from '@/components/cameras/CameraDiagnosticModal'
 import { useAuthStore } from '@/stores/authStore'
-import { apiGet } from '@/lib/api'
+import { apiGet, apiPost } from '@/lib/api'
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout } from '@/types'
 
@@ -32,33 +33,22 @@ export function LiveViewPage() {
   const [page, setPage] = useState(0)
   const [streams, setStreams] = useState<Record<string, StreamInfo>>({})
   const [loadingStreams, setLoadingStreams] = useState<Record<string, boolean>>({})
-  const [failedStreams, setFailedStreams] = useState<Set<string>>(new Set())
+  const [streamErrors, setStreamErrors] = useState<Record<string, CameraPlaybackError>>({})
   const [focusCamera, setFocusCamera] = useState<string | null>(null)
+  const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
 
-  useEffect(() => {
-    loadNVRs()
-    loadCameras()
-  }, [])
-
-  useEffect(() => {
-    if (nvrFilter) setSelectedNVR(nvrFilter)
-  }, [nvrFilter])
-
-  // Resetear página al cambiar NVR o layout
+  useEffect(() => { loadNVRs(); loadCameras() }, [])
+  useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
   useEffect(() => { setPage(0) }, [selectedNVR, gridLayout])
 
-  // Todas las cámaras filtradas por NVR (sin paginar)
   const allFiltered = cameras.filter((c) =>
     selectedNVR === 'all' ? true : c.nvrId === selectedNVR
   )
 
   const totalPages = Math.max(1, Math.ceil(allFiltered.length / gridLayout))
   const safePage = Math.min(page, totalPages - 1)
-
-  // Cámaras de la página actual
   const filteredCameras = allFiltered.slice(safePage * gridLayout, (safePage + 1) * gridLayout)
 
-  // Cargar stream de una cámara
   const loadStream = useCallback(async (camera: Camera) => {
     if (streams[camera.id] || loadingStreams[camera.id]) return
 
@@ -66,12 +56,23 @@ export function LiveViewPage() {
     try {
       const info = await apiGet<StreamInfo>(`/cameras/${camera.id}/stream`)
       setStreams((prev) => ({ ...prev, [camera.id]: info }))
-      setFailedStreams((prev) => {
-        if (!prev.has(camera.id)) return prev
-        const next = new Set(prev); next.delete(camera.id); return next
+      setStreamErrors((prev) => {
+        const next = { ...prev }
+        delete next[camera.id]
+        return next
       })
-    } catch {
-      setFailedStreams((prev) => new Set(prev).add(camera.id))
+    } catch (err: any) {
+      // Mapear el error de API a un código normalizado
+      const msg: string = err?.response?.data?.message || ''
+      let code: CameraPlaybackError['code'] = 'UNKNOWN'
+      let message = 'No se pudo obtener el stream'
+
+      if (msg.includes('offline') || msg.includes('NVR')) { code = 'NVR_OFFLINE'; message = 'NVR offline o inaccesible' }
+      else if (msg.includes('401') || msg.includes('auth') || msg.includes('credencial')) { code = 'AUTH_FAILED'; message = 'Credenciales inválidas' }
+      else if (msg.includes('timeout')) { code = 'RTSP_TIMEOUT'; message = 'RTSP timeout' }
+      else if (msg.includes('canal') || msg.includes('channel') || msg.includes('404')) { code = 'RTSP_CHANNEL_NOT_FOUND'; message = 'Canal no encontrado' }
+
+      setStreamErrors((prev) => ({ ...prev, [camera.id]: { code, message, technicalDetail: msg } }))
     } finally {
       setLoadingStreams((prev) => ({ ...prev, [camera.id]: false }))
     }
@@ -81,19 +82,26 @@ export function LiveViewPage() {
     filteredCameras.forEach((cam) => loadStream(cam))
   }, [filteredCameras.map(c => c.id).join(',')])
 
+  const handleDiagnostic = useCallback((cameraId: string) => {
+    const cam = cameras.find(c => c.id === cameraId)
+    if (cam) setDiagnosticCamera({ id: cameraId, name: `${cam.nvr?.name || ''} · ${cam.name}` })
+  }, [cameras])
+
+  const handleRestartStream = useCallback(async (cameraId: string) => {
+    // Forzar recarga del stream tras reinicio
+    setStreams((prev) => { const next = { ...prev }; delete next[cameraId]; return next })
+    setStreamErrors((prev) => { const next = { ...prev }; delete next[cameraId]; return next })
+    const cam = cameras.find(c => c.id === cameraId)
+    if (cam) setTimeout(() => loadStream(cam), 3000)
+  }, [cameras, loadStream])
+
   const currentGrid = GRID_OPTIONS.find((g) => g.value === gridLayout) || GRID_OPTIONS[2]
-
-  const handleFullscreen = (cameraId: string) => {
-    setFocusCamera(focusCamera === cameraId ? null : cameraId)
-  }
-
   const totalForFilter = allFiltered.length
 
   return (
     <div className="flex flex-col h-full">
       {/* Toolbar */}
       <div className="flex-shrink-0 flex items-center gap-3 px-4 py-2 bg-surface-800 border-b border-surface-600">
-        {/* Selector NVR */}
         <div className="relative">
           <select
             value={selectedNVR}
@@ -113,7 +121,6 @@ export function LiveViewPage() {
 
         <div className="h-4 w-px bg-surface-600" />
 
-        {/* Layout selector */}
         <div className="flex gap-1">
           {GRID_OPTIONS.map((opt) => (
             <button
@@ -134,14 +141,12 @@ export function LiveViewPage() {
 
         <div className="flex-1" />
 
-        {/* Paginación */}
         {totalPages > 1 && (
           <div className="flex items-center gap-1.5">
             <button
               onClick={() => setPage((p) => Math.max(0, p - 1))}
               disabled={safePage === 0}
               className="p-1 rounded-lg bg-surface-700 text-surface-300 hover:bg-surface-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              title="Página anterior"
             >
               <ChevronLeft size={14} />
             </button>
@@ -152,7 +157,6 @@ export function LiveViewPage() {
               onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
               disabled={safePage === totalPages - 1}
               className="p-1 rounded-lg bg-surface-700 text-surface-300 hover:bg-surface-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              title="Página siguiente"
             >
               <ChevronRight size={14} />
             </button>
@@ -167,7 +171,6 @@ export function LiveViewPage() {
       {/* Grid de video */}
       <div className="flex-1 overflow-hidden p-2 bg-surface-900">
         {focusCamera ? (
-          // Vista de una sola cámara
           <div className="h-full">
             {(() => {
               const cam = cameras.find(c => c.id === focusCamera)
@@ -178,10 +181,12 @@ export function LiveViewPage() {
                   <VideoPlayer
                     hlsUrl={stream?.hls || ''}
                     cameraName={`${cam.nvr?.name} — ${cam.name}`}
+                    cameraId={cam.id}
                     isRecording={cam.online}
-                    onFullscreen={() => handleFullscreen(focusCamera)}
+                    onFullscreen={() => setFocusCamera(null)}
+                    onDiagnostic={handleDiagnostic}
                     className="flex-1 h-full"
-                    error={failedStreams.has(focusCamera)}
+                    playbackError={streamErrors[focusCamera]}
                   />
                   {(user?.role === 'ADMIN' || user?.role === 'SUPERVISOR') && cam.ptzEnabled && (
                     <PTZControls cameraId={cam.id} />
@@ -191,7 +196,6 @@ export function LiveViewPage() {
             })()}
           </div>
         ) : (
-          // Grid de cámaras
           <div className={clsx('grid gap-1.5 h-full', currentGrid.cols)}>
             {filteredCameras.map((camera) => {
               const stream = streams[camera.id]
@@ -200,15 +204,16 @@ export function LiveViewPage() {
                   <VideoPlayer
                     hlsUrl={stream?.hls || ''}
                     cameraName={`${camera.nvr?.name || ''} · ${camera.name}`}
+                    cameraId={camera.id}
                     isRecording={camera.online}
-                    onFullscreen={() => handleFullscreen(camera.id)}
+                    onFullscreen={() => setFocusCamera(camera.id)}
+                    onDiagnostic={handleDiagnostic}
                     className="w-full h-full"
-                    error={failedStreams.has(camera.id)}
+                    playbackError={streamErrors[camera.id]}
                   />
                 </div>
               )
             })}
-            {/* Celdas vacías para completar la grilla */}
             {Array.from({ length: Math.max(0, gridLayout - filteredCameras.length) }).map((_, i) => (
               <div key={`empty-${i}`} className="rounded-lg border border-surface-700 bg-surface-800/50 flex items-center justify-center">
                 <span className="text-xs text-surface-600">Sin cámara</span>
@@ -217,6 +222,16 @@ export function LiveViewPage() {
           </div>
         )}
       </div>
+
+      {/* Modal diagnóstico */}
+      {diagnosticCamera && (
+        <CameraDiagnosticModal
+          cameraId={diagnosticCamera.id}
+          cameraName={diagnosticCamera.name}
+          onClose={() => setDiagnosticCamera(null)}
+          onRestartStream={() => handleRestartStream(diagnosticCamera.id)}
+        />
+      )}
     </div>
   )
 }

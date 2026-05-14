@@ -4,6 +4,7 @@ import { z } from 'zod'
 import {
   getNVRStatus, getNVRChannels, getIpCameraList,
   getStorageInfo, getNVRUsers, getDeviceInfo, rebootDevice,
+  adoptIpCamera, getFreeChannels,
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { AuditAction } from '../services/audit'
@@ -458,5 +459,76 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     await server.prisma.nVR.delete({ where: { id } })
     await AuditAction(server.prisma, request.user.sub, 'NVR_DELETED', id, request)
     return reply.send({ message: 'NVR eliminado' })
+  })
+
+  // GET /api/nvrs/:id/free-channels — Canales libres para adoptar cámara
+  server.get('/:id/free-channels', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
+    const freeChannels = await getFreeChannels(nvrDec as any, nvr.channels)
+    return reply.send({ freeChannels, total: nvr.channels })
+  })
+
+  // POST /api/nvrs/:id/cameras/adopt — Adoptar cámara IP en NVR via ISAPI
+  server.post('/:id/cameras/adopt', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const schema = z.object({
+      channel:   z.number().int().min(1),
+      name:      z.string().min(1).max(100),
+      ipAddress: z.string().ip(),
+      port:      z.number().int().default(8000),
+      username:  z.string().min(1),
+      password:  z.string().min(1),
+      protocol:  z.string().default('HIKVISION'),
+    })
+    const params = schema.parse(request.body)
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
+
+    // 1. Intentar adoptar via ISAPI
+    const adoptResult = await adoptIpCamera(nvrDec as any, params)
+    if (!adoptResult.success) {
+      return reply.status(400).send({ message: `Error al adoptar: ${adoptResult.error}` })
+    }
+
+    // 2. Upsert en DB
+    const camera = await server.prisma.camera.upsert({
+      where: { nvrId_channel: { nvrId: id, channel: params.channel } },
+      update: {
+        name: params.name,
+        ipAddress: params.ipAddress,
+        managementPort: params.port,
+        protocol: params.protocol,
+        active: true,
+        lastSyncAt: new Date(),
+      },
+      create: {
+        nvrId: id,
+        channel: params.channel,
+        name: params.name,
+        ipAddress: params.ipAddress,
+        managementPort: params.port,
+        protocol: params.protocol,
+        ptzEnabled: false,
+        active: true,
+        online: false,
+        lastSyncAt: new Date(),
+      },
+    })
+
+    await AuditAction(server.prisma, request.user.sub, 'CAMERA_ADOPTED', camera.id, request, {
+      channel: params.channel, name: params.name, ipAddress: params.ipAddress,
+    })
+
+    // 3. Registrar en MediaMTX
+    const cameras = await server.prisma.camera.findMany({ where: { nvrId: id, active: true } })
+    publishAllStreams(nvrDec as any, cameras).catch(() => {})
+
+    return reply.send({ success: true, camera, message: 'Cámara adoptada correctamente' })
   })
 }

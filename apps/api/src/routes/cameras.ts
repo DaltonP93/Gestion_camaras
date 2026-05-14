@@ -2,6 +2,7 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus } from '../services/stream'
+import { startStream, stopStream, touchSession } from '../services/stream-manager'
 import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
 import { AuditAction } from '../services/audit'
@@ -275,6 +276,36 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const ok  = await sendPTZCommand(nvr as any, camera.channel, command as PTZCommand, speed)
     await AuditAction(server.prisma, user.sub, 'PTZ_COMMAND', id, request, { command, speed })
     return reply.send({ success: ok, command })
+  })
+
+  // POST /api/cameras/:id/start-stream — Iniciar stream (con session tracking)
+  server.post('/:id/start-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const user = request.user
+
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
+      return reply.status(403).send({ message: 'Sin permiso para ver esta cámara' })
+    }
+
+    const result = await startStream(server, user.sub, id)
+    if (result.error) return reply.status(400).send({ message: result.error })
+    return reply.send(result)
+  })
+
+  // POST /api/cameras/:id/stop-stream — Notificar que el usuario dejó de ver
+  server.post('/:id/stop-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const user = request.user
+    await stopStream(server, user.sub, id)
+    return reply.send({ ok: true })
+  })
+
+  // POST /api/cameras/:id/touch-stream — Heartbeat para evitar timeout
+  server.post('/:id/touch-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const user = request.user
+    touchSession(user.sub, id)
+    return reply.send({ ok: true })
   })
 
   // PUT /api/cameras/:id — Actualizar cámara

@@ -18,6 +18,23 @@ const settingsSchema = z.object({
 })
 
 const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
+  // GET /api/alerts/settings/deliveries
+  server.get('/settings/deliveries', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { page = '0', limit = '50' } = request.query as Record<string, string>
+    const skip = Number(page) * Number(limit)
+    const [deliveries, total] = await Promise.all([
+      server.prisma.notificationDelivery.findMany({
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: Number(limit),
+      }),
+      server.prisma.notificationDelivery.count(),
+    ])
+    return reply.send({ deliveries, total, page: Number(page), limit: Number(limit) })
+  })
+
   // GET /api/alerts/settings
   server.get('/settings', {
     preHandler: [server.authorize(['ADMIN'])],

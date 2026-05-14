@@ -589,6 +589,75 @@ export async function sendPTZCommand(nvr: NVR, channel: number, command: PTZComm
   }
 }
 
+// ─── Adopción de cámara IP en NVR ─────────────────────────────
+
+export interface AdoptCameraParams {
+  channel: number          // Canal destino en el NVR (1-based)
+  name: string
+  ipAddress: string
+  port?: number            // Puerto de gestión (default 8000)
+  username: string
+  password: string
+  protocol?: string        // HIKVISION | ONVIF | DAHUA | etc.
+}
+
+export async function adoptIpCamera(nvr: NVR, params: AdoptCameraParams): Promise<{ success: boolean; error?: string }> {
+  try {
+    const client = createHikClient(nvr)
+    const ch = String(params.channel)
+
+    const body = {
+      InputProxyChannel: {
+        id: ch,
+        name: params.name,
+        addressingFormatType: 'ipaddress',
+        ipAddress: params.ipAddress,
+        managePort: params.port || 8000,
+        userName: params.username,
+        password: params.password,
+        srcInputPortDescriptor: {
+          ProxyProtocol: { proxyProtocolType: params.protocol || 'HIKVISION' },
+        },
+      },
+    }
+
+    // Intentar crear primero
+    try {
+      await client.post(`/ISAPI/ContentMgmt/InputProxy/channels`, body)
+      return { success: true }
+    } catch (err: any) {
+      const status = err.response?.status
+      // Si ya existe en ese canal, intentar actualizar
+      if (status === 400 || status === 409) {
+        await client.put(`/ISAPI/ContentMgmt/InputProxy/channels/${ch}`, body)
+        return { success: true }
+      }
+      throw err
+    }
+  } catch (err: any) {
+    const msg = err.response?.data?.ResponseStatus?.statusString
+      || err.response?.statusText
+      || err.message
+      || 'Error desconocido'
+    return { success: false, error: msg }
+  }
+}
+
+// Obtener lista de canales libres en un NVR (canales sin cámara asignada)
+export async function getFreeChannels(nvr: NVR, totalChannels: number): Promise<number[]> {
+  try {
+    const cameras = await getIpCameraList(nvr)
+    const usedChannels = new Set(cameras.map(c => c.channel))
+    const free: number[] = []
+    for (let i = 1; i <= totalChannels; i++) {
+      if (!usedChannels.has(i)) free.push(i)
+    }
+    return free
+  } catch {
+    return []
+  }
+}
+
 // ─── Snapshot ─────────────────────────────────────────────────
 
 export async function captureSnapshot(nvr: NVR, channel: number): Promise<Buffer | null> {

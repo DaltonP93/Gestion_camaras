@@ -5,7 +5,7 @@ import {
   ArrowLeft, RefreshCw, Power, Wifi, WifiOff,
   HardDrive, Camera, Users, Wrench, Activity,
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
-  Loader2, Play, RotateCcw, Stethoscope,
+  Loader2, Play, RotateCcw, Stethoscope, Plus, X,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
@@ -224,6 +224,7 @@ export function NVRDetailPage() {
       {tab === 'summary' && <SummaryTab nvr={nvr} />}
       {tab === 'cameras' && (
         <CamerasTab
+          nvrId={nvr.id}
           cameras={cameras}
           loading={loadingCameras}
           onRefresh={loadCameras}
@@ -320,7 +321,7 @@ function SummaryTab({ nvr }: { nvr: NVR }) {
 // ─── Cameras Tab ──────────────────────────────────────────────
 
 function CamerasTab({
-  cameras, loading, onRefresh, onRestartStream, onDiagnostics, isAdmin,
+  cameras, loading, onRefresh, onRestartStream, onDiagnostics, isAdmin, nvrId,
 }: {
   cameras: { fromNvr: IpCamera[]; fromDb: CameraType[] } | null
   loading: boolean
@@ -328,7 +329,10 @@ function CamerasTab({
   onRestartStream: (id: string, name: string) => void
   onDiagnostics: (cam: CameraType) => void
   isAdmin: boolean
+  nvrId: string
 }) {
+  const [showAdopt, setShowAdopt] = useState(false)
+
   if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
 
   const list = cameras?.fromDb || []
@@ -337,8 +341,23 @@ function CamerasTab({
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <span className="text-sm text-surface-400">{list.length} cámaras en base de datos · {cameras?.fromNvr.length || 0} detectadas en NVR</span>
-        <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
+        <div className="flex gap-2">
+          {isAdmin && (
+            <button onClick={() => setShowAdopt(true)} className="btn-primary text-xs">
+              <Plus size={12} /> Adoptar cámara
+            </button>
+          )}
+          <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
+        </div>
       </div>
+
+      {showAdopt && isAdmin && (
+        <AdoptCameraModal
+          nvrId={nvrId}
+          onClose={() => setShowAdopt(false)}
+          onSuccess={() => { setShowAdopt(false); onRefresh() }}
+        />
+      )}
 
       <div className="card overflow-hidden">
         <table className="w-full text-xs">
@@ -691,6 +710,121 @@ function DiagnosticsTab({
                   <p className="text-surface-400 font-mono truncate">{result.frontend.hlsUrl}</p>
                 </div>
               </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Adopt Camera Modal ────────────────────────────────────────
+
+function AdoptCameraModal({ nvrId, onClose, onSuccess }: { nvrId: string; onClose: () => void; onSuccess: () => void }) {
+  const [form, setForm] = useState({
+    channel: 1, name: '', ipAddress: '', port: 8000,
+    username: 'admin', password: '', protocol: 'HIKVISION',
+  })
+  const [freeChannels, setFreeChannels] = useState<number[]>([])
+  const [loadingCh, setLoadingCh] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    setLoadingCh(true)
+    apiGet<{ freeChannels: number[] }>(`/nvrs/${nvrId}/free-channels`)
+      .then(r => {
+        setFreeChannels(r.freeChannels)
+        if (r.freeChannels.length > 0) setForm(f => ({ ...f, channel: r.freeChannels[0] }))
+      })
+      .catch(() => {})
+      .finally(() => setLoadingCh(false))
+  }, [nvrId])
+
+  const handleSave = async () => {
+    if (!form.name || !form.ipAddress || !form.password) {
+      toast.error('Nombre, IP y contraseña son obligatorios')
+      return
+    }
+    setSaving(true)
+    try {
+      await apiPost(`/nvrs/${nvrId}/cameras/adopt`, form)
+      toast.success(`Cámara "${form.name}" adoptada en canal ${form.channel}`)
+      onSuccess()
+    } catch (err: any) {
+      toast.error(err?.response?.data?.message || 'Error al adoptar la cámara')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const f = (key: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    const value = (e.target as HTMLInputElement).type === 'number' ? Number(e.target.value) : e.target.value
+    setForm(prev => ({ ...prev, [key]: value }))
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+      <div className="card w-full max-w-md p-6 animate-slide-in shadow-2xl">
+        <div className="flex items-center justify-between mb-5">
+          <h3 className="text-sm font-semibold text-surface-100">Adoptar cámara IP</h3>
+          <button onClick={onClose} className="btn-ghost p-1"><X size={14} /></button>
+        </div>
+
+        {loadingCh ? (
+          <div className="flex justify-center py-8"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
+        ) : (
+          <div className="space-y-3">
+            <div>
+              <label className="label">Canal destino en NVR</label>
+              <select className="input w-full" value={form.channel} onChange={f('channel')}>
+                {freeChannels.length === 0
+                  ? <option value="">Sin canales libres</option>
+                  : freeChannels.map(ch => <option key={ch} value={ch}>Canal {ch}</option>)
+                }
+              </select>
+              {freeChannels.length === 0 && (
+                <p className="text-xs text-amber-400 mt-1">Todos los canales están ocupados</p>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="label">Nombre de cámara *</label>
+                <input className="input" placeholder="Cámara Entrada" value={form.name} onChange={f('name')} />
+              </div>
+              <div>
+                <label className="label">Protocolo</label>
+                <select className="input w-full" value={form.protocol} onChange={f('protocol')}>
+                  {['HIKVISION', 'ONVIF', 'DAHUA', 'AXIS', 'RTSP', 'OTHER'].map(p => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <div className="col-span-2">
+                <label className="label">IP de la cámara *</label>
+                <input className="input font-mono" placeholder="192.168.1.50" value={form.ipAddress} onChange={f('ipAddress')} />
+              </div>
+              <div>
+                <label className="label">Puerto</label>
+                <input className="input" type="number" value={form.port} onChange={f('port')} />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="label">Usuario</label>
+                <input className="input" placeholder="admin" value={form.username} onChange={f('username')} />
+              </div>
+              <div>
+                <label className="label">Contraseña *</label>
+                <input className="input" type="password" placeholder="••••••••" value={form.password} onChange={f('password')} />
+              </div>
+            </div>
+            <div className="flex gap-2 mt-5 justify-end">
+              <button onClick={onClose} className="btn-secondary text-xs">Cancelar</button>
+              <button onClick={handleSave} disabled={saving || freeChannels.length === 0} className="btn-primary text-xs">
+                {saving ? <><Loader2 size={12} className="animate-spin" /> Adoptando...</> : <><Plus size={12} /> Adoptar cámara</>}
+              </button>
             </div>
           </div>
         )}
