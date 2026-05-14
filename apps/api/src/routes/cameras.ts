@@ -289,7 +289,16 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     const result = await startStream(server, user.sub, id)
     if (result.error) return reply.status(400).send({ message: result.error })
-    return reply.send(result)
+
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+    return reply.send({
+      cameraId:   id,
+      streamPath: result.streamPath,
+      hls:        result.hlsUrl,
+      webrtc:     result.webrtcUrl,
+      channel:    camera?.channel ?? 0,
+      nvrName:    camera?.nvr?.name ?? '',
+    })
   })
 
   // POST /api/cameras/:id/stop-stream — Notificar que el usuario dejó de ver

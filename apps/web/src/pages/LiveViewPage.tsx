@@ -1,5 +1,5 @@
 // src/pages/LiveViewPage.tsx
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   Grid2x2, Grid3x3, LayoutGrid, Maximize2, ChevronDown,
@@ -10,7 +10,7 @@ import { VideoPlayer, type CameraPlaybackError } from '@/components/cameras/Vide
 import { PTZControls } from '@/components/cameras/PTZControls'
 import { CameraDiagnosticModal } from '@/components/cameras/CameraDiagnosticModal'
 import { useAuthStore } from '@/stores/authStore'
-import { apiGet, apiPost } from '@/lib/api'
+import { apiPost } from '@/lib/api'
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout } from '@/types'
 
@@ -37,9 +37,31 @@ export function LiveViewPage() {
   const [focusCamera, setFocusCamera] = useState<string | null>(null)
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
 
+  // Track active sessions to send stop/heartbeat
+  const activeSessions = useRef<Set<string>>(new Set())
+
   useEffect(() => { loadNVRs(); loadCameras() }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
   useEffect(() => { setPage(0) }, [selectedNVR, gridLayout])
+
+  // Heartbeat every 60s to keep stream sessions alive in StreamManager
+  useEffect(() => {
+    const interval = setInterval(() => {
+      activeSessions.current.forEach((cameraId) => {
+        apiPost(`/cameras/${cameraId}/touch-stream`, {}).catch(() => {})
+      })
+    }, 60_000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Stop all sessions when leaving the page
+  useEffect(() => {
+    return () => {
+      activeSessions.current.forEach((cameraId) => {
+        apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
+      })
+    }
+  }, [])
 
   const allFiltered = cameras.filter((c) =>
     selectedNVR === 'all' ? true : c.nvrId === selectedNVR
@@ -54,7 +76,8 @@ export function LiveViewPage() {
 
     setLoadingStreams((prev) => ({ ...prev, [camera.id]: true }))
     try {
-      const info = await apiGet<StreamInfo>(`/cameras/${camera.id}/stream`)
+      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, {})
+      activeSessions.current.add(camera.id)
       setStreams((prev) => ({ ...prev, [camera.id]: info }))
       setStreamErrors((prev) => {
         const next = { ...prev }
@@ -62,7 +85,6 @@ export function LiveViewPage() {
         return next
       })
     } catch (err: any) {
-      // Mapear el error de API a un código normalizado
       const msg: string = err?.response?.data?.message || ''
       let code: CameraPlaybackError['code'] = 'UNKNOWN'
       let message = 'No se pudo obtener el stream'
@@ -71,6 +93,7 @@ export function LiveViewPage() {
       else if (msg.includes('401') || msg.includes('auth') || msg.includes('credencial')) { code = 'AUTH_FAILED'; message = 'Credenciales inválidas' }
       else if (msg.includes('timeout')) { code = 'RTSP_TIMEOUT'; message = 'RTSP timeout' }
       else if (msg.includes('canal') || msg.includes('channel') || msg.includes('404')) { code = 'RTSP_CHANNEL_NOT_FOUND'; message = 'Canal no encontrado' }
+      else if (msg.includes('Límite')) { code = 'UNKNOWN'; message = msg }
 
       setStreamErrors((prev) => ({ ...prev, [camera.id]: { code, message, technicalDetail: msg } }))
     } finally {
@@ -80,6 +103,15 @@ export function LiveViewPage() {
 
   useEffect(() => {
     filteredCameras.forEach((cam) => loadStream(cam))
+    // Stop sessions for cameras no longer visible
+    const visibleIds = new Set(filteredCameras.map(c => c.id))
+    activeSessions.current.forEach((id) => {
+      if (!visibleIds.has(id)) {
+        apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {})
+        activeSessions.current.delete(id)
+        setStreams((prev) => { const next = { ...prev }; delete next[id]; return next })
+      }
+    })
   }, [filteredCameras.map(c => c.id).join(',')])
 
   const handleDiagnostic = useCallback((cameraId: string) => {
@@ -88,7 +120,7 @@ export function LiveViewPage() {
   }, [cameras])
 
   const handleRestartStream = useCallback(async (cameraId: string) => {
-    // Forzar recarga del stream tras reinicio
+    activeSessions.current.delete(cameraId)
     setStreams((prev) => { const next = { ...prev }; delete next[cameraId]; return next })
     setStreamErrors((prev) => { const next = { ...prev }; delete next[cameraId]; return next })
     const cam = cameras.find(c => c.id === cameraId)
