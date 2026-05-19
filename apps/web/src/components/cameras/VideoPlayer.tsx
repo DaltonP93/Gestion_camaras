@@ -1,6 +1,7 @@
 // src/components/cameras/VideoPlayer.tsx
 import { useEffect, useRef, useState, useCallback } from 'react'
 import Hls from 'hls.js'
+import type { ErrorData } from 'hls.js'
 import {
   Maximize2, Volume2, VolumeX, RefreshCw,
   Circle, AlertTriangle, Loader2, Stethoscope,
@@ -45,7 +46,7 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   UNKNOWN:                 { icon: <AlertTriangle size={16} />, label: 'Error desconocido',          color: 'text-surface-400' },
 }
 
-function classifyHlsError(data: Hls.errorData): CameraPlaybackErrorCode {
+function classifyHlsError(data: ErrorData): CameraPlaybackErrorCode {
   if (data.response?.code === 401) return 'RTSP_UNAUTHORIZED'
   if (data.response?.code === 404) return 'HLS_MANIFEST_NOT_FOUND'
   if (data.type === Hls.ErrorTypes.NETWORK_ERROR) return 'MEDIAMTX_NOT_READY'
