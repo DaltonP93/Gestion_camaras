@@ -52,11 +52,25 @@ export function touchSession(userId: string, cameraId: string) {
 }
 
 // Iniciar stream para un usuario
+interface StreamError {
+  code: string
+  message: string
+  details?: string
+}
+
+const HEALTH_STATUS_ERRORS: Record<string, StreamError> = {
+  RTSP_SUB_NOT_FOUND:    { code: 'RTSP_SUB_NOT_FOUND',    message: 'Substream RTSP no disponible',                          details: 'Substream /Streaming/Channels/502 devolvió 404' },
+  CODEC_UNSUPPORTED_HEVC:{ code: 'CODEC_UNSUPPORTED_HEVC', message: 'Codec HEVC/H.265 no compatible para reproducción web' },
+  AUTH_FAILED:           { code: 'AUTH_FAILED',            message: 'Credenciales inválidas en cámara' },
+  OFFLINE:               { code: 'OFFLINE',                message: 'Cámara offline' },
+  RTSP_MAIN_NOT_FOUND:   { code: 'RTSP_MAIN_NOT_FOUND',   message: 'Stream RTSP principal no disponible' },
+}
+
 export async function startStream(
   server: FastifyInstance,
   userId: string,
   cameraId: string,
-): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; error?: string }> {
+): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; error?: StreamError }> {
   // Buscar cámara en DB con NVR
   const camera = await server.prisma.camera.findUnique({
     where: { id: cameraId },
@@ -64,33 +78,34 @@ export async function startStream(
   })
 
   if (!camera || !camera.nvr) {
-    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: 'Cámara no encontrada' }
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_NOT_FOUND', message: 'Cámara no encontrada' } }
   }
 
   if (!camera.active) {
-    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: 'Cámara desactivada' }
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_DISABLED', message: 'Cámara desactivada' } }
   }
 
   // Rechazar cámaras con estado de salud bloqueante
   const healthStatus = (camera as any).streamHealthStatus as string | undefined
   if (healthStatus && BLOCKED_HEALTH_STATUSES.has(healthStatus)) {
+    const knownError = HEALTH_STATUS_ERRORS[healthStatus]
     return {
       hlsUrl: '',
       webrtcUrl: '',
       streamPath: '',
-      error: `Stream no disponible: ${healthStatus}`,
+      error: knownError ?? { code: healthStatus, message: `Stream no disponible: ${healthStatus}` },
     }
   }
 
   // Verificar límites
   const userSessions = getSessionsForUser(userId)
   if (userSessions.length >= MAX_STREAMS_PER_USER && !userSessions.some(s => s.cameraId === cameraId)) {
-    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: `Límite de ${MAX_STREAMS_PER_USER} streams por usuario alcanzado` }
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_REACHED', message: 'Límite de streams por usuario alcanzado' } }
   }
 
   const totalSessions = sessions.size
   if (totalSessions >= MAX_STREAMS_GLOBAL && !sessions.has(sessionKey(userId, cameraId))) {
-    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: `Límite global de ${MAX_STREAMS_GLOBAL} streams alcanzado` }
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado' } }
   }
 
   const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
@@ -103,7 +118,7 @@ export async function startStream(
       hlsUrl: '',
       webrtcUrl: '',
       streamPath: '',
-      error: 'Error al registrar stream en el servidor de medios',
+      error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar stream en el servidor de medios' },
     }
   }
 

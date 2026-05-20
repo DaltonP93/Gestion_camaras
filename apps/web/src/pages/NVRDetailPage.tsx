@@ -116,6 +116,21 @@ export function NVRDetailPage() {
     }
   }
 
+  const handleForceNamesSync = async () => {
+    if (!id) return
+    try {
+      setSyncing(true)
+      const result = await apiPost<{ log: any[] }>(`/nvrs/${id}/force-names-sync`)
+      const updated = result.log?.filter((e: any) => e.updated)?.length ?? result.log?.length ?? 0
+      toast.success(`Nombres sincronizados: ${updated} cámaras actualizadas`)
+      setCameras(null)
+    } catch {
+      toast.error('Error al sincronizar nombres')
+    } finally {
+      setSyncing(false)
+    }
+  }
+
   const handleReboot = async () => {
     if (!confirm('¿Confirmas reiniciar el NVR? El dispositivo quedará inaccesible por ~1 minuto.')) return
     try {
@@ -188,10 +203,16 @@ export function NVRDetailPage() {
         </div>
         <div className="flex items-center gap-2">
           {isSupervisor && (
-            <button onClick={handleSync} disabled={syncing} className="btn-secondary text-xs">
-              {syncing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-              {syncing ? 'Sincronizando...' : 'Sincronizar'}
-            </button>
+            <>
+              <button onClick={handleSync} disabled={syncing} className="btn-secondary text-xs">
+                {syncing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                {syncing ? 'Sincronizando...' : 'Sincronizar'}
+              </button>
+              <button onClick={handleForceNamesSync} disabled={syncing} className="btn-ghost text-xs" title="Forzar resincronización de nombres reales desde el NVR">
+                <RefreshCw size={11} />
+                Nombres
+              </button>
+            </>
           )}
           {isAdmin && (
             <button onClick={handleReboot} disabled={rebooting} className="btn-ghost text-xs text-red-400 hover:text-red-300">

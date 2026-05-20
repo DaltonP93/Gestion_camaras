@@ -253,14 +253,32 @@ export async function getNVRChannels(nvr: NVR): Promise<HikChannel[]> {
   try {
     const client = createHikClient(nvr)
     const res = await client.get('/ISAPI/System/Video/inputs/channels')
+    const data = res.data
 
-    const channelsData = res.data?.VideoInputChannelList?.VideoInputChannel
+    if (typeof data === 'string') {
+      const blocks = xmlGetAll(data, 'VideoInputChannel')
+      const channels: HikChannel[] = []
+      for (const block of blocks) {
+        const id = parseInt(xmlGet(block, 'id') || '0')
+        if (!id) continue
+        const name = xmlGet(block, 'customName') || xmlGet(block, 'name')
+        channels.push({
+          id,
+          name:    name || `Canal ${id}`,
+          online:  true,
+          rtspUrl: buildRtspUrl(nvr, id),
+        })
+      }
+      return channels
+    }
+
+    const channelsData = data?.VideoInputChannelList?.VideoInputChannel
     if (!channelsData) return []
     const channels = Array.isArray(channelsData) ? channelsData : [channelsData]
 
     return channels.map((ch: any) => ({
       id:     parseInt(ch.id),
-      name:   ch.name || `Canal ${ch.id}`,
+      name:   ch.customName || ch.name || `Canal ${ch.id}`,
       online: ch.connectionType !== 'N/A',
       rtspUrl: buildRtspUrl(nvr, parseInt(ch.id)),
     }))
@@ -276,11 +294,21 @@ export async function getNVRChannels(nvr: NVR): Promise<HikChannel[]> {
 
 // ─── Lista de cámaras IP conectadas (con nombres reales) ──────
 
-// Helper: decides whether a name looks like an auto-generated placeholder
+// Helper: decides whether a name looks like an auto-generated placeholder.
+// Only matches PURELY auto-generated names — real names like "Box 7" or "Ingreso UTI" return false.
 function isPlaceholderName(name: string): boolean {
-  if (!name) return true
-  // Matches patterns like "IPCamera01", "IPCamera 1", "Canal 1", "Camera1", etc.
-  return /^(IPCamera\s*\d*|Camera\s*\d*|Canal\s*\d*|D\d+)$/i.test(name.trim())
+  if (!name || !name.trim()) return true
+  const trimmed = name.trim()
+  // "IPCamera01", "IPCamera 1", "IPCamera" — purely auto-generated
+  if (/^IPCamera\s*\d*$/i.test(trimmed)) return true
+  // "Camera1", "Camera 01" — purely auto-generated
+  if (/^Camera\s*\d*$/i.test(trimmed)) return true
+  // "Canal 1", "Canal 01" — purely auto-generated
+  if (/^Canal\s*\d+$/i.test(trimmed)) return true
+  // "D1", "D12" — D followed by ONLY digits (end of string) — placeholder
+  // "D1 Box 7" — has real text after digits — NOT a placeholder
+  if (/^D\d+$/i.test(trimmed)) return true
+  return false
 }
 
 export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
@@ -368,9 +396,48 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     // VideoInput endpoint may not be available — continue with what we have
   }
 
-  // ── Step 3: Merge — prefer InputProxy data, use best available name ─
-  if (inputProxyMap.size === 0 && videoInputNames.size === 0) {
-    // Neither endpoint worked — fall back to getNVRChannels
+  // ── Step 3: Streaming channels — often have real camera names ─
+  const streamingChannelNames = new Map<number, string>()
+
+  try {
+    const res = await client.get('/ISAPI/Streaming/channels')
+    const data = res.data
+
+    if (typeof data === 'string') {
+      const blocks = xmlGetAll(data, 'StreamingChannel')
+      for (const block of blocks) {
+        const rawId = parseInt(xmlGet(block, 'id') || '0')
+        if (!rawId) continue
+        // id 101 = ch1, 202 = ch2, 1901 = ch19
+        const ch = Math.round(rawId / 100)
+        const channelName = xmlGet(block, 'channelName')
+        if (channelName && !streamingChannelNames.has(ch)) {
+          streamingChannelNames.set(ch, channelName)
+        }
+      }
+    } else {
+      const rawChannels = data?.StreamingChannelList?.StreamingChannel
+      if (rawChannels) {
+        const chList = Array.isArray(rawChannels) ? rawChannels : [rawChannels]
+        for (const sc of chList) {
+          const rawId = parseInt(sc.id || '0')
+          if (!rawId) continue
+          const ch = Math.round(rawId / 100)
+          const channelName = sc.channelName || ''
+          if (channelName && !streamingChannelNames.has(ch)) {
+            streamingChannelNames.set(ch, channelName)
+          }
+        }
+      }
+    }
+  } catch {
+    // Streaming channels endpoint not available — continue
+  }
+
+  // ── Step 4: Merge — prefer InputProxy data, use best available name ─
+  // Priority: InputProxy name > VideoInput name > Streaming channel name > placeholder fallback
+  if (inputProxyMap.size === 0 && videoInputNames.size === 0 && streamingChannelNames.size === 0) {
+    // No endpoint worked — fall back to getNVRChannels
     try {
       const fallback = await getNVRChannels(nvr)
       return fallback.map(ch => ({
@@ -388,17 +455,25 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     }
   }
 
-  // Build merged result from InputProxy entries (supplemented by VideoInput names)
+  // Build merged result from InputProxy entries (supplemented by VideoInput/Streaming names)
   const cameras: HikIpCamera[] = []
 
   for (const [ch, entry] of inputProxyMap.entries()) {
-    const inputProxyName = entry.name
-    const videoInputName = videoInputNames.get(ch) || ''
+    const inputProxyName   = entry.name
+    const videoInputName   = videoInputNames.get(ch) || ''
+    const streamingName    = streamingChannelNames.get(ch) || ''
 
-    // Prefer InputProxy name if it's not a placeholder; otherwise use VideoInput name
-    const bestName = !isPlaceholderName(inputProxyName)
-      ? inputProxyName
-      : (!isPlaceholderName(videoInputName) ? videoInputName : (inputProxyName || videoInputName || `Canal ${ch}`))
+    // Priority: InputProxy name > VideoInput name > Streaming channel name > placeholder fallback
+    let bestName: string
+    if (!isPlaceholderName(inputProxyName)) {
+      bestName = inputProxyName
+    } else if (!isPlaceholderName(videoInputName)) {
+      bestName = videoInputName
+    } else if (!isPlaceholderName(streamingName)) {
+      bestName = streamingName
+    } else {
+      bestName = inputProxyName || videoInputName || streamingName || `Canal ${ch}`
+    }
 
     cameras.push({
       channel:        ch,
@@ -412,20 +487,35 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     })
   }
 
-  // Add any VideoInput channels not covered by InputProxy
-  for (const [ch, name] of videoInputNames.entries()) {
-    if (!inputProxyMap.has(ch)) {
-      cameras.push({
-        channel:        ch,
-        channelCode:    `D${ch}`,
-        name:           name || `Canal ${ch}`,
-        ipAddress:      '',
-        protocol:       'HIKVISION',
-        managementPort: 8000,
-        securityStatus: '',
-        status:         'unknown',
-      })
+  // Collect all channel numbers seen in VideoInput or Streaming but not in InputProxy
+  const extraChannels = new Set<number>([
+    ...videoInputNames.keys(),
+    ...streamingChannelNames.keys(),
+  ])
+  for (const ch of extraChannels) {
+    if (inputProxyMap.has(ch)) continue
+    const videoInputName = videoInputNames.get(ch) || ''
+    const streamingName  = streamingChannelNames.get(ch) || ''
+
+    let bestName: string
+    if (!isPlaceholderName(videoInputName)) {
+      bestName = videoInputName
+    } else if (!isPlaceholderName(streamingName)) {
+      bestName = streamingName
+    } else {
+      bestName = videoInputName || streamingName || `Canal ${ch}`
     }
+
+    cameras.push({
+      channel:        ch,
+      channelCode:    `D${ch}`,
+      name:           bestName,
+      ipAddress:      '',
+      protocol:       'HIKVISION',
+      managementPort: 8000,
+      securityStatus: '',
+      status:         'unknown',
+    })
   }
 
   cameras.sort((a, b) => a.channel - b.channel)

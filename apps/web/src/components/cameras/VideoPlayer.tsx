@@ -60,6 +60,7 @@ interface Props {
   isRecording?: boolean
   onFullscreen?: () => void
   onDiagnostic?: (cameraId: string) => void
+  onStreamError?: (cameraId: string, err: CameraPlaybackError) => void
   className?: string
   error?: boolean
   playbackError?: CameraPlaybackError
@@ -74,6 +75,7 @@ export function VideoPlayer({
   isRecording,
   onFullscreen,
   onDiagnostic,
+  onStreamError,
   className,
   error,
   playbackError: externalError,
@@ -121,8 +123,10 @@ export function VideoPlayer({
         // Timeout si no llegan frames tras 15s
         firstFrameTimer.current = setTimeout(() => {
           if (status !== 'playing') {
+            const err: CameraPlaybackError = { code: 'PLAYER_TIMEOUT', message: 'Sin frames tras 15 segundos', technicalDetail: hlsUrl }
             setStatus('error')
-            setInternalError({ code: 'PLAYER_TIMEOUT', message: 'Sin frames tras 15 segundos', technicalDetail: hlsUrl })
+            setInternalError(err)
+            if (cameraId) onStreamError?.(cameraId, err)
           }
         }, 15000)
       })
@@ -136,28 +140,50 @@ export function VideoPlayer({
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
           const errorCode = classifyHlsError(data)
+
+          // 401 — session expired, no retry needed
+          if (data.response?.code === 401) {
+            const err: CameraPlaybackError = {
+              code: 'RTSP_UNAUTHORIZED',
+              message: 'Sesión expirada (401 Unauthorized)',
+              technicalDetail: `URL: ${hlsUrl}`,
+            }
+            setStatus('error')
+            setInternalError(err)
+            if (cameraId) onStreamError?.(cameraId, err)
+            return
+          }
+
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            // 404 → max 2 retries (stream starting up); other network errors → 5 retries
+            const is404 = data.response?.code === 404
+            const maxRetries = is404 ? 2 : 5
             setRetryCount((r) => {
-              if (r >= 5) {
-                setStatus('error')
-                setInternalError({
+              if (r >= maxRetries) {
+                const err: CameraPlaybackError = {
                   code: errorCode,
-                  message: 'Sin respuesta del servidor de streaming',
-                  technicalDetail: `Fatal network error. URL: ${hlsUrl}`,
-                })
+                  message: is404 ? 'Stream no disponible en el servidor' : 'Sin respuesta del servidor de streaming',
+                  technicalDetail: `${data.type}/${data.details}. URL: ${hlsUrl}`,
+                }
+                setStatus('error')
+                setInternalError(err)
+                if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              // Reintento con backoff exponencial — no reinicializar periódicamente
-              setTimeout(() => hls.startLoad(), 3000 * (r + 1))
+              // Retry via startLoad — keeps HLS instance alive, no full recreate
+              const delay = is404 ? 4000 : 3000 * (r + 1)
+              setTimeout(() => hls.startLoad(), delay)
               return r + 1
             })
           } else {
-            setStatus('error')
-            setInternalError({
+            const err: CameraPlaybackError = {
               code: errorCode,
               message: data.reason || 'Error fatal del player',
               technicalDetail: `${data.type} / ${data.details}`,
-            })
+            }
+            setStatus('error')
+            setInternalError(err)
+            if (cameraId) onStreamError?.(cameraId, err)
           }
         }
       })

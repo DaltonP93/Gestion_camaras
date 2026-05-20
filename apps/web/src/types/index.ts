@@ -2,6 +2,17 @@
 
 export type Role = 'ADMIN' | 'SUPERVISOR' | 'OPERATOR' | 'AUDITOR'
 
+export type StreamHealthStatus =
+  | 'HEALTHY'
+  | 'RTSP_SUB_NOT_FOUND'
+  | 'RTSP_MAIN_NOT_FOUND'
+  | 'CODEC_UNSUPPORTED_HEVC'
+  | 'STREAM_UNSTABLE'
+  | 'MEDIA_SERVER_ERROR'
+  | 'AUTH_FAILED'
+  | 'OFFLINE'
+  | 'UNKNOWN'
+
 export interface User {
   id: string
   username: string
@@ -119,6 +130,8 @@ export interface Camera {
   lastRtspCheckAt?: string
   lastRtspError?: string
   consecutiveFailures?: number
+  streamHealthStatus?: StreamHealthStatus
+  onlineInNvr?: boolean
   rtspUrl?: string
   hlsPath?: string
   ptzEnabled: boolean
