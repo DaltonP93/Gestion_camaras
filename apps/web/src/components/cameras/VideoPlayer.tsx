@@ -140,22 +140,39 @@ export function VideoPlayer({
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
           const errorCode = classifyHlsError(data)
+
+          // 401 — session expired, no retry needed
+          if (data.response?.code === 401) {
+            const err: CameraPlaybackError = {
+              code: 'RTSP_UNAUTHORIZED',
+              message: 'Sesión expirada (401 Unauthorized)',
+              technicalDetail: `URL: ${hlsUrl}`,
+            }
+            setStatus('error')
+            setInternalError(err)
+            if (cameraId) onStreamError?.(cameraId, err)
+            return
+          }
+
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            // 404 → max 2 retries (stream starting up); other network errors → 5 retries
+            const is404 = data.response?.code === 404
+            const maxRetries = is404 ? 2 : 5
             setRetryCount((r) => {
-              if (r >= 5) {
+              if (r >= maxRetries) {
                 const err: CameraPlaybackError = {
                   code: errorCode,
-                  message: 'Sin respuesta del servidor de streaming',
-                  technicalDetail: `Fatal network error. URL: ${hlsUrl}`,
+                  message: is404 ? 'Stream no disponible en el servidor' : 'Sin respuesta del servidor de streaming',
+                  technicalDetail: `${data.type}/${data.details}. URL: ${hlsUrl}`,
                 }
                 setStatus('error')
                 setInternalError(err)
-                // Notify parent so it can release the backend session
                 if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              // Exponential backoff retry via startLoad (keeps HLS session)
-              setTimeout(() => hls.startLoad(), 3000 * (r + 1))
+              // Retry via startLoad — keeps HLS instance alive, no full recreate
+              const delay = is404 ? 4000 : 3000 * (r + 1)
+              setTimeout(() => hls.startLoad(), delay)
               return r + 1
             })
           } else {
@@ -166,7 +183,6 @@ export function VideoPlayer({
             }
             setStatus('error')
             setInternalError(err)
-            // Notify parent on all fatal non-network errors (401, 404, media errors)
             if (cameraId) onStreamError?.(cameraId, err)
           }
         }

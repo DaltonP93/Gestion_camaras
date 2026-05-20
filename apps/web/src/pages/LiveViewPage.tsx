@@ -145,6 +145,42 @@ export function LiveViewPage() {
     }
   }, [clearStaggerTimers])
 
+  // ─── Refresh visible streams (after lock/focus/fullscreen) ──
+  const refreshVisibleStreams = useCallback(async (
+    reason: 'visibilitychange' | 'fullscreen-exit' | 'manual-retry'
+  ) => {
+    clearStaggerTimers()
+    const allActive = Array.from(activeSessions.current)
+    if (allActive.length === 0 && reason !== 'manual-retry') return
+
+    // Stop all active sessions
+    await Promise.allSettled(
+      allActive.map(id => apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {}))
+    )
+    activeSessions.current.clear()
+    pendingStarts.current.clear()
+    setStreams({})
+    setStreamErrors({})
+    setLoadingStreams({})
+
+    // Give MediaMTX a moment to release connections before reconnecting
+    await new Promise(r => setTimeout(r, 400))
+
+    // Re-start visible cameras with stagger
+    startVisibleStreams(filteredCameras)
+  }, [clearStaggerTimers, filteredCameras]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── Page visibility: resume streams after lock/minimize ────
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && activeSessions.current.size > 0) {
+        refreshVisibleStreams('visibilitychange')
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => document.removeEventListener('visibilitychange', handleVisibility)
+  }, [refreshVisibleStreams])
+
   // ─── Load a single stream ────────────────────────────────────
   const loadStream = useCallback(async (camera: Camera): Promise<void> => {
     if (streams[camera.id] || pendingStarts.current.has(camera.id)) return
@@ -171,22 +207,31 @@ export function LiveViewPage() {
         return next
       })
     } catch (err: any) {
-      const msg: string = err?.response?.data?.message || ''
-      let code: CameraPlaybackError['code'] = 'UNKNOWN'
-      let message = 'No se pudo obtener el stream'
+      const body = err?.response?.data || {}
+      // Backend now returns { error: "CODE", message: "...", details: "..." }
+      const code: string = body.error || ''
+      const rawMsg: string = body.message || body.error || ''
 
-      if (msg.includes('offline') || msg.includes('NVR')) { code = 'NVR_OFFLINE'; message = 'NVR offline o inaccesible' }
-      else if (msg.includes('401') || msg.includes('auth') || msg.includes('credencial')) { code = 'AUTH_FAILED'; message = 'Credenciales inválidas' }
-      else if (msg.includes('timeout')) { code = 'RTSP_TIMEOUT'; message = 'RTSP timeout' }
-      else if (msg.includes('canal') || msg.includes('channel') || msg.includes('404')) { code = 'RTSP_CHANNEL_NOT_FOUND'; message = 'Canal no encontrado' }
-      else if (msg.includes('HEVC') || msg.includes('H.265')) { code = 'CODEC_UNSUPPORTED'; message = 'Codec HEVC no soportado' }
-      else if (msg.includes('Límite')) {
-        // Limit hit — try to cleanup non-visible sessions and retry once
+      if (code === 'STREAM_LIMIT_REACHED' || code === 'STREAM_LIMIT_GLOBAL' || rawMsg.includes('Límite')) {
         await handleLimitHit(camera)
         return
       }
 
-      setStreamErrors(prev => ({ ...prev, [camera.id]: { code, message, technicalDetail: msg } }))
+      const errCodeMap: Record<string, CameraPlaybackError['code']> = {
+        RTSP_SUB_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
+        RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
+        CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
+        AUTH_FAILED:            'AUTH_FAILED',
+        OFFLINE:                'CAMERA_OFFLINE',
+        MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
+        CAMERA_NOT_FOUND:       'UNKNOWN',
+        CAMERA_DISABLED:        'UNKNOWN',
+      }
+
+      const playbackCode: CameraPlaybackError['code'] = errCodeMap[code] || 'UNKNOWN'
+      const message = rawMsg || 'No se pudo obtener el stream'
+
+      setStreamErrors(prev => ({ ...prev, [camera.id]: { code: playbackCode, message, technicalDetail: body.details } }))
     } finally {
       pendingStarts.current.delete(camera.id)
       setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
@@ -320,8 +365,42 @@ export function LiveViewPage() {
       apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
       activeSessions.current.delete(cameraId)
     }
-    setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
-  }, [])
+
+    if (err.code === 'RTSP_UNAUTHORIZED') {
+      // JWT expired or session invalidated — auto-restart after short delay
+      setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+      setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+      const cam = cameras.find(c => c.id === cameraId)
+      if (cam) setTimeout(() => loadStream(cam), 2000)
+    } else {
+      setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
+    }
+  }, [cameras, loadStream])
+
+  // ─── Exit focus/fullscreen: refresh grid streams ────────────
+  const handleExitFocus = useCallback(async () => {
+    setFocusCamera(null)
+    // Grid VideoPlayer instances were unmounted while in focus view.
+    // Their HLS sessions may have expired. Refresh them.
+    const gridIds = filteredCameras.map(c => c.id)
+    const staleIds = gridIds.filter(id => streams[id])
+    if (staleIds.length > 0) {
+      await Promise.allSettled(
+        staleIds.map(id => apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {}))
+      )
+      staleIds.forEach(id => {
+        activeSessions.current.delete(id)
+        pendingStarts.current.delete(id)
+      })
+      setStreams(prev => {
+        const n = { ...prev }
+        staleIds.forEach(id => delete n[id])
+        return n
+      })
+      await new Promise(r => setTimeout(r, 300))
+      startVisibleStreams(filteredCameras)
+    }
+  }, [filteredCameras, streams, startVisibleStreams]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const currentGrid   = GRID_OPTIONS.find(g => g.value === gridLayout) || GRID_OPTIONS[2]
   const totalForFilter = allFiltered.length
@@ -411,7 +490,7 @@ export function LiveViewPage() {
                     cameraName={`${cam.nvr?.name} — ${cam.name}`}
                     cameraId={cam.id}
                     isRecording={cam.online}
-                    onFullscreen={() => setFocusCamera(null)}
+                    onFullscreen={handleExitFocus}
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
                     className="flex-1 h-full"
