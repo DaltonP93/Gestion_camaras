@@ -522,6 +522,107 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
   return cameras
 }
 
+// ─── Debug: raw name sources from each ISAPI endpoint ─────────
+// Returns raw intermediate data so admins can diagnose why names aren't syncing.
+export async function debugGetCameraNameSources(nvr: NVR): Promise<{
+  inputProxy:  { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
+  videoInput:  { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
+  streaming:   { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
+}> {
+  const client = createHikClient(nvr)
+
+  // InputProxy
+  const inputProxy = { ok: false, count: 0, channels: [] as { ch: number; name: string }[], error: undefined as string | undefined }
+  try {
+    const res = await client.get('/ISAPI/ContentMgmt/InputProxy/channels')
+    const data = res.data
+    if (typeof data === 'string') {
+      const blocks = xmlGetAll(data, 'InputProxyChannel')
+      for (const block of blocks) {
+        const ch = parseInt(xmlGet(block, 'id') || '0')
+        const name = xmlGet(block, 'name')
+        if (ch) inputProxy.channels.push({ ch, name })
+      }
+    } else {
+      const raw = data?.InputProxyChannelList?.InputProxyChannel
+      if (raw) {
+        const list = Array.isArray(raw) ? raw : [raw]
+        for (const item of list) {
+          const ch = parseInt(item.id || item.channelNo || '0')
+          const name = item.name || ''
+          if (ch) inputProxy.channels.push({ ch, name })
+        }
+      }
+    }
+    inputProxy.ok = true
+    inputProxy.count = inputProxy.channels.length
+  } catch (e: any) {
+    inputProxy.error = e?.response?.status ? `HTTP ${e.response.status}` : (e?.message || 'Error')
+  }
+
+  // VideoInput
+  const videoInput = { ok: false, count: 0, channels: [] as { ch: number; name: string }[], error: undefined as string | undefined }
+  try {
+    const res = await client.get('/ISAPI/System/Video/inputs/channels')
+    const data = res.data
+    if (typeof data === 'string') {
+      const blocks = xmlGetAll(data, 'VideoInputChannel')
+      for (const block of blocks) {
+        const ch = parseInt(xmlGet(block, 'id') || xmlGet(block, 'inputPort') || '0')
+        const name = xmlGet(block, 'customName') || xmlGet(block, 'name')
+        if (ch) videoInput.channels.push({ ch, name })
+      }
+    } else {
+      const raw = data?.VideoInputChannelList?.VideoInputChannel
+      if (raw) {
+        const list = Array.isArray(raw) ? raw : [raw]
+        for (const item of list) {
+          const ch = parseInt(item.id || item.inputPort || '0')
+          const name = item.customName || item.name || ''
+          if (ch) videoInput.channels.push({ ch, name })
+        }
+      }
+    }
+    videoInput.ok = true
+    videoInput.count = videoInput.channels.length
+  } catch (e: any) {
+    videoInput.error = e?.response?.status ? `HTTP ${e.response.status}` : (e?.message || 'Error')
+  }
+
+  // Streaming channels
+  const streaming = { ok: false, count: 0, channels: [] as { ch: number; name: string }[], error: undefined as string | undefined }
+  try {
+    const res = await client.get('/ISAPI/Streaming/channels')
+    const data = res.data
+    if (typeof data === 'string') {
+      const blocks = xmlGetAll(data, 'StreamingChannel')
+      for (const block of blocks) {
+        const rawId = parseInt(xmlGet(block, 'id') || '0')
+        if (!rawId) continue
+        const ch = Math.round(rawId / 100)
+        const name = xmlGet(block, 'channelName')
+        streaming.channels.push({ ch, name })
+      }
+    } else {
+      const raw = data?.StreamingChannelList?.StreamingChannel
+      if (raw) {
+        const list = Array.isArray(raw) ? raw : [raw]
+        for (const item of list) {
+          const rawId = parseInt(item.id || '0')
+          if (!rawId) continue
+          streaming.channels.push({ ch: Math.round(rawId / 100), name: item.channelName || '' })
+        }
+      }
+    }
+    streaming.ok = true
+    streaming.count = streaming.channels.length
+  } catch (e: any) {
+    streaming.error = e?.response?.status ? `HTTP ${e.response.status}` : (e?.message || 'Error')
+  }
+
+  return { inputProxy, videoInput, streaming }
+}
+
 // ─── Almacenamiento / HDDs ────────────────────────────────────
 
 export async function getStorageInfo(nvr: NVR): Promise<HikStorageDisk[]> {

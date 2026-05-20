@@ -120,12 +120,18 @@ export function NVRDetailPage() {
     if (!id) return
     try {
       setSyncing(true)
-      const result = await apiPost<{ log: any[] }>(`/nvrs/${id}/force-names-sync`)
-      const updated = result.log?.filter((e: any) => e.updated)?.length ?? result.log?.length ?? 0
-      toast.success(`Nombres sincronizados: ${updated} cámaras actualizadas`)
+      const result = await apiPost<{ log: any[]; synced: number; debug?: any }>(`/nvrs/${id}/force-names-sync`)
+      const updated = result.synced ?? result.log?.length ?? 0
+      const dbg = result.debug
+      const debugSummary = dbg
+        ? ` | InputProxy: ${dbg.inputProxy?.count ?? '?'} canales, VideoInput: ${dbg.videoInput?.count ?? '?'}, Streaming: ${dbg.streaming?.count ?? '?'}`
+        : ''
+      toast.success(`Nombres sincronizados: ${updated} cámaras${debugSummary}`)
+      if (dbg) console.info('[force-names-sync] debug:', JSON.stringify(dbg, null, 2))
       setCameras(null)
-    } catch {
+    } catch (e: any) {
       toast.error('Error al sincronizar nombres')
+      console.error('[force-names-sync] error:', e)
     } finally {
       setSyncing(false)
     }
