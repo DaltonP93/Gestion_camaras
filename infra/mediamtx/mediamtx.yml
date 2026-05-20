@@ -53,7 +53,6 @@ hlsSegmentCount: 3
 hlsSegmentDuration: 2s
 hlsSegmentMaxSize: 50MB
 hlsEncryption: no
-hlsCookies: no
 hlsAllowOrigin: "*"
 hlsAlwaysRemux: no
 

@@ -14,6 +14,14 @@ const MAX_STREAMS_PER_USER = Number(process.env.MAX_STREAMS_PER_USER || 16)
 const MAX_STREAMS_GLOBAL   = Number(process.env.MAX_STREAMS_GLOBAL   || 50)
 const STREAM_IDLE_TIMEOUT  = Number(process.env.STREAM_IDLE_TIMEOUT  || 90)  // segundos
 
+// Estados de salud que impiden el inicio del stream
+const BLOCKED_HEALTH_STATUSES = new Set([
+  'RTSP_SUB_NOT_FOUND',
+  'CODEC_UNSUPPORTED_HEVC',
+  'AUTH_FAILED',
+  'OFFLINE',
+])
+
 interface StreamSession {
   cameraId: string
   userId: string
@@ -63,6 +71,17 @@ export async function startStream(
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: 'Cámara desactivada' }
   }
 
+  // Rechazar cámaras con estado de salud bloqueante
+  const healthStatus = (camera as any).streamHealthStatus as string | undefined
+  if (healthStatus && BLOCKED_HEALTH_STATUSES.has(healthStatus)) {
+    return {
+      hlsUrl: '',
+      webrtcUrl: '',
+      streamPath: '',
+      error: `Stream no disponible: ${healthStatus}`,
+    }
+  }
+
   // Verificar límites
   const userSessions = getSessionsForUser(userId)
   if (userSessions.length >= MAX_STREAMS_PER_USER && !userSessions.some(s => s.cameraId === cameraId)) {
@@ -77,10 +96,18 @@ export async function startStream(
   const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
   const streamPath = getStreamPath(nvr as NVR, camera as Camera)
 
-  // Registrar en MediaMTX si no existe
-  await publishStream(nvr as NVR, camera as Camera)
+  // Registrar en MediaMTX — si falla, NO registrar sesión
+  const published = await publishStream(nvr as NVR, camera as Camera)
+  if (!published) {
+    return {
+      hlsUrl: '',
+      webrtcUrl: '',
+      streamPath: '',
+      error: 'Error al registrar stream en el servidor de medios',
+    }
+  }
 
-  // Registrar sesión
+  // Registrar sesión solo si publishStream tuvo éxito
   const key = sessionKey(userId, cameraId)
   sessions.set(key, {
     cameraId,
@@ -115,6 +142,35 @@ export async function stopStream(
   }
 }
 
+// Limpiar todas las sesiones de un usuario y liberar streams sin otros viewers
+export async function cleanupUserSessions(
+  server: FastifyInstance,
+  userId: string,
+): Promise<number> {
+  const userSessions = getSessionsForUser(userId)
+  let removed = 0
+
+  for (const session of userSessions) {
+    const key = sessionKey(userId, session.cameraId)
+    sessions.delete(key)
+    removed++
+
+    // Si nadie más está mirando esta cámara, remover el stream de MediaMTX
+    const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === session.cameraId)
+    if (!othersWatching) {
+      const camera = await server.prisma.camera.findUnique({
+        where: { id: session.cameraId },
+        include: { nvr: true },
+      })
+      if (camera?.nvr) {
+        removeStream(camera.nvr, camera).catch(() => {})
+      }
+    }
+  }
+
+  return removed
+}
+
 // Limpiar sesiones inactivas (llamar desde un cron)
 export async function cleanupIdleSessions(server: FastifyInstance): Promise<number> {
   const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
@@ -129,6 +185,23 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
   }
 
   return removed
+}
+
+// Resumen de todas las sesiones activas (para panel admin)
+export function getAdminSessionsSummary(): Array<{
+  cameraId: string
+  userId: string
+  streamPath: string
+  startedAt: Date
+  lastSeenAt: Date
+}> {
+  return Array.from(sessions.values()).map(s => ({
+    cameraId:   s.cameraId,
+    userId:     s.userId,
+    streamPath: s.streamPath,
+    startedAt:  s.startedAt,
+    lastSeenAt: s.lastSeenAt,
+  }))
 }
 
 // Estado global de streams (para panel admin)

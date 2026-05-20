@@ -7,6 +7,7 @@ import {
   adoptIpCamera, getFreeChannels,
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
+import { validateAndUpdateCameraHealth } from '../services/stream-validator'
 import { AuditAction } from '../services/audit'
 import CryptoJS from 'crypto-js'
 
@@ -373,11 +374,28 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       } catch {}
     }
 
-    // 7. Registrar streams en MediaMTX
-    const cameras = await server.prisma.camera.findMany({ where: { nvrId: id, active: true } })
-    const streamResult = await publishAllStreams(nvrDec as any, cameras)
-    result.synced = streamResult.success
-    result.failed = streamResult.failed
+    // 7. Trigger async RTSP health check for cameras that need it (fire and forget)
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
+    const camerasToProbe = await server.prisma.camera.findMany({
+      where: {
+        nvrId: id,
+        active: true,
+        OR: [
+          { lastRtspCheckAt: null },
+          { lastRtspCheckAt: { lt: oneHourAgo } },
+        ],
+      },
+      include: { nvr: true },
+    })
+
+    if (camerasToProbe.length > 0) {
+      Promise.all(
+        camerasToProbe.map(cam =>
+          validateAndUpdateCameraHealth(server.prisma, { ...cam.nvr, password: decryptPassword(cam.nvr.password) } as any, cam as any)
+            .catch(() => {})
+        )
+      ).catch(() => {})
+    }
 
     await AuditAction(server.prisma, request.user.sub, 'NVR_SYNCED', id, request, result)
 
@@ -396,6 +414,73 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const result   = await publishAllStreams(nvrDec as any, cameras)
 
     return reply.send({ success: true, synced: result.success, failed: result.failed, total: cameras.length })
+  })
+
+  // POST /api/nvrs/:id/force-names-sync — Forzar sincronización de nombres reales de cámaras
+  server.post('/:id/force-names-sync', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
+
+    // Obtener nombres desde ambos endpoints
+    const [ipCams, nvrcChannels] = await Promise.all([
+      getIpCameraList(nvrDec as any),
+      getNVRChannels(nvrDec as any).catch(() => [] as Awaited<ReturnType<typeof getNVRChannels>>),
+    ])
+
+    // Build map of channel → name from NVRChannels (VideoInput names)
+    const videoInputNames = new Map<number, string>()
+    for (const ch of nvrcChannels) {
+      if (ch.name) videoInputNames.set(ch.id, ch.name)
+    }
+
+    const syncLog: Array<{
+      channel: number
+      channelCode: string
+      name: string
+      ipAddress: string
+      protocol: string
+      source: 'input_proxy' | 'video_input' | 'merged'
+    }> = []
+
+    for (const cam of ipCams) {
+      const videoName = videoInputNames.get(cam.channel) || ''
+
+      // Determine best name and source
+      const isPlaceholder = (n: string) => !n || /^(IPCamera\s*\d*|Camera\s*\d*|Canal\s*\d*|D\d+)$/i.test(n.trim())
+      let bestName = cam.name
+      let source: 'input_proxy' | 'video_input' | 'merged' = 'input_proxy'
+
+      if (isPlaceholder(cam.name) && !isPlaceholder(videoName)) {
+        bestName = videoName
+        source = 'video_input'
+      } else if (!isPlaceholder(cam.name) && !isPlaceholder(videoName) && cam.name !== videoName) {
+        // Both have real names — keep InputProxy name but log as merged
+        source = 'merged'
+      }
+
+      // Update DB
+      await server.prisma.camera.updateMany({
+        where: { nvrId: id, channel: cam.channel },
+        data: { name: bestName, lastSyncAt: new Date() },
+      })
+
+      syncLog.push({
+        channel:     cam.channel,
+        channelCode: cam.channelCode,
+        name:        bestName,
+        ipAddress:   cam.ipAddress,
+        protocol:    cam.protocol,
+        source,
+      })
+    }
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_NAMES_SYNCED', id, request, { count: syncLog.length })
+
+    return reply.send({ success: true, synced: syncLog.length, log: syncLog })
   })
 
   // POST /api/nvrs/:id/reboot — Reiniciar NVR

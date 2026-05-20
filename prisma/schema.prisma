@@ -149,6 +149,10 @@ model Camera {
   lastRtspError       String?
   consecutiveFailures Int       @default(0)
 
+  // Estado de salud del stream
+  streamHealthStatus  String    @default("UNKNOWN")
+  onlineInNvr         Boolean?
+
   // Legado / compatibilidad
   rtspUrl     String?
   hlsPath     String?
