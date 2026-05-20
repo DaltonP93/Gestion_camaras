@@ -2,9 +2,10 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus } from '../services/stream'
-import { startStream, stopStream, touchSession } from '../services/stream-manager'
+import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary } from '../services/stream-manager'
 import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
+import { validateAndUpdateCameraHealth } from '../services/stream-validator'
 import { AuditAction } from '../services/audit'
 import CryptoJS from 'crypto-js'
 
@@ -288,7 +289,19 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const result = await startStream(server, user.sub, id)
-    if (result.error) return reply.status(400).send({ message: result.error })
+    if (result.error) {
+      // Si el error es del servidor de medios (no de límites ni de estado de salud),
+      // marcar la cámara como MEDIA_SERVER_ERROR
+      const isLimitError = result.error.includes('Límite')
+      const isHealthError = result.error.includes('Stream no disponible:')
+      if (!isLimitError && !isHealthError) {
+        await server.prisma.camera.update({
+          where: { id },
+          data: { streamHealthStatus: 'MEDIA_SERVER_ERROR' } as any,
+        }).catch(() => {})
+      }
+      return reply.status(400).send({ message: result.error })
+    }
 
     const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
     return reply.send({
@@ -299,6 +312,19 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       channel:    camera?.channel ?? 0,
       nvrName:    camera?.nvr?.name ?? '',
     })
+  })
+
+  // POST /api/cameras/cleanup-my-sessions — Limpiar sesiones del usuario actual
+  server.post('/cleanup-my-sessions', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const user = request.user
+    const cleaned = await cleanupUserSessions(server, user.sub)
+    return reply.send({ cleaned })
+  })
+
+  // GET /api/cameras/stream-sessions — Resumen de sesiones activas (solo ADMIN)
+  server.get('/stream-sessions', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const sessions = getAdminSessionsSummary()
+    return reply.send(sessions)
   })
 
   // POST /api/cameras/:id/stop-stream — Notificar que el usuario dejó de ver
@@ -315,6 +341,28 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const user = request.user
     touchSession(user.sub, id)
     return reply.send({ ok: true })
+  })
+
+  // POST /api/cameras/:id/validate-stream — Validar salud RTSP y actualizar streamHealthStatus
+  server.post('/:id/validate-stream', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+
+    const healthStatus = await validateAndUpdateCameraHealth(server.prisma, camera.nvr as any, camera as any)
+
+    const updated = await server.prisma.camera.findUnique({ where: { id } })
+
+    return reply.send({
+      cameraId: id,
+      streamHealthStatus: healthStatus,
+      rtspSubOk:    (updated as any)?.rtspSubOk ?? null,
+      subCodec:     (updated as any)?.subCodec ?? null,
+      subResolution:(updated as any)?.subResolution ?? null,
+      lastRtspCheckAt: (updated as any)?.lastRtspCheckAt ?? null,
+      lastRtspError:   (updated as any)?.lastRtspError ?? null,
+    })
   })
 
   // PUT /api/cameras/:id — Actualizar cámara
