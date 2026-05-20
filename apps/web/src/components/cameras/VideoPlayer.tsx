@@ -60,6 +60,7 @@ interface Props {
   isRecording?: boolean
   onFullscreen?: () => void
   onDiagnostic?: (cameraId: string) => void
+  onStreamError?: (cameraId: string, err: CameraPlaybackError) => void
   className?: string
   error?: boolean
   playbackError?: CameraPlaybackError
@@ -74,6 +75,7 @@ export function VideoPlayer({
   isRecording,
   onFullscreen,
   onDiagnostic,
+  onStreamError,
   className,
   error,
   playbackError: externalError,
@@ -121,8 +123,10 @@ export function VideoPlayer({
         // Timeout si no llegan frames tras 15s
         firstFrameTimer.current = setTimeout(() => {
           if (status !== 'playing') {
+            const err: CameraPlaybackError = { code: 'PLAYER_TIMEOUT', message: 'Sin frames tras 15 segundos', technicalDetail: hlsUrl }
             setStatus('error')
-            setInternalError({ code: 'PLAYER_TIMEOUT', message: 'Sin frames tras 15 segundos', technicalDetail: hlsUrl })
+            setInternalError(err)
+            if (cameraId) onStreamError?.(cameraId, err)
           }
         }, 15000)
       })
@@ -139,25 +143,31 @@ export function VideoPlayer({
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             setRetryCount((r) => {
               if (r >= 5) {
-                setStatus('error')
-                setInternalError({
+                const err: CameraPlaybackError = {
                   code: errorCode,
                   message: 'Sin respuesta del servidor de streaming',
                   technicalDetail: `Fatal network error. URL: ${hlsUrl}`,
-                })
+                }
+                setStatus('error')
+                setInternalError(err)
+                // Notify parent so it can release the backend session
+                if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              // Reintento con backoff exponencial — no reinicializar periódicamente
+              // Exponential backoff retry via startLoad (keeps HLS session)
               setTimeout(() => hls.startLoad(), 3000 * (r + 1))
               return r + 1
             })
           } else {
-            setStatus('error')
-            setInternalError({
+            const err: CameraPlaybackError = {
               code: errorCode,
               message: data.reason || 'Error fatal del player',
               technicalDetail: `${data.type} / ${data.details}`,
-            })
+            }
+            setStatus('error')
+            setInternalError(err)
+            // Notify parent on all fatal non-network errors (401, 404, media errors)
+            if (cameraId) onStreamError?.(cameraId, err)
           }
         }
       })
