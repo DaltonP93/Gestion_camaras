@@ -100,13 +100,16 @@ export function VideoPlayer({
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
-        lowLatencyMode: true,
+        lowLatencyMode: false,
         backBufferLength: 30,
         maxBufferLength: 60,
         liveSyncDurationCount: 3,
         liveMaxLatencyDurationCount: 10,
         fragLoadingTimeOut: 10000,
         manifestLoadingTimeOut: 10000,
+        xhrSetup: (xhr) => {
+          xhr.withCredentials = true
+        },
       })
 
       hlsRef.current = hls
@@ -144,7 +147,8 @@ export function VideoPlayer({
                 })
                 return r
               }
-              setTimeout(() => initPlayer(), 4000)
+              // Reintento con backoff exponencial — no reinicializar periódicamente
+              setTimeout(() => hls.startLoad(), 3000 * (r + 1))
               return r + 1
             })
           } else {
@@ -158,6 +162,7 @@ export function VideoPlayer({
         }
       })
     } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari nativo (no usa xhrSetup, las cookies se envían automáticamente)
       videoRef.current.src = hlsUrl
       videoRef.current.addEventListener('loadedmetadata', () => {
         videoRef.current?.play()
@@ -171,7 +176,8 @@ export function VideoPlayer({
       setStatus('error')
       setInternalError({ code: 'UNKNOWN', message: 'Navegador no soporta HLS' })
     }
-  }, [hlsUrl, retryCount])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hlsUrl])
 
   useEffect(() => {
     if (error || externalError) {
@@ -183,13 +189,12 @@ export function VideoPlayer({
       setStatus('loading')
       return
     }
-    const timer = setTimeout(() => initPlayer(), 1500)
+    initPlayer()
     return () => {
-      clearTimeout(timer)
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
       hlsRef.current?.destroy()
     }
-  }, [hlsUrl, error])
+  }, [hlsUrl, error, initPlayer])
 
   const handleRetry = () => {
     setRetryCount(0)
