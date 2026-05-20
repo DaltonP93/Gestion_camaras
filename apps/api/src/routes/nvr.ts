@@ -345,7 +345,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    // Si no hay cámaras IP del NVR, crear entradas genéricas si no existen
+    // Si no hay cámaras IP del NVR, intentar actualizar nombres desde VideoInput o crear entradas genéricas
     if (ipCams.length === 0) {
       const existing = await server.prisma.camera.count({ where: { nvrId: id } })
       if (existing === 0) {
@@ -358,6 +358,20 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             result.cameras++
           } catch {}
         }
+      } else {
+        // Try to get real names from VideoInput and update existing cameras
+        try {
+          const channels = await getNVRChannels(nvrDec as any)
+          for (const ch of channels) {
+            const isGenericName = !ch.name || /^(Canal\s*\d+|D\d+|IPCamera\s*\d*|Camera\s*\d*)$/i.test(ch.name.trim())
+            if (!isGenericName) {
+              await server.prisma.camera.updateMany({
+                where: { nvrId: id, channel: ch.id },
+                data: { name: ch.name },
+              })
+            }
+          }
+        } catch {}
       }
     }
 
