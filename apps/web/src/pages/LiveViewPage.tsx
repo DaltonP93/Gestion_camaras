@@ -15,7 +15,7 @@ import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus } from '@/types'
 
 // ─── Stagger delay per layout ────────────────────────────────
-const STAGGER_MS: Record<GridLayout, number> = { 1: 0, 4: 250, 9: 400, 16: 500 }
+const STAGGER_MS: Record<GridLayout, number> = { 1: 0, 4: 250, 9: 400, 16: 500, 25: 600 }
 
 // ─── Health status config ────────────────────────────────────
 const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; blockStream: boolean }> = {
