@@ -4,7 +4,7 @@ import { z } from 'zod'
 import {
   getNVRStatus, getNVRChannels, getIpCameraList,
   getStorageInfo, getNVRUsers, getDeviceInfo, rebootDevice,
-  adoptIpCamera, getFreeChannels,
+  adoptIpCamera, getFreeChannels, debugGetCameraNameSources,
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -494,7 +494,10 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     await AuditAction(server.prisma, request.user.sub, 'NVR_NAMES_SYNCED', id, request, { count: syncLog.length })
 
-    return reply.send({ success: true, synced: syncLog.length, log: syncLog })
+    // Include per-endpoint debug info so admins can diagnose parsing issues
+    const debug = await debugGetCameraNameSources(nvrDec as any).catch(() => null)
+
+    return reply.send({ success: true, synced: syncLog.length, log: syncLog, debug })
   })
 
   // POST /api/nvrs/:id/reboot — Reiniciar NVR

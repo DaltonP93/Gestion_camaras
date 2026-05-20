@@ -207,18 +207,26 @@ export function VideoPlayer({
 
   useEffect(() => {
     if (error || externalError) {
+      if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
       hlsRef.current?.destroy()
+      hlsRef.current = null
       setStatus('error')
       return
     }
     if (!hlsUrl) {
+      // hlsUrl cleared (session stopped) — destroy HLS so it stops making requests
+      if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
+      hlsRef.current?.destroy()
+      hlsRef.current = null
       setStatus('loading')
+      setInternalError(null)
       return
     }
     initPlayer()
     return () => {
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
       hlsRef.current?.destroy()
+      hlsRef.current = null
     }
   }, [hlsUrl, error, initPlayer])
 
