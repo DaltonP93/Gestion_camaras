@@ -25,6 +25,7 @@ export function NVRDetailPage() {
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
   const [rebooting, setRebooting] = useState(false)
+  const [validatingHealth, setValidatingHealth] = useState(false)
 
   // Tabs data
   const [cameras, setCameras] = useState<{ fromNvr: IpCamera[]; fromDb: CameraType[] } | null>(null)
@@ -150,6 +151,19 @@ export function NVRDetailPage() {
     }
   }
 
+  const handleValidateHealth = async () => {
+    if (!id) return
+    try {
+      setValidatingHealth(true)
+      const result = await apiPost<{ validating: number }>(`/nvrs/${id}/validate-health`)
+      toast.success(`Validando ${result.validating} cámaras RTSP en segundo plano. Re-sincroniza en ~30s para ver resultados.`)
+    } catch {
+      toast.error('Error al lanzar validación de salud RTSP')
+    } finally {
+      setValidatingHealth(false)
+    }
+  }
+
   const handleRestartStream = async (cameraId: string, cameraName: string) => {
     try {
       await apiPost(`/cameras/${cameraId}/restart-stream`)
@@ -218,6 +232,10 @@ export function NVRDetailPage() {
                 <RefreshCw size={11} />
                 Nombres
               </button>
+              <button onClick={handleValidateHealth} disabled={validatingHealth} className="btn-ghost text-xs" title="Validar salud RTSP de todas las cámaras (detecta HEVC, 404, offline)">
+                {validatingHealth ? <Loader2 size={11} className="animate-spin" /> : <Activity size={11} />}
+                Revalidar RTSP
+              </button>
             </>
           )}
           {isAdmin && (
@@ -262,7 +280,7 @@ export function NVRDetailPage() {
       )}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} onRefresh={loadStorage} />}
       {tab === 'users'   && <UsersTab users={nvrUsers} loading={loadingUsers} onRefresh={loadUsers} />}
-      {tab === 'maintenance' && <MaintenanceTab nvr={nvr} onSync={handleSync} onReboot={handleReboot} syncing={syncing} rebooting={rebooting} isAdmin={isAdmin} />}
+      {tab === 'maintenance' && <MaintenanceTab nvr={nvr} onSync={handleSync} onReboot={handleReboot} onValidateHealth={handleValidateHealth} syncing={syncing} rebooting={rebooting} validatingHealth={validatingHealth} isAdmin={isAdmin} isSupervisor={isSupervisor} />}
       {tab === 'diagnostics' && (
         <DiagnosticsTab
           dbCameras={cameras?.fromDb || []}
@@ -577,14 +595,17 @@ function UsersTab({ users, loading, onRefresh }: { users: any[]; loading: boolea
 // ─── Maintenance Tab ──────────────────────────────────────────
 
 function MaintenanceTab({
-  nvr, onSync, onReboot, syncing, rebooting, isAdmin,
+  nvr, onSync, onReboot, onValidateHealth, syncing, rebooting, validatingHealth, isAdmin, isSupervisor,
 }: {
   nvr: NVR
   onSync: () => void
   onReboot: () => void
+  onValidateHealth: () => void
   syncing: boolean
   rebooting: boolean
+  validatingHealth: boolean
   isAdmin: boolean
+  isSupervisor: boolean
 }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -603,6 +624,22 @@ function MaintenanceTab({
           </p>
         )}
       </div>
+
+      {isSupervisor && (
+        <div className="card p-4 space-y-3">
+          <h3 className="text-sm font-medium text-surface-300">Salud RTSP</h3>
+          <p className="text-xs text-surface-500">
+            Prueba la conexión RTSP de cada cámara y actualiza su estado de salud (detecta HEVC, substream 404, offline, credenciales inválidas).
+          </p>
+          <button onClick={onValidateHealth} disabled={validatingHealth} className="btn-secondary w-full justify-center">
+            {validatingHealth ? <Loader2 size={14} className="animate-spin" /> : <Activity size={14} />}
+            {validatingHealth ? 'Lanzando validación...' : 'Revalidar RTSP de todas las cámaras'}
+          </button>
+          <p className="text-xs text-surface-500 text-center">
+            La validación se ejecuta en segundo plano. Re-sincroniza en ~30s para ver resultados.
+          </p>
+        </div>
+      )}
 
       {isAdmin && (
         <div className="card p-4 space-y-3 border border-red-900/30">
