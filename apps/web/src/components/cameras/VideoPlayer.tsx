@@ -49,6 +49,7 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
 function classifyHlsError(data: ErrorData): CameraPlaybackErrorCode {
   if (data.response?.code === 401) return 'RTSP_UNAUTHORIZED'
   if (data.response?.code === 404) return 'HLS_MANIFEST_NOT_FOUND'
+  if (data.response?.code === 500) return 'MEDIAMTX_NOT_READY'
   if (data.type === Hls.ErrorTypes.NETWORK_ERROR) return 'MEDIAMTX_NOT_READY'
   return 'UNKNOWN'
 }
@@ -155,23 +156,28 @@ export function VideoPlayer({
           }
 
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            // 404 → max 2 retries (stream starting up); other network errors → 5 retries
-            const is404 = data.response?.code === 404
-            const maxRetries = is404 ? 2 : 5
+            // 500 → MediaMTX source error (HEVC/RTSP fail) → max 1 retry
+            // 404 → stream still starting up → max 2 retries
+            // other network errors → max 5 retries with backoff
+            const statusCode = data.response?.code
+            const is500 = statusCode === 500
+            const is404 = statusCode === 404
+            const maxRetries = is500 ? 1 : is404 ? 2 : 5
             setRetryCount((r) => {
               if (r >= maxRetries) {
                 const err: CameraPlaybackError = {
                   code: errorCode,
-                  message: is404 ? 'Stream no disponible en el servidor' : 'Sin respuesta del servidor de streaming',
-                  technicalDetail: `${data.type}/${data.details}. URL: ${hlsUrl}`,
+                  message: is500 ? 'Error en servidor de streaming (MediaMTX 500)'
+                          : is404 ? 'Stream no disponible en el servidor'
+                          :         'Sin respuesta del servidor de streaming',
+                  technicalDetail: `HTTP ${statusCode ?? 'err'} ${data.details}. URL: ${hlsUrl}`,
                 }
                 setStatus('error')
                 setInternalError(err)
                 if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              // Retry via startLoad — keeps HLS instance alive, no full recreate
-              const delay = is404 ? 4000 : 3000 * (r + 1)
+              const delay = is500 ? 5000 : is404 ? 4000 : 3000 * (r + 1)
               setTimeout(() => hls.startLoad(), delay)
               return r + 1
             })

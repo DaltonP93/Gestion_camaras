@@ -388,7 +388,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       } catch {}
     }
 
-    // 7. Trigger async RTSP health check for cameras that need it (fire and forget)
+    // 7. Trigger async RTSP health check for cameras that need it (fire and forget).
+    // Cameras with UNKNOWN status are always re-checked (may have been created before codec detection).
+    // NOTE: validateAndUpdateCameraHealth decrypts the password internally — pass nvr as-is from DB.
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
     const camerasToProbe = await server.prisma.camera.findMany({
       where: {
@@ -397,6 +399,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         OR: [
           { lastRtspCheckAt: null },
           { lastRtspCheckAt: { lt: oneHourAgo } },
+          { streamHealthStatus: 'UNKNOWN' },
         ],
       },
       include: { nvr: true },
@@ -405,7 +408,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     if (camerasToProbe.length > 0) {
       Promise.all(
         camerasToProbe.map(cam =>
-          validateAndUpdateCameraHealth(server.prisma, { ...cam.nvr, password: decryptPassword(cam.nvr.password) } as any, cam as any)
+          validateAndUpdateCameraHealth(server.prisma, cam.nvr as any, cam as any)
             .catch(() => {})
         )
       ).catch(() => {})
@@ -498,6 +501,26 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const debug = await debugGetCameraNameSources(nvrDec as any).catch(() => null)
 
     return reply.send({ success: true, synced: syncLog.length, log: syncLog, debug })
+  })
+
+  // POST /api/nvrs/:id/validate-health — Forzar validación RTSP de todas las cámaras
+  server.post('/:id/validate-health', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const cameras = await server.prisma.camera.findMany({ where: { nvrId: id, active: true } })
+
+    // Fire and forget — each probe can take up to 15s; return count immediately.
+    // validateAndUpdateCameraHealth decrypts the password internally — pass nvr as-is from DB.
+    Promise.all(
+      cameras.map(cam =>
+        validateAndUpdateCameraHealth(server.prisma, nvr as any, cam as any).catch(() => {})
+      )
+    ).catch(() => {})
+
+    return reply.send({ success: true, validating: cameras.length, message: `Validando ${cameras.length} cámaras en segundo plano...` })
   })
 
   // POST /api/nvrs/:id/reboot — Reiniciar NVR
