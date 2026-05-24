@@ -55,6 +55,8 @@ export interface HikStorageDisk {
   type: string
   property: string
   process: string
+  _rawCapacity?: number  // raw value from ISAPI (for unit debugging)
+  _rawFree?: number
 }
 
 export interface HikNVRUser {
@@ -308,6 +310,10 @@ function isPlaceholderName(name: string): boolean {
   // "D1", "D12" — D followed by ONLY digits (end of string) — placeholder
   // "D1 Box 7" — has real text after digits — NOT a placeholder
   if (/^D\d+$/i.test(trimmed)) return true
+  // Pure 3-4 digit number = Hikvision streaming channel ID (101=ch1 main, 102=ch1 sub, 1201=ch12 main)
+  if (/^\d{3,4}$/.test(trimmed)) return true
+  // "Channel X" variations
+  if (/^Channel\s*\d+$/i.test(trimmed)) return true
   return false
 }
 
@@ -411,8 +417,11 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         // id 101 = ch1, 202 = ch2, 1901 = ch19
         const ch = Math.round(rawId / 100)
         const channelName = xmlGet(block, 'channelName')
-        if (channelName && !streamingChannelNames.has(ch)) {
-          streamingChannelNames.set(ch, channelName)
+        // Skip channelNames that are just the stream ID or pure numerics
+        if (channelName && channelName.trim() !== String(rawId) && !isPlaceholderName(channelName)) {
+          if (!streamingChannelNames.has(ch)) {
+            streamingChannelNames.set(ch, channelName)
+          }
         }
       }
     } else {
@@ -424,8 +433,11 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
           if (!rawId) continue
           const ch = Math.round(rawId / 100)
           const channelName = sc.channelName || ''
-          if (channelName && !streamingChannelNames.has(ch)) {
-            streamingChannelNames.set(ch, channelName)
+          // Skip channelNames that are just the stream ID or pure numerics
+          if (channelName && channelName.trim() !== String(rawId) && !isPlaceholderName(channelName)) {
+            if (!streamingChannelNames.has(ch)) {
+              streamingChannelNames.set(ch, channelName)
+            }
           }
         }
       }
@@ -667,6 +679,9 @@ export async function getStorageInfo(nvr: NVR): Promise<HikStorageDisk[]> {
           type:        xmlGet(b, 'type') || 'local',
           property:    xmlGet(b, 'property'),
           process:     xmlGet(b, 'hddProcess'),
+          // Debug raw values for unit validation
+          _rawCapacity: cap,
+          _rawFree: free,
         })
       })
     } else {

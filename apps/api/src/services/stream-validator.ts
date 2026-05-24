@@ -10,6 +10,7 @@ const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toStr
 // Posibles valores de streamHealthStatus
 export type StreamHealthStatus =
   | 'HEALTHY'
+  | 'USING_MAIN_STREAM'
   | 'RTSP_SUB_NOT_FOUND'
   | 'CODEC_UNSUPPORTED_HEVC'
   | 'STREAM_UNSTABLE'
@@ -34,49 +35,61 @@ export async function validateAndUpdateCameraHealth(
   let subCodec: string | null = null
   let subResolution: string | null = null
   let lastRtspError: string | null = null
+  let preferredStream: 'sub' | 'main' = 'sub'
 
   try {
     const result = await probeBothStreams(nvrDecrypted, camera.channel)
     const sub = result.sub
+    const main = result.main
 
-    if (sub.ok) {
+    const subCodecLower = (sub.codec || '').toLowerCase()
+    const mainCodecLower = (main.codec || '').toLowerCase()
+    const subIsHevc = subCodecLower.includes('hevc') || subCodecLower.includes('h265') || subCodecLower.includes('h.265')
+    const mainIsHevc = mainCodecLower.includes('hevc') || mainCodecLower.includes('h265') || mainCodecLower.includes('h.265')
+    const mainIsH264 = mainCodecLower === 'h264' || mainCodecLower === 'avc' || (main.ok && !mainIsHevc && mainCodecLower !== '')
+
+    if (sub.ok && !subIsHevc) {
+      // Substream OK and H264-compatible → use substream
+      healthStatus = 'HEALTHY'
       rtspSubOk = true
       subCodec = sub.codec || null
       subResolution = sub.width ? `${sub.width}x${sub.height}` : null
-
-      const codec = (sub.codec || '').toLowerCase()
-
-      if (codec.includes('hevc') || codec.includes('h265')) {
-        healthStatus = 'CODEC_UNSUPPORTED_HEVC'
-      } else if (codec === 'h264' || codec === 'avc') {
-        // Check for SPS/PPS warnings in ffprobe error output (not available here,
-        // but treat as HEALTHY if codec ok and no error)
-        healthStatus = 'HEALTHY'
-      } else if (codec) {
-        // Other codec that is not hevc — treat as stable
-        healthStatus = 'HEALTHY'
+      preferredStream = 'sub'
+    } else if (sub.ok && subIsHevc) {
+      // Substream is HEVC → check if main is H264
+      rtspSubOk = true
+      subCodec = sub.codec || null
+      if (main.ok && mainIsH264) {
+        healthStatus = 'USING_MAIN_STREAM'
+        preferredStream = 'main'
       } else {
-        // No codec info — stream_unstable
-        healthStatus = 'STREAM_UNSTABLE'
+        healthStatus = 'CODEC_UNSUPPORTED_HEVC'
+        preferredStream = 'sub'
       }
     } else {
+      // Substream failed → try main as fallback
       rtspSubOk = false
-      const error = sub.error || ''
-      lastRtspError = error
-
-      if (error.includes('404') || error.includes('Not Found') || error.includes('no encontrado')) {
-        healthStatus = 'RTSP_SUB_NOT_FOUND'
-      } else if (error.includes('401') || error.includes('Unauthorized') || error.includes('Credenciales')) {
-        healthStatus = 'AUTH_FAILED'
-      } else if (
-        error.includes('Timeout') || error.includes('timeout') ||
-        error.includes('Connection refused') || error.includes('ECONNREFUSED') ||
-        error.includes('ETIMEDOUT') || error.includes('EHOSTUNREACH') ||
-        error.includes('Host no encontrado')
-      ) {
-        healthStatus = 'OFFLINE'
+      lastRtspError = sub.error || null
+      if (main.ok && mainIsH264) {
+        healthStatus = 'USING_MAIN_STREAM'
+        preferredStream = 'main'
+      } else if (main.ok && mainIsHevc) {
+        healthStatus = 'CODEC_UNSUPPORTED_HEVC'
+        preferredStream = 'sub'
       } else {
-        healthStatus = 'UNKNOWN'
+        // Both failed — determine error type from sub error
+        const error = sub.error || ''
+        if (error.includes('404') || error.includes('Not Found') || error.includes('no encontrado')) {
+          healthStatus = 'RTSP_SUB_NOT_FOUND'
+        } else if (error.includes('401') || error.includes('Unauthorized') || error.includes('Credenciales')) {
+          healthStatus = 'AUTH_FAILED'
+        } else if (error.includes('Timeout') || error.includes('timeout') || error.includes('Connection refused') ||
+                   error.includes('ECONNREFUSED') || error.includes('ETIMEDOUT') || error.includes('EHOSTUNREACH') ||
+                   error.includes('Host no encontrado')) {
+          healthStatus = 'OFFLINE'
+        } else {
+          healthStatus = 'UNKNOWN'
+        }
       }
     }
   } catch (err: any) {
@@ -94,6 +107,9 @@ export async function validateAndUpdateCameraHealth(
       ...(subResolution ? { subResolution } : {}),
       lastRtspCheckAt: new Date(),
       lastRtspError,
+      preferredStream,
+      // If either stream works, mark camera as online
+      ...(healthStatus === 'HEALTHY' || healthStatus === 'USING_MAIN_STREAM' ? { online: true } : {}),
     } as any,
   })
 

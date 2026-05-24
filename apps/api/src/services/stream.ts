@@ -27,8 +27,9 @@ export function getWebRtcUrl(streamPath: string): string {
 // ─── Publicar stream desde NVR a MediaMTX ───────────────────
 export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> {
   const streamPath = getStreamPath(nvr, camera)
-  // Usar substream (H264) en lugar del main stream (que suele ser H265 incompatible con browsers)
-  const rtspUrl = buildRtspUrl(nvr, camera.channel, true)
+  // Usar substream (H264) por defecto; main stream si preferredStream === 'main'
+  const useSub = (camera as any).preferredStream !== 'main'
+  const rtspUrl = buildRtspUrl(nvr, camera.channel, useSub)
 
   const pathConfig = {
     source: rtspUrl,
@@ -40,29 +41,56 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
   }
 
   try {
-    // Intentar crear primero
+    // GET check: verify if path already exists
+    let existingSource: string | undefined
+    try {
+      const existing = await mediamtxApi.get('/v3/config/paths/get/' + streamPath)
+      existingSource = existing.data?.source
+    } catch (getErr: any) {
+      if (getErr.response?.status !== 404) {
+        // Unexpected error on GET — proceed to POST anyway
+      }
+    }
+
+    if (existingSource !== undefined) {
+      // Path already exists
+      if (existingSource === rtspUrl) {
+        // Same source — nothing to do
+        console.info(`[stream] path exists (same source), skipping: ${streamPath}`)
+        return true
+      }
+      // Different source — update with PATCH
+      await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
+      console.info(`[stream] path updated: ${streamPath}`)
+      return true
+    }
+
+    // Path doesn't exist — create with POST
     await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
+    console.info(`[stream] path created: ${streamPath}`)
     return true
   } catch (err: any) {
     const status = err.response?.status
 
-    // 400 = path ya existe con este nombre exacto → actualizar con PATCH
+    // 400 on POST = race condition: path was created between our GET and POST → PATCH
     if (status === 400) {
       try {
         await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
+        console.info(`[stream] path updated (race condition): ${streamPath}`)
         return true
       } catch {
-        return true // Si PATCH falla, el path existe y probablemente ya funciona
+        console.info(`[stream] path exists (PATCH skipped): ${streamPath}`)
+        return true // If PATCH fails, path likely exists and is already working
       }
     }
 
-    // 401 o 403 = problema de auth con MediaMTX API
+    // 401 or 403 = MediaMTX API auth problem
     if (status === 401 || status === 403) {
       console.error(`[stream] MediaMTX auth error (${status}) para ${streamPath}. Verificar configuración de auth en mediamtx.yml`)
       return false
     }
 
-    console.error(`[stream] Error registrando path ${streamPath}:`, status, err.message)
+    console.error(`[stream] failed to register path ${streamPath}:`, status, err.message)
     return false
   }
 }
@@ -85,10 +113,16 @@ export async function publishAllStreams(
   let success = 0
   let failed = 0
 
-  for (const camera of cameras) {
-    if (!camera.active) continue
-    const ok = await publishStream(nvr, camera)
-    ok ? success++ : failed++
+  const activeCameras = cameras.filter((c) => c.active)
+  const CONCURRENCY = 5
+
+  // Semaphore-based batching: max CONCURRENCY concurrent calls
+  for (let i = 0; i < activeCameras.length; i += CONCURRENCY) {
+    const batch = activeCameras.slice(i, i + CONCURRENCY)
+    const results = await Promise.all(batch.map((camera) => publishStream(nvr, camera)))
+    for (const ok of results) {
+      ok ? success++ : failed++
+    }
   }
 
   return { success, failed }
