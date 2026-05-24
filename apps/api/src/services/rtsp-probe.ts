@@ -19,6 +19,11 @@ export interface RtspProbeResult {
 const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe'
 const PROBE_TIMEOUT_MS = 12000
 
+// Masks passwords in RTSP URLs: rtsp://user:pass@host → rtsp://user:***@host
+function sanitizeRtsp(s: string): string {
+  return s.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+}
+
 export async function probeRtspStream(rtspUrl: string): Promise<RtspProbeResult> {
   const start = Date.now()
 
@@ -65,7 +70,7 @@ export async function probeRtspStream(rtspUrl: string): Promise<RtspProbeResult>
     }
   } catch (err: any) {
     const latencyMs = Date.now() - start
-    let error = err.message || 'ffprobe error'
+    let error = sanitizeRtsp(err.message || 'ffprobe error')
 
     if (err.code === 'ETIMEDOUT' || latencyMs >= PROBE_TIMEOUT_MS) {
       error = `Timeout después de ${PROBE_TIMEOUT_MS}ms`

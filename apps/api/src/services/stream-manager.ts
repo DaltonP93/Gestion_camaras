@@ -70,7 +70,7 @@ export async function startStream(
   server: FastifyInstance,
   userId: string,
   cameraId: string,
-): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; error?: StreamError }> {
+): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; error?: StreamError; warning?: StreamError }> {
   // Buscar cámara en DB con NVR
   const camera = await server.prisma.camera.findUnique({
     where: { id: cameraId },
@@ -96,6 +96,9 @@ export async function startStream(
       error: knownError ?? { code: healthStatus, message: `Stream no disponible: ${healthStatus}` },
     }
   }
+
+  // USING_MAIN_STREAM is allowed but returns a warning
+  const usingMainStream = (camera as any).streamHealthStatus === 'USING_MAIN_STREAM'
 
   // Verificar límites
   const userSessions = getSessionsForUser(userId)
@@ -136,6 +139,7 @@ export async function startStream(
     hlsUrl: getHlsUrl(streamPath),
     webrtcUrl: getWebRtcUrl(streamPath),
     streamPath,
+    warning: usingMainStream ? { code: 'USING_MAIN_STREAM', message: 'Substream no disponible — usando stream principal (calidad HD)' } : undefined,
   }
 }
 

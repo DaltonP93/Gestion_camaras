@@ -12,6 +12,11 @@ import CryptoJS from 'crypto-js'
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
+const sanitizeRtsp = (s: string | null | undefined): string | null => {
+  if (!s) return s ?? null
+  return s.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+}
+
 const cameraUpdateSchema = z.object({
   name:          z.string().min(1).max(100).optional(),
   location:      z.string().optional(),
@@ -144,7 +149,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         rtspMainOk:     rtsp.main.ok,
         rtspSubOk:      rtsp.sub.ok,
         lastRtspCheckAt: new Date(),
-        lastRtspError:  rtsp.sub.ok ? null : (rtsp.sub.error || rtsp.main.error || null),
+        lastRtspError:  rtsp.sub.ok ? null : sanitizeRtsp(rtsp.sub.error || rtsp.main.error || null),
         mainCodec:      rtsp.main.codec || camera.mainCodec,
         subCodec:       rtsp.sub.codec  || camera.subCodec,
         mainResolution: rtsp.main.width ? `${rtsp.main.width}x${rtsp.main.height}` : camera.mainResolution,
@@ -177,8 +182,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         subUrlMasked:   buildRtspUrlMasked(nvrDecrypted, camera.channel, true),
         mainOk:         rtsp.main.ok,
         subOk:          rtsp.sub.ok,
-        mainError:      rtsp.main.error,
-        subError:       rtsp.sub.error,
+        mainError:      sanitizeRtsp(rtsp.main.error),
+        subError:       sanitizeRtsp(rtsp.sub.error),
         preferred:      camera.preferredStream || 'sub',
         mainCodec:      rtsp.main.codec,
         subCodec:       rtsp.sub.codec,

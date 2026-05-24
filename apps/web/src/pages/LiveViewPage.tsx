@@ -19,6 +19,7 @@ const STAGGER_MS: Record<GridLayout, number> = { 1: 0, 4: 250, 9: 400, 16: 500, 
 
 // ─── Health status config ────────────────────────────────────
 const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; blockStream: boolean }> = {
+  USING_MAIN_STREAM:       { icon: <Film size={12} />,          label: 'Main stream',           blockStream: false },
   RTSP_SUB_NOT_FOUND:      { icon: <AlertTriangle size={12} />, label: 'Substream 404',         blockStream: true },
   RTSP_MAIN_NOT_FOUND:     { icon: <AlertTriangle size={12} />, label: 'RTSP no encontrado',    blockStream: true },
   CODEC_UNSUPPORTED_HEVC:  { icon: <Film size={12} />,          label: 'HEVC no compatible',    blockStream: true },
@@ -529,9 +530,16 @@ export function LiveViewPage() {
                 >
                   {/* Health badge */}
                   {health && health !== 'HEALTHY' && health !== 'UNKNOWN' && HEALTH_CONFIG[health] && (
-                    <div className="absolute top-1.5 left-1.5 z-10 flex items-center gap-1 bg-black/70 rounded px-1.5 py-0.5">
-                      <span className="text-amber-400">{HEALTH_CONFIG[health].icon}</span>
-                      <span className="text-[9px] text-amber-300 font-medium">{HEALTH_CONFIG[health].label}</span>
+                    <div className={clsx(
+                      'absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5',
+                      health === 'USING_MAIN_STREAM' ? 'bg-blue-900/70' : 'bg-black/70'
+                    )}>
+                      <span className={health === 'USING_MAIN_STREAM' ? 'text-blue-400' : 'text-amber-400'}>
+                        {HEALTH_CONFIG[health].icon}
+                      </span>
+                      <span className={clsx('text-[9px] font-medium', health === 'USING_MAIN_STREAM' ? 'text-blue-300' : 'text-amber-300')}>
+                        {HEALTH_CONFIG[health].label}
+                      </span>
                     </div>
                   )}
                   <VideoPlayer

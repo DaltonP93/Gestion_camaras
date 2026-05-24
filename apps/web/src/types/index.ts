@@ -4,6 +4,7 @@ export type Role = 'ADMIN' | 'SUPERVISOR' | 'OPERATOR' | 'AUDITOR'
 
 export type StreamHealthStatus =
   | 'HEALTHY'
+  | 'USING_MAIN_STREAM'   // Sub failed/HEVC, using main stream (H264)
   | 'RTSP_SUB_NOT_FOUND'
   | 'RTSP_MAIN_NOT_FOUND'
   | 'CODEC_UNSUPPORTED_HEVC'
@@ -160,6 +161,7 @@ export interface StreamInfo {
   webrtc: string
   channel: number
   nvrName: string
+  warning?: { code: string; message: string }
 }
 
 export interface CameraDiagnostics {
