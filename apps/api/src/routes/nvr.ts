@@ -16,6 +16,12 @@ const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET 
 const encryptPassword = (p: string) => CryptoJS.AES.encrypt(p, ENCRYPTION_KEY).toString()
 const decryptPassword = (enc: string) => CryptoJS.AES.decrypt(enc, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
+// Strip debug/non-schema fields before passing a HikStorageDisk to Prisma
+function sanitizeDiskForDb(disk: any) {
+  const { _rawCapacity, _rawFree, rawCapacity, rawFree, ...dbDisk } = disk
+  return dbDisk
+}
+
 const connectionTestSchema = z.object({
   ipAddress: z.string().min(1),
   port:      z.number().int().min(1).max(65535).default(80),
@@ -229,15 +235,21 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
     const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
-    const disks  = await getStorageInfo(nvrDec as any)
+    let disks: any[] = []
+    try {
+      disks = await getStorageInfo(nvrDec as any)
 
-    // Actualizar en DB
-    for (const disk of disks) {
-      await server.prisma.nvrHdd.upsert({
-        where: { nvrId_diskNumber: { nvrId: id, diskNumber: disk.diskNumber } },
-        create: { nvrId: id, ...disk, lastSyncAt: new Date() },
-        update: { ...disk, lastSyncAt: new Date() },
-      })
+      for (const disk of disks) {
+        const dbDisk = sanitizeDiskForDb(disk)
+        await server.prisma.nvrHdd.upsert({
+          where: { nvrId_diskNumber: { nvrId: id, diskNumber: dbDisk.diskNumber } },
+          create: { nvrId: id, ...dbDisk, lastSyncAt: new Date() },
+          update: { ...dbDisk, lastSyncAt: new Date() },
+        })
+      }
+    } catch (e: any) {
+      server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
+      return reply.status(500).send({ message: 'No se pudo sincronizar almacenamiento del NVR. Ver logs del servidor.' })
     }
 
     return reply.send({ disks, syncedAt: new Date().toISOString() })
@@ -313,7 +325,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     // 5. Upsert cámaras en DB (sin duplicar)
     for (const cam of ipCams) {
       try {
-        const online = cam.status?.toLowerCase().includes('online') || cam.status?.toLowerCase().includes('en línea')
+        // onlineInNvr: lo que reporta el NVR vía ISAPI (puede ser unreliable)
+        // online: solo se fuerza a true desde ISAPI; a false lo gestiona la validación RTSP
+        const onlineInNvr = cam.status?.toLowerCase().includes('online') || cam.status?.toLowerCase().includes('en línea')
         await server.prisma.camera.upsert({
           where:  { nvrId_channel: { nvrId: id, channel: cam.channel } },
           create: {
@@ -325,7 +339,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             protocol:       cam.protocol,
             managementPort: cam.managementPort,
             securityStatus: cam.securityStatus,
-            online,
+            online:         onlineInNvr,
+            onlineInNvr:    onlineInNvr,
             lastSyncAt:     new Date(),
           },
           update: {
@@ -335,7 +350,10 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             protocol:       cam.protocol,
             managementPort: cam.managementPort,
             securityStatus: cam.securityStatus,
-            online,
+            onlineInNvr:    onlineInNvr,
+            // Only force online=true if NVR confirms; never force to false here —
+            // validateAndUpdateCameraHealth sets online=true when RTSP works.
+            ...(onlineInNvr ? { online: true } : {}),
             lastSyncAt:     new Date(),
           },
         })
@@ -379,10 +397,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const disks = await getStorageInfo(nvrDec as any)
     for (const disk of disks) {
       try {
+        const dbDisk = sanitizeDiskForDb(disk)
         await server.prisma.nvrHdd.upsert({
-          where:  { nvrId_diskNumber: { nvrId: id, diskNumber: disk.diskNumber } },
-          create: { nvrId: id, ...disk, lastSyncAt: new Date() },
-          update: { ...disk, lastSyncAt: new Date() },
+          where:  { nvrId_diskNumber: { nvrId: id, diskNumber: dbDisk.diskNumber } },
+          create: { nvrId: id, ...dbDisk, lastSyncAt: new Date() },
+          update: { ...dbDisk, lastSyncAt: new Date() },
         })
         result.hdds++
       } catch {}
@@ -454,32 +473,49 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       if (ch.name) videoInputNames.set(ch.id, ch.name)
     }
 
+    // Placeholder detection: matches auto-generated names and Hikvision streaming channel IDs
+    const isPlaceholder = (n: string) =>
+      !n ||
+      /^(IPCamera\s*\d*|Camera\s*\d*|Canal\s*\d*|Channel\s*\d*|D\d+)$/i.test(n.trim()) ||
+      /^\d{3,4}$/.test(n.trim())  // Hikvision stream IDs: 101, 201, 1201 etc.
+
+    // Load current DB names to avoid overwriting real names with placeholders
+    const existingCameras = await server.prisma.camera.findMany({
+      where: { nvrId: id },
+      select: { channel: true, name: true },
+    })
+    const existingNames = new Map(existingCameras.map(c => [c.channel, c.name]))
+
     const syncLog: Array<{
       channel: number
       channelCode: string
       name: string
       ipAddress: string
       protocol: string
-      source: 'input_proxy' | 'video_input' | 'merged'
+      source: 'input_proxy' | 'video_input' | 'merged' | 'preserved'
+      previous?: string
     }> = []
 
     for (const cam of ipCams) {
       const videoName = videoInputNames.get(cam.channel) || ''
+      const currentDbName = existingNames.get(cam.channel) || ''
 
-      // Determine best name and source
-      const isPlaceholder = (n: string) => !n || /^(IPCamera\s*\d*|Camera\s*\d*|Canal\s*\d*|D\d+)$/i.test(n.trim())
       let bestName = cam.name
-      let source: 'input_proxy' | 'video_input' | 'merged' = 'input_proxy'
+      let source: 'input_proxy' | 'video_input' | 'merged' | 'preserved' = 'input_proxy'
 
       if (isPlaceholder(cam.name) && !isPlaceholder(videoName)) {
         bestName = videoName
         source = 'video_input'
       } else if (!isPlaceholder(cam.name) && !isPlaceholder(videoName) && cam.name !== videoName) {
-        // Both have real names — keep InputProxy name but log as merged
         source = 'merged'
       }
 
-      // Update DB
+      // Never overwrite a real DB name with a placeholder — keep whatever is already good
+      if (isPlaceholder(bestName) && !isPlaceholder(currentDbName)) {
+        bestName = currentDbName
+        source = 'preserved'
+      }
+
       await server.prisma.camera.updateMany({
         where: { nvrId: id, channel: cam.channel },
         data: { name: bestName, lastSyncAt: new Date() },
@@ -492,6 +528,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         ipAddress:   cam.ipAddress,
         protocol:    cam.protocol,
         source,
+        ...(source === 'preserved' ? { previous: currentDbName } : {}),
       })
     }
 

@@ -648,8 +648,8 @@ export async function getStorageInfo(nvr: NVR): Promise<HikStorageDisk[]> {
       list.forEach((d: any, i: number) => {
         const capacityKb = parseInt(d.capacity || d.totalCapacity || '0')
         const freeKb     = parseInt(d.freeSpace || d.remainCapacity || '0')
-        const capGb      = capacityKb / 1024 / 1024
-        const freeGb     = freeKb / 1024 / 1024
+        const capGb      = capacityKb / 1024
+        const freeGb     = freeKb / 1024
         disks.push({
           diskNumber:  parseInt(d.id || d.hddIndex || `${i + 1}`),
           capacityGb:  Math.round(capGb * 100) / 100,
@@ -668,8 +668,8 @@ export async function getStorageInfo(nvr: NVR): Promise<HikStorageDisk[]> {
       blocks.forEach((b, i) => {
         const cap  = parseInt(xmlGet(b, 'capacity') || '0')
         const free = parseInt(xmlGet(b, 'freeSpace') || '0')
-        const capGb  = cap / 1024 / 1024
-        const freeGb = free / 1024 / 1024
+        const capGb  = cap / 1024
+        const freeGb = free / 1024
         disks.push({
           diskNumber:  i + 1,
           capacityGb:  Math.round(capGb * 100) / 100,
