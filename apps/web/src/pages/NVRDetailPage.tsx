@@ -125,7 +125,7 @@ export function NVRDetailPage() {
       const updated = result.synced ?? result.log?.length ?? 0
       const dbg = result.debug
       const debugSummary = dbg
-        ? ` | InputProxy: ${dbg.inputProxy?.count ?? '?'} canales, VideoInput: ${dbg.videoInput?.count ?? '?'}, Streaming: ${dbg.streaming?.count ?? '?'}`
+        ? ` | InputProxy: ${dbg.inputProxy?.count ?? '?'}, VideoInput: ${dbg.videoInput?.count ?? '?'}, Streaming: ${dbg.streaming?.count ?? '?'}${dbg.streamingProxy ? `, StreamingProxy: ${dbg.streamingProxy.count}` : ''}`
         : ''
       toast.success(`Nombres sincronizados: ${updated} cámaras${debugSummary}`)
       if (dbg) console.info('[force-names-sync] debug:', JSON.stringify(dbg, null, 2))
@@ -368,7 +368,9 @@ function SummaryTab({ nvr }: { nvr: NVR }) {
 function camStatusDisplay(cam: CameraType): { color: string; dot: string; label: string } {
   const hs = cam.streamHealthStatus
   if (hs === 'CODEC_UNSUPPORTED_HEVC')
-    return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'HEVC no compatible' }
+    return cam.rtspMainOk
+      ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'HEVC / sub no disponible' }
+      : { color: 'text-amber-400', dot: 'bg-amber-400', label: 'HEVC no compatible' }
   if (hs === 'RTSP_SUB_NOT_FOUND') {
     const mainIsHevc = (cam.mainCodec || '').toLowerCase().match(/hevc|h\.?265/)
     return mainIsHevc
@@ -792,6 +794,21 @@ function DiagnosticsTab({
                   : result.rtsp.mainError || undefined
                 }
               />
+              {(() => {
+                const sc = (result.rtsp.subCodec || '').toLowerCase()
+                const mc = (result.rtsp.mainCodec || '').toLowerCase()
+                const subHevc = sc.includes('hevc') || sc.includes('h265') || sc.includes('h.265')
+                const mainHevc = mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')
+                if (result.rtsp.subOk && !subHevc)
+                  return <Check ok={true} label="Codec compatible web" detail={`Sub H.264: ${result.rtsp.subCodec?.toUpperCase() || '?'} · ${result.rtsp.subResolution || '?'}`} />
+                if (result.rtsp.mainOk && !mainHevc)
+                  return <Check ok={true} label="Codec compatible web" detail={`Main H.264: ${result.rtsp.mainCodec?.toUpperCase() || '?'} · ${result.rtsp.mainResolution || '?'}`} />
+                if (result.rtsp.mainOk && mainHevc)
+                  return <Check ok={'warn'} label="Codec no compatible web (HEVC)" detail={`Main: ${result.rtsp.mainCodec?.toUpperCase() || 'HEVC'} — HLS/WebRTC solo soporta H.264`} />
+                if (result.rtsp.subOk && subHevc)
+                  return <Check ok={'warn'} label="Codec no compatible web (HEVC)" detail={`Sub: ${result.rtsp.subCodec?.toUpperCase() || 'HEVC'} — configura substream en H.264 en el NVR`} />
+                return null
+              })()}
               <Check
                 ok={result.mediaServer.routeExists}
                 label="MediaMTX route registrada"

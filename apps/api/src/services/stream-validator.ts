@@ -32,7 +32,9 @@ export async function validateAndUpdateCameraHealth(
 
   let healthStatus: StreamHealthStatus = 'UNKNOWN'
   let rtspSubOk = false
+  let rtspMainOk = false
   let subCodec: string | null = null
+  let mainCodec: string | null = null
   let subResolution: string | null = null
   let lastRtspError: string | null = null
   let preferredStream: 'sub' | 'main' = 'sub'
@@ -41,6 +43,10 @@ export async function validateAndUpdateCameraHealth(
     const result = await probeBothStreams(nvrDecrypted, camera.channel)
     const sub = result.sub
     const main = result.main
+
+    // Capture main stream results unconditionally for DB persistence
+    rtspMainOk = main.ok
+    mainCodec = main.codec || null
 
     const subCodecLower = (sub.codec || '').toLowerCase()
     const mainCodecLower = (main.codec || '').toLowerCase()
@@ -103,7 +109,9 @@ export async function validateAndUpdateCameraHealth(
     data: {
       streamHealthStatus: healthStatus,
       rtspSubOk,
+      rtspMainOk,
       subCodec,
+      mainCodec,
       ...(subResolution ? { subResolution } : {}),
       lastRtspCheckAt: new Date(),
       lastRtspError,
