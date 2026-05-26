@@ -402,11 +402,12 @@ export function LiveViewPage() {
       activeSessions.current.delete(cameraId)
     }
 
-    if (err.code === 'RTSP_UNAUTHORIZED') {
-      // Session expired — clear stale stream, bump key so HLS.js is destroyed,
-      // then auto-restart once (rate-limited to 1 attempt per 30s per camera).
+    if (err.code === 'HLS_SESSION_EXPIRED') {
+      // HLS session expired (muxer destroyed or cookie timeout) — clear stale stream,
+      // bump key so HLS.js is destroyed, then auto-restart once (rate-limited 30s/camera).
       setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+      setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
       bumpPlayerKeys([cameraId])
 
       const now = Date.now()
@@ -417,11 +418,12 @@ export function LiveViewPage() {
         if (cam) setTimeout(() => loadStream(cam), 500)
       } else {
         // Restarted too recently — show error so user can retry manually
+        setLoadingStreams(prev => ({ ...prev, [cameraId]: false }))
         setStreamErrors(prev => ({
           ...prev,
           [cameraId]: {
-            code: 'RTSP_UNAUTHORIZED',
-            message: 'Sesión expirada. Haz clic en Reintentar.',
+            code: 'HLS_SESSION_EXPIRED',
+            message: 'Sesión HLS expirada. Haz clic en Reintentar.',
           },
         }))
       }

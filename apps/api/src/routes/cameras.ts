@@ -136,8 +136,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     // 1. Estado HTTP del NVR (ya lo tenemos en DB)
     const nvrOnlineHttp = nvr.online
 
-    // 2. Estado del stream en MediaMTX
-    const mediamtxStatus = await getStreamStatus(streamPath)
+    // 2. Estado del stream en MediaMTX (getStreamDetails exposes sourceType + sourceMasked)
+    const mediamtxStatus = await getStreamDetails(streamPath)
 
     // 3. Probe RTSP (ambos streams)
     const rtsp = await probeBothStreams(nvrDecrypted, camera.channel)
@@ -195,11 +195,13 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         subLatencyMs:   rtsp.sub.latencyMs,
       },
       mediaServer: {
-        provider:   'mediamtx',
-        route:      streamPath,
+        provider:    'mediamtx',
+        route:       streamPath,
         routeExists: mediamtxStatus.routeExists,
-        ready:      mediamtxStatus.active,
-        readers:    mediamtxStatus.readers,
+        ready:       mediamtxStatus.active,
+        readers:     mediamtxStatus.readers,
+        sourceType:  mediamtxStatus.sourceType,
+        sourceMasked: mediamtxStatus.sourceMasked,
       },
       frontend: {
         hlsUrl,
