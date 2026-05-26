@@ -342,7 +342,8 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
       const blocks = xmlGetAll(data, 'InputProxyChannel')
       items = blocks.map(block => ({
         id:             parseInt(xmlGet(block, 'id') || '0'),
-        name:           xmlGet(block, 'name'),
+        // customName is the user-set label; name may be auto-generated
+        name:           xmlGet(block, 'customName') || xmlGet(block, 'name'),
         ipAddress:      xmlGet(block, 'ipAddress'),
         protocol:       xmlGet(block, 'protocolType') || xmlGet(block, 'proxyProtocol'),
         port:           parseInt(xmlGet(block, 'managementPortNo') || '8000'),
@@ -359,7 +360,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
       if (!ch) continue
       inputProxyMap.set(ch, {
         channel:        ch,
-        name:           item.name || '',
+        name:           item.customName || item.name || '',
         ipAddress:      item.ipAddress || item.ip || '',
         protocol:       item.protocol || item.protocolType || item.proxyProtocol || 'HIKVISION',
         managementPort: parseInt(item.port || item.managementPortNo || '8000'),
@@ -537,9 +538,10 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
 // ─── Debug: raw name sources from each ISAPI endpoint ─────────
 // Returns raw intermediate data so admins can diagnose why names aren't syncing.
 export async function debugGetCameraNameSources(nvr: NVR): Promise<{
-  inputProxy:  { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
-  videoInput:  { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
-  streaming:   { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
+  inputProxy:      { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
+  videoInput:      { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
+  streaming:       { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
+  streamingProxy?: { ok: boolean; count: number; channels: { ch: number; name: string }[]; error?: string }
 }> {
   const client = createHikClient(nvr)
 
@@ -552,7 +554,7 @@ export async function debugGetCameraNameSources(nvr: NVR): Promise<{
       const blocks = xmlGetAll(data, 'InputProxyChannel')
       for (const block of blocks) {
         const ch = parseInt(xmlGet(block, 'id') || '0')
-        const name = xmlGet(block, 'name')
+        const name = xmlGet(block, 'customName') || xmlGet(block, 'name')
         if (ch) inputProxy.channels.push({ ch, name })
       }
     } else {
@@ -561,7 +563,7 @@ export async function debugGetCameraNameSources(nvr: NVR): Promise<{
         const list = Array.isArray(raw) ? raw : [raw]
         for (const item of list) {
           const ch = parseInt(item.id || item.channelNo || '0')
-          const name = item.name || ''
+          const name = item.customName || item.name || ''
           if (ch) inputProxy.channels.push({ ch, name })
         }
       }
@@ -632,7 +634,36 @@ export async function debugGetCameraNameSources(nvr: NVR): Promise<{
     streaming.error = e?.response?.status ? `HTTP ${e.response.status}` : (e?.message || 'Error')
   }
 
-  return { inputProxy, videoInput, streaming }
+  // StreamingProxy channels (some Hikvision NVR firmware exposes this)
+  const streamingProxy = { ok: false, count: 0, channels: [] as { ch: number; name: string }[], error: undefined as string | undefined }
+  try {
+    const res = await client.get('/ISAPI/ContentMgmt/StreamingProxy/channels')
+    const data = res.data
+    if (typeof data === 'string') {
+      const blocks = xmlGetAll(data, 'StreamingProxyChannel')
+      for (const block of blocks) {
+        const ch = parseInt(xmlGet(block, 'id') || xmlGet(block, 'channelNo') || '0')
+        const name = xmlGet(block, 'customName') || xmlGet(block, 'name') || xmlGet(block, 'channelName')
+        if (ch) streamingProxy.channels.push({ ch, name })
+      }
+    } else {
+      const raw = data?.StreamingProxyChannelList?.StreamingProxyChannel
+      if (raw) {
+        const list = Array.isArray(raw) ? raw : [raw]
+        for (const item of list) {
+          const ch = parseInt(item.id || item.channelNo || '0')
+          const name = item.customName || item.name || item.channelName || ''
+          if (ch) streamingProxy.channels.push({ ch, name })
+        }
+      }
+    }
+    streamingProxy.ok = true
+    streamingProxy.count = streamingProxy.channels.length
+  } catch (e: any) {
+    streamingProxy.error = e?.response?.status ? `HTTP ${e.response.status}` : (e?.message || 'Error')
+  }
+
+  return { inputProxy, videoInput, streaming, streamingProxy }
 }
 
 // ─── Almacenamiento / HDDs ────────────────────────────────────

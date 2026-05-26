@@ -29,8 +29,15 @@ const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; bloc
   OFFLINE:                 { icon: <WifiOff size={12} />,       label: 'Offline',               blockStream: true },
 }
 
-function isBlockedByHealth(status?: StreamHealthStatus): boolean {
+function isBlockedByHealth(camera: Camera): boolean {
+  const status = camera.streamHealthStatus
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
+  if (status === 'USING_MAIN_STREAM') {
+    // Block if main codec is HEVC — browser can't play it; validator may have stale data
+    const mc = ((camera as any).mainCodec || '').toLowerCase()
+    if (mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')) return true
+    return false
+  }
   return HEALTH_CONFIG[status]?.blockStream ?? false
 }
 
@@ -90,6 +97,8 @@ export function LiveViewPage() {
   const staggerTimers  = useRef<ReturnType<typeof setTimeout>[]>([])
   // Track when page became hidden to decide whether to refresh on unhide
   const hiddenSince    = useRef<number | null>(null)
+  // Rate-limit per-camera 401 auto-restarts: timestamp of last restart per cameraId
+  const lastRestartAt  = useRef<Record<string, number>>({})
 
   useEffect(() => { loadNVRs(); loadCameras() }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
@@ -163,14 +172,19 @@ export function LiveViewPage() {
   }, [clearStaggerTimers])
 
   // ─── Load a single stream ────────────────────────────────────
+  // NOTE: intentionally does NOT depend on `streams` state — using it would create
+  // a stale closure bug where after a 401 clears streams[id], the setTimeout that
+  // calls loadStream still sees the old streams snapshot and returns early.
+  // pendingStarts guards against concurrent duplicate calls instead.
   const loadStream = useCallback(async (camera: Camera): Promise<void> => {
-    if (streams[camera.id] || pendingStarts.current.has(camera.id)) return
+    if (pendingStarts.current.has(camera.id)) return
 
-    // Block cameras with known bad health
-    if (isBlockedByHealth(camera.streamHealthStatus)) {
+    // Block cameras with known bad health (including USING_MAIN_STREAM + HEVC)
+    if (isBlockedByHealth(camera)) {
+      const effectiveStatus = camera.streamHealthStatus === 'USING_MAIN_STREAM' ? 'CODEC_UNSUPPORTED_HEVC' : camera.streamHealthStatus!
       setStreamErrors(prev => ({
         ...prev,
-        [camera.id]: getHealthError(camera.streamHealthStatus!, camera.channel),
+        [camera.id]: getHealthError(effectiveStatus, camera.channel),
       }))
       return
     }
@@ -221,7 +235,7 @@ export function LiveViewPage() {
       pendingStarts.current.delete(camera.id)
       setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
     }
-  }, [streams]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Handle stream limit: cleanup non-visible then retry ────
   const handleLimitHit = useCallback(async (camera: Camera) => {
@@ -381,20 +395,36 @@ export function LiveViewPage() {
 
   // ─── HLS fatal error from VideoPlayer ───────────────────────
   const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
+    console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
+
     if (activeSessions.current.has(cameraId)) {
       apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
       activeSessions.current.delete(cameraId)
     }
 
     if (err.code === 'RTSP_UNAUTHORIZED') {
-      // JWT/session expired — clear stale stream data, bump key (forces HLS remount),
-      // then restart after 2s. Without the key bump, same URL → VideoPlayer
-      // useEffect doesn't re-run → old broken HLS.js keeps making 401 requests.
+      // Session expired — clear stale stream, bump key so HLS.js is destroyed,
+      // then auto-restart once (rate-limited to 1 attempt per 30s per camera).
       setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       bumpPlayerKeys([cameraId])
-      const cam = cameras.find(c => c.id === cameraId)
-      if (cam) setTimeout(() => loadStream(cam), 2000)
+
+      const now = Date.now()
+      const last = lastRestartAt.current[cameraId] ?? 0
+      if (now - last >= 30_000) {
+        lastRestartAt.current[cameraId] = now
+        const cam = cameras.find(c => c.id === cameraId)
+        if (cam) setTimeout(() => loadStream(cam), 500)
+      } else {
+        // Restarted too recently — show error so user can retry manually
+        setStreamErrors(prev => ({
+          ...prev,
+          [cameraId]: {
+            code: 'RTSP_UNAUTHORIZED',
+            message: 'Sesión expirada. Haz clic en Reintentar.',
+          },
+        }))
+      }
     } else {
       setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
     }
@@ -529,19 +559,22 @@ export function LiveViewPage() {
                   className="relative min-h-0 rounded-lg overflow-hidden border border-surface-700"
                 >
                   {/* Health badge */}
-                  {health && health !== 'HEALTHY' && health !== 'UNKNOWN' && HEALTH_CONFIG[health] && (
-                    <div className={clsx(
-                      'absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5',
-                      health === 'USING_MAIN_STREAM' ? 'bg-blue-900/70' : 'bg-black/70'
-                    )}>
-                      <span className={health === 'USING_MAIN_STREAM' ? 'text-blue-400' : 'text-amber-400'}>
-                        {HEALTH_CONFIG[health].icon}
-                      </span>
-                      <span className={clsx('text-[9px] font-medium', health === 'USING_MAIN_STREAM' ? 'text-blue-300' : 'text-amber-300')}>
-                        {HEALTH_CONFIG[health].label}
-                      </span>
-                    </div>
-                  )}
+                  {(() => {
+                    if (!health || health === 'HEALTHY' || health === 'UNKNOWN' || !HEALTH_CONFIG[health]) return null
+                    const mc = ((camera as any).mainCodec || '').toLowerCase()
+                    const mainIsHevc = mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')
+                    const isHevcMain = health === 'USING_MAIN_STREAM' && mainIsHevc
+                    const badgeLabel = isHevcMain ? 'Main HEVC' : HEALTH_CONFIG[health].label
+                    const bgClass = isHevcMain ? 'bg-amber-900/70' : health === 'USING_MAIN_STREAM' ? 'bg-blue-900/70' : 'bg-black/70'
+                    const iconClass = isHevcMain ? 'text-amber-400' : health === 'USING_MAIN_STREAM' ? 'text-blue-400' : 'text-amber-400'
+                    const textClass = isHevcMain ? 'text-amber-300' : health === 'USING_MAIN_STREAM' ? 'text-blue-300' : 'text-amber-300'
+                    return (
+                      <div className={clsx('absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5', bgClass)}>
+                        <span className={iconClass}>{HEALTH_CONFIG[health].icon}</span>
+                        <span className={clsx('text-[9px] font-medium', textClass)}>{badgeLabel}</span>
+                      </div>
+                    )
+                  })()}
                   <VideoPlayer
                     key={`${camera.id}-${playerKeys[camera.id] ?? 0}`}
                     hlsUrl={stream?.hls || ''}

@@ -32,7 +32,9 @@ export async function validateAndUpdateCameraHealth(
 
   let healthStatus: StreamHealthStatus = 'UNKNOWN'
   let rtspSubOk = false
+  let rtspMainOk = false
   let subCodec: string | null = null
+  let mainCodec: string | null = null
   let subResolution: string | null = null
   let lastRtspError: string | null = null
   let preferredStream: 'sub' | 'main' = 'sub'
@@ -41,6 +43,10 @@ export async function validateAndUpdateCameraHealth(
     const result = await probeBothStreams(nvrDecrypted, camera.channel)
     const sub = result.sub
     const main = result.main
+
+    // Capture main stream results unconditionally for DB persistence
+    rtspMainOk = main.ok
+    mainCodec = main.codec || null
 
     const subCodecLower = (sub.codec || '').toLowerCase()
     const mainCodecLower = (main.codec || '').toLowerCase()
@@ -55,6 +61,7 @@ export async function validateAndUpdateCameraHealth(
       subCodec = sub.codec || null
       subResolution = sub.width ? `${sub.width}x${sub.height}` : null
       preferredStream = 'sub'
+      console.info(`[validator] ch${camera.channel} → HEALTHY sub=${sub.codec} ${subResolution || ''}`)
     } else if (sub.ok && subIsHevc) {
       // Substream is HEVC → check if main is H264
       rtspSubOk = true
@@ -62,9 +69,12 @@ export async function validateAndUpdateCameraHealth(
       if (main.ok && mainIsH264) {
         healthStatus = 'USING_MAIN_STREAM'
         preferredStream = 'main'
+        console.info(`[validator] ch${camera.channel} → USING_MAIN_STREAM (sub=HEVC, main=${main.codec})`)
       } else {
+        // main is also HEVC or failed — can't play in browser
         healthStatus = 'CODEC_UNSUPPORTED_HEVC'
         preferredStream = 'sub'
+        console.info(`[validator] ch${camera.channel} → CODEC_UNSUPPORTED_HEVC (sub=${sub.codec}, main=${main.codec || 'failed'})`)
       }
     } else {
       // Substream failed → try main as fallback
@@ -73,9 +83,12 @@ export async function validateAndUpdateCameraHealth(
       if (main.ok && mainIsH264) {
         healthStatus = 'USING_MAIN_STREAM'
         preferredStream = 'main'
+        console.info(`[validator] ch${camera.channel} → USING_MAIN_STREAM (sub failed, main=${main.codec})`)
       } else if (main.ok && mainIsHevc) {
+        // Main is HEVC — cannot play in browser without transcoding
         healthStatus = 'CODEC_UNSUPPORTED_HEVC'
         preferredStream = 'sub'
+        console.info(`[validator] ch${camera.channel} → CODEC_UNSUPPORTED_HEVC (sub failed, main=HEVC ${main.codec})`)
       } else {
         // Both failed — determine error type from sub error
         const error = sub.error || ''
@@ -90,6 +103,7 @@ export async function validateAndUpdateCameraHealth(
         } else {
           healthStatus = 'UNKNOWN'
         }
+        console.info(`[validator] ch${camera.channel} → ${healthStatus} (sub err: ${error.slice(0, 80)})`)
       }
     }
   } catch (err: any) {
@@ -97,19 +111,23 @@ export async function validateAndUpdateCameraHealth(
     healthStatus = 'UNKNOWN'
   }
 
+  const cameraIsReachable = healthStatus === 'HEALTHY' || healthStatus === 'USING_MAIN_STREAM'
+
   // Actualizar la cámara en DB
   await prisma.camera.update({
     where: { id: camera.id },
     data: {
       streamHealthStatus: healthStatus,
       rtspSubOk,
+      rtspMainOk,
       subCodec,
+      mainCodec,
       ...(subResolution ? { subResolution } : {}),
       lastRtspCheckAt: new Date(),
       lastRtspError,
       preferredStream,
-      // If either stream works, mark camera as online
-      ...(healthStatus === 'HEALTHY' || healthStatus === 'USING_MAIN_STREAM' ? { online: true } : {}),
+      // RTSP confirmed reachable → update both online flags
+      ...(cameraIsReachable ? { online: true, onlineInNvr: true } : {}),
     } as any,
   })
 

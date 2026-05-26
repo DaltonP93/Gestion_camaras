@@ -25,11 +25,17 @@ export function Topbar() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [search, setSearch] = useState('')
 
+  // Ensure NVRs are loaded regardless of which page the user lands on
+  useEffect(() => {
+    if (nvrs.length === 0) loadNVRs()
+  }, [])
+
   const title = PAGE_TITLES[location.pathname] || 'VisionCore'
 
-  // Cuentas de estado
-  const onlineNVRs = nvrs.filter((n) => n.active).length
-  const totalCameras = nvrs.reduce((acc, n) => acc + n.channels, 0)
+  // online=true means reachable at last sync; active=true means enabled in DB
+  const onlineNVRs = nvrs.filter((n) => n.online).length
+  // Use actual synced camera count when available, fall back to configured channel capacity
+  const totalCameras = nvrs.reduce((acc, n) => acc + (n.cameras?.length ?? n.channels), 0)
 
   const handleRefresh = async () => {
     setIsRefreshing(true)

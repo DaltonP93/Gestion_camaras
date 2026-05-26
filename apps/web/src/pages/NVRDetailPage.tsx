@@ -125,7 +125,7 @@ export function NVRDetailPage() {
       const updated = result.synced ?? result.log?.length ?? 0
       const dbg = result.debug
       const debugSummary = dbg
-        ? ` | InputProxy: ${dbg.inputProxy?.count ?? '?'} canales, VideoInput: ${dbg.videoInput?.count ?? '?'}, Streaming: ${dbg.streaming?.count ?? '?'}`
+        ? ` | InputProxy: ${dbg.inputProxy?.count ?? '?'}, VideoInput: ${dbg.videoInput?.count ?? '?'}, Streaming: ${dbg.streaming?.count ?? '?'}${dbg.streamingProxy ? `, StreamingProxy: ${dbg.streamingProxy.count}` : ''}`
         : ''
       toast.success(`Nombres sincronizados: ${updated} cámaras${debugSummary}`)
       if (dbg) console.info('[force-names-sync] debug:', JSON.stringify(dbg, null, 2))
@@ -363,6 +363,32 @@ function SummaryTab({ nvr }: { nvr: NVR }) {
   )
 }
 
+// ─── Camera status helper ─────────────────────────────────────
+
+function camStatusDisplay(cam: CameraType): { color: string; dot: string; label: string } {
+  const hs = cam.streamHealthStatus
+  if (hs === 'CODEC_UNSUPPORTED_HEVC')
+    return cam.rtspMainOk
+      ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'HEVC / sub no disponible' }
+      : { color: 'text-amber-400', dot: 'bg-amber-400', label: 'HEVC no compatible' }
+  if (hs === 'RTSP_SUB_NOT_FOUND') {
+    const mainIsHevc = (cam.mainCodec || '').toLowerCase().match(/hevc|h\.?265/)
+    return mainIsHevc
+      ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Main HEVC / Sub no disp.' }
+      : { color: 'text-orange-400', dot: 'bg-orange-400', label: 'Sub no encontrado' }
+  }
+  if (hs === 'AUTH_FAILED')     return { color: 'text-red-400',     dot: 'bg-red-500',     label: 'Auth fallida' }
+  if (hs === 'OFFLINE')         return { color: 'text-red-400',     dot: 'bg-red-500',     label: 'Offline' }
+  if (hs === 'STREAM_UNSTABLE') return { color: 'text-amber-400',   dot: 'bg-amber-400',   label: 'Inestable' }
+  if (hs === 'HEALTHY' || hs === 'USING_MAIN_STREAM')
+    return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  // No health status yet — fall back to raw RTSP / online fields
+  if (cam.rtspMainOk || cam.rtspSubOk) return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  if (cam.mainCodec || cam.subCodec)   return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Detectado' }
+  if (cam.online)                      return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  return { color: 'text-surface-500', dot: 'bg-surface-600', label: 'Offline' }
+}
+
 // ─── Cameras Tab ──────────────────────────────────────────────
 
 function CamerasTab({
@@ -426,9 +452,12 @@ function CamerasTab({
                   <td className="px-3 py-2 text-surface-400">{cam.managementPort || fromNvr?.managementPort || '—'}</td>
                   <td className="px-3 py-2 text-surface-400">{cam.securityStatus || fromNvr?.securityStatus || '—'}</td>
                   <td className="px-3 py-2">
-                    <span className={clsx('inline-flex items-center gap-1', cam.online ? 'text-green-400' : 'text-surface-500')}>
-                      {cam.online ? '●' : '○'} {cam.online ? 'Online' : 'Offline'}
-                    </span>
+                    {(() => { const s = camStatusDisplay(cam); return (
+                      <span className={clsx('inline-flex items-center gap-1.5 text-xs', s.color)}>
+                        <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0', s.dot)} />
+                        {s.label}
+                      </span>
+                    )})()}
                   </td>
                   <td className="px-3 py-2 text-surface-400">{cam.subCodec || cam.mainCodec || '—'}</td>
                   <td className="px-3 py-2 text-surface-400">{cam.subResolution || cam.mainResolution || '—'}</td>
@@ -672,16 +701,22 @@ function DiagnosticsTab({
   result: CameraDiagnostics | null
   loading: boolean
 }) {
-  const Check = ({ ok, label, detail }: { ok: boolean | null; label: string; detail?: string }) => (
+  const Check = ({ ok, label, detail }: { ok: boolean | null | 'warn'; label: string; detail?: string }) => (
     <div className="flex items-start gap-2 py-1.5">
       {ok === null
         ? <Loader2 size={14} className="animate-spin text-surface-400 mt-0.5 flex-shrink-0" />
-        : ok
-          ? <CheckCircle2 size={14} className="text-green-400 mt-0.5 flex-shrink-0" />
-          : <XCircle size={14} className="text-red-400 mt-0.5 flex-shrink-0" />
+        : ok === 'warn'
+          ? <AlertTriangle size={14} className="text-amber-400 mt-0.5 flex-shrink-0" />
+          : ok
+            ? <CheckCircle2 size={14} className="text-green-400 mt-0.5 flex-shrink-0" />
+            : <XCircle size={14} className="text-red-400 mt-0.5 flex-shrink-0" />
       }
       <div>
-        <span className={clsx('text-sm', ok ? 'text-surface-200' : ok === null ? 'text-surface-400' : 'text-red-300')}>{label}</span>
+        <span className={clsx('text-sm',
+          ok === true    ? 'text-surface-200' :
+          ok === 'warn'  ? 'text-amber-200'   :
+          ok === null    ? 'text-surface-400'  : 'text-red-300'
+        )}>{label}</span>
         {detail && <p className="text-xs text-surface-500 mt-0.5">{detail}</p>}
       </div>
     </div>
@@ -759,7 +794,34 @@ function DiagnosticsTab({
                   : result.rtsp.mainError || undefined
                 }
               />
-              <Check ok={result.mediaServer.ready} label="MediaMTX route activa" detail={`Route: ${result.mediaServer.route} · ${result.mediaServer.readers} lectores`} />
+              {(() => {
+                const sc = (result.rtsp.subCodec || '').toLowerCase()
+                const mc = (result.rtsp.mainCodec || '').toLowerCase()
+                const subHevc = sc.includes('hevc') || sc.includes('h265') || sc.includes('h.265')
+                const mainHevc = mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')
+                if (result.rtsp.subOk && !subHevc)
+                  return <Check ok={true} label="Codec compatible web" detail={`Sub H.264: ${result.rtsp.subCodec?.toUpperCase() || '?'} · ${result.rtsp.subResolution || '?'}`} />
+                if (result.rtsp.mainOk && !mainHevc)
+                  return <Check ok={true} label="Codec compatible web" detail={`Main H.264: ${result.rtsp.mainCodec?.toUpperCase() || '?'} · ${result.rtsp.mainResolution || '?'}`} />
+                if (result.rtsp.mainOk && mainHevc)
+                  return <Check ok={'warn'} label="Codec no compatible web (HEVC)" detail={`Main: ${result.rtsp.mainCodec?.toUpperCase() || 'HEVC'} — HLS/WebRTC solo soporta H.264`} />
+                if (result.rtsp.subOk && subHevc)
+                  return <Check ok={'warn'} label="Codec no compatible web (HEVC)" detail={`Sub: ${result.rtsp.subCodec?.toUpperCase() || 'HEVC'} — configura substream en H.264 en el NVR`} />
+                return null
+              })()}
+              <Check
+                ok={result.mediaServer.routeExists}
+                label="MediaMTX route registrada"
+                detail={`Route: ${result.mediaServer.route}`}
+              />
+              <Check
+                ok={result.mediaServer.ready ? true : (result.mediaServer.routeExists ? 'warn' : false)}
+                label="Stream activo en MediaMTX"
+                detail={result.mediaServer.ready
+                  ? `${result.mediaServer.readers} lectores activos`
+                  : 'Sin lectores — se activa al reproducir (sourceOnDemand)'
+                }
+              />
               <Check ok={true} label="URL HLS generada" detail={result.frontend.hlsUrl} />
             </div>
 

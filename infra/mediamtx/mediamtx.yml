@@ -48,8 +48,9 @@ rtcpAddress: :8001
 ###############################################
 hls: yes
 hlsAddress: :8888
-hlsVariant: mpegts
-hlsSegmentCount: 3
+# fmp4 handles B-frames and reordered DTS natively; mpegts fails with "too many reordered frames"
+hlsVariant: fmp4
+hlsSegmentCount: 4
 hlsSegmentDuration: 2s
 hlsSegmentMaxSize: 50MB
 hlsEncryption: no
@@ -73,7 +74,7 @@ webrtcAllowOrigin: "*"
 paths:
   ~^nvr_.*:
     sourceOnDemandStartTimeout: 15s
-    sourceOnDemandCloseAfter: 30s
+    sourceOnDemandCloseAfter: 5m
     record: no
     overridePublisher: yes
 
