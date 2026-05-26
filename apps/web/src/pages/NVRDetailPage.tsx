@@ -6,8 +6,9 @@ import {
   HardDrive, Camera, Users, Wrench, Activity,
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
   Loader2, Play, RotateCcw, Stethoscope, Plus, X,
+  Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
 } from 'lucide-react'
-import { apiGet, apiPost, apiPut } from '@/lib/api'
+import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
 import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics } from '@/types'
 import { clsx } from 'clsx'
@@ -50,7 +51,7 @@ export function NVRDetailPage() {
     if (!id || !nvr) return
     if (tab === 'cameras' && !cameras) loadCameras()
     if (tab === 'storage') loadStorage()
-    if (tab === 'users' && nvrUsers.length === 0) loadUsers()
+    if (tab === 'users') loadUsers()
   }, [tab, nvr])
 
   const loadNvr = async () => {
@@ -279,7 +280,7 @@ export function NVRDetailPage() {
         />
       )}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} onRefresh={loadStorage} />}
-      {tab === 'users'   && <UsersTab users={nvrUsers} loading={loadingUsers} onRefresh={loadUsers} />}
+      {tab === 'users'   && <UsersTab nvrId={nvr.id} users={nvrUsers} loading={loadingUsers} onRefresh={loadUsers} isAdmin={isAdmin} />}
       {tab === 'maintenance' && <MaintenanceTab nvr={nvr} onSync={handleSync} onReboot={handleReboot} onValidateHealth={handleValidateHealth} syncing={syncing} rebooting={rebooting} validatingHealth={validatingHealth} isAdmin={isAdmin} isSupervisor={isSupervisor} />}
       {tab === 'diagnostics' && (
         <DiagnosticsTab
@@ -575,27 +576,77 @@ function StorageTab({ hdds, loading, onRefresh }: { hdds: NvrHdd[]; loading: boo
 
 // ─── Users Tab ────────────────────────────────────────────────
 
-function UsersTab({ users, loading, onRefresh }: { users: any[]; loading: boolean; onRefresh: () => void }) {
-  if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
+const LEVEL_OPTIONS = ['Administrator', 'Operator', 'User'] as const
+type NVRUserLevel = typeof LEVEL_OPTIONS[number]
 
-  const levelLabel = (l: string) => {
-    if (!l) return '—'
-    if (l.toLowerCase().includes('admin')) return 'Administrador'
-    if (l.toLowerCase().includes('oper')) return 'Operador'
-    return l
+function levelLabel(l: string) {
+  if (!l) return '—'
+  if (l.toLowerCase().includes('admin')) return 'Administrador'
+  if (l.toLowerCase().includes('oper')) return 'Operador'
+  if (l.toLowerCase().includes('user')) return 'Usuario'
+  return l
+}
+
+function levelColor(l: string) {
+  if (l.toLowerCase().includes('admin')) return 'text-red-400'
+  if (l.toLowerCase().includes('oper')) return 'text-amber-400'
+  return 'text-surface-400'
+}
+
+function UsersTab({
+  nvrId, users, loading, onRefresh, isAdmin,
+}: {
+  nvrId: string
+  users: any[]
+  loading: boolean
+  onRefresh: () => void
+  isAdmin: boolean
+}) {
+  const [showCreate, setShowCreate] = useState(false)
+  const [editTarget, setEditTarget]   = useState<any | null>(null)
+  const [pwdTarget, setPwdTarget]     = useState<any | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<any | null>(null)
+  const [deleting, setDeleting]       = useState(false)
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return
+    setDeleting(true)
+    try {
+      await apiDelete(`/nvrs/${nvrId}/users/${deleteTarget.id}`)
+      toast.success(`Usuario "${deleteTarget.name}" eliminado del NVR`)
+      setDeleteTarget(null)
+      onRefresh()
+    } catch (err: any) {
+      const body = err?.response?.data
+      const msg: string = body?.message || 'Error al eliminar usuario'
+      const unsupported: boolean = body?.unsupported ?? false
+      toast.error(unsupported ? `NVR no soporta eliminación: ${msg}` : msg)
+    } finally {
+      setDeleting(false)
+    }
   }
+
+  if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
 
   return (
     <div className="space-y-3">
-      <div className="flex justify-end">
-        <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
+      <div className="flex items-center justify-between">
+        <span className="text-sm text-surface-400">{users.length} usuarios en el NVR</span>
+        <div className="flex gap-2">
+          {isAdmin && (
+            <button onClick={() => setShowCreate(true)} className="btn-primary text-xs">
+              <UserPlus size={12} /> Nuevo usuario
+            </button>
+          )}
+          <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
+        </div>
       </div>
 
       <div className="card overflow-hidden">
         <table className="w-full text-xs">
           <thead>
             <tr className="border-b border-surface-700 bg-surface-800/50">
-              {['#', 'Usuario', 'Nivel', 'Estado'].map(h => (
+              {['ID', 'Usuario', 'Nivel', 'Estado', ...(isAdmin ? ['Acciones'] : [])].map(h => (
                 <th key={h} className="text-left px-4 py-2 text-surface-400 font-medium">{h}</th>
               ))}
             </tr>
@@ -605,10 +656,41 @@ function UsersTab({ users, loading, onRefresh }: { users: any[]; loading: boolea
               <tr key={u.id} className="hover:bg-surface-700/30 transition-colors">
                 <td className="px-4 py-2 text-surface-500">{u.id}</td>
                 <td className="px-4 py-2 text-surface-100 font-medium">{u.name}</td>
-                <td className="px-4 py-2 text-surface-400">{levelLabel(u.userLevel)}</td>
+                <td className={clsx('px-4 py-2 font-medium', levelColor(u.userLevel))}>{levelLabel(u.userLevel)}</td>
                 <td className="px-4 py-2">
-                  <span className="text-green-400 text-xs">● Activo</span>
+                  {u.enabled === false
+                    ? <span className="text-surface-500 flex items-center gap-1"><ShieldOff size={11} /> Inactivo</span>
+                    : <span className="text-green-400 flex items-center gap-1"><ShieldCheck size={11} /> Activo</span>
+                  }
                 </td>
+                {isAdmin && (
+                  <td className="px-4 py-2">
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => setEditTarget(u)}
+                        className="p-1 rounded text-surface-400 hover:text-brand-400 hover:bg-surface-700 transition-colors"
+                        title="Editar usuario"
+                      >
+                        <Pencil size={11} />
+                      </button>
+                      <button
+                        onClick={() => setPwdTarget(u)}
+                        className="p-1 rounded text-surface-400 hover:text-amber-400 hover:bg-surface-700 transition-colors"
+                        title="Cambiar contraseña"
+                      >
+                        <KeyRound size={11} />
+                      </button>
+                      <button
+                        onClick={() => setDeleteTarget(u)}
+                        className="p-1 rounded text-surface-400 hover:text-red-400 hover:bg-surface-700 transition-colors"
+                        title="Eliminar usuario"
+                        disabled={u.userLevel?.toLowerCase().includes('admin') && users.filter(x => x.userLevel?.toLowerCase().includes('admin')).length <= 1}
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    </div>
+                  </td>
+                )}
               </tr>
             ))}
           </tbody>
@@ -616,6 +698,291 @@ function UsersTab({ users, loading, onRefresh }: { users: any[]; loading: boolea
         {users.length === 0 && (
           <div className="py-10 text-center text-surface-500 text-sm">Sin usuarios o el NVR no soporta este endpoint</div>
         )}
+      </div>
+
+      {/* Create modal */}
+      {showCreate && (
+        <NVRUserCreateModal
+          nvrId={nvrId}
+          onClose={() => setShowCreate(false)}
+          onSuccess={() => { setShowCreate(false); onRefresh() }}
+        />
+      )}
+
+      {/* Edit modal */}
+      {editTarget && (
+        <NVRUserEditModal
+          nvrId={nvrId}
+          user={editTarget}
+          onClose={() => setEditTarget(null)}
+          onSuccess={() => { setEditTarget(null); onRefresh() }}
+        />
+      )}
+
+      {/* Change password modal */}
+      {pwdTarget && (
+        <NVRUserPasswordModal
+          nvrId={nvrId}
+          user={pwdTarget}
+          onClose={() => setPwdTarget(null)}
+          onSuccess={() => setPwdTarget(null)}
+        />
+      )}
+
+      {/* Delete confirmation */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="card w-full max-w-sm p-6 animate-slide-in shadow-2xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-full bg-red-900/40 flex items-center justify-center flex-shrink-0">
+                <Trash2 size={16} className="text-red-400" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-surface-100">Eliminar usuario NVR</h3>
+                <p className="text-xs text-surface-400">Esta acción es irreversible en el NVR.</p>
+              </div>
+            </div>
+            <p className="text-xs text-surface-300">
+              ¿Eliminar al usuario <span className="font-semibold text-surface-100">"{deleteTarget.name}"</span> ({levelLabel(deleteTarget.userLevel)}) del NVR?
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => setDeleteTarget(null)} className="btn-secondary text-xs" disabled={deleting}>Cancelar</button>
+              <button
+                onClick={handleDelete}
+                disabled={deleting}
+                className="px-3 py-1.5 rounded-lg bg-red-900/40 border border-red-800/50 text-red-400 hover:bg-red-900/60 text-xs font-medium transition-colors flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {deleting ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+                {deleting ? 'Eliminando...' : 'Eliminar'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── NVR User Create Modal ─────────────────────────────────────
+
+function NVRUserCreateModal({ nvrId, onClose, onSuccess }: { nvrId: string; onClose: () => void; onSuccess: () => void }) {
+  const [form, setForm] = useState({ name: '', password: '', confirm: '', userLevel: 'Operator' as NVRUserLevel })
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  const f = (key: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
+    setForm(prev => ({ ...prev, [key]: e.target.value }))
+
+  const handleSave = async () => {
+    if (!form.name.trim()) { setError('El nombre de usuario es obligatorio'); return }
+    if (form.password.length < 8) { setError('La contraseña debe tener al menos 8 caracteres'); return }
+    if (form.password !== form.confirm) { setError('Las contraseñas no coinciden'); return }
+    setError('')
+    setSaving(true)
+    try {
+      await apiPost(`/nvrs/${nvrId}/users`, { name: form.name, password: form.password, userLevel: form.userLevel })
+      toast.success(`Usuario "${form.name}" creado en el NVR`)
+      onSuccess()
+    } catch (err: any) {
+      const body = err?.response?.data
+      const msg: string = body?.message || 'Error al crear usuario'
+      setError(body?.unsupported ? `NVR no soporta creación de usuarios: ${msg}` : msg)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+      <div className="card w-full max-w-md p-6 animate-slide-in shadow-2xl">
+        <div className="flex items-center justify-between mb-5">
+          <h3 className="text-sm font-semibold text-surface-100">Nuevo usuario NVR</h3>
+          <button onClick={onClose} className="btn-ghost p-1"><X size={14} /></button>
+        </div>
+        <div className="space-y-3">
+          <div>
+            <label className="label">Nombre de usuario *</label>
+            <input className="input" placeholder="operador1" value={form.name} onChange={f('name')} autoFocus />
+            <p className="text-[10px] text-surface-500 mt-1">Solo letras, números y _ @ . -</p>
+          </div>
+          <div>
+            <label className="label">Nivel / Rol</label>
+            <select className="input w-full" value={form.userLevel} onChange={f('userLevel')}>
+              {LEVEL_OPTIONS.map(l => <option key={l} value={l}>{levelLabel(l)}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="label">Contraseña *</label>
+            <input className="input" type="password" placeholder="Mín. 8 caracteres" value={form.password} onChange={f('password')} />
+          </div>
+          <div>
+            <label className="label">Confirmar contraseña *</label>
+            <input className="input" type="password" placeholder="Repetir contraseña" value={form.confirm} onChange={f('confirm')} />
+          </div>
+          {error && <p className="text-xs text-red-400 bg-red-900/20 border border-red-900/40 rounded-lg px-3 py-2">{error}</p>}
+        </div>
+        <div className="flex gap-2 mt-5 justify-end">
+          <button onClick={onClose} className="btn-secondary text-xs" disabled={saving}>Cancelar</button>
+          <button onClick={handleSave} disabled={saving} className="btn-primary text-xs">
+            {saving ? <><Loader2 size={12} className="animate-spin" /> Creando...</> : <><UserPlus size={12} /> Crear usuario</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── NVR User Edit Modal ───────────────────────────────────────
+
+function NVRUserEditModal({
+  nvrId, user, onClose, onSuccess,
+}: { nvrId: string; user: any; onClose: () => void; onSuccess: () => void }) {
+  const [form, setForm] = useState({
+    name:      user.name as string,
+    userLevel: (user.userLevel || 'Operator') as NVRUserLevel,
+    enabled:   user.enabled !== false,
+  })
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  const handleSave = async () => {
+    if (!form.name.trim()) { setError('El nombre no puede estar vacío'); return }
+    setError('')
+    setSaving(true)
+    try {
+      await apiPut(`/nvrs/${nvrId}/users/${user.id}`, form)
+      toast.success(`Usuario "${form.name}" actualizado`)
+      onSuccess()
+    } catch (err: any) {
+      const body = err?.response?.data
+      const msg: string = body?.message || 'Error al actualizar usuario'
+      setError(body?.unsupported ? `NVR no soporta edición de usuarios: ${msg}` : msg)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+      <div className="card w-full max-w-md p-6 animate-slide-in shadow-2xl">
+        <div className="flex items-center justify-between mb-5">
+          <h3 className="text-sm font-semibold text-surface-100">Editar usuario NVR</h3>
+          <button onClick={onClose} className="btn-ghost p-1"><X size={14} /></button>
+        </div>
+        <div className="space-y-3">
+          <div>
+            <label className="label">Nombre de usuario</label>
+            <input
+              className="input"
+              value={form.name}
+              onChange={e => setForm(p => ({ ...p, name: e.target.value }))}
+            />
+          </div>
+          <div>
+            <label className="label">Nivel / Rol</label>
+            <select
+              className="input w-full"
+              value={form.userLevel}
+              onChange={e => setForm(p => ({ ...p, userLevel: e.target.value as NVRUserLevel }))}
+            >
+              {LEVEL_OPTIONS.map(l => <option key={l} value={l}>{levelLabel(l)}</option>)}
+            </select>
+          </div>
+          {user.enabled !== undefined && (
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={form.enabled}
+                onChange={e => setForm(p => ({ ...p, enabled: e.target.checked }))}
+                className="w-4 h-4 rounded border-surface-600 bg-surface-800 text-brand-500"
+              />
+              <span className="text-xs text-surface-300">Usuario habilitado</span>
+            </label>
+          )}
+          {error && <p className="text-xs text-red-400 bg-red-900/20 border border-red-900/40 rounded-lg px-3 py-2">{error}</p>}
+        </div>
+        <div className="flex gap-2 mt-5 justify-end">
+          <button onClick={onClose} className="btn-secondary text-xs" disabled={saving}>Cancelar</button>
+          <button onClick={handleSave} disabled={saving} className="btn-primary text-xs">
+            {saving ? <><Loader2 size={12} className="animate-spin" /> Guardando...</> : <><Pencil size={12} /> Guardar cambios</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── NVR User Password Modal ───────────────────────────────────
+
+function NVRUserPasswordModal({
+  nvrId, user, onClose, onSuccess,
+}: { nvrId: string; user: any; onClose: () => void; onSuccess: () => void }) {
+  const [newPassword, setNewPassword] = useState('')
+  const [confirm, setConfirm]         = useState('')
+  const [saving, setSaving]           = useState(false)
+  const [error, setError]             = useState('')
+
+  const handleSave = async () => {
+    if (newPassword.length < 8) { setError('La contraseña debe tener al menos 8 caracteres'); return }
+    if (newPassword !== confirm) { setError('Las contraseñas no coinciden'); return }
+    setError('')
+    setSaving(true)
+    try {
+      await apiPost(`/nvrs/${nvrId}/users/${user.id}/change-password`, {
+        newPassword,
+        userName: user.name,
+      })
+      toast.success(`Contraseña de "${user.name}" actualizada`)
+      onSuccess()
+    } catch (err: any) {
+      const body = err?.response?.data
+      const msg: string = body?.message || 'Error al cambiar contraseña'
+      setError(body?.unsupported ? `NVR no soporta cambio de contraseña: ${msg}` : msg)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+      <div className="card w-full max-w-sm p-6 animate-slide-in shadow-2xl">
+        <div className="flex items-center justify-between mb-5">
+          <div>
+            <h3 className="text-sm font-semibold text-surface-100">Cambiar contraseña</h3>
+            <p className="text-xs text-surface-500 mt-0.5">Usuario: <span className="text-surface-300 font-medium">{user.name}</span></p>
+          </div>
+          <button onClick={onClose} className="btn-ghost p-1"><X size={14} /></button>
+        </div>
+        <div className="space-y-3">
+          <div>
+            <label className="label">Nueva contraseña *</label>
+            <input
+              className="input"
+              type="password"
+              placeholder="Mín. 8 caracteres"
+              value={newPassword}
+              onChange={e => setNewPassword(e.target.value)}
+              autoFocus
+            />
+          </div>
+          <div>
+            <label className="label">Confirmar contraseña *</label>
+            <input
+              className="input"
+              type="password"
+              placeholder="Repetir contraseña"
+              value={confirm}
+              onChange={e => setConfirm(e.target.value)}
+            />
+          </div>
+          {error && <p className="text-xs text-red-400 bg-red-900/20 border border-red-900/40 rounded-lg px-3 py-2">{error}</p>}
+        </div>
+        <div className="flex gap-2 mt-5 justify-end">
+          <button onClick={onClose} className="btn-secondary text-xs" disabled={saving}>Cancelar</button>
+          <button onClick={handleSave} disabled={saving} className="btn-primary text-xs">
+            {saving ? <><Loader2 size={12} className="animate-spin" /> Guardando...</> : <><KeyRound size={12} /> Cambiar contraseña</>}
+          </button>
+        </div>
       </div>
     </div>
   )

@@ -5,6 +5,7 @@ import {
   getNVRStatus, getNVRChannels, getIpCameraList,
   getStorageInfo, getNVRUsers, getDeviceInfo, rebootDevice,
   adoptIpCamera, getFreeChannels, debugGetCameraNameSources,
+  createNVRUser, updateNVRUser, changeNVRUserPassword, deleteNVRUser,
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -692,5 +693,115 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     publishAllStreams(nvrDec as any, cameras).catch(() => {})
 
     return reply.send({ success: true, camera, message: 'Cámara adoptada correctamente' })
+  })
+
+  // ─── Gestión de usuarios NVR ───────────────────────────────
+
+  // POST /api/nvrs/:id/users — Crear usuario en el NVR
+  server.post('/:id/users', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const schema = z.object({
+      name:      z.string().min(1).max(32).regex(/^[a-zA-Z0-9_@.-]+$/, 'Solo letras, números y _ @ . -'),
+      password:  z.string().min(8).max(64),
+      userLevel: z.enum(['Administrator', 'Operator', 'User']).default('Operator'),
+    })
+    const params = schema.parse(request.body)
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
+    const result = await createNVRUser(nvrDec as any, params)
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_USER_CREATED', id, request, {
+      nvrName: nvr.name, targetUser: params.name, userLevel: params.userLevel,
+      success: result.success, error: result.error,
+    })
+
+    if (!result.success) {
+      const status = result.unsupported ? 501 : 400
+      return reply.status(status).send({ message: result.error, unsupported: result.unsupported ?? false })
+    }
+    return reply.status(201).send({ success: true, id: result.id })
+  })
+
+  // PUT /api/nvrs/:id/users/:userId — Editar usuario NVR
+  server.put('/:id/users/:userId', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id, userId } = request.params as { id: string; userId: string }
+    const schema = z.object({
+      name:      z.string().min(1).max(32).regex(/^[a-zA-Z0-9_@.-]+$/),
+      userLevel: z.enum(['Administrator', 'Operator', 'User']),
+      enabled:   z.boolean().optional(),
+    })
+    const params = schema.parse(request.body)
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
+    const result = await updateNVRUser(nvrDec as any, parseInt(userId), params)
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_USER_UPDATED', id, request, {
+      nvrName: nvr.name, userId, changes: { name: params.name, userLevel: params.userLevel, enabled: params.enabled },
+      success: result.success, error: result.error,
+    })
+
+    if (!result.success) {
+      const status = result.unsupported ? 501 : 400
+      return reply.status(status).send({ message: result.error, unsupported: result.unsupported ?? false })
+    }
+    return reply.send({ success: true })
+  })
+
+  // POST /api/nvrs/:id/users/:userId/change-password — Cambiar contraseña de usuario NVR
+  server.post('/:id/users/:userId/change-password', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id, userId } = request.params as { id: string; userId: string }
+    const schema = z.object({
+      newPassword: z.string().min(8).max(64),
+      userName:    z.string().min(1),
+    })
+    const { newPassword, userName } = schema.parse(request.body)
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
+    const result = await changeNVRUserPassword(nvrDec as any, parseInt(userId), newPassword, userName)
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_USER_PASSWORD_CHANGED', id, request, {
+      nvrName: nvr.name, userId, userName, success: result.success, error: result.error,
+    })
+
+    if (!result.success) {
+      const status = result.unsupported ? 501 : 400
+      return reply.status(status).send({ message: result.error, unsupported: result.unsupported ?? false })
+    }
+    return reply.send({ success: true })
+  })
+
+  // DELETE /api/nvrs/:id/users/:userId — Eliminar usuario NVR
+  server.delete('/:id/users/:userId', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id, userId } = request.params as { id: string; userId: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    // Get current users first to capture name for audit
+    const users = await getNVRUsers({ ...nvr, password: decryptPassword(nvr.password) } as any)
+    const target = users.find(u => u.id === parseInt(userId))
+
+    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
+    const result = await deleteNVRUser(nvrDec as any, parseInt(userId))
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_USER_DELETED', id, request, {
+      nvrName: nvr.name, userId, userName: target?.name ?? '?',
+      success: result.success, error: result.error,
+    })
+
+    if (!result.success) {
+      const status = result.unsupported ? 501 : 400
+      return reply.status(status).send({ message: result.error, unsupported: result.unsupported ?? false })
+    }
+    return reply.send({ success: true })
   })
 }

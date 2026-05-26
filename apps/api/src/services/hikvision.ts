@@ -64,6 +64,14 @@ export interface HikNVRUser {
   name: string
   userLevel: string   // Administrator, Operator, User
   active: boolean
+  enabled?: boolean   // explicit enabled flag (some models expose it)
+}
+
+export interface HikUserWriteResult {
+  success: boolean
+  id?: number         // returned on create
+  error?: string
+  unsupported?: boolean  // true when NVR doesn't support the ISAPI operation
 }
 
 export interface HikVideoEncoding {
@@ -737,11 +745,13 @@ export async function getNVRUsers(nvr: NVR): Promise<HikNVRUser[]> {
     if (typeof res.data === 'string') {
       const blocks = xmlGetAll(res.data, 'User')
       blocks.forEach(b => {
+        const enabledStr = xmlGet(b, 'enabled')
         users.push({
           id:        parseInt(xmlGet(b, 'id') || '0'),
           name:      xmlGet(b, 'userName'),
           userLevel: xmlGet(b, 'userLevel') || xmlGet(b, 'roleType'),
-          active:    true,
+          active:    enabledStr ? enabledStr === 'true' : true,
+          enabled:   enabledStr ? enabledStr === 'true' : undefined,
         })
       })
     } else {
@@ -749,11 +759,13 @@ export async function getNVRUsers(nvr: NVR): Promise<HikNVRUser[]> {
       if (raw) {
         const list = Array.isArray(raw) ? raw : [raw]
         list.forEach((u: any) => {
+          const enabled = u.enabled !== undefined ? u.enabled === true || u.enabled === 'true' : undefined
           users.push({
             id:        parseInt(u.id || '0'),
             name:      u.userName || u.name || '',
             userLevel: u.userLevel || u.roleType || '',
-            active:    true,
+            active:    enabled !== undefined ? enabled : true,
+            enabled,
           })
         })
       }
@@ -762,6 +774,107 @@ export async function getNVRUsers(nvr: NVR): Promise<HikNVRUser[]> {
     return users
   } catch {
     return []
+  }
+}
+
+// ─── Gestión de usuarios NVR ─────────────────────────────────
+
+function hikUserError(err: any): HikUserWriteResult {
+  const status: number = err?.response?.status
+  if (status === 404 || status === 405)
+    return { success: false, unsupported: true, error: 'El NVR no soporta este endpoint ISAPI' }
+  if (status === 400) {
+    const detail = err?.response?.data
+    const msg = typeof detail === 'string'
+      ? (detail.match(/<errorMsg>([^<]+)<\/errorMsg>/)?.[1] || detail.slice(0, 120))
+      : (detail?.ResponseStatus?.subStatusCode || detail?.statusString || 'Datos inválidos')
+    return { success: false, error: String(msg) }
+  }
+  if (status === 401) return { success: false, error: 'Sin autorización (credenciales NVR)' }
+  if (status === 403) return { success: false, error: 'Sin permisos para esta operación en el NVR' }
+  return { success: false, error: `Error HTTP ${status ?? 'desconocido'}: ${err?.message || ''}` }
+}
+
+export async function createNVRUser(
+  nvr: NVR,
+  params: { name: string; password: string; userLevel: string }
+): Promise<HikUserWriteResult> {
+  try {
+    const client = createHikClient(nvr)
+    const body = `<?xml version="1.0" encoding="UTF-8"?>
+<User version="2.0">
+  <userName>${params.name}</userName>
+  <userLevel>${params.userLevel}</userLevel>
+  <password>${params.password}</password>
+</User>`
+    const res = await client.post('/ISAPI/Security/users', body, {
+      headers: { 'Content-Type': 'application/xml' },
+    })
+    const newId = parseInt(
+      (typeof res.data === 'string' ? xmlGet(res.data, 'id') : String(res.data?.id || '')) || '0'
+    )
+    return { success: true, id: newId || undefined }
+  } catch (err) {
+    return hikUserError(err)
+  }
+}
+
+export async function updateNVRUser(
+  nvr: NVR,
+  userId: number,
+  params: { name: string; userLevel: string; enabled?: boolean }
+): Promise<HikUserWriteResult> {
+  try {
+    const client = createHikClient(nvr)
+    const enabledTag = params.enabled !== undefined
+      ? `\n  <enabled>${params.enabled}</enabled>`
+      : ''
+    const body = `<?xml version="1.0" encoding="UTF-8"?>
+<User version="2.0">
+  <id>${userId}</id>
+  <userName>${params.name}</userName>
+  <userLevel>${params.userLevel}</userLevel>${enabledTag}
+</User>`
+    await client.put(`/ISAPI/Security/users/${userId}`, body, {
+      headers: { 'Content-Type': 'application/xml' },
+    })
+    return { success: true }
+  } catch (err) {
+    return hikUserError(err)
+  }
+}
+
+export async function changeNVRUserPassword(
+  nvr: NVR,
+  userId: number,
+  newPassword: string,
+  userName: string
+): Promise<HikUserWriteResult> {
+  try {
+    const client = createHikClient(nvr)
+    // Include userName to satisfy strict NVR validators that require it on PUT
+    const body = `<?xml version="1.0" encoding="UTF-8"?>
+<User version="2.0">
+  <id>${userId}</id>
+  <userName>${userName}</userName>
+  <password>${newPassword}</password>
+</User>`
+    await client.put(`/ISAPI/Security/users/${userId}`, body, {
+      headers: { 'Content-Type': 'application/xml' },
+    })
+    return { success: true }
+  } catch (err) {
+    return hikUserError(err)
+  }
+}
+
+export async function deleteNVRUser(nvr: NVR, userId: number): Promise<HikUserWriteResult> {
+  try {
+    const client = createHikClient(nvr)
+    await client.delete(`/ISAPI/Security/users/${userId}`)
+    return { success: true }
+  } catch (err) {
+    return hikUserError(err)
   }
 }
 
