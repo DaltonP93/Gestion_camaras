@@ -40,6 +40,8 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
     overridePublisher: true,
   }
 
+  console.info(`[stream] publish → path=${streamPath} stream=${useSub ? 'sub' : 'main'} preferredStream=${(camera as any).preferredStream || 'sub'} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} closeAfter=10m`)
+
   try {
     // GET check: verify if path already exists
     let existingSource: string | undefined

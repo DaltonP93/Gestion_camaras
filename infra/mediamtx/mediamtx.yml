@@ -38,6 +38,10 @@ metricsAddress: :9998
 ###############################################
 protocols: [tcp]
 
+# Forzar TCP para pulling RTSP → evita pérdida de paquetes RTP en UDP
+# protocols:[tcp] solo restringe conexiones entrantes; esto fuerza el pull de fuentes
+rtspTransport: tcp
+
 rtspAddress: :8554
 rtspsAddress: :8322
 rtpAddress: :8000

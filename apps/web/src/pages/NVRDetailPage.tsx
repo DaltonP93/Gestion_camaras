@@ -1193,15 +1193,34 @@ function DiagnosticsTab({
                 const mc = (result.rtsp.mainCodec || '').toLowerCase()
                 const subHevc = sc.includes('hevc') || sc.includes('h265') || sc.includes('h.265')
                 const mainHevc = mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')
-                if (result.rtsp.subOk && !subHevc)
-                  return <Check ok={true} label="Codec compatible web" detail={`Sub H.264: ${result.rtsp.subCodec?.toUpperCase() || '?'} · ${result.rtsp.subResolution || '?'}`} />
-                if (result.rtsp.mainOk && !mainHevc)
-                  return <Check ok={true} label="Codec compatible web" detail={`Main H.264: ${result.rtsp.mainCodec?.toUpperCase() || '?'} · ${result.rtsp.mainResolution || '?'}`} />
-                if (result.rtsp.mainOk && mainHevc)
-                  return <Check ok={'warn'} label="Codec no compatible web (HEVC)" detail={`Main: ${result.rtsp.mainCodec?.toUpperCase() || 'HEVC'} — HLS/WebRTC solo soporta H.264`} />
-                if (result.rtsp.subOk && subHevc)
-                  return <Check ok={'warn'} label="Codec no compatible web (HEVC)" detail={`Sub: ${result.rtsp.subCodec?.toUpperCase() || 'HEVC'} — configura substream en H.264 en el NVR`} />
-                return null
+                const preferred = result.rtsp.preferred || result.camera.preferredStream || 'sub'
+                const chosenCodec = preferred === 'main'
+                  ? (result.rtsp.mainCodec || result.rtsp.subCodec || '?')
+                  : (result.rtsp.subCodec || result.rtsp.mainCodec || '?')
+                const chosenRes = preferred === 'main' ? result.rtsp.mainResolution : result.rtsp.subResolution
+                const chosenIsHevc = preferred === 'main' ? mainHevc : subHevc
+                return <>
+                  <Check
+                    ok={!chosenIsHevc}
+                    label={`Stream elegido: ${preferred.toUpperCase()} · ${chosenCodec.toUpperCase()}`}
+                    detail={chosenRes ? `Resolución: ${chosenRes}` : undefined}
+                  />
+                  {(subHevc || mainHevc) && (
+                    <div className="py-1.5 pl-6 text-xs text-amber-300 bg-amber-900/20 rounded px-3 my-1">
+                      Recomendación HEVC: En el NVR, configura el subflujo en H.264, desactiva H.264+ y desactiva B-frames.
+                    </div>
+                  )}
+                  {result.rtsp.subOk && !subHevc
+                    ? <Check ok={true} label="Codec compatible web (sub)" detail={`${result.rtsp.subCodec?.toUpperCase() || '?'} · ${result.rtsp.subResolution || '?'}`} />
+                    : result.rtsp.mainOk && !mainHevc
+                      ? <Check ok={true} label="Codec compatible web (main)" detail={`${result.rtsp.mainCodec?.toUpperCase() || '?'} · ${result.rtsp.mainResolution || '?'}`} />
+                      : result.rtsp.mainOk && mainHevc
+                        ? <Check ok={'warn'} label="Codec no compatible web (HEVC)" detail={`Main: ${result.rtsp.mainCodec?.toUpperCase() || 'HEVC'} — HLS/WebRTC solo soporta H.264`} />
+                        : result.rtsp.subOk && subHevc
+                          ? <Check ok={'warn'} label="Codec no compatible web (HEVC)" detail={`Sub: ${result.rtsp.subCodec?.toUpperCase() || 'HEVC'} — configura substream en H.264 en el NVR`} />
+                          : null
+                  }
+                </>
               })()}
               <Check
                 ok={result.mediaServer.routeExists}
@@ -1212,10 +1231,13 @@ function DiagnosticsTab({
                 ok={result.mediaServer.ready ? true : (result.mediaServer.routeExists ? 'warn' : false)}
                 label="Stream activo en MediaMTX"
                 detail={result.mediaServer.ready
-                  ? `${result.mediaServer.readers} lectores activos`
+                  ? `${result.mediaServer.readers} lector(es) activo(s)`
                   : 'Sin lectores — se activa al reproducir (sourceOnDemand)'
                 }
               />
+              {result.mediaServer.sourceType && (
+                <Check ok={true} label={`Tipo de fuente: ${result.mediaServer.sourceType}`} detail={result.mediaServer.sourceMasked} />
+              )}
               <Check ok={true} label="URL HLS generada" detail={result.frontend.hlsUrl} />
             </div>
 

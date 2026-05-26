@@ -205,6 +205,8 @@ export interface CameraDiagnostics {
     routeExists: boolean
     ready: boolean
     readers: number
+    sourceType?: string
+    sourceMasked?: string
   }
   frontend: {
     hlsUrl: string

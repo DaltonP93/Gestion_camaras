@@ -21,6 +21,7 @@ export type CameraPlaybackErrorCode =
   | 'MEDIAMTX_ROUTE_MISSING'
   | 'MEDIAMTX_NOT_READY'
   | 'HLS_MANIFEST_NOT_FOUND'
+  | 'HLS_SESSION_EXPIRED'
   | 'PLAYER_TIMEOUT'
   | 'UNKNOWN'
 
@@ -42,12 +43,13 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   MEDIAMTX_ROUTE_MISSING:  { icon: <Server size={16} />,       label: 'Ruta MediaMTX no existe',    color: 'text-orange-400' },
   MEDIAMTX_NOT_READY:      { icon: <Server size={16} />,       label: 'Stream MediaMTX no listo',   color: 'text-orange-400' },
   HLS_MANIFEST_NOT_FOUND:  { icon: <Film size={16} />,         label: 'HLS manifest no encontrado', color: 'text-orange-400' },
+  HLS_SESSION_EXPIRED:     { icon: <Clock size={16} />,        label: 'Sesión HLS expirada',         color: 'text-amber-400' },
   PLAYER_TIMEOUT:          { icon: <Clock size={16} />,        label: 'Sin frames (timeout)',        color: 'text-surface-400' },
   UNKNOWN:                 { icon: <AlertTriangle size={16} />, label: 'Error desconocido',          color: 'text-surface-400' },
 }
 
 function classifyHlsError(data: ErrorData): CameraPlaybackErrorCode {
-  if (data.response?.code === 401) return 'RTSP_UNAUTHORIZED'
+  if (data.response?.code === 401) return 'HLS_SESSION_EXPIRED'
   if (data.response?.code === 404) return 'HLS_MANIFEST_NOT_FOUND'
   if (data.response?.code === 500) return 'MEDIAMTX_NOT_READY'
   if (data.type === Hls.ErrorTypes.NETWORK_ERROR) return 'MEDIAMTX_NOT_READY'
@@ -146,16 +148,19 @@ export function VideoPlayer({
         if (data.fatal) {
           const errorCode = classifyHlsError(data)
 
-          // 401 — MediaMTX session expired (cookie mismatch or source closed)
+          // 401 — MediaMTX HLS session expired (cookie expired or muxer destroyed)
           if (data.response?.code === 401) {
-            console.warn('[VideoPlayer] HLS 401', { cameraId, hlsUrl, detail: data.details })
+            const urlHint = (data.url || '').includes('index.m3u8') ? 'index'
+              : (data.url || '').includes('video') ? 'variant' : 'segment'
+            console.warn('[VideoPlayer] HLS 401', { cameraId, urlType: urlHint, url: data.url, detail: data.details })
             const err: CameraPlaybackError = {
-              code: 'RTSP_UNAUTHORIZED',
-              message: 'Sesión expirada (401 Unauthorized)',
-              technicalDetail: `URL: ${hlsUrl}`,
+              code: 'HLS_SESSION_EXPIRED',
+              message: 'Sesión HLS expirada; reconectando...',
+              technicalDetail: `URL: ${data.url || hlsUrl} (${urlHint})`,
             }
-            setStatus('error')
-            setInternalError(err)
+            // Keep loading state — parent (LiveView) handles auto-restart; avoid error flash
+            setStatus('loading')
+            setInternalError(null)
             if (cameraId) onStreamError?.(cameraId, err)
             return
           }
