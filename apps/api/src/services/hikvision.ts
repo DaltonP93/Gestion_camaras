@@ -424,7 +424,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         const rawId = parseInt(xmlGet(block, 'id') || '0')
         if (!rawId) continue
         // id 101 = ch1, 202 = ch2, 1901 = ch19
-        const ch = Math.round(rawId / 100)
+        const ch = Math.floor(rawId / 100)
         const channelName = xmlGet(block, 'channelName')
         // Skip channelNames that are just the stream ID or pure numerics
         if (channelName && channelName.trim() !== String(rawId) && !isPlaceholderName(channelName)) {
@@ -440,7 +440,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         for (const sc of chList) {
           const rawId = parseInt(sc.id || '0')
           if (!rawId) continue
-          const ch = Math.round(rawId / 100)
+          const ch = Math.floor(rawId / 100)
           const channelName = sc.channelName || ''
           // Skip channelNames that are just the stream ID or pure numerics
           if (channelName && channelName.trim() !== String(rawId) && !isPlaceholderName(channelName)) {
