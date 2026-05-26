@@ -174,7 +174,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         name:             camera.name,
         ipAddress:        camera.ipAddress,
         protocol:         camera.protocol,
-        onlineInNvr:      camera.online,
+        onlineInNvr:      (camera as any).onlineInNvr ?? camera.online,
         preferredStream:  camera.preferredStream,
       },
       rtsp: {
@@ -367,6 +367,59 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       subResolution:(updated as any)?.subResolution ?? null,
       lastRtspCheckAt: (updated as any)?.lastRtspCheckAt ?? null,
       lastRtspError:   (updated as any)?.lastRtspError ?? null,
+    })
+  })
+
+  // GET /api/cameras/:id/debug-stream — Estado completo del stream sin probar RTSP
+  server.get('/:id/debug-stream', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+
+    const nvr = camera.nvr
+    const streamPath = getStreamPath(nvr, camera)
+    const mediamtxStatus = await getStreamStatus(streamPath)
+
+    return reply.send({
+      cameraId:           id,
+      name:               camera.name,
+      channel:            camera.channel,
+      channelCode:        (camera as any).channelCode || `D${camera.channel}`,
+      active:             camera.active,
+      online:             camera.online,
+      onlineInNvr:        (camera as any).onlineInNvr ?? null,
+      preferredStream:    (camera as any).preferredStream ?? null,
+      streamHealthStatus: (camera as any).streamHealthStatus ?? null,
+      rtspMainOk:         (camera as any).rtspMainOk ?? null,
+      rtspSubOk:          (camera as any).rtspSubOk ?? null,
+      mainCodec:          (camera as any).mainCodec ?? null,
+      subCodec:           (camera as any).subCodec ?? null,
+      mainResolution:     (camera as any).mainResolution ?? null,
+      subResolution:      (camera as any).subResolution ?? null,
+      mainFps:            (camera as any).mainFps ?? null,
+      subFps:             (camera as any).subFps ?? null,
+      lastRtspCheckAt:    (camera as any).lastRtspCheckAt ?? null,
+      lastRtspError:      sanitizeRtsp((camera as any).lastRtspError),
+      consecutiveFailures:(camera as any).consecutiveFailures ?? 0,
+      subUrlMasked:       buildRtspUrlMasked({ ...nvr, password: '***' } as any, camera.channel, true),
+      mainUrlMasked:      buildRtspUrlMasked({ ...nvr, password: '***' } as any, camera.channel, false),
+      mediaServer: {
+        streamPath,
+        hlsUrl:      getHlsUrl(streamPath),
+        webrtcUrl:   getWebRtcUrl(streamPath),
+        routeExists: mediamtxStatus.routeExists,
+        active:      mediamtxStatus.active,
+        readers:     mediamtxStatus.readers,
+        bytesReceived: mediamtxStatus.bytesReceived,
+      },
+      nvr: {
+        id:         nvr.id,
+        name:       nvr.name,
+        ipAddress:  nvr.ipAddress,
+        online:     nvr.online,
+        lastSeen:   nvr.lastSeen,
+      },
     })
   })
 

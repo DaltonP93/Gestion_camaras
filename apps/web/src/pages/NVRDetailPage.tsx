@@ -368,6 +368,16 @@ function SummaryTab({ nvr }: { nvr: NVR }) {
 
 function camStatusDisplay(cam: CameraType): { color: string; dot: string; label: string } {
   const hs = cam.streamHealthStatus
+
+  // Positive RTSP/online confirmation overrides stale health status (including OFFLINE)
+  const rtspConfirmed =
+    cam.rtspSubOk === true ||
+    (cam.rtspMainOk === true && cam.preferredStream === 'main')
+  const healthOnline =
+    cam.onlineInNvr === true && (hs === 'HEALTHY' || hs === 'USING_MAIN_STREAM')
+
+  // Hard errors that always show regardless of RTSP fields
+  if (hs === 'AUTH_FAILED')     return { color: 'text-red-400',   dot: 'bg-red-500',   label: 'Auth fallida' }
   if (hs === 'CODEC_UNSUPPORTED_HEVC')
     return cam.rtspMainOk
       ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'HEVC / sub no disponible' }
@@ -378,15 +388,18 @@ function camStatusDisplay(cam: CameraType): { color: string; dot: string; label:
       ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Main HEVC / Sub no disp.' }
       : { color: 'text-orange-400', dot: 'bg-orange-400', label: 'Sub no encontrado' }
   }
-  if (hs === 'AUTH_FAILED')     return { color: 'text-red-400',     dot: 'bg-red-500',     label: 'Auth fallida' }
-  if (hs === 'OFFLINE')         return { color: 'text-red-400',     dot: 'bg-red-500',     label: 'Offline' }
-  if (hs === 'STREAM_UNSTABLE') return { color: 'text-amber-400',   dot: 'bg-amber-400',   label: 'Inestable' }
-  if (hs === 'HEALTHY' || hs === 'USING_MAIN_STREAM')
-    return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  if (hs === 'STREAM_UNSTABLE') return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Inestable' }
+  if (hs === 'HEALTHY')         return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  if (hs === 'USING_MAIN_STREAM') return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online (Main)' }
+  if (hs === 'OFFLINE') {
+    // Don't show Offline if RTSP confirms the stream is reachable
+    if (rtspConfirmed) return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Online' }
+    return { color: 'text-red-400', dot: 'bg-red-500', label: 'Offline' }
+  }
   // No health status yet — fall back to raw RTSP / online fields
-  if (cam.rtspMainOk || cam.rtspSubOk) return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
-  if (cam.mainCodec || cam.subCodec)   return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Detectado' }
-  if (cam.online)                      return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  if (rtspConfirmed || healthOnline || cam.rtspMainOk) return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  if (cam.mainCodec || cam.subCodec) return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Detectado' }
+  if (cam.online)                    return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
   return { color: 'text-surface-500', dot: 'bg-surface-600', label: 'Offline' }
 }
 
@@ -460,8 +473,27 @@ function CamerasTab({
                       </span>
                     )})()}
                   </td>
-                  <td className="px-3 py-2 text-surface-400">{cam.subCodec || cam.mainCodec || '—'}</td>
-                  <td className="px-3 py-2 text-surface-400">{cam.subResolution || cam.mainResolution || '—'}</td>
+                  <td className="px-3 py-2">
+                    {(() => {
+                      const useSub = cam.preferredStream !== 'main'
+                      const codec = useSub ? (cam.subCodec || cam.mainCodec) : (cam.mainCodec || cam.subCodec)
+                      const isHevc = (codec || '').toLowerCase().match(/hevc|h\.?265/)
+                      const isMain = !useSub && !!cam.mainCodec
+                      if (!codec) return <span className="text-surface-600">—</span>
+                      return (
+                        <span className="inline-flex items-center gap-1">
+                          <span className="text-surface-400">{codec.toUpperCase()}</span>
+                          {isMain && <span className="text-[10px] px-1 rounded bg-blue-900/40 text-blue-400">Main</span>}
+                          {isHevc && <span className="text-[10px] px-1 rounded bg-red-900/40 text-red-400">HEVC</span>}
+                        </span>
+                      )
+                    })()}
+                  </td>
+                  <td className="px-3 py-2 text-surface-400">
+                    {cam.preferredStream !== 'main'
+                      ? (cam.subResolution || cam.mainResolution || '—')
+                      : (cam.mainResolution || cam.subResolution || '—')}
+                  </td>
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-1">
                       <button
@@ -1144,7 +1176,7 @@ function DiagnosticsTab({
 
             <div className="space-y-1 divide-y divide-surface-700/30">
               <Check ok={result.nvr.onlineHttp} label="NVR HTTP conectado" detail={`Última conexión: ${result.nvr.lastSeen ? format(new Date(result.nvr.lastSeen), 'dd/MM HH:mm') : '—'}`} />
-              <Check ok={result.camera.onlineInNvr} label={`Canal ${result.channelCode} online en NVR`} detail={result.camera.ipAddress ? `IP: ${result.camera.ipAddress} · ${result.camera.protocol}` : undefined} />
+              <Check ok={result.camera.onlineInNvr} label={`Canal ${result.channelCode} ${result.camera.onlineInNvr ? 'online' : 'offline'} en NVR`} detail={result.camera.ipAddress ? `IP: ${result.camera.ipAddress} · ${result.camera.protocol}` : undefined} />
               <Check
                 ok={result.rtsp.subOk}
                 label="RTSP substream (sub)"
