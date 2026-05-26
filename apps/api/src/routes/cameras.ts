@@ -1,7 +1,7 @@
 // apps/api/src/routes/cameras.ts
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus } from '../services/stream'
+import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus, getStreamDetails } from '../services/stream'
 import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary } from '../services/stream-manager'
 import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
@@ -379,7 +379,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     const nvr = camera.nvr
     const streamPath = getStreamPath(nvr, camera)
-    const mediamtxStatus = await getStreamStatus(streamPath)
+    const details = await getStreamDetails(streamPath)
 
     return reply.send({
       cameraId:           id,
@@ -406,12 +406,14 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       mainUrlMasked:      buildRtspUrlMasked({ ...nvr, password: '***' } as any, camera.channel, false),
       mediaServer: {
         streamPath,
-        hlsUrl:      getHlsUrl(streamPath),
-        webrtcUrl:   getWebRtcUrl(streamPath),
-        routeExists: mediamtxStatus.routeExists,
-        active:      mediamtxStatus.active,
-        readers:     mediamtxStatus.readers,
-        bytesReceived: mediamtxStatus.bytesReceived,
+        hlsUrl:       getHlsUrl(streamPath),
+        webrtcUrl:    getWebRtcUrl(streamPath),
+        routeExists:  details.routeExists,
+        active:       details.active,
+        readers:      details.readers,
+        bytesReceived: details.bytesReceived,
+        sourceType:   details.sourceType ?? null,
+        sourceMasked: details.sourceMasked ?? null,
       },
       nvr: {
         id:         nvr.id,

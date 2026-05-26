@@ -368,38 +368,33 @@ function SummaryTab({ nvr }: { nvr: NVR }) {
 
 function camStatusDisplay(cam: CameraType): { color: string; dot: string; label: string } {
   const hs = cam.streamHealthStatus
+  // Per user spec: camera is effectively online if health confirmed OR any RTSP stream responded
+  const effectiveOnline =
+    hs === 'HEALTHY' || hs === 'USING_MAIN_STREAM' ||
+    cam.rtspSubOk === true || cam.rtspMainOk === true
 
-  // Positive RTSP/online confirmation overrides stale health status (including OFFLINE)
-  const rtspConfirmed =
-    cam.rtspSubOk === true ||
-    (cam.rtspMainOk === true && cam.preferredStream === 'main')
-  const healthOnline =
-    cam.onlineInNvr === true && (hs === 'HEALTHY' || hs === 'USING_MAIN_STREAM')
+  if (hs === 'AUTH_FAILED') return { color: 'text-red-400', dot: 'bg-red-500', label: 'Auth fallida' }
 
-  // Hard errors that always show regardless of RTSP fields
-  if (hs === 'AUTH_FAILED')     return { color: 'text-red-400',   dot: 'bg-red-500',   label: 'Auth fallida' }
   if (hs === 'CODEC_UNSUPPORTED_HEVC')
     return cam.rtspMainOk
-      ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'HEVC / sub no disponible' }
+      ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Main HEVC (sin sub)' }
       : { color: 'text-amber-400', dot: 'bg-amber-400', label: 'HEVC no compatible' }
+
   if (hs === 'RTSP_SUB_NOT_FOUND') {
     const mainIsHevc = (cam.mainCodec || '').toLowerCase().match(/hevc|h\.?265/)
     return mainIsHevc
       ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Main HEVC / Sub no disp.' }
       : { color: 'text-orange-400', dot: 'bg-orange-400', label: 'Sub no encontrado' }
   }
+
   if (hs === 'STREAM_UNSTABLE') return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Inestable' }
   if (hs === 'HEALTHY')         return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
   if (hs === 'USING_MAIN_STREAM') return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online (Main)' }
-  if (hs === 'OFFLINE') {
-    // Don't show Offline if RTSP confirms the stream is reachable
-    if (rtspConfirmed) return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Online' }
-    return { color: 'text-red-400', dot: 'bg-red-500', label: 'Offline' }
-  }
-  // No health status yet — fall back to raw RTSP / online fields
-  if (rtspConfirmed || healthOnline || cam.rtspMainOk) return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+
+  // For OFFLINE/UNKNOWN/no-status: check effectiveOnline before declaring offline
+  if (effectiveOnline) return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  if (cam.online)      return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
   if (cam.mainCodec || cam.subCodec) return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Detectado' }
-  if (cam.online)                    return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
   return { color: 'text-surface-500', dot: 'bg-surface-600', label: 'Offline' }
 }
 

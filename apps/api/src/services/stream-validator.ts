@@ -36,6 +36,7 @@ export async function validateAndUpdateCameraHealth(
   let subCodec: string | null = null
   let mainCodec: string | null = null
   let subResolution: string | null = null
+  let mainResolution: string | null = null
   let lastRtspError: string | null = null
   let preferredStream: 'sub' | 'main' = 'sub'
 
@@ -47,6 +48,7 @@ export async function validateAndUpdateCameraHealth(
     // Capture main stream results unconditionally for DB persistence
     rtspMainOk = main.ok
     mainCodec = main.codec || null
+    mainResolution = main.ok && main.width ? `${main.width}x${main.height}` : null
 
     const subCodecLower = (sub.codec || '').toLowerCase()
     const mainCodecLower = (main.codec || '').toLowerCase()
@@ -111,7 +113,9 @@ export async function validateAndUpdateCameraHealth(
     healthStatus = 'UNKNOWN'
   }
 
-  const cameraIsReachable = healthStatus === 'HEALTHY' || healthStatus === 'USING_MAIN_STREAM'
+  // Camera is reachable if any RTSP stream responded — regardless of codec/browser-compatibility
+  const rtspReachable = rtspSubOk || rtspMainOk
+  const hardOffline = healthStatus === 'OFFLINE' || healthStatus === 'AUTH_FAILED'
 
   // Actualizar la cámara en DB
   await prisma.camera.update({
@@ -123,11 +127,12 @@ export async function validateAndUpdateCameraHealth(
       subCodec,
       mainCodec,
       ...(subResolution ? { subResolution } : {}),
+      ...(mainResolution ? { mainResolution } : {}),
       lastRtspCheckAt: new Date(),
       lastRtspError,
       preferredStream,
-      // RTSP confirmed reachable → update both online flags
-      ...(cameraIsReachable ? { online: true, onlineInNvr: true } : {}),
+      // online is RTSP-truth: true when any stream responds, false only when confirmed unreachable
+      ...(rtspReachable ? { online: true } : hardOffline ? { online: false } : {}),
     } as any,
   })
 
