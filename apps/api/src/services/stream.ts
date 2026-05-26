@@ -35,7 +35,7 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
     source: rtspUrl,
     sourceOnDemand: true,
     sourceOnDemandStartTimeout: '8s',
-    sourceOnDemandCloseAfter: '60s',
+    sourceOnDemandCloseAfter: '5m',  // survive tab switches and PC lock/unlock
     record: false,
     overridePublisher: true,
   }

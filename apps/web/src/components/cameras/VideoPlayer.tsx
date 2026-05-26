@@ -84,6 +84,8 @@ export function VideoPlayer({
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const firstFrameTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Ref mirrors playing state so firstFrameTimer closure reads current value, not stale snapshot
+  const isPlayingRef = useRef(false)
   const [status, setStatus] = useState<Status>('loading')
   const [internalError, setInternalError] = useState<CameraPlaybackError | null>(null)
   const [muted, setMuted] = useState(true)
@@ -97,6 +99,7 @@ export function VideoPlayer({
 
     hlsRef.current?.destroy()
     if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
+    isPlayingRef.current = false
     setStatus('loading')
     setInternalError(null)
 
@@ -121,9 +124,9 @@ export function VideoPlayer({
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoRef.current?.play().catch(() => {})
-        // Timeout si no llegan frames tras 15s
+        // Timeout si no llegan frames tras 15s — use ref, not state, to avoid stale closure
         firstFrameTimer.current = setTimeout(() => {
-          if (status !== 'playing') {
+          if (!isPlayingRef.current) {
             const err: CameraPlaybackError = { code: 'PLAYER_TIMEOUT', message: 'Sin frames tras 15 segundos', technicalDetail: hlsUrl }
             setStatus('error')
             setInternalError(err)
@@ -134,6 +137,7 @@ export function VideoPlayer({
 
       hls.on(Hls.Events.FRAG_LOADED, () => {
         if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
+        isPlayingRef.current = true
         setStatus('playing')
         setInternalError(null)
       })
@@ -142,8 +146,9 @@ export function VideoPlayer({
         if (data.fatal) {
           const errorCode = classifyHlsError(data)
 
-          // 401 — session expired, no retry needed
+          // 401 — MediaMTX session expired (cookie mismatch or source closed)
           if (data.response?.code === 401) {
+            console.warn('[VideoPlayer] HLS 401', { cameraId, hlsUrl, detail: data.details })
             const err: CameraPlaybackError = {
               code: 'RTSP_UNAUTHORIZED',
               message: 'Sesión expirada (401 Unauthorized)',
@@ -231,6 +236,7 @@ export function VideoPlayer({
     initPlayer()
     return () => {
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
+      isPlayingRef.current = false
       hlsRef.current?.destroy()
       hlsRef.current = null
     }

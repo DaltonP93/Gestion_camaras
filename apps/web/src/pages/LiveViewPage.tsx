@@ -90,6 +90,8 @@ export function LiveViewPage() {
   const staggerTimers  = useRef<ReturnType<typeof setTimeout>[]>([])
   // Track when page became hidden to decide whether to refresh on unhide
   const hiddenSince    = useRef<number | null>(null)
+  // Rate-limit per-camera 401 auto-restarts: timestamp of last restart per cameraId
+  const lastRestartAt  = useRef<Record<string, number>>({})
 
   useEffect(() => { loadNVRs(); loadCameras() }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
@@ -163,8 +165,12 @@ export function LiveViewPage() {
   }, [clearStaggerTimers])
 
   // ─── Load a single stream ────────────────────────────────────
+  // NOTE: intentionally does NOT depend on `streams` state — using it would create
+  // a stale closure bug where after a 401 clears streams[id], the setTimeout that
+  // calls loadStream still sees the old streams snapshot and returns early.
+  // pendingStarts guards against concurrent duplicate calls instead.
   const loadStream = useCallback(async (camera: Camera): Promise<void> => {
-    if (streams[camera.id] || pendingStarts.current.has(camera.id)) return
+    if (pendingStarts.current.has(camera.id)) return
 
     // Block cameras with known bad health
     if (isBlockedByHealth(camera.streamHealthStatus)) {
@@ -221,7 +227,7 @@ export function LiveViewPage() {
       pendingStarts.current.delete(camera.id)
       setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
     }
-  }, [streams]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Handle stream limit: cleanup non-visible then retry ────
   const handleLimitHit = useCallback(async (camera: Camera) => {
@@ -387,14 +393,28 @@ export function LiveViewPage() {
     }
 
     if (err.code === 'RTSP_UNAUTHORIZED') {
-      // JWT/session expired — clear stale stream data, bump key (forces HLS remount),
-      // then restart after 2s. Without the key bump, same URL → VideoPlayer
-      // useEffect doesn't re-run → old broken HLS.js keeps making 401 requests.
+      // Session expired — clear stale stream, bump key so HLS.js is destroyed,
+      // then auto-restart once (rate-limited to 1 attempt per 30s per camera).
       setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       bumpPlayerKeys([cameraId])
-      const cam = cameras.find(c => c.id === cameraId)
-      if (cam) setTimeout(() => loadStream(cam), 2000)
+
+      const now = Date.now()
+      const last = lastRestartAt.current[cameraId] ?? 0
+      if (now - last >= 30_000) {
+        lastRestartAt.current[cameraId] = now
+        const cam = cameras.find(c => c.id === cameraId)
+        if (cam) setTimeout(() => loadStream(cam), 500)
+      } else {
+        // Restarted too recently — show error so user can retry manually
+        setStreamErrors(prev => ({
+          ...prev,
+          [cameraId]: {
+            code: 'RTSP_UNAUTHORIZED',
+            message: 'Sesión expirada. Haz clic en Reintentar.',
+          },
+        }))
+      }
     } else {
       setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
     }

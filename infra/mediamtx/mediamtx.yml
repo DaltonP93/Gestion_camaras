@@ -73,7 +73,7 @@ webrtcAllowOrigin: "*"
 paths:
   ~^nvr_.*:
     sourceOnDemandStartTimeout: 15s
-    sourceOnDemandCloseAfter: 30s
+    sourceOnDemandCloseAfter: 5m
     record: no
     overridePublisher: yes
 
