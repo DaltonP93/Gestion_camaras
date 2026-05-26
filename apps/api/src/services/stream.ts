@@ -35,7 +35,7 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
     source: rtspUrl,
     sourceOnDemand: true,
     sourceOnDemandStartTimeout: '8s',
-    sourceOnDemandCloseAfter: '5m',  // survive tab switches and PC lock/unlock
+    sourceOnDemandCloseAfter: '10m',  // survive tab switches, PC lock/unlock, browser background
     record: false,
     overridePublisher: true,
   }
@@ -131,6 +131,7 @@ export async function publishAllStreams(
 // ─── Estado de un stream en MediaMTX ────────────────────────
 export async function getStreamStatus(streamPath: string): Promise<{
   active: boolean
+  routeExists: boolean
   readers: number
   bytesReceived: number
 }> {
@@ -140,16 +141,23 @@ export async function getStreamStatus(streamPath: string): Promise<{
     const path = paths.find((p) => p.name === streamPath)
 
     if (!path) {
-      return { active: false, readers: 0, bytesReceived: 0 }
+      // Path not in active list — check config to see if it's registered
+      try {
+        await mediamtxApi.get('/v3/config/paths/get/' + streamPath)
+        return { active: false, routeExists: true, readers: 0, bytesReceived: 0 }
+      } catch {
+        return { active: false, routeExists: false, readers: 0, bytesReceived: 0 }
+      }
     }
 
     return {
       active: path.ready === true,
+      routeExists: true,
       readers: path.readers?.length || 0,
       bytesReceived: path.bytesReceived || 0,
     }
   } catch {
-    return { active: false, readers: 0, bytesReceived: 0 }
+    return { active: false, routeExists: false, readers: 0, bytesReceived: 0 }
   }
 }
 

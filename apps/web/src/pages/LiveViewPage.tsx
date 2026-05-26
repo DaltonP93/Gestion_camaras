@@ -29,8 +29,15 @@ const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; bloc
   OFFLINE:                 { icon: <WifiOff size={12} />,       label: 'Offline',               blockStream: true },
 }
 
-function isBlockedByHealth(status?: StreamHealthStatus): boolean {
+function isBlockedByHealth(camera: Camera): boolean {
+  const status = camera.streamHealthStatus
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
+  if (status === 'USING_MAIN_STREAM') {
+    // Block if main codec is HEVC — browser can't play it; validator may have stale data
+    const mc = ((camera as any).mainCodec || '').toLowerCase()
+    if (mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')) return true
+    return false
+  }
   return HEALTH_CONFIG[status]?.blockStream ?? false
 }
 
@@ -172,11 +179,12 @@ export function LiveViewPage() {
   const loadStream = useCallback(async (camera: Camera): Promise<void> => {
     if (pendingStarts.current.has(camera.id)) return
 
-    // Block cameras with known bad health
-    if (isBlockedByHealth(camera.streamHealthStatus)) {
+    // Block cameras with known bad health (including USING_MAIN_STREAM + HEVC)
+    if (isBlockedByHealth(camera)) {
+      const effectiveStatus = camera.streamHealthStatus === 'USING_MAIN_STREAM' ? 'CODEC_UNSUPPORTED_HEVC' : camera.streamHealthStatus!
       setStreamErrors(prev => ({
         ...prev,
-        [camera.id]: getHealthError(camera.streamHealthStatus!, camera.channel),
+        [camera.id]: getHealthError(effectiveStatus, camera.channel),
       }))
       return
     }
@@ -387,6 +395,8 @@ export function LiveViewPage() {
 
   // ─── HLS fatal error from VideoPlayer ───────────────────────
   const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
+    console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
+
     if (activeSessions.current.has(cameraId)) {
       apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
       activeSessions.current.delete(cameraId)
@@ -549,19 +559,22 @@ export function LiveViewPage() {
                   className="relative min-h-0 rounded-lg overflow-hidden border border-surface-700"
                 >
                   {/* Health badge */}
-                  {health && health !== 'HEALTHY' && health !== 'UNKNOWN' && HEALTH_CONFIG[health] && (
-                    <div className={clsx(
-                      'absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5',
-                      health === 'USING_MAIN_STREAM' ? 'bg-blue-900/70' : 'bg-black/70'
-                    )}>
-                      <span className={health === 'USING_MAIN_STREAM' ? 'text-blue-400' : 'text-amber-400'}>
-                        {HEALTH_CONFIG[health].icon}
-                      </span>
-                      <span className={clsx('text-[9px] font-medium', health === 'USING_MAIN_STREAM' ? 'text-blue-300' : 'text-amber-300')}>
-                        {HEALTH_CONFIG[health].label}
-                      </span>
-                    </div>
-                  )}
+                  {(() => {
+                    if (!health || health === 'HEALTHY' || health === 'UNKNOWN' || !HEALTH_CONFIG[health]) return null
+                    const mc = ((camera as any).mainCodec || '').toLowerCase()
+                    const mainIsHevc = mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')
+                    const isHevcMain = health === 'USING_MAIN_STREAM' && mainIsHevc
+                    const badgeLabel = isHevcMain ? 'Main HEVC' : HEALTH_CONFIG[health].label
+                    const bgClass = isHevcMain ? 'bg-amber-900/70' : health === 'USING_MAIN_STREAM' ? 'bg-blue-900/70' : 'bg-black/70'
+                    const iconClass = isHevcMain ? 'text-amber-400' : health === 'USING_MAIN_STREAM' ? 'text-blue-400' : 'text-amber-400'
+                    const textClass = isHevcMain ? 'text-amber-300' : health === 'USING_MAIN_STREAM' ? 'text-blue-300' : 'text-amber-300'
+                    return (
+                      <div className={clsx('absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5', bgClass)}>
+                        <span className={iconClass}>{HEALTH_CONFIG[health].icon}</span>
+                        <span className={clsx('text-[9px] font-medium', textClass)}>{badgeLabel}</span>
+                      </div>
+                    )
+                  })()}
                   <VideoPlayer
                     key={`${camera.id}-${playerKeys[camera.id] ?? 0}`}
                     hlsUrl={stream?.hls || ''}

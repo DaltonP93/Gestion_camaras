@@ -197,7 +197,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       mediaServer: {
         provider:   'mediamtx',
         route:      streamPath,
-        routeExists: true,
+        routeExists: mediamtxStatus.routeExists,
         ready:      mediamtxStatus.active,
         readers:    mediamtxStatus.readers,
       },

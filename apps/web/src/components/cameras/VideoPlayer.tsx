@@ -161,12 +161,13 @@ export function VideoPlayer({
           }
 
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            // 500 → MediaMTX source error (HEVC/RTSP fail) → max 1 retry
+            // 500 → MediaMTX source error (HEVC/RTSP fail / muxer destroyed) → max 1 retry
             // 404 → stream still starting up → max 2 retries
             // other network errors → max 5 retries with backoff
             const statusCode = data.response?.code
             const is500 = statusCode === 500
             const is404 = statusCode === 404
+            if (is500) console.warn('[VideoPlayer] HLS 500 — MediaMTX muxer/source error', { cameraId, details: data.details })
             const maxRetries = is500 ? 1 : is404 ? 2 : 5
             setRetryCount((r) => {
               if (r >= maxRetries) {
