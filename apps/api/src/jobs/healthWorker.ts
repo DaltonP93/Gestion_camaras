@@ -66,14 +66,14 @@ export function startHealthWorker(server: FastifyInstance) {
               }).catch((e) => server.log.error(`Email NVR_OFFLINE: ${e}`))
             }
 
-            // Marcar NVR y sus cámaras como offline
+            // Marcar NVR offline; no tocar camera.online — el validador RTSP lo gestiona
             await server.prisma.nVR.update({
               where: { id: nvr.id },
               data: { online: false },
             })
             await server.prisma.camera.updateMany({
               where: { nvrId: nvr.id },
-              data: { online: false },
+              data: { onlineInNvr: false } as any,
             })
           } else {
             // NVR online: resolver alerta si existía
@@ -115,48 +115,18 @@ export function startHealthWorker(server: FastifyInstance) {
               }
             }
 
-            // Verificar canales online
+            // Actualizar onlineInNvr desde ISAPI (informativo; no toca camera.online)
+            // camera.online se gestiona exclusivamente por el validador RTSP
             const channels = await getNVRChannels(nvrDecrypted as any)
             for (const channel of channels) {
               const camera = nvr.cameras.find((c) => c.channel === channel.id)
-              if (camera && camera.online !== channel.online) {
-                await server.prisma.camera.update({
-                  where: { id: camera.id },
-                  data: { online: channel.online, lastCheck: new Date() },
-                })
-
-                if (!channel.online) {
-                  const existingCamAlert = await server.prisma.alert.findFirst({
-                    where: { cameraId: camera.id, type: 'CAMERA_OFFLINE', resolved: false },
-                  })
-
-                  if (!existingCamAlert) {
-                    const camAlert = await server.prisma.alert.create({
-                      data: {
-                        nvrId: nvr.id,
-                        cameraId: camera.id,
-                        type: 'CAMERA_OFFLINE',
-                        severity: 'MEDIUM',
-                        message: `Cámara "${camera.name}" offline en ${nvr.name}`,
-                      },
-                    })
-
-                    sendAlertNotification(server.prisma, {
-                      id: camAlert.id,
-                      type: camAlert.type,
-                      severity: camAlert.severity,
-                      message: camAlert.message,
-                      nvrId: camAlert.nvrId,
-                      cameraId: camAlert.cameraId,
-                    }).catch((e) => server.log.error(`Email CAMERA_OFFLINE: ${e}`))
-                  }
-                } else {
-                  await server.prisma.alert.updateMany({
-                    where: { cameraId: camera.id, type: 'CAMERA_OFFLINE', resolved: false },
-                    data: { resolved: true, resolvedAt: new Date() },
-                  })
-                }
-              }
+              if (!camera) continue
+              const onlineInNvr = channel.online
+              // Only update onlineInNvr — never overwrite RTSP-based online field here
+              await server.prisma.camera.update({
+                where: { id: camera.id },
+                data: { onlineInNvr, lastCheck: new Date() } as any,
+              })
             }
 
             await server.prisma.nVR.update({

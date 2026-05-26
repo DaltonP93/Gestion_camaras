@@ -161,6 +161,61 @@ export async function getStreamStatus(streamPath: string): Promise<{
   }
 }
 
+// ─── Detalles completos de un path en MediaMTX (para debug) ─
+export async function getStreamDetails(streamPath: string): Promise<{
+  active: boolean
+  routeExists: boolean
+  readers: number
+  bytesReceived: number
+  sourceType?: string
+  sourceMasked?: string
+  configSource?: string
+}> {
+  let livePath: any = null
+  let configPath: any = null
+
+  try {
+    const liveRes = await mediamtxApi.get('/v3/paths/get/' + streamPath)
+    livePath = liveRes.data
+  } catch {
+    // not active
+  }
+
+  try {
+    const cfgRes = await mediamtxApi.get('/v3/config/paths/get/' + streamPath)
+    configPath = cfgRes.data
+  } catch {
+    // not registered
+  }
+
+  const configSource: string = configPath?.source || ''
+  const sourceMasked = configSource
+    ? configSource.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+    : undefined
+
+  if (!livePath) {
+    return {
+      active: false,
+      routeExists: !!configPath,
+      readers: 0,
+      bytesReceived: 0,
+      sourceType: configPath ? 'rtspSource' : undefined,
+      sourceMasked,
+      configSource: sourceMasked,
+    }
+  }
+
+  return {
+    active: livePath.ready === true,
+    routeExists: true,
+    readers: livePath.readers?.length || 0,
+    bytesReceived: livePath.bytesReceived || 0,
+    sourceType: livePath.source?.type,
+    sourceMasked,
+    configSource: sourceMasked,
+  }
+}
+
 // ─── Listar todos los streams activos ───────────────────────
 export async function listActiveStreams(): Promise<string[]> {
   try {
