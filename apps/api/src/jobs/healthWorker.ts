@@ -4,7 +4,7 @@ import cron from 'node-cron'
 import type { FastifyInstance } from 'fastify'
 import { getNVRStatus, getNVRChannels } from '../services/hikvision'
 import { broadcastAlert } from '../routes/websocket'
-import { publishAllStreams } from '../services/stream'
+import { publishStream, getStreamPath, listRegisteredConfigPaths, clearRegisteredPath } from '../services/stream'
 import { sendAlertNotification } from '../services/notification.service'
 import { cleanupIdleSessions } from '../services/stream-manager'
 import CryptoJS from 'crypto-js'
@@ -144,15 +144,36 @@ export function startHealthWorker(server: FastifyInstance) {
   })
 
   // Re-registrar paths en MediaMTX cada 5 minutos (recupera reinicios de mediamtx)
+  // Solo registra paths que faltan en MediaMTX — evita spam "path already exists" /
+  // "reloading configuration" cuando los paths ya existen con la config correcta.
   cron.schedule('*/5 * * * *', async () => {
     try {
+      // Obtener qué paths tiene MediaMTX configurados actualmente.
+      // Si la API no responde (null), saltar este ciclo sin hacer nada.
+      const mediamtxPaths = await listRegisteredConfigPaths()
+      if (mediamtxPaths === null) return  // MediaMTX no disponible
+
       const nvrs = await server.prisma.nVR.findMany({
         where: { active: true },
         include: { cameras: { where: { active: true } } },
       })
+
+      let registered = 0
       for (const nvr of nvrs) {
         const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
-        await publishAllStreams(nvrDecrypted as any, nvr.cameras)
+        for (const camera of nvr.cameras) {
+          const path = getStreamPath(nvrDecrypted as any, camera)
+          if (!mediamtxPaths.has(path)) {
+            // Path ausente en MediaMTX (p.ej. reinicio de MediaMTX) — re-registrar
+            clearRegisteredPath(path)  // invalidar cache local para forzar POST
+            await publishStream(nvrDecrypted as any, camera)
+            registered++
+          }
+        }
+      }
+
+      if (registered > 0) {
+        server.log.info(`[healthWorker] ${registered} path(s) re-registrados en MediaMTX tras reinicio`)
       }
     } catch {
       // Silencioso — mediamtx puede estar temporalmente caído

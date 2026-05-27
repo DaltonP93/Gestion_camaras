@@ -9,6 +9,35 @@ const mediamtxApi = axios.create({
   timeout: 10000,
 })
 
+// ─── Cache local de paths registrados ───────────────────────────
+// Evita POST/PATCH repetitivos que generan spam en logs de MediaMTX.
+// Clave: streamPath. Valor: fingerprint de la config (source|transport|closeAfter).
+// Se limpia en removeStream (path eliminado) y cuando el health worker detecta
+// que MediaMTX ya no tiene el path (e.g. después de reinicio de MediaMTX).
+const registeredPaths = new Map<string, string>()
+// Evita solicitudes concurrentes duplicadas para el mismo path
+const inFlightPaths   = new Set<string>()
+
+function configFingerprint(source: string, useSub: boolean): string {
+  return `${source}|tcp|10m|${useSub ? 'sub' : 'main'}`
+}
+
+export function clearRegisteredPath(streamPath: string): void {
+  registeredPaths.delete(streamPath)
+}
+
+// Lista los paths configurados actualmente en MediaMTX.
+// Retorna null si la API está caída (el llamador debe manejar este caso).
+export async function listRegisteredConfigPaths(): Promise<Set<string> | null> {
+  try {
+    const res = await mediamtxApi.get('/v3/config/paths/list')
+    const items: any[] = res.data?.items || []
+    return new Set(items.map((p: any) => p.name).filter(Boolean))
+  } catch {
+    return null  // API no disponible — el llamador decide si reintenta
+  }
+}
+
 // Nombre del path en MediaMTX para una cámara
 export function getStreamPath(nvr: NVR, camera: Camera): string {
   return `nvr_${nvr.id}_ch${String(camera.channel).padStart(2, '0')}`
@@ -27,64 +56,81 @@ export function getWebRtcUrl(streamPath: string): string {
 // ─── Publicar stream desde NVR a MediaMTX ───────────────────
 export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> {
   const streamPath = getStreamPath(nvr, camera)
+
+  // Evitar solicitudes concurrentes duplicadas para el mismo path
+  if (inFlightPaths.has(streamPath)) return true
+
   const useSub = (camera as any).preferredStream !== 'main'
   const rtspUrl = buildRtspUrl(nvr, camera.channel, useSub)
-  const sourceMasked = rtspUrl.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
 
   const pathConfig = {
     source: rtspUrl,
     sourceOnDemand: true,
     sourceOnDemandStartTimeout: '8s',
-    sourceOnDemandCloseAfter: '10m',  // GC fallback — heartbeat/stop-stream limpian antes
-    rtspTransport: 'tcp',             // forzar TCP en pull (evita pérdida RTP UDP)
+    sourceOnDemandCloseAfter: '10m',
+    rtspTransport: 'tcp',
     record: false,
     overridePublisher: true,
   }
 
-  console.info(`[stream] publish path=${streamPath} stream=${useSub ? 'sub' : 'main'} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} source=${sourceMasked} closeAfter=10m transport=tcp`)
+  const fp = configFingerprint(rtspUrl, useSub)
 
+  // Si el path ya fue registrado con la misma config, no repetir POST/PATCH.
+  // Esto elimina el spam de "path already exists" y "reloading configuration".
+  if (registeredPaths.get(streamPath) === fp) return true
+
+  const sourceMasked = rtspUrl.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+  console.info(`[stream] publish path=${streamPath} stream=${useSub ? 'sub' : 'main'} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} source=${sourceMasked}`)
+
+  inFlightPaths.add(streamPath)
   try {
-    // Intentar crear directamente (optimistic POST).
-    // Si el path ya existe MediaMTX devuelve 400 → hacemos PATCH.
-    // Evitar GET previo: causa ERR "path configuration not found" en logs de MediaMTX.
-    await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
-    console.info(`[stream] path created: ${streamPath}`)
-    return true
-  } catch (err: any) {
-    const status = err.response?.status
+    try {
+      // Optimistic POST — si el path ya existe MediaMTX devuelve 400.
+      await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
+      registeredPaths.set(streamPath, fp)
+      console.info(`[stream] path created: ${streamPath}`)
+      return true
+    } catch (err: any) {
+      const status = err.response?.status
 
-    // 400 = path ya existe — actualizar con PATCH para asegurar rtspTransport/closeAfter
-    if (status === 400) {
-      try {
-        await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
-        console.info(`[stream] path updated: ${streamPath}`)
-        return true
-      } catch (patchErr: any) {
-        // Si el PATCH falla porque el path desapareció entre el POST y el PATCH,
-        // reintentar creando. Si falla de nuevo, logar y retornar false.
-        if (patchErr.response?.status === 404) {
-          try {
-            await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
-            console.info(`[stream] path re-created after race: ${streamPath}`)
-            return true
-          } catch {
-            console.error(`[stream] failed to re-create path ${streamPath} after race`)
-            return false
-          }
+      if (status === 400) {
+        // Path ya existe. Si el fingerprint coincide con el caché, no hay nada que actualizar.
+        // Si no coincide (cambió preferredStream, IP, etc.), hacer PATCH para actualizar.
+        if (registeredPaths.get(streamPath) === fp) {
+          // Config sin cambios — tratar como éxito sin PATCH (evita "reloading configuration")
+          return true
         }
-        console.error(`[stream] PATCH failed for ${streamPath}:`, patchErr.response?.status, patchErr.message)
+        try {
+          await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
+          registeredPaths.set(streamPath, fp)
+          console.info(`[stream] path updated: ${streamPath}`)
+          return true
+        } catch (patchErr: any) {
+          if (patchErr.response?.status === 404) {
+            try {
+              await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
+              registeredPaths.set(streamPath, fp)
+              return true
+            } catch {
+              console.error(`[stream] failed to re-create path ${streamPath} after race`)
+              return false
+            }
+          }
+          console.error(`[stream] PATCH failed for ${streamPath}:`, patchErr.response?.status, patchErr.message)
+          return false
+        }
+      }
+
+      if (status === 401 || status === 403) {
+        console.error(`[stream] MediaMTX auth error (${status}) para ${streamPath} — verificar mediamtx.yml`)
         return false
       }
-    }
 
-    // 401/403 = problema de auth con la API de MediaMTX
-    if (status === 401 || status === 403) {
-      console.error(`[stream] MediaMTX auth error (${status}) para ${streamPath} — verificar mediamtx.yml`)
+      console.error(`[stream] failed to register path ${streamPath}:`, status, err.message)
       return false
     }
-
-    console.error(`[stream] failed to register path ${streamPath}:`, status, err.message)
-    return false
+  } finally {
+    inFlightPaths.delete(streamPath)
   }
 }
 
@@ -92,6 +138,7 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
 export async function removeStream(nvr: NVR, camera: Camera): Promise<void> {
   try {
     const streamPath = getStreamPath(nvr, camera)
+    registeredPaths.delete(streamPath)  // invalidar cache
     await mediamtxApi.delete('/v3/config/paths/delete/' + streamPath)
   } catch {
     // Ignorar errores al eliminar

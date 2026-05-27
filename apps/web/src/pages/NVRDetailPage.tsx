@@ -33,8 +33,12 @@ export function NVRDetailPage() {
   const [loadingCameras, setLoadingCameras] = useState(false)
   const [hdds, setHdds] = useState<NvrHdd[]>([])
   const [loadingStorage, setLoadingStorage] = useState(false)
+  const [storageSupported, setStorageSupported] = useState<boolean | null>(null)
+  const [storageUnsupportedReason, setStorageUnsupportedReason] = useState('')
   const [nvrUsers, setNvrUsers] = useState<any[]>([])
   const [loadingUsers, setLoadingUsers] = useState(false)
+  const [usersSupported, setUsersSupported] = useState<boolean | null>(null)
+  const [usersUnsupportedReason, setUsersUnsupportedReason] = useState('')
   const [diagCamera, setDiagCamera] = useState<string>('')
   const [diagResult, setDiagResult] = useState<CameraDiagnostics | null>(null)
   const [diagLoading, setDiagLoading] = useState(false)
@@ -82,10 +86,14 @@ export function NVRDetailPage() {
   const loadStorage = async () => {
     try {
       setLoadingStorage(true)
-      const data = await apiGet<{ disks: NvrHdd[] }>(`/nvrs/${id}/storage`)
+      const data = await apiGet<{ disks: NvrHdd[]; supported?: boolean; reason?: string }>(`/nvrs/${id}/storage`)
       setHdds(data.disks)
+      const sup = data.supported !== false
+      setStorageSupported(sup)
+      if (!sup) setStorageUnsupportedReason(data.reason || 'No soportado por este modelo/firmware')
     } catch {
       toast.error('Error al cargar almacenamiento')
+      setStorageSupported(null)
     } finally {
       setLoadingStorage(false)
     }
@@ -94,10 +102,14 @@ export function NVRDetailPage() {
   const loadUsers = async () => {
     try {
       setLoadingUsers(true)
-      const data = await apiGet<{ users: any[] }>(`/nvrs/${id}/users`)
+      const data = await apiGet<{ users: any[]; supported?: boolean; reason?: string }>(`/nvrs/${id}/users`)
       setNvrUsers(data.users)
+      const sup = data.supported !== false
+      setUsersSupported(sup)
+      if (!sup) setUsersUnsupportedReason(data.reason || 'No soportado por este modelo/firmware')
     } catch {
       toast.error('Error al cargar usuarios del NVR')
+      setUsersSupported(null)
     } finally {
       setLoadingUsers(false)
     }
@@ -279,8 +291,8 @@ export function NVRDetailPage() {
           isAdmin={isAdmin}
         />
       )}
-      {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} onRefresh={loadStorage} />}
-      {tab === 'users'   && <UsersTab nvrId={nvr.id} users={nvrUsers} loading={loadingUsers} onRefresh={loadUsers} isAdmin={isAdmin} />}
+      {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} supported={storageSupported} unsupportedReason={storageUnsupportedReason} onRefresh={loadStorage} />}
+      {tab === 'users'   && <UsersTab nvrId={nvr.id} users={nvrUsers} loading={loadingUsers} supported={usersSupported} unsupportedReason={usersUnsupportedReason} onRefresh={loadUsers} isAdmin={isAdmin} />}
       {tab === 'maintenance' && <MaintenanceTab nvr={nvr} onSync={handleSync} onReboot={handleReboot} onValidateHealth={handleValidateHealth} syncing={syncing} rebooting={rebooting} validatingHealth={validatingHealth} isAdmin={isAdmin} isSupervisor={isSupervisor} />}
       {tab === 'diagnostics' && (
         <DiagnosticsTab
@@ -383,17 +395,18 @@ function camStatusDisplay(cam: CameraType): { color: string; dot: string; label:
   if (hs === 'RTSP_SUB_NOT_FOUND') {
     const mainIsHevc = (cam.mainCodec || '').toLowerCase().match(/hevc|h\.?265/)
     return mainIsHevc
-      ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Main HEVC / Sub no disp.' }
-      : { color: 'text-orange-400', dot: 'bg-orange-400', label: 'Sub no encontrado' }
+      ? { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Main HEVC / Sin sub' }
+      : { color: 'text-orange-400', dot: 'bg-orange-400', label: 'RTSP no encontrado' }
   }
 
-  if (hs === 'STREAM_UNSTABLE') return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Inestable' }
-  if (hs === 'HEALTHY')         return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  if (hs === 'OFFLINE')         return { color: 'text-red-400',    dot: 'bg-red-500',    label: 'Sin señal' }
+  if (hs === 'STREAM_UNSTABLE') return { color: 'text-amber-400',  dot: 'bg-amber-400',  label: 'Inestable' }
+  if (hs === 'HEALTHY')         return { color: 'text-green-400',  dot: 'bg-green-400',  label: 'Online' }
   if (hs === 'USING_MAIN_STREAM') return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online (Main)' }
 
-  // For OFFLINE/UNKNOWN/no-status: check effectiveOnline before declaring offline
-  if (effectiveOnline) return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
-  if (cam.online)      return { color: 'text-green-400', dot: 'bg-green-400', label: 'Online' }
+  // For UNKNOWN/no-status: check effectiveOnline before declaring offline
+  if (effectiveOnline) return { color: 'text-green-400',   dot: 'bg-green-400',   label: 'Online' }
+  if (cam.online)      return { color: 'text-green-400',   dot: 'bg-green-400',   label: 'Online' }
   if (cam.mainCodec || cam.subCodec) return { color: 'text-amber-400', dot: 'bg-amber-400', label: 'Detectado' }
   return { color: 'text-surface-500', dot: 'bg-surface-600', label: 'Offline' }
 }
@@ -533,8 +546,30 @@ function CamerasTab({
 
 // ─── Storage Tab ──────────────────────────────────────────────
 
-function StorageTab({ hdds, loading, onRefresh }: { hdds: NvrHdd[]; loading: boolean; onRefresh: () => void }) {
+function StorageTab({ hdds, loading, supported, unsupportedReason, onRefresh }: {
+  hdds: NvrHdd[]
+  loading: boolean
+  supported: boolean | null
+  unsupportedReason?: string
+  onRefresh: () => void
+}) {
   if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
+
+  if (supported === false) {
+    return (
+      <div className="space-y-3">
+        <div className="flex justify-end">
+          <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
+        </div>
+        <div className="card p-8 text-center space-y-2">
+          <HardDrive size={20} className="mx-auto text-surface-500" />
+          <p className="text-sm text-surface-400 font-medium">No soportado por este modelo/firmware</p>
+          {unsupportedReason && <p className="text-xs text-surface-500">{unsupportedReason}</p>}
+          <p className="text-xs text-surface-600">El NVR no expone la API ISAPI de almacenamiento.</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-3">
@@ -621,11 +656,13 @@ function levelColor(l: string) {
 }
 
 function UsersTab({
-  nvrId, users, loading, onRefresh, isAdmin,
+  nvrId, users, loading, supported, unsupportedReason, onRefresh, isAdmin,
 }: {
   nvrId: string
   users: any[]
   loading: boolean
+  supported: boolean | null
+  unsupportedReason?: string
   onRefresh: () => void
   isAdmin: boolean
 }) {
@@ -654,6 +691,22 @@ function UsersTab({
   }
 
   if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
+
+  if (supported === false) {
+    return (
+      <div className="space-y-3">
+        <div className="flex justify-end">
+          <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
+        </div>
+        <div className="card p-8 text-center space-y-2">
+          <Users size={20} className="mx-auto text-surface-500" />
+          <p className="text-sm text-surface-400 font-medium">No soportado por este modelo/firmware</p>
+          {unsupportedReason && <p className="text-xs text-surface-500">{unsupportedReason}</p>}
+          <p className="text-xs text-surface-600">El NVR no expone la API ISAPI de usuarios.</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-3">

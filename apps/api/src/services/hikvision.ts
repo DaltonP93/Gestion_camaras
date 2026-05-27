@@ -680,6 +680,7 @@ export async function getStorageInfo(nvr: NVR): Promise<HikStorageDisk[]> {
   try {
     const client = createHikClient(nvr)
     const res = await client.get('/ISAPI/ContentMgmt/Storage')
+    if (!res) throw new Error('empty response')
     const disks: HikStorageDisk[] = []
 
     const parseDisks = (raw: any) => {
@@ -729,8 +730,15 @@ export async function getStorageInfo(nvr: NVR): Promise<HikStorageDisk[]> {
     }
 
     return disks
-  } catch {
-    return []
+  } catch (err: any) {
+    const status: number | undefined = err?.response?.status
+    if (status === 403 || status === 404 || status === 405) {
+      const e = new Error(`/ISAPI/ContentMgmt/Storage no soportado (HTTP ${status})`)
+      ;(e as any).unsupported = true
+      ;(e as any).httpStatus  = status
+      throw e
+    }
+    return []  // error de red / parseo — no implica "no soportado"
   }
 }
 
@@ -772,7 +780,14 @@ export async function getNVRUsers(nvr: NVR): Promise<HikNVRUser[]> {
     }
 
     return users
-  } catch {
+  } catch (err: any) {
+    const status: number | undefined = err?.response?.status
+    if (status === 403 || status === 404 || status === 405) {
+      const e = new Error(`/ISAPI/Security/users no soportado (HTTP ${status})`)
+      ;(e as any).unsupported = true
+      ;(e as any).httpStatus  = status
+      throw e
+    }
     return []
   }
 }
