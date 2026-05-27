@@ -38,10 +38,6 @@ metricsAddress: :9998
 ###############################################
 protocols: [tcp]
 
-# Forzar TCP para pulling RTSP → evita pérdida de paquetes RTP en UDP
-# protocols:[tcp] solo restringe conexiones entrantes; esto fuerza el pull de fuentes
-rtspTransport: tcp
-
 rtspAddress: :8554
 rtspsAddress: :8322
 rtpAddress: :8000
@@ -57,6 +53,7 @@ hlsVariant: fmp4
 hlsSegmentCount: 4
 hlsSegmentDuration: 2s
 hlsSegmentMaxSize: 50MB
+hlsMuxerCloseAfter: 10m
 hlsEncryption: no
 hlsAllowOrigin: "*"
 hlsAlwaysRemux: no
@@ -70,6 +67,14 @@ webrtcICEServers2: []
 webrtcAllowOrigin: "*"
 
 ###############################################
+# Defaults para todos los paths
+# rtspTransport: tcp fuerza TCP al conectar a fuentes RTSP (evita pérdida RTP UDP)
+# El payload de la API también incluye rtspTransport: tcp por redundancia
+###############################################
+pathDefaults:
+  rtspTransport: tcp
+
+###############################################
 # Paths
 # Las rutas NVR se crean dinámicamente vía API
 # con source: rtsp://... y sourceOnDemand: true
@@ -78,7 +83,7 @@ webrtcAllowOrigin: "*"
 paths:
   ~^nvr_.*:
     sourceOnDemandStartTimeout: 15s
-    sourceOnDemandCloseAfter: 5m
+    sourceOnDemandCloseAfter: 10m
     record: no
     overridePublisher: yes
 

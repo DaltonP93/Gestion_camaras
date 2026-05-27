@@ -394,6 +394,8 @@ export function LiveViewPage() {
   }, [cameras, loadStream, bumpPlayerKeys])
 
   // ─── HLS fatal error from VideoPlayer ───────────────────────
+  // IMPORTANT: HLS_SESSION_EXPIRED MUST only restart the single affected camera.
+  // Never call refreshVisibleStreams here — that would restart the whole grid.
   const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
     console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
 
@@ -403,8 +405,8 @@ export function LiveViewPage() {
     }
 
     if (err.code === 'HLS_SESSION_EXPIRED') {
-      // HLS session expired (muxer destroyed or cookie timeout) — clear stale stream,
-      // bump key so HLS.js is destroyed, then auto-restart once (rate-limited 30s/camera).
+      // HLS muxer destroyed or cookie expired — restart only this camera.
+      // Rate-limited to 1 auto-restart per 30s per camera to prevent cascading loops.
       setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
@@ -415,9 +417,10 @@ export function LiveViewPage() {
       if (now - last >= 30_000) {
         lastRestartAt.current[cameraId] = now
         const cam = cameras.find(c => c.id === cameraId)
+        // loadStream targets only this camera — other grid cameras are not touched
         if (cam) setTimeout(() => loadStream(cam), 500)
       } else {
-        // Restarted too recently — show error so user can retry manually
+        // Restarted too recently — show error with manual retry button
         setLoadingStreams(prev => ({ ...prev, [cameraId]: false }))
         setStreamErrors(prev => ({
           ...prev,
