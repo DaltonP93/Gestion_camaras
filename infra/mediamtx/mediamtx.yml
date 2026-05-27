@@ -83,7 +83,9 @@ pathDefaults:
 paths:
   ~^nvr_.*:
     sourceOnDemandStartTimeout: 15s
-    sourceOnDemandCloseAfter: 10m
+    # 2m es suficiente: el frontend envía stop-stream al salir y el heartbeat mantiene
+    # activos los streams que sí están siendo vistos; 2m es solo el garbage collector
+    sourceOnDemandCloseAfter: 2m
     record: no
     overridePublisher: yes
 
