@@ -36,32 +36,27 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
     sourceOnDemand: true,
     sourceOnDemandStartTimeout: '8s',
     sourceOnDemandCloseAfter: '10m',  // survive tab switches, PC lock/unlock, browser background
+    rtspTransport: 'tcp',             // force TCP pull — prevents UDP RTP packet loss → muxer destroy
     record: false,
     overridePublisher: true,
   }
 
-  console.info(`[stream] publish → path=${streamPath} stream=${useSub ? 'sub' : 'main'} preferredStream=${(camera as any).preferredStream || 'sub'} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} closeAfter=10m`)
+  console.info(`[stream] publish → path=${streamPath} stream=${useSub ? 'sub' : 'main'} preferredStream=${(camera as any).preferredStream || 'sub'} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} transport=tcp closeAfter=10m`)
 
   try {
     // GET check: verify if path already exists
-    let existingSource: string | undefined
+    let pathExists = false
     try {
-      const existing = await mediamtxApi.get('/v3/config/paths/get/' + streamPath)
-      existingSource = existing.data?.source
+      await mediamtxApi.get('/v3/config/paths/get/' + streamPath)
+      pathExists = true
     } catch (getErr: any) {
       if (getErr.response?.status !== 404) {
         // Unexpected error on GET — proceed to POST anyway
       }
     }
 
-    if (existingSource !== undefined) {
-      // Path already exists
-      if (existingSource === rtspUrl) {
-        // Same source — nothing to do
-        console.info(`[stream] path exists (same source), skipping: ${streamPath}`)
-        return true
-      }
-      // Different source — update with PATCH
+    if (pathExists) {
+      // Always PATCH existing paths to ensure rtspTransport and closeAfter are current
       await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
       console.info(`[stream] path updated: ${streamPath}`)
       return true

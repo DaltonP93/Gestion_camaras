@@ -12,7 +12,7 @@ import { CameraDiagnosticModal } from '@/components/cameras/CameraDiagnosticModa
 import { useAuthStore } from '@/stores/authStore'
 import { apiPost } from '@/lib/api'
 import { clsx } from 'clsx'
-import type { Camera, StreamInfo, GridLayout, StreamHealthStatus } from '@/types'
+import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
 
 // ─── Stagger delay per layout ────────────────────────────────
 const STAGGER_MS: Record<GridLayout, number> = { 1: 0, 4: 250, 9: 400, 16: 500, 25: 600 }
@@ -33,7 +33,6 @@ function isBlockedByHealth(camera: Camera): boolean {
   const status = camera.streamHealthStatus
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
   if (status === 'USING_MAIN_STREAM') {
-    // Block if main codec is HEVC — browser can't play it; validator may have stale data
     const mc = ((camera as any).mainCodec || '').toLowerCase()
     if (mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')) return true
     return false
@@ -70,6 +69,12 @@ const GRID_OPTIONS: { value: GridLayout; label: string; icon: React.ReactNode; c
   { value: 16, label: '4×4',  icon: <LayoutGrid size={14} />, cols: 'grid-cols-4' },
 ]
 
+// Genera un ID estable para este tab/view del navegador
+function makeViewId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
+  return `view-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
 export function LiveViewPage() {
   const [searchParams] = useSearchParams()
   const nvrFilter = searchParams.get('nvr')
@@ -89,16 +94,21 @@ export function LiveViewPage() {
   // playerKeys forces VideoPlayer remount (new HLS instance) when incremented for a camera
   const [playerKeys, setPlayerKeys] = useState<Record<string, number>>({})
 
+  // Stable ID for this browser tab — used by backend to track sessions per view
+  const [viewId] = useState<string>(makeViewId)
+
   // Track which cameraIds have active sessions in the backend
   const activeSessions = useRef<Set<string>>(new Set())
   // Track pending start-stream requests to avoid double-firing
   const pendingStarts  = useRef<Set<string>>(new Set())
   // Stagger timers so we can cancel them on navigation
   const staggerTimers  = useRef<ReturnType<typeof setTimeout>[]>([])
-  // Track when page became hidden to decide whether to refresh on unhide
+  // Track when page became hidden to decide whether to reconcile on unhide
   const hiddenSince    = useRef<number | null>(null)
   // Rate-limit per-camera 401 auto-restarts: timestamp of last restart per cameraId
   const lastRestartAt  = useRef<Record<string, number>>({})
+  // Ref mirror of filteredCameras to avoid stale closures in heartbeat interval
+  const filteredCamerasRef = useRef<Camera[]>([])
 
   useEffect(() => { loadNVRs(); loadCameras() }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
@@ -111,9 +121,10 @@ export function LiveViewPage() {
   const safePage        = Math.min(page, totalPages - 1)
   const filteredCameras = allFiltered.slice(safePage * gridLayout, (safePage + 1) * gridLayout)
 
+  // Keep ref in sync — used by heartbeat and visibility handlers to avoid stale closures
+  filteredCamerasRef.current = filteredCameras
+
   // ─── Bump player keys to force VideoPlayer remount ──────────
-  // This is necessary because when hlsUrl stays the same after a session restart,
-  // VideoPlayer's useEffect doesn't re-run and the old (broken) HLS instance persists.
   const bumpPlayerKeys = useCallback((cameraIds: string[]) => {
     setPlayerKeys(prev => {
       const next = { ...prev }
@@ -121,6 +132,98 @@ export function LiveViewPage() {
       return next
     })
   }, [])
+
+  // ─── Apply heartbeat response to state ─────────────────────
+  // Updates streams state, bumps keys for newly started cameras, sets errors.
+  // Called from both the periodic heartbeat and visibility-restore handler.
+  const applyHeartbeat = useCallback((result: HeartbeatResponse) => {
+    // Merge stream URLs into state (started + already-running)
+    if (Object.keys(result.streams).length > 0) {
+      setStreams(prev => {
+        const next = { ...prev }
+        for (const [cameraId, info] of Object.entries(result.streams)) {
+          next[cameraId] = {
+            cameraId,
+            streamPath: info.streamPath,
+            hls: info.hls,
+            webrtc: info.webrtc,
+            channel: info.channel ?? 0,
+            nvrName: info.nvrName ?? '',
+            warning: info.warning,
+          }
+          activeSessions.current.add(cameraId)
+        }
+        return next
+      })
+    }
+    // Cameras that the backend newly started need fresh HLS.js instances
+    if (result.startedIds.length > 0) {
+      bumpPlayerKeys(result.startedIds)
+      // Clear any previous errors for restarted cameras
+      setStreamErrors(prev => {
+        const n = { ...prev }
+        result.startedIds.forEach(id => delete n[id])
+        return n
+      })
+      setLoadingStreams(prev => {
+        const n = { ...prev }
+        result.startedIds.forEach(id => { n[id] = false })
+        return n
+      })
+    }
+    // Cameras the backend stopped
+    if (result.stoppedIds.length > 0) {
+      result.stoppedIds.forEach(id => activeSessions.current.delete(id))
+    }
+    // Map backend errors to frontend error format
+    for (const [cameraId, err] of Object.entries(result.errors)) {
+      const errCodeMap: Record<string, CameraPlaybackError['code']> = {
+        RTSP_SUB_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
+        RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
+        CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
+        AUTH_FAILED:            'AUTH_FAILED',
+        OFFLINE:                'CAMERA_OFFLINE',
+        MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
+        CAMERA_NOT_FOUND:       'UNKNOWN',
+        CAMERA_DISABLED:        'UNKNOWN',
+      }
+      setStreamErrors(prev => ({
+        ...prev,
+        [cameraId]: {
+          code: errCodeMap[err.code] || 'UNKNOWN',
+          message: err.message,
+        },
+      }))
+      setLoadingStreams(prev => ({ ...prev, [cameraId]: false }))
+    }
+  }, [bumpPlayerKeys])
+
+  // ─── Send viewport heartbeat ────────────────────────────────
+  // Single call replaces N per-camera touch-stream calls.
+  // Backend reconciles: starts missing streams, stops removed streams, touches existing.
+  const sendHeartbeat = useCallback(async (visibleCameraIds: string[]): Promise<void> => {
+    if (visibleCameraIds.length === 0) return
+    try {
+      const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', {
+        viewId,
+        visibleCameraIds,
+      })
+      applyHeartbeat(result)
+    } catch {
+      // Silently ignore — next heartbeat will retry
+    }
+  }, [viewId, applyHeartbeat])
+
+  // ─── Periodic viewport heartbeat every 30s ──────────────────
+  // Replaces per-camera touch-stream (N requests → 1 request).
+  // Also reconciles state if any camera was stopped by backend idle cleanup.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const ids = filteredCamerasRef.current.map(c => c.id)
+      sendHeartbeat(ids)
+    }, 30_000)
+    return () => clearInterval(interval)
+  }, [sendHeartbeat])
 
   // ─── Stop sessions for a set of cameraIds ───────────────────
   const stopSessions = useCallback(async (cameraIds: string[]) => {
@@ -151,35 +254,27 @@ export function LiveViewPage() {
     setLoadingStreams({})
   }, [stopSessions, clearStaggerTimers])
 
-  // ─── Heartbeat every 60s ────────────────────────────────────
-  useEffect(() => {
-    const interval = setInterval(() => {
-      activeSessions.current.forEach(id => {
-        apiPost(`/cameras/${id}/touch-stream`, {}).catch(() => {})
-      })
-    }, 60_000)
-    return () => clearInterval(interval)
-  }, [])
-
   // ─── Cleanup on unmount ─────────────────────────────────────
   useEffect(() => {
     return () => {
       clearStaggerTimers()
-      activeSessions.current.forEach(id => {
-        apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {})
+      // cleanup-my-sessions is more efficient than N individual stop-stream calls
+      apiPost('/cameras/cleanup-my-sessions', {}).catch(() => {
+        // Fallback: individual stops
+        activeSessions.current.forEach(id => {
+          apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {})
+        })
       })
     }
   }, [clearStaggerTimers])
 
   // ─── Load a single stream ────────────────────────────────────
   // NOTE: intentionally does NOT depend on `streams` state — using it would create
-  // a stale closure bug where after a 401 clears streams[id], the setTimeout that
-  // calls loadStream still sees the old streams snapshot and returns early.
-  // pendingStarts guards against concurrent duplicate calls instead.
+  // a stale closure bug. pendingStarts guards against concurrent duplicate calls.
   const loadStream = useCallback(async (camera: Camera): Promise<void> => {
     if (pendingStarts.current.has(camera.id)) return
 
-    // Block cameras with known bad health (including USING_MAIN_STREAM + HEVC)
+    // Block cameras with known bad health
     if (isBlockedByHealth(camera)) {
       const effectiveStatus = camera.streamHealthStatus === 'USING_MAIN_STREAM' ? 'CODEC_UNSUPPORTED_HEVC' : camera.streamHealthStatus!
       setStreamErrors(prev => ({
@@ -203,7 +298,6 @@ export function LiveViewPage() {
       })
     } catch (err: any) {
       const body = err?.response?.data || {}
-      // Backend returns { error: "CODE", message: "...", details: "..." }
       const code: string = body.error || ''
       const rawMsg: string = body.message || body.error || ''
 
@@ -269,44 +363,11 @@ export function LiveViewPage() {
     })
   }, [gridLayout, loadStream])
 
-  // ─── Full session refresh: stop → bump keys → restart ───────
-  // Used after PC lock/unlock (visibilitychange > 10s) and fullscreen exit.
-  // Bumping playerKeys forces VideoPlayer to remount so the stale HLS.js
-  // instance (which keeps making 401 requests) is fully destroyed.
-  const refreshVisibleStreams = useCallback(async (
-    reason: 'visibilitychange' | 'fullscreen-exit' | 'manual-retry',
-    cams?: Camera[],
-  ) => {
-    clearStaggerTimers()
-    const targetCams = cams ?? filteredCameras
-    const targetIds  = targetCams.map(c => c.id)
-
-    // Stop sessions for target cameras + any non-visible active ones
-    const toStop = Array.from(activeSessions.current)
-    await Promise.allSettled(
-      toStop.map(id => apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {}))
-    )
-    toStop.forEach(id => {
-      activeSessions.current.delete(id)
-      pendingStarts.current.delete(id)
-    })
-
-    // Clear state
-    setStreams({})
-    setStreamErrors({})
-    setLoadingStreams({})
-
-    // Bump player keys — forces VideoPlayer to unmount+remount so stale HLS
-    // instances are fully destroyed before we restart
-    bumpPlayerKeys(targetIds)
-
-    // Wait for state to settle + MediaMTX to release connections
-    await new Promise(r => setTimeout(r, 500))
-
-    startVisibleStreams(targetCams)
-  }, [clearStaggerTimers, filteredCameras, bumpPlayerKeys, startVisibleStreams])
-
-  // ─── Page visibility: refresh after 10s of being hidden ─────
+  // ─── Page visibility: reconcile on unhide ───────────────────
+  // When the PC is locked/unlocked or tab switches, instead of restarting
+  // the whole grid (wasteful), we send a heartbeat. The backend reconciles:
+  // cameras still active → just touched (HLS.js self-heals); cameras that
+  // the backend stopped → returned as startedIds → get bumped player keys.
   useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === 'hidden') {
@@ -314,15 +375,16 @@ export function LiveViewPage() {
       } else {
         const hiddenMs = hiddenSince.current ? Date.now() - hiddenSince.current : 0
         hiddenSince.current = null
-        // Only refresh if hidden long enough that sessions might have expired
         if (hiddenMs > 10_000 && activeSessions.current.size > 0) {
-          refreshVisibleStreams('visibilitychange')
+          // Reconcile only — do NOT restart all cameras
+          const ids = filteredCamerasRef.current.map(c => c.id)
+          sendHeartbeat(ids)
         }
       }
     }
     document.addEventListener('visibilitychange', handleVisibility)
     return () => document.removeEventListener('visibilitychange', handleVisibility)
-  }, [refreshVisibleStreams])
+  }, [sendHeartbeat])
 
   // ─── React to visible camera set changes ────────────────────
   const prevVisibleIds = useRef<string[]>([])
@@ -394,6 +456,8 @@ export function LiveViewPage() {
   }, [cameras, loadStream, bumpPlayerKeys])
 
   // ─── HLS fatal error from VideoPlayer ───────────────────────
+  // IMPORTANT: HLS_SESSION_EXPIRED MUST only restart the single affected camera.
+  // Never call stopAllSessions or refreshVisibleStreams here.
   const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
     console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
 
@@ -403,8 +467,8 @@ export function LiveViewPage() {
     }
 
     if (err.code === 'HLS_SESSION_EXPIRED') {
-      // HLS session expired (muxer destroyed or cookie timeout) — clear stale stream,
-      // bump key so HLS.js is destroyed, then auto-restart once (rate-limited 30s/camera).
+      // HLS muxer destroyed or cookie expired — restart only this camera.
+      // Rate-limited to 1 auto-restart per 30s per camera to prevent cascading loops.
       setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
@@ -415,9 +479,10 @@ export function LiveViewPage() {
       if (now - last >= 30_000) {
         lastRestartAt.current[cameraId] = now
         const cam = cameras.find(c => c.id === cameraId)
+        // loadStream targets only this camera — other grid cameras are not touched
         if (cam) setTimeout(() => loadStream(cam), 500)
       } else {
-        // Restarted too recently — show error so user can retry manually
+        // Restarted too recently — show error with manual retry button
         setLoadingStreams(prev => ({ ...prev, [cameraId]: false }))
         setStreamErrors(prev => ({
           ...prev,
@@ -433,20 +498,27 @@ export function LiveViewPage() {
   }, [cameras, loadStream, bumpPlayerKeys])
 
   // ─── Exit fullscreen/focus view ──────────────────────────────
-  // Grid cameras were unmounted while focus was active. On return they would
-  // remount with the same (now-stale) HLS URL → triggers 401 from expired sessions.
-  // refreshVisibleStreams bumps playerKeys so they get fresh HLS instances.
+  // On return from fullscreen, stop the focus camera and restart the grid cameras.
+  // We do NOT restart cameras that weren't affected by the fullscreen.
   const handleExitFocus = useCallback(async () => {
+    const prevFocusId = focusCamera
     setFocusCamera(null)
-    // Stop the focus camera session too
-    if (focusCamera && activeSessions.current.has(focusCamera)) {
-      apiPost(`/cameras/${focusCamera}/stop-stream`, {}).catch(() => {})
-      activeSessions.current.delete(focusCamera)
+
+    if (prevFocusId && activeSessions.current.has(prevFocusId)) {
+      apiPost(`/cameras/${prevFocusId}/stop-stream`, {}).catch(() => {})
+      activeSessions.current.delete(prevFocusId)
     }
-    // Small delay so focusCamera state clears before we restart grid
-    await new Promise(r => setTimeout(r, 50))
-    await refreshVisibleStreams('fullscreen-exit', filteredCameras)
-  }, [focusCamera, filteredCameras, refreshVisibleStreams])
+
+    // Reconcile the grid cameras after returning from fullscreen.
+    // Small delay for state to settle before starting streams.
+    await new Promise(r => setTimeout(r, 100))
+    const ids = filteredCamerasRef.current.map(c => c.id)
+
+    // Bump keys for grid cameras so stale HLS instances are destroyed
+    bumpPlayerKeys(ids)
+    await new Promise(r => setTimeout(r, 300))
+    startVisibleStreams(filteredCamerasRef.current)
+  }, [focusCamera, bumpPlayerKeys, startVisibleStreams])
 
   const currentGrid    = GRID_OPTIONS.find(g => g.value === gridLayout) || GRID_OPTIONS[2]
   const totalForFilter = allFiltered.length
