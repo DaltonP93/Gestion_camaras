@@ -6,6 +6,7 @@ import {
   getStorageInfo, getNVRUsers, getDeviceInfo, rebootDevice,
   adoptIpCamera, getFreeChannels, debugGetCameraNameSources,
   createNVRUser, updateNVRUser, changeNVRUserPassword, deleteNVRUser,
+  testNVRConnection,
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -49,17 +50,27 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   // POST /api/nvrs/test-connection
   server.post('/test-connection', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const data = connectionTestSchema.parse(request.body)
-    const fakeNvr = { id: 'test', ...data, rtspPort: 554, channels: 0, hddCount: 0, firmware: null } as any
+    const result = await testNVRConnection(data)
 
-    const status = await getNVRStatus(fakeNvr)
-    if (!status.online) {
-      const message = status.errorReason === 'auth'    ? 'Credenciales incorrectas (usuario o contraseña)'
-                    : status.errorReason === 'network' ? `No se pudo alcanzar ${data.ipAddress}:${data.port} — verifica IP, puerto y que el NVR esté encendido`
-                    :                                    'No se pudo conectar al NVR. Verifica IP, puerto y credenciales.'
-      return reply.status(503).send({ success: false, message })
+    if (!result.reachable) {
+      server.log.warn(`[test-connection] ${data.ipAddress}:${data.port} errorCode=${result.errorCode} endpoints=${JSON.stringify(result.endpoints)}`)
+      return reply.status(503).send({
+        success: false,
+        errorCode: result.errorCode,
+        message: result.errorMessage,
+        endpoints: result.endpoints,
+      })
     }
 
-    return reply.send({ success: true, firmware: status.firmware, diskUsage: status.diskUsage })
+    server.log.info(`[test-connection] ${data.ipAddress}:${data.port} ok model=${result.model} firmware=${result.firmware}`)
+    return reply.send({
+      success: true,
+      firmware: result.firmware,
+      model: result.model,
+      serialNumber: result.serialNumber,
+      ...(result.errorCode ? { errorCode: result.errorCode, warning: result.errorMessage } : {}),
+      endpoints: result.endpoints,
+    })
   })
 
   // POST /api/nvrs/detect — Auto-detectar info del NVR
@@ -68,27 +79,35 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const fakeNvr = { id: 'detect', ...data, rtspPort: 554, channels: 0, hddCount: 0, firmware: null } as any
 
     try {
-      const [status, info, channels] = await Promise.allSettled([
-        getNVRStatus(fakeNvr),
+      const [connResult, info, channels] = await Promise.allSettled([
+        testNVRConnection(data),
         getDeviceInfo(fakeNvr),
         getIpCameraList(fakeNvr),
       ])
 
-      const s = status.status === 'fulfilled' ? status.value : null
-      if (!s?.online) return reply.status(503).send({ success: false, message: 'No se pudo conectar' })
+      const conn = connResult.status === 'fulfilled' ? connResult.value : null
+
+      if (!conn?.reachable) {
+        const errorCode = conn?.errorCode ?? 'NETWORK_UNREACHABLE'
+        const message   = conn?.errorMessage ?? 'No se pudo conectar al NVR'
+        server.log.warn(`[detect] ${data.ipAddress}:${data.port} errorCode=${errorCode}`)
+        return reply.status(503).send({ success: false, errorCode, message, endpoints: conn?.endpoints })
+      }
 
       const d = info.status === 'fulfilled' ? info.value : null
       const c = channels.status === 'fulfilled' ? channels.value : []
 
+      server.log.info(`[detect] ${data.ipAddress}:${data.port} ok model=${conn.model || d?.model} channels=${c.length || d?.channelCount}`)
       return reply.send({
         success: true,
-        model:           d?.model || '',
-        serialNumber:    d?.serialNumber || '',
-        firmware:        d?.firmware || s.firmware || '',
+        model:           d?.model || conn.model || '',
+        serialNumber:    d?.serialNumber || conn.serialNumber || '',
+        firmware:        d?.firmware || conn.firmware || '',
         encodingVersion: d?.encodingVersion || '',
         webVersion:      d?.webVersion || '',
-        channels:        c.length || d?.channelCount || 0,
+        channels:        c.length || d?.channelCount || conn.channelCount || 0,
         hddCount:        d?.hddCount || 0,
+        ...(conn.errorCode ? { warning: conn.errorMessage } : {}),
       })
     } catch (err: any) {
       return reply.status(503).send({ success: false, message: err.message })
@@ -641,8 +660,33 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const { id } = request.params as { id: string }
     const data = nvrSchema.partial().parse(request.body)
 
+    const existing = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!existing) return reply.status(404).send({ message: 'NVR no encontrado' })
+
     const updateData: any = { ...data }
-    if (data.password) updateData.password = encryptPassword(data.password)
+
+    if (data.password) {
+      // Validate new credentials before saving
+      const ipToTest = data.ipAddress || existing.ipAddress
+      const portToTest = data.port || existing.port
+      const connTest = await testNVRConnection({
+        ipAddress: ipToTest,
+        port: portToTest,
+        username: data.username || existing.username,
+        password: data.password,
+      })
+      if (!connTest.reachable && connTest.errorCode === 'AUTH_FAILED') {
+        return reply.status(400).send({
+          success: false,
+          errorCode: 'AUTH_FAILED',
+          message: 'La nueva contraseña no es válida — las credenciales fueron rechazadas por el NVR',
+        })
+      }
+      updateData.password = encryptPassword(data.password)
+    } else {
+      // Never overwrite existing password if field is blank
+      delete updateData.password
+    }
 
     const nvr = await server.prisma.nVR.update({ where: { id }, data: updateData })
     await AuditAction(server.prisma, request.user.sub, 'NVR_UPDATED', nvr.id, request)
