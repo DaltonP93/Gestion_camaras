@@ -246,7 +246,7 @@ export function VideoPlayer({
       hlsRef.current?.destroy()
       hlsRef.current = null
     }
-  }, [hlsUrl, error, initPlayer])
+  }, [hlsUrl, error, externalError, initPlayer])
 
   const handleRetry = () => {
     setRetryCount(0)
@@ -274,7 +274,7 @@ export function VideoPlayer({
       )}
 
       {/* Error overlay — muestra causa técnica real */}
-      {(status === 'error' || (error && status !== 'playing')) && (
+      {(status === 'error' || !!activeError || (error && status !== 'playing')) && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-surface-900/95 gap-2 px-3">
           <div className={clsx('flex items-center gap-1.5', errCfg?.color || 'text-surface-500')}>
             {errCfg?.icon || <AlertTriangle size={16} />}
