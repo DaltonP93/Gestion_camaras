@@ -237,9 +237,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
     let disks: any[] = []
+    let storageSupported = true
+    let storageReason: string | undefined
+
     try {
       disks = await getStorageInfo(nvrDec as any)
-
       for (const disk of disks) {
         const dbDisk = sanitizeDiskForDb(disk)
         await server.prisma.nvrHdd.upsert({
@@ -249,11 +251,22 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         })
       }
     } catch (e: any) {
-      server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
-      return reply.status(500).send({ message: 'No se pudo sincronizar almacenamiento del NVR. Ver logs del servidor.' })
+      if ((e as any).unsupported) {
+        storageSupported = false
+        storageReason = `No soportado por este modelo/firmware (HTTP ${(e as any).httpStatus})`
+        server.log.warn(`[storage] ${nvr.name} (${nvr.ipAddress}): ${e.message}`)
+      } else {
+        server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
+        return reply.status(500).send({ message: 'No se pudo sincronizar almacenamiento del NVR. Ver logs del servidor.' })
+      }
     }
 
-    return reply.send({ disks, syncedAt: new Date().toISOString() })
+    return reply.send({
+      disks,
+      supported: storageSupported,
+      ...(storageReason ? { reason: storageReason } : {}),
+      syncedAt: new Date().toISOString(),
+    })
   })
 
   // GET /api/nvrs/:id/users — Usuarios configurados en el NVR
@@ -264,9 +277,27 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
     const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
-    const users  = await getNVRUsers(nvrDec as any)
+    let users: any[] = []
+    let usersSupported = true
+    let usersReason: string | undefined
 
-    return reply.send({ users })
+    try {
+      users = await getNVRUsers(nvrDec as any)
+    } catch (e: any) {
+      if ((e as any).unsupported) {
+        usersSupported = false
+        usersReason = `No soportado por este modelo/firmware (HTTP ${(e as any).httpStatus})`
+        server.log.warn(`[users] ${nvr.name} (${nvr.ipAddress}): ${e.message}`)
+      } else {
+        throw e
+      }
+    }
+
+    return reply.send({
+      users,
+      supported: usersSupported,
+      ...(usersReason ? { reason: usersReason } : {}),
+    })
   })
 
   // GET /api/nvrs/:id/cameras — Cámaras IP del NVR desde ISAPI
@@ -394,18 +425,25 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    // 6. HDDs
-    const disks = await getStorageInfo(nvrDec as any)
-    for (const disk of disks) {
-      try {
-        const dbDisk = sanitizeDiskForDb(disk)
-        await server.prisma.nvrHdd.upsert({
-          where:  { nvrId_diskNumber: { nvrId: id, diskNumber: dbDisk.diskNumber } },
-          create: { nvrId: id, ...dbDisk, lastSyncAt: new Date() },
-          update: { ...dbDisk, lastSyncAt: new Date() },
-        })
-        result.hdds++
-      } catch {}
+    // 6. HDDs — algunos modelos no soportan /ISAPI/ContentMgmt/Storage (403/404/405)
+    try {
+      const disks = await getStorageInfo(nvrDec as any)
+      for (const disk of disks) {
+        try {
+          const dbDisk = sanitizeDiskForDb(disk)
+          await server.prisma.nvrHdd.upsert({
+            where:  { nvrId_diskNumber: { nvrId: id, diskNumber: dbDisk.diskNumber } },
+            create: { nvrId: id, ...dbDisk, lastSyncAt: new Date() },
+            update: { ...dbDisk, lastSyncAt: new Date() },
+          })
+          result.hdds++
+        } catch {}
+      }
+    } catch (e: any) {
+      if (!(e as any).unsupported) {
+        result.errors.push(`HDDs: ${e.message}`)
+      }
+      // unsupported: modelo no soporta storage ISAPI — continuar sync sin HDDs
     }
 
     // 7. Trigger async RTSP health check for cameras that need it (fire and forget).
