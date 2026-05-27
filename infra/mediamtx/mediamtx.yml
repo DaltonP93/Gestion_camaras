@@ -68,24 +68,24 @@ webrtcAllowOrigin: "*"
 
 ###############################################
 # Defaults para todos los paths
-# rtspTransport: tcp fuerza TCP al conectar a fuentes RTSP (evita pérdida RTP UDP)
-# El payload de la API también incluye rtspTransport: tcp por redundancia
+# rtspTransport: tcp fuerza TCP en pull de fuentes RTSP (evita pérdida RTP UDP)
+# Los paths creados por API también incluyen rtspTransport: tcp en su payload.
 ###############################################
 pathDefaults:
   rtspTransport: tcp
 
 ###############################################
 # Paths
-# Las rutas NVR se crean dinámicamente vía API
-# con source: rtsp://... y sourceOnDemand: true
-# NO poner source: publisher acá — eso impide el pull
+# Las rutas NVR se crean dinámicamente vía API con source: rtsp://... y
+# sourceOnDemand: true — MediaMTX NO conecta RTSP hasta que haya un lector HLS.
+# El valor aquí sirve como fallback para paths que el API no haya creado aún.
+# Los paths creados por API llevan sourceOnDemandCloseAfter: 10m en su payload
+# (el frontend limpia con stop-stream; 10m es solo el GC para sesiones huérfanas).
 ###############################################
 paths:
   ~^nvr_.*:
     sourceOnDemandStartTimeout: 15s
-    # 2m es suficiente: el frontend envía stop-stream al salir y el heartbeat mantiene
-    # activos los streams que sí están siendo vistos; 2m es solo el garbage collector
-    sourceOnDemandCloseAfter: 2m
+    sourceOnDemandCloseAfter: 10m
     record: no
     overridePublisher: yes
 

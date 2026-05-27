@@ -109,6 +109,10 @@ export function LiveViewPage() {
   const lastRestartAt  = useRef<Record<string, number>>({})
   // Ref mirror of filteredCameras to avoid stale closures in heartbeat interval
   const filteredCamerasRef = useRef<Camera[]>([])
+  // Coalescing queue for HLS_SESSION_EXPIRED: collects simultaneous 401s
+  // and flushes them as a single heartbeat after a 2s window
+  const hlsExpiryQueue    = useRef<Set<string>>(new Set())
+  const hlsExpiryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => { loadNVRs(); loadCameras() }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
@@ -213,6 +217,53 @@ export function LiveViewPage() {
       // Silently ignore — next heartbeat will retry
     }
   }, [viewId, applyHeartbeat])
+
+  // ─── Flush coalesced HLS_SESSION_EXPIRED batch ──────────────
+  // Called 2s after the first 401 to batch simultaneous muxer expirations
+  // into a single heartbeat instead of N individual restarts.
+  const flushHlsExpiry = useCallback(async () => {
+    hlsExpiryTimerRef.current = null
+    const expiredIds = Array.from(hlsExpiryQueue.current)
+    hlsExpiryQueue.current.clear()
+    if (expiredIds.length === 0) return
+
+    console.warn(`[LiveView] HLS_SESSION_EXPIRED batch: ${expiredIds.length} cámara(s) [${expiredIds.join(', ')}]`)
+
+    const now = Date.now()
+    const toRestart = expiredIds.filter(id => (now - (lastRestartAt.current[id] ?? 0)) >= 30_000)
+    const tooRecent = expiredIds.filter(id => (now - (lastRestartAt.current[id] ?? 0)) < 30_000)
+
+    if (tooRecent.length > 0) {
+      setLoadingStreams(prev => { const n = { ...prev }; tooRecent.forEach(id => { n[id] = false }); return n })
+      setStreamErrors(prev => {
+        const n = { ...prev }
+        tooRecent.forEach(id => {
+          n[id] = { code: 'HLS_SESSION_EXPIRED', message: 'Sesión HLS expirada. Haz clic en Reintentar.' }
+        })
+        return n
+      })
+    }
+
+    if (toRestart.length === 0) return
+    toRestart.forEach(id => { lastRestartAt.current[id] = now })
+
+    const visibleIds = filteredCamerasRef.current.map(c => c.id)
+    if (visibleIds.length === 0) return
+
+    try {
+      const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', { viewId, visibleCameraIds: visibleIds })
+      applyHeartbeat(result)
+    } catch {
+      // Fallback: individual restart per camera
+      toRestart.forEach(id => {
+        const cam = filteredCamerasRef.current.find(c => c.id === id)
+        if (cam) {
+          bumpPlayerKeys([id])
+          setTimeout(() => loadStream(cam), 500)
+        }
+      })
+    }
+  }, [viewId, applyHeartbeat, bumpPlayerKeys, loadStream])
 
   // ─── Periodic viewport heartbeat every 30s ──────────────────
   // Replaces per-camera touch-stream (N requests → 1 request).
@@ -456,8 +507,8 @@ export function LiveViewPage() {
   }, [cameras, loadStream, bumpPlayerKeys])
 
   // ─── HLS fatal error from VideoPlayer ───────────────────────
-  // IMPORTANT: HLS_SESSION_EXPIRED MUST only restart the single affected camera.
-  // Never call stopAllSessions or refreshVisibleStreams here.
+  // HLS_SESSION_EXPIRED is coalesced: batches simultaneous 401s into one
+  // heartbeat (2s window) so N cameras expiring together get 1 backend call.
   const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
     console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
 
@@ -467,35 +518,21 @@ export function LiveViewPage() {
     }
 
     if (err.code === 'HLS_SESSION_EXPIRED') {
-      // HLS muxer destroyed or cookie expired — restart only this camera.
-      // Rate-limited to 1 auto-restart per 30s per camera to prevent cascading loops.
+      // Coalesce simultaneous 401s (all muxers expire at the same time) into
+      // a single heartbeat after a 2s window — prevents N individual restarts
+      // from looking like a full-grid restart.
       setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
-      bumpPlayerKeys([cameraId])
-
-      const now = Date.now()
-      const last = lastRestartAt.current[cameraId] ?? 0
-      if (now - last >= 30_000) {
-        lastRestartAt.current[cameraId] = now
-        const cam = cameras.find(c => c.id === cameraId)
-        // loadStream targets only this camera — other grid cameras are not touched
-        if (cam) setTimeout(() => loadStream(cam), 500)
-      } else {
-        // Restarted too recently — show error with manual retry button
-        setLoadingStreams(prev => ({ ...prev, [cameraId]: false }))
-        setStreamErrors(prev => ({
-          ...prev,
-          [cameraId]: {
-            code: 'HLS_SESSION_EXPIRED',
-            message: 'Sesión HLS expirada. Haz clic en Reintentar.',
-          },
-        }))
+      hlsExpiryQueue.current.add(cameraId)
+      if (!hlsExpiryTimerRef.current) {
+        hlsExpiryTimerRef.current = setTimeout(flushHlsExpiry, 2_000)
       }
+      return
     } else {
       setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
     }
-  }, [cameras, loadStream, bumpPlayerKeys])
+  }, [cameras, loadStream, bumpPlayerKeys, flushHlsExpiry])
 
   // ─── Exit fullscreen/focus view ──────────────────────────────
   // On return from fullscreen, stop the focus camera and restart the grid cameras.
