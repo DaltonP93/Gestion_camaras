@@ -207,14 +207,23 @@ export function LiveViewPage() {
   // Backend reconciles: starts missing streams, stops removed streams, touches existing.
   const sendHeartbeat = useCallback(async (visibleCameraIds: string[]): Promise<void> => {
     if (visibleCameraIds.length === 0) return
+    if (!useAuthStore.getState().isAuthenticated) return
     try {
       const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', {
         viewId,
         visibleCameraIds,
       })
       applyHeartbeat(result)
-    } catch {
-      // Silently ignore — next heartbeat will retry
+    } catch (err: any) {
+      const status = err?.response?.status
+      if (status === 401) {
+        // Interceptor already attempted token refresh + retry.
+        // If refresh succeeded: should not reach here (interceptor returned retried response).
+        // If refresh failed: dispatchAuthExpired fired → isAuthenticated=false → login redirect.
+        // Either way: do NOT modify camera state — user view must stay intact during auth recovery.
+        console.warn(`[LiveView] heartbeat 401 — token refresh attempted by interceptor`)
+      }
+      // Network errors / 5xx: next 30s heartbeat will retry automatically
     }
   }, [viewId, applyHeartbeat])
 
@@ -253,8 +262,9 @@ export function LiveViewPage() {
     try {
       const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', { viewId, visibleCameraIds: visibleIds })
       applyHeartbeat(result)
-    } catch {
-      // Fallback: individual restart per camera
+    } catch (err: any) {
+      if (err?.response?.status === 401) return  // auth expired; interceptor handles redirect
+      // Fallback: individual restart per camera (non-auth errors only)
       toRestart.forEach(id => {
         const cam = filteredCamerasRef.current.find(c => c.id === id)
         if (cam) {
@@ -426,7 +436,7 @@ export function LiveViewPage() {
       } else {
         const hiddenMs = hiddenSince.current ? Date.now() - hiddenSince.current : 0
         hiddenSince.current = null
-        if (hiddenMs > 10_000 && activeSessions.current.size > 0) {
+        if (hiddenMs > 10_000 && activeSessions.current.size > 0 && useAuthStore.getState().isAuthenticated) {
           // Reconcile only — do NOT restart all cameras
           const ids = filteredCamerasRef.current.map(c => c.id)
           sendHeartbeat(ids)

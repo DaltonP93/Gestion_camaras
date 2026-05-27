@@ -46,7 +46,15 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
   server.decorate('authenticate', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       await request.jwtVerify()
-    } catch (err) {
+    } catch (err: any) {
+      const hasHeader = !!request.headers.authorization
+      // Distinguish expired from missing/malformed — critical for 24/7 session diagnosis
+      const reason = err?.message || 'unknown'
+      const code   = err?.code   || ''
+      server.log.warn(
+        `[auth] 401 ${request.method} ${request.url} | ` +
+        `header=${hasHeader} | code=${code} | reason=${reason}`
+      )
       reply.status(401).send({
         statusCode: 401,
         error: 'Unauthorized',
@@ -70,7 +78,14 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
             message: 'No tienes permisos para realizar esta acción',
           })
         }
-      } catch (err) {
+      } catch (err: any) {
+        const hasHeader = !!request.headers.authorization
+        const reason = err?.message || 'unknown'
+        const code   = err?.code   || ''
+        server.log.warn(
+          `[auth] 401 ${request.method} ${request.url} | ` +
+          `header=${hasHeader} | code=${code} | reason=${reason}`
+        )
         reply.status(401).send({
           statusCode: 401,
           error: 'Unauthorized',
