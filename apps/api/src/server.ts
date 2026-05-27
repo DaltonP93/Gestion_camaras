@@ -125,7 +125,7 @@ async function main() {
           count++
         }
       }
-      server.log.info(`[startup] ${count} paths de stream registrados en MediaMTX`)
+      server.log.info(`[startup] ${count} paths on-demand registrados en MediaMTX (RTSP inactivo hasta primer viewer — sourceOnDemand=true)`)
     } catch (err) {
       server.log.warn(`[startup] Error registrando streams en MediaMTX: ${err}`)
     }

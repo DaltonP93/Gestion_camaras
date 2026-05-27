@@ -27,63 +27,59 @@ export function getWebRtcUrl(streamPath: string): string {
 // ─── Publicar stream desde NVR a MediaMTX ───────────────────
 export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> {
   const streamPath = getStreamPath(nvr, camera)
-  // Usar substream (H264) por defecto; main stream si preferredStream === 'main'
   const useSub = (camera as any).preferredStream !== 'main'
   const rtspUrl = buildRtspUrl(nvr, camera.channel, useSub)
+  const sourceMasked = rtspUrl.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
 
   const pathConfig = {
     source: rtspUrl,
     sourceOnDemand: true,
     sourceOnDemandStartTimeout: '8s',
-    sourceOnDemandCloseAfter: '10m',  // survive tab switches, PC lock/unlock, browser background
-    rtspTransport: 'tcp',             // force TCP pull — prevents UDP RTP packet loss → muxer destroy
+    sourceOnDemandCloseAfter: '10m',  // GC fallback — heartbeat/stop-stream limpian antes
+    rtspTransport: 'tcp',             // forzar TCP en pull (evita pérdida RTP UDP)
     record: false,
     overridePublisher: true,
   }
 
-  console.info(`[stream] publish → path=${streamPath} stream=${useSub ? 'sub' : 'main'} preferredStream=${(camera as any).preferredStream || 'sub'} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} transport=tcp closeAfter=10m`)
+  console.info(`[stream] publish path=${streamPath} stream=${useSub ? 'sub' : 'main'} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} source=${sourceMasked} closeAfter=10m transport=tcp`)
 
   try {
-    // GET check: verify if path already exists
-    let pathExists = false
-    try {
-      await mediamtxApi.get('/v3/config/paths/get/' + streamPath)
-      pathExists = true
-    } catch (getErr: any) {
-      if (getErr.response?.status !== 404) {
-        // Unexpected error on GET — proceed to POST anyway
-      }
-    }
-
-    if (pathExists) {
-      // Always PATCH existing paths to ensure rtspTransport and closeAfter are current
-      await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
-      console.info(`[stream] path updated: ${streamPath}`)
-      return true
-    }
-
-    // Path doesn't exist — create with POST
+    // Intentar crear directamente (optimistic POST).
+    // Si el path ya existe MediaMTX devuelve 400 → hacemos PATCH.
+    // Evitar GET previo: causa ERR "path configuration not found" en logs de MediaMTX.
     await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
     console.info(`[stream] path created: ${streamPath}`)
     return true
   } catch (err: any) {
     const status = err.response?.status
 
-    // 400 on POST = race condition: path was created between our GET and POST → PATCH
+    // 400 = path ya existe — actualizar con PATCH para asegurar rtspTransport/closeAfter
     if (status === 400) {
       try {
         await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
-        console.info(`[stream] path updated (race condition): ${streamPath}`)
+        console.info(`[stream] path updated: ${streamPath}`)
         return true
-      } catch {
-        console.info(`[stream] path exists (PATCH skipped): ${streamPath}`)
-        return true // If PATCH fails, path likely exists and is already working
+      } catch (patchErr: any) {
+        // Si el PATCH falla porque el path desapareció entre el POST y el PATCH,
+        // reintentar creando. Si falla de nuevo, logar y retornar false.
+        if (patchErr.response?.status === 404) {
+          try {
+            await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
+            console.info(`[stream] path re-created after race: ${streamPath}`)
+            return true
+          } catch {
+            console.error(`[stream] failed to re-create path ${streamPath} after race`)
+            return false
+          }
+        }
+        console.error(`[stream] PATCH failed for ${streamPath}:`, patchErr.response?.status, patchErr.message)
+        return false
       }
     }
 
-    // 401 or 403 = MediaMTX API auth problem
+    // 401/403 = problema de auth con la API de MediaMTX
     if (status === 401 || status === 403) {
-      console.error(`[stream] MediaMTX auth error (${status}) para ${streamPath}. Verificar configuración de auth en mediamtx.yml`)
+      console.error(`[stream] MediaMTX auth error (${status}) para ${streamPath} — verificar mediamtx.yml`)
       return false
     }
 
@@ -126,6 +122,8 @@ export async function publishAllStreams(
 }
 
 // ─── Estado de un stream en MediaMTX ────────────────────────
+// Usa solo /v3/paths/list (live state) — no llama a /v3/config/paths/get
+// porque ese endpoint genera ERR "path configuration not found" en los logs de MediaMTX.
 export async function getStreamStatus(streamPath: string): Promise<{
   active: boolean
   routeExists: boolean
@@ -138,13 +136,8 @@ export async function getStreamStatus(streamPath: string): Promise<{
     const path = paths.find((p) => p.name === streamPath)
 
     if (!path) {
-      // Path not in active list — check config to see if it's registered
-      try {
-        await mediamtxApi.get('/v3/config/paths/get/' + streamPath)
-        return { active: false, routeExists: true, readers: 0, bytesReceived: 0 }
-      } catch {
-        return { active: false, routeExists: false, readers: 0, bytesReceived: 0 }
-      }
+      // Not in active list — assume path exists in config (registered at startup) but no readers yet
+      return { active: false, routeExists: true, readers: 0, bytesReceived: 0 }
     }
 
     return {
