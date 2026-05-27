@@ -113,6 +113,9 @@ export function LiveViewPage() {
   // and flushes them as a single heartbeat after a 2s window
   const hlsExpiryQueue    = useRef<Set<string>>(new Set())
   const hlsExpiryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Ref to loadStream so flushHlsExpiry (declared before loadStream) can call it
+  // without a forward-reference compile error.
+  const loadStreamRef = useRef<((camera: Camera) => Promise<void>) | null>(null)
 
   useEffect(() => { loadNVRs(); loadCameras() }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
@@ -264,16 +267,18 @@ export function LiveViewPage() {
       applyHeartbeat(result)
     } catch (err: any) {
       if (err?.response?.status === 401) return  // auth expired; interceptor handles redirect
-      // Fallback: individual restart per camera (non-auth errors only)
+      // Fallback: individual restart per camera (non-auth errors only).
+      // Uses loadStreamRef to avoid forward-reference compile error (loadStream
+      // is declared later in this component but ref is always current).
       toRestart.forEach(id => {
         const cam = filteredCamerasRef.current.find(c => c.id === id)
         if (cam) {
           bumpPlayerKeys([id])
-          setTimeout(() => loadStream(cam), 500)
+          setTimeout(() => loadStreamRef.current?.(cam), 500)
         }
       })
     }
-  }, [viewId, applyHeartbeat, bumpPlayerKeys, loadStream])
+  }, [viewId, applyHeartbeat, bumpPlayerKeys])
 
   // ─── Periodic viewport heartbeat every 30s ──────────────────
   // Replaces per-camera touch-stream (N requests → 1 request).
@@ -391,6 +396,7 @@ export function LiveViewPage() {
       setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  loadStreamRef.current = loadStream  // keep ref current for flushHlsExpiry
 
   // ─── Handle stream limit: cleanup non-visible then retry ────
   const handleLimitHit = useCallback(async (camera: Camera) => {
@@ -542,7 +548,7 @@ export function LiveViewPage() {
     } else {
       setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
     }
-  }, [cameras, loadStream, bumpPlayerKeys, flushHlsExpiry])
+  }, [cameras, bumpPlayerKeys, flushHlsExpiry])
 
   // ─── Exit fullscreen/focus view ──────────────────────────────
   // On return from fullscreen, stop the focus camera and restart the grid cameras.
