@@ -452,56 +452,68 @@ function CamerasTab({
         />
       )}
 
-      <div className="card overflow-hidden">
-        <table className="w-full text-xs">
+      <div className="card overflow-x-auto">
+        <table className="w-full text-xs min-w-[900px]">
           <thead>
             <tr className="border-b border-surface-700 bg-surface-800/50">
-              {['Canal', 'Código', 'Nombre', 'IP Cámara', 'Protocolo', 'Puerto', 'Seguridad', 'Estado', 'Codec', 'Resolución', 'Acciones'].map(h => (
-                <th key={h} className="text-left px-3 py-2 text-surface-400 font-medium">{h}</th>
+              {['Canal', 'Nombre', 'IP / Puerto', 'Protocolo', 'NVR', 'RTSP', 'Codec', 'Resolución', 'Última validación', 'Acciones'].map(h => (
+                <th key={h} className="text-left px-3 py-2 text-surface-400 font-medium whitespace-nowrap">{h}</th>
               ))}
             </tr>
           </thead>
           <tbody className="divide-y divide-surface-700/50">
             {list.map(cam => {
               const fromNvr = cameras?.fromNvr.find(n => n.channel === cam.channel)
+              const status  = camStatusDisplay(cam)
+              const useSub  = cam.preferredStream !== 'main'
+              const codec   = useSub ? (cam.subCodec || cam.mainCodec) : (cam.mainCodec || cam.subCodec)
+              const isHevc  = (codec || '').toLowerCase().match(/hevc|h\.?265/)
+              const isMain  = !useSub && !!cam.mainCodec
+              const resolution = cam.preferredStream !== 'main'
+                ? (cam.subResolution || cam.mainResolution || '—')
+                : (cam.mainResolution || cam.subResolution || '—')
+              const lastCheck = (cam as any).lastRtspCheckAt
+                ? format(new Date((cam as any).lastRtspCheckAt), 'dd/MM HH:mm')
+                : '—'
+              const lastError = (cam as any).lastRtspError || ''
               return (
                 <tr key={cam.id} className="hover:bg-surface-700/30 transition-colors">
-                  <td className="px-3 py-2 text-surface-300">{cam.channel}</td>
-                  <td className="px-3 py-2 text-surface-400">{cam.channelCode || `D${cam.channel}`}</td>
-                  <td className="px-3 py-2 text-surface-100 font-medium max-w-[120px] truncate">{cam.name}</td>
-                  <td className="px-3 py-2 text-surface-400">{cam.ipAddress || fromNvr?.ipAddress || '—'}</td>
+                  <td className="px-3 py-2 text-surface-300 font-mono">{cam.channelCode || `D${cam.channel}`}</td>
+                  <td className="px-3 py-2 text-surface-100 font-medium max-w-[140px] truncate" title={cam.name}>{cam.name}</td>
+                  <td className="px-3 py-2 text-surface-400 whitespace-nowrap">
+                    {(cam.ipAddress || fromNvr?.ipAddress) ? (
+                      <span>{cam.ipAddress || fromNvr?.ipAddress}<span className="text-surface-600">:{cam.managementPort || fromNvr?.managementPort || '—'}</span></span>
+                    ) : '—'}
+                  </td>
                   <td className="px-3 py-2 text-surface-400">{cam.protocol || fromNvr?.protocol || '—'}</td>
-                  <td className="px-3 py-2 text-surface-400">{cam.managementPort || fromNvr?.managementPort || '—'}</td>
-                  <td className="px-3 py-2 text-surface-400">{cam.securityStatus || fromNvr?.securityStatus || '—'}</td>
                   <td className="px-3 py-2">
-                    {(() => { const s = camStatusDisplay(cam); return (
-                      <span className={clsx('inline-flex items-center gap-1.5 text-xs', s.color)}>
-                        <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0', s.dot)} />
-                        {s.label}
+                    {(cam as any).onlineInNvr === true
+                      ? <span className="text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-green-400" />Online</span>
+                      : (cam as any).onlineInNvr === false
+                        ? <span className="text-red-400 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-red-500" />Offline</span>
+                        : <span className="text-surface-600">—</span>}
+                  </td>
+                  <td className="px-3 py-2">
+                    <span
+                      className={clsx('inline-flex items-center gap-1.5', status.color)}
+                      title={lastError || undefined}
+                    >
+                      <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0', status.dot)} />
+                      {status.label}
+                      {lastError && <AlertTriangle size={9} className="text-amber-500 ml-0.5" title={lastError} />}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2">
+                    {codec ? (
+                      <span className="inline-flex items-center gap-1">
+                        <span className="text-surface-400">{codec.toUpperCase()}</span>
+                        {isMain && <span className="text-[10px] px-1 rounded bg-blue-900/40 text-blue-400">Main</span>}
+                        {isHevc && <span className="text-[10px] px-1 rounded bg-red-900/40 text-red-400">HEVC</span>}
                       </span>
-                    )})()}
+                    ) : <span className="text-surface-600">—</span>}
                   </td>
-                  <td className="px-3 py-2">
-                    {(() => {
-                      const useSub = cam.preferredStream !== 'main'
-                      const codec = useSub ? (cam.subCodec || cam.mainCodec) : (cam.mainCodec || cam.subCodec)
-                      const isHevc = (codec || '').toLowerCase().match(/hevc|h\.?265/)
-                      const isMain = !useSub && !!cam.mainCodec
-                      if (!codec) return <span className="text-surface-600">—</span>
-                      return (
-                        <span className="inline-flex items-center gap-1">
-                          <span className="text-surface-400">{codec.toUpperCase()}</span>
-                          {isMain && <span className="text-[10px] px-1 rounded bg-blue-900/40 text-blue-400">Main</span>}
-                          {isHevc && <span className="text-[10px] px-1 rounded bg-red-900/40 text-red-400">HEVC</span>}
-                        </span>
-                      )
-                    })()}
-                  </td>
-                  <td className="px-3 py-2 text-surface-400">
-                    {cam.preferredStream !== 'main'
-                      ? (cam.subResolution || cam.mainResolution || '—')
-                      : (cam.mainResolution || cam.subResolution || '—')}
-                  </td>
+                  <td className="px-3 py-2 text-surface-400 whitespace-nowrap">{resolution}</td>
+                  <td className="px-3 py-2 text-surface-500 whitespace-nowrap" title={lastError || undefined}>{lastCheck}</td>
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-1">
                       <button

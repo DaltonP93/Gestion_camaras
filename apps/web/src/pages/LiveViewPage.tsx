@@ -52,12 +52,14 @@ function getHealthError(status: StreamHealthStatus, channel: number): CameraPlay
     STREAM_UNSTABLE:        'UNKNOWN',
   }
   return {
-    code:            codeMap[status] ?? 'UNKNOWN',
-    message:         cfg?.label ?? status,
+    code:    codeMap[status] ?? 'UNKNOWN',
+    message: status === 'CODEC_UNSUPPORTED_HEVC'
+      ? 'HEVC/H.265 no es compatible con navegadores. Configura H.264 en la cámara o habilita transcodificación en el NVR.'
+      : cfg?.label ?? status,
     technicalDetail: status === 'RTSP_SUB_NOT_FOUND'
       ? `Substream /Streaming/Channels/${channel}02 devolvió 404`
       : status === 'CODEC_UNSUPPORTED_HEVC'
-        ? 'El stream usa HEVC/H.265 — no reproducible en navegadores sin transcodificación'
+        ? 'Recomendación: cambiar el codec del substream a H.264 en la interfaz del NVR (Configuración → Video → Substream → Codec: H.264)'
         : undefined,
   }
 }
@@ -194,11 +196,17 @@ export function LiveViewPage() {
         CAMERA_NOT_FOUND:       'UNKNOWN',
         CAMERA_DISABLED:        'UNKNOWN',
       }
+      const isHevc = err.code === 'CODEC_UNSUPPORTED_HEVC'
       setStreamErrors(prev => ({
         ...prev,
         [cameraId]: {
           code: errCodeMap[err.code] || 'UNKNOWN',
-          message: err.message,
+          message: isHevc
+            ? 'HEVC/H.265 no es compatible con navegadores. Configura H.264 en la cámara o habilita transcodificación en el NVR.'
+            : err.message,
+          technicalDetail: isHevc
+            ? 'Recomendación: cambiar el codec del substream a H.264 en la interfaz del NVR (Configuración → Video → Substream → Codec: H.264)'
+            : err.details,
         },
       }))
       setLoadingStreams(prev => ({ ...prev, [cameraId]: false }))

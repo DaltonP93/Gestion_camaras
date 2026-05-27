@@ -1114,6 +1114,139 @@ export async function getFreeChannels(nvr: NVR, totalChannels: number): Promise<
   }
 }
 
+// ─── Test de conexión robusto ──────────────────────────────────
+// Prueba múltiples endpoints ISAPI — no falla si uno no responde.
+// Retorna structured result con código de error específico.
+
+export interface HikConnectionTestResult {
+  reachable: boolean
+  errorCode?: 'AUTH_FAILED' | 'NETWORK_UNREACHABLE' | 'ENDPOINT_UNSUPPORTED' | 'DEVICE_REACHABLE_PARTIAL_ISAPI'
+  errorMessage?: string
+  firmware?: string
+  model?: string
+  serialNumber?: string
+  diskUsage?: number
+  channelCount?: number
+  endpoints: { path: string; status: number | 'ok' | 'network_error' | 'auth' | 'unsupported' }[]
+}
+
+export async function testNVRConnection(
+  nvr: { ipAddress: string; port: number; username: string; password: string },
+): Promise<HikConnectionTestResult> {
+  const client = createHikClient(nvr as any, 8000)
+  const endpoints = [
+    '/ISAPI/System/deviceInfo',
+    '/ISAPI/ContentMgmt/InputProxy/channels',
+    '/ISAPI/System/Video/inputs/channels',
+  ]
+
+  type EndpointResult = { path: string; status: number | 'ok' | 'network_error' | 'auth' | 'unsupported'; data?: any }
+  const results: EndpointResult[] = []
+  let networkError = false
+  let allAuth = true
+
+  for (const path of endpoints) {
+    try {
+      const res = await client.get(path)
+      results.push({ path, status: 'ok', data: res.data })
+      allAuth = false
+    } catch (err: any) {
+      const httpStatus: number | undefined = err.response?.status
+      const code = err.code as string | undefined
+      const isNetwork = !err.response && ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNABORTED', 'EHOSTUNREACH', 'ENOTFOUND', 'ECONNRESET'].includes(code ?? '')
+
+      if (isNetwork) {
+        results.push({ path, status: 'network_error' })
+        networkError = true
+      } else if (httpStatus === 401 || httpStatus === 403) {
+        results.push({ path, status: 'auth' })
+        // allAuth stays true unless another endpoint succeeded
+      } else if (httpStatus === 404 || httpStatus === 405) {
+        results.push({ path, status: 'unsupported' })
+        allAuth = false
+      } else {
+        results.push({ path, status: httpStatus ?? 'network_error' })
+        allAuth = false
+      }
+    }
+  }
+
+  const summary = results.map(r => ({ path: r.path, status: r.status }))
+
+  // All endpoints failed with network errors
+  const anyOk = results.some(r => r.status === 'ok')
+  const anyAuth = results.some(r => r.status === 'auth')
+
+  if (!anyOk && networkError && !anyAuth) {
+    return {
+      reachable: false,
+      errorCode: 'NETWORK_UNREACHABLE',
+      errorMessage: `No se pudo alcanzar ${nvr.ipAddress}:${nvr.port} — verifica IP, puerto y que el NVR esté encendido`,
+      endpoints: summary,
+    }
+  }
+
+  if (!anyOk && allAuth) {
+    return {
+      reachable: false,
+      errorCode: 'AUTH_FAILED',
+      errorMessage: 'Credenciales incorrectas (usuario o contraseña)',
+      endpoints: summary,
+    }
+  }
+
+  if (!anyOk) {
+    return {
+      reachable: false,
+      errorCode: 'ENDPOINT_UNSUPPORTED',
+      errorMessage: 'El dispositivo responde pero ningún endpoint ISAPI fue accesible',
+      endpoints: summary,
+    }
+  }
+
+  // At least one endpoint OK — extract device info
+  const deviceInfoResult = results.find(r => r.path === '/ISAPI/System/deviceInfo' && r.status === 'ok')
+  let firmware: string | undefined
+  let model: string | undefined
+  let serialNumber: string | undefined
+  let channelCount: number | undefined
+
+  if (deviceInfoResult?.data) {
+    const d = deviceInfoResult.data
+    if (typeof d === 'string') {
+      firmware      = xmlGet(d, 'firmwareVersion') || undefined
+      model         = xmlGet(d, 'model') || undefined
+      serialNumber  = xmlGet(d, 'serialNumber') || undefined
+      const chNum   = parseInt(xmlGet(d, 'ipChannelNum') || xmlGet(d, 'analogChannelNum') || '0')
+      channelCount  = chNum || undefined
+    } else {
+      const di = d?.DeviceInfo || d
+      firmware      = di?.firmwareVersion || undefined
+      model         = di?.model || undefined
+      serialNumber  = di?.serialNumber || undefined
+      const chNum   = parseInt(di?.ipChannelNum || di?.analogChannelNum || '0')
+      channelCount  = chNum || undefined
+    }
+  }
+
+  // Partial reachability: some endpoints failed
+  const partialOnly = results.some(r => r.status !== 'ok' && r.status !== 'unsupported')
+  if (partialOnly && !deviceInfoResult) {
+    return {
+      reachable: true,
+      errorCode: 'DEVICE_REACHABLE_PARTIAL_ISAPI',
+      errorMessage: 'Dispositivo alcanzable pero algunos endpoints ISAPI no respondieron correctamente',
+      firmware,
+      model,
+      serialNumber,
+      channelCount,
+      endpoints: summary,
+    }
+  }
+
+  return { reachable: true, firmware, model, serialNumber, channelCount, endpoints: summary }
+}
+
 // ─── Snapshot ─────────────────────────────────────────────────
 
 export async function captureSnapshot(nvr: NVR, channel: number): Promise<Buffer | null> {
