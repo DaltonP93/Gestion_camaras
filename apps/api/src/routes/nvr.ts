@@ -18,6 +18,25 @@ const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET 
 const encryptPassword = (p: string) => CryptoJS.AES.encrypt(p, ENCRYPTION_KEY).toString()
 const decryptPassword = (enc: string) => CryptoJS.AES.decrypt(enc, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
+function safeDecrypt(enc: string): string | null {
+  try {
+    const plain = CryptoJS.AES.decrypt(enc, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+    return plain || null
+  } catch {
+    return null
+  }
+}
+
+// Rechaza valores que claramente son máscaras/placeholders, no contraseñas reales.
+function isMaskedPassword(value: string): boolean {
+  if (!value) return false
+  // Solo puntos, bullets o asteriscos → placeholder visual
+  if (/^[•\*•]+$/.test(value)) return true
+  // 8 caracteres o menos, todos iguales → placeholder
+  if (value.length <= 12 && new Set(value.split('')).size === 1) return true
+  return false
+}
+
 // Strip debug/non-schema fields before passing a HikStorageDisk to Prisma
 function sanitizeDiskForDb(disk: any) {
   const { _rawCapacity, _rawFree, rawCapacity, rawFree, ...dbDisk } = disk
@@ -25,10 +44,11 @@ function sanitizeDiskForDb(disk: any) {
 }
 
 const connectionTestSchema = z.object({
+  nvrId:     z.string().optional(),   // Si está presente y no hay password, usa credencial guardada
   ipAddress: z.string().min(1),
   port:      z.number().int().min(1).max(65535).default(80),
   username:  z.string().min(1),
-  password:  z.string().min(1),
+  password:  z.string().optional(),
 })
 
 const nvrSchema = z.object({
@@ -49,12 +69,43 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
   // POST /api/nvrs/test-connection
   server.post('/test-connection', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
-    const data = connectionTestSchema.parse(request.body)
+    const raw = connectionTestSchema.parse(request.body)
+
+    // Resolve password: use provided value, or load from stored NVR when editing
+    let password = raw.password || ''
+    let passwordSource: 'provided' | 'stored' | 'missing' = 'provided'
+
+    if (isMaskedPassword(password)) {
+      server.log.warn(`[test-connection] contraseña con valor de máscara recibida — ignorando`)
+      password = ''
+    }
+
+    if (!password && raw.nvrId) {
+      const storedNvr = await server.prisma.nVR.findUnique({ where: { id: raw.nvrId } })
+      if (!storedNvr) return reply.status(404).send({ success: false, message: 'NVR no encontrado' })
+      const dec = safeDecrypt(storedNvr.password)
+      if (!dec) {
+        server.log.error(`[test-connection] DECRYPT_ERROR nvrId=${raw.nvrId} name=${storedNvr.name}`)
+        return reply.status(422).send({
+          success: false,
+          errorCode: 'DECRYPT_ERROR',
+          message: 'La contraseña guardada no se puede descifrar. Vuelva a guardar la contraseña real del NVR.',
+        })
+      }
+      password = dec
+      passwordSource = 'stored'
+    }
+
+    if (!password) {
+      return reply.status(400).send({ success: false, errorCode: 'PASSWORD_MISSING', message: 'Ingresa la contraseña para probar la conexión' })
+    }
+
+    const data = { ipAddress: raw.ipAddress, port: raw.port, username: raw.username, password }
     const result = await testNVRConnection(data)
 
+    server.log.info(`[test-connection] ${data.ipAddress}:${data.port} errorCode=${result.errorCode ?? 'none'} user=${data.username} passwordSource=${passwordSource} reachable=${result.reachable}`)
+
     if (!result.reachable) {
-      server.log.warn(`[test-connection] ${data.ipAddress}:${data.port} errorCode=${result.errorCode} user=${data.username}`)
-      // Use 422 for auth errors (not 401 — that triggers the frontend token-refresh interceptor)
       const httpStatus = (result.errorCode === 'AUTH_FAILED') ? 422 : 503
       return reply.status(httpStatus).send({
         success: false,
@@ -65,13 +116,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       })
     }
 
-    server.log.info(`[test-connection] ${data.ipAddress}:${data.port} ok model=${result.model} firmware=${result.firmware}`)
     return reply.send({
       success: true,
       firmware: result.firmware,
       model: result.model,
       serialNumber: result.serialNumber,
-      // Partial permission issues are surfaced as warnings (reachable=true but restricted)
       ...(result.errorCode ? { errorCode: result.errorCode, warning: result.errorMessage, hint: result.hint } : {}),
       endpoints: result.endpoints,
     })
@@ -79,7 +128,38 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
   // POST /api/nvrs/detect — Auto-detectar info del NVR
   server.post('/detect', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
-    const data = connectionTestSchema.parse(request.body)
+    const raw = connectionTestSchema.parse(request.body)
+
+    // Resolve password: use provided value, or load from stored NVR when editing
+    let password = raw.password || ''
+    let passwordSource: 'provided' | 'stored' | 'missing' = 'provided'
+
+    if (isMaskedPassword(password)) {
+      server.log.warn(`[detect] contraseña con valor de máscara recibida — ignorando`)
+      password = ''
+    }
+
+    if (!password && raw.nvrId) {
+      const storedNvr = await server.prisma.nVR.findUnique({ where: { id: raw.nvrId } })
+      if (!storedNvr) return reply.status(404).send({ success: false, message: 'NVR no encontrado' })
+      const dec = safeDecrypt(storedNvr.password)
+      if (!dec) {
+        server.log.error(`[detect] DECRYPT_ERROR nvrId=${raw.nvrId} name=${storedNvr.name}`)
+        return reply.status(422).send({
+          success: false,
+          errorCode: 'DECRYPT_ERROR',
+          message: 'La contraseña guardada no se puede descifrar. Vuelva a guardar la contraseña real del NVR.',
+        })
+      }
+      password = dec
+      passwordSource = 'stored'
+    }
+
+    if (!password) {
+      return reply.status(400).send({ success: false, errorCode: 'PASSWORD_MISSING', message: 'Ingresa la contraseña para auto-detectar' })
+    }
+
+    const data = { ipAddress: raw.ipAddress, port: raw.port, username: raw.username, password }
     const fakeNvr = { id: 'detect', ...data, rtspPort: 554, channels: 0, hddCount: 0, firmware: null } as any
 
     try {
@@ -94,7 +174,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       if (!conn?.reachable) {
         const errorCode = conn?.errorCode ?? 'NETWORK_UNREACHABLE'
         const message   = conn?.errorMessage ?? 'No se pudo conectar al NVR'
-        server.log.warn(`[detect] ${data.ipAddress}:${data.port} errorCode=${errorCode} user=${data.username}`)
+        server.log.warn(`[detect] ${data.ipAddress}:${data.port} errorCode=${errorCode} user=${data.username} passwordSource=${passwordSource}`)
         const httpStatus = errorCode === 'AUTH_FAILED' ? 422 : 503
         return reply.status(httpStatus).send({
           success: false, errorCode, message, hint: conn?.hint, endpoints: conn?.endpoints,
@@ -681,6 +761,13 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const updateData: any = { ...data }
 
     if (data.password) {
+      if (isMaskedPassword(data.password)) {
+        return reply.status(400).send({
+          success: false,
+          errorCode: 'MASKED_PASSWORD',
+          message: 'Se recibió un valor de máscara como contraseña. Ingresa la contraseña real o deja el campo vacío.',
+        })
+      }
       updateData.password = encryptPassword(data.password)
     } else {
       // Never overwrite existing password if field is blank

@@ -20,6 +20,19 @@ function decryptPass(p: string): string | null {
   }
 }
 
+// Throttle DECRYPT_ERROR logs: solo una vez cada 10 minutos por NVR
+const decryptErrorLastLog = new Map<string, number>()
+const DECRYPT_ERROR_LOG_INTERVAL_MS = 10 * 60 * 1000
+
+function logDecryptError(server: FastifyInstance, nvrId: string, nvrName: string, context: string) {
+  const now = Date.now()
+  const last = decryptErrorLastLog.get(nvrId) ?? 0
+  if (now - last >= DECRYPT_ERROR_LOG_INTERVAL_MS) {
+    decryptErrorLastLog.set(nvrId, now)
+    server.log.error(`[${context}] DECRYPT_ERROR para NVR ${nvrName} (${nvrId}) — contraseña no descifrable. Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales del NVR.`)
+  }
+}
+
 export function startHealthWorker(server: FastifyInstance) {
   // Verificar estado de NVRs cada 60 segundos
   cron.schedule('*/60 * * * * *', async () => {
@@ -33,7 +46,7 @@ export function startHealthWorker(server: FastifyInstance) {
         try {
           const plainPass = decryptPass(nvr.password)
           if (!plainPass) {
-            server.log.error(`[healthWorker] DECRYPT_ERROR para NVR ${nvr.name} (${nvr.id}) — contraseña no descifrable. Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales del NVR.`)
+            logDecryptError(server, nvr.id, nvr.name, 'healthWorker')
             continue
           }
           const nvrDecrypted = { ...nvr, password: plainPass }
@@ -175,7 +188,7 @@ export function startHealthWorker(server: FastifyInstance) {
       for (const nvr of nvrs) {
         const plainPass = decryptPass(nvr.password)
         if (!plainPass) {
-          server.log.error(`[healthWorker] DECRYPT_ERROR en re-registro de streams para NVR ${nvr.name} (${nvr.id}) — omitiendo.`)
+          logDecryptError(server, nvr.id, nvr.name, 'healthWorker:streams')
           continue
         }
         const nvrDecrypted = { ...nvr, password: plainPass }
