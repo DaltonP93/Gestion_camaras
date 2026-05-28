@@ -44,6 +44,8 @@ export interface HikIpCamera {
   managementPort: number    // 8000
   securityStatus: string    // Secure, Non-Secure
   status: string            // online, offline
+  chanDetectResult?: string
+  passwordStatus?: string
 }
 
 export interface HikStorageDisk {
@@ -337,6 +339,8 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     managementPort: number
     securityStatus: string
     status: string
+    chanDetectResult?: string
+    passwordStatus?: string
   }
 
   const inputProxyMap = new Map<number, InputProxyEntry>()
@@ -353,8 +357,8 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         // customName is the user-set label; name may be auto-generated
         name:           xmlGet(block, 'customName') || xmlGet(block, 'name'),
         ipAddress:      xmlGet(block, 'ipAddress'),
-        protocol:       xmlGet(block, 'protocolType') || xmlGet(block, 'proxyProtocol'),
-        port:           parseInt(xmlGet(block, 'managementPortNo') || '8000'),
+        protocol:       xmlGet(block, 'proxyProtocol') || xmlGet(block, 'protocolType'),
+        port:           parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '8000'),
         securityStatus: xmlGet(block, 'securityStatus'),
         status:         xmlGet(block, 'status'),
       }))
@@ -393,6 +397,10 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         const entry = inputProxyMap.get(ch)
         if (entry) {
           entry.status = onlineStr === 'true' ? 'online' : 'offline'
+          const chanDetect = xmlGet(block, 'chanDetectResult')
+          const pwdStatus = xmlGet(block, 'PasswordStatus')
+          if (chanDetect) entry.chanDetectResult = chanDetect
+          if (pwdStatus) entry.passwordStatus = pwdStatus
         }
       }
     } else {
@@ -405,6 +413,9 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
           const entry = inputProxyMap.get(ch)
           if (entry) {
             entry.status = item.online === true || item.online === 'true' ? 'online' : 'offline'
+            if (item.chanDetectResult) entry.chanDetectResult = item.chanDetectResult
+            if (item.SecurityStatus?.PasswordStatus) entry.passwordStatus = item.SecurityStatus.PasswordStatus
+            else if (item.PasswordStatus) entry.passwordStatus = item.PasswordStatus
           }
         }
       }
@@ -531,14 +542,16 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     }
 
     cameras.push({
-      channel:        ch,
-      channelCode:    `D${ch}`,
-      name:           bestName,
-      ipAddress:      entry.ipAddress,
-      protocol:       entry.protocol,
-      managementPort: entry.managementPort,
-      securityStatus: entry.securityStatus,
-      status:         entry.status,
+      channel:          ch,
+      channelCode:      `D${ch}`,
+      name:             bestName,
+      ipAddress:        entry.ipAddress,
+      protocol:         entry.protocol,
+      managementPort:   entry.managementPort,
+      securityStatus:   entry.securityStatus,
+      status:           entry.status,
+      chanDetectResult: entry.chanDetectResult,
+      passwordStatus:   entry.passwordStatus,
     })
   }
 

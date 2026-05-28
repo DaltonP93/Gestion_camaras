@@ -193,6 +193,22 @@ export function NVRDetailPage() {
     }
   }
 
+  const handleForceSyncNames = async () => {
+    if (!id) return
+    if (!confirm('¿Reemplazar todos los nombres con los del NVR, incluso si ya tienes nombres personalizados?')) return
+    try {
+      setSyncingCameras(true)
+      const res = await apiPost<{ synced: number; total: number }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
+      toast.success(`Nombres forzados desde NVR: ${res.synced} actualizadas de ${res.total}`)
+      setCameras(null)
+    } catch (e: any) {
+      const msg = e?.response?.data?.message || 'Error al forzar nombres desde NVR'
+      toast.error(msg)
+    } finally {
+      setSyncingCameras(false)
+    }
+  }
+
   const handleRestartStream = async (cameraId: string, cameraName: string) => {
     try {
       await apiPost(`/cameras/${cameraId}/restart-stream`)
@@ -303,6 +319,7 @@ export function NVRDetailPage() {
           loading={loadingCameras}
           onRefresh={loadCameras}
           onSyncCameras={handleSyncCameras}
+          onForceSyncNames={handleForceSyncNames}
           syncingCameras={syncingCameras}
           onRestartStream={handleRestartStream}
           onDiagnostics={(cam) => { setDiagCamera(cam.id); setTab('diagnostics'); handleDiagnostics(cam.id) }}
@@ -447,12 +464,13 @@ function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolea
 }
 
 function CamerasTab({
-  cameras, loading, onRefresh, onSyncCameras, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus,
+  cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus,
 }: {
   cameras: { fromNvr: IpCamera[]; fromDb: CameraType[] } | null
   loading: boolean
   onRefresh: () => void
   onSyncCameras: () => void
+  onForceSyncNames: () => void
   syncingCameras: boolean
   onRestartStream: (id: string, name: string) => void
   onDiagnostics: (cam: CameraType) => void
@@ -479,6 +497,9 @@ function CamerasTab({
           <button onClick={onSyncCameras} disabled={syncingCameras} className="btn-secondary text-xs" title="Sincroniza nombre, IP, puerto, protocolo y estado desde el NVR via ISAPI">
             {syncingCameras ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
             Sincronizar cámaras IP
+          </button>
+          <button onClick={onForceSyncNames} disabled={syncingCameras} className="btn-ghost text-xs" title="Reemplaza nombres con los del NVR aunque ya existan nombres personalizados">
+            <RefreshCw size={12} /> Forzar nombres NVR
           </button>
           <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
         </div>
