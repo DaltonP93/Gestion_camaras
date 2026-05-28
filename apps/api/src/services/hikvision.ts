@@ -46,6 +46,12 @@ export interface HikIpCamera {
   status: string            // online, offline
   chanDetectResult?: string
   passwordStatus?: string
+  // Tracks which ISAPI endpoint actually provided this camera's metadata.
+  // sync-cameras uses this to decide which fields are safe to write to the DB.
+  // 'inputproxy' = real IP/port/protocol/status available
+  // 'videoinput' | 'streaming' = name only (no IP/port/status)
+  // 'fallback' = getNVRChannels — channel number only, no reliable metadata
+  metadataSource: 'inputproxy' | 'videoinput' | 'streaming' | 'fallback'
 }
 
 export interface HikStorageDisk {
@@ -511,10 +517,11 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         channelCode:    `D${ch.id}`,
         name:           ch.name,
         ipAddress:      '',
-        protocol:       'HIKVISION',
-        managementPort: 8000,
+        protocol:       '',
+        managementPort: 0,
         securityStatus: '',
         status:         'unknown',  // fallback doesn't know real IP camera status
+        metadataSource: 'fallback' as const,
       }))
     } catch {
       return []
@@ -552,6 +559,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
       status:           entry.status,
       chanDetectResult: entry.chanDetectResult,
       passwordStatus:   entry.passwordStatus,
+      metadataSource:   'inputproxy',
     })
   }
 
@@ -579,10 +587,11 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
       channelCode:    `D${ch}`,
       name:           bestName,
       ipAddress:      '',
-      protocol:       'HIKVISION',
-      managementPort: 8000,
+      protocol:       '',
+      managementPort: 0,
       securityStatus: '',
       status:         'unknown',
+      metadataSource: videoInputNames.has(ch) ? 'videoinput' : 'streaming',
     })
   }
 
@@ -860,6 +869,7 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
     snippet:        '',
     parseable:      false,
     detectedFields: [],
+    hasFields:      {} as Record<string, boolean>,
     error:          'Promise rejected',
   })
 }
