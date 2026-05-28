@@ -622,22 +622,20 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     }
 
     if (isapIStatus === 'unsupported') {
-      return reply.status(422).send({
-        success: false,
-        errorCode: 'ISAPI_UNSUPPORTED',
-        isapIStatus,
-        message: 'Este modelo no soporta el endpoint InputProxy (HTTP 400/404/405). No es posible leer datos de cámara IP via ISAPI.',
-      })
+      server.log.info(`[sync-cameras] ${nvr.name} InputProxy no soportado — continuando con fallbacks (VideoInput / Streaming / getNVRChannels)`)
     }
 
-    // isapIStatus === 'available' | 'error' | 'unknown' — proceed with getIpCameraList
+    // isapIStatus === 'available' | 'unsupported' | 'error' | 'unknown' — proceed with getIpCameraList
+    // getIpCameraList has its own fallback chain: InputProxy → VideoInput → Streaming → getNVRChannels
     const ipCams = await getIpCameraList(nvrDec as any)
 
     const isPlaceholder = (n: string) =>
       !n || /^(IPCamera\s*\d*|Camera\s*\d*|Canal\s*\d+|Channel\s*\d+|D\d+)$/i.test(n.trim()) || /^\d{3,4}$/.test(n.trim())
 
-    const syncLog: Array<{ channel: number; changes: string[] }> = []
+    const syncLog: Array<{ channel: number; source: string; changes: string[] }> = []
     let synced = 0
+    let updatedMetadata = 0
+    let preservedMetadata = 0
 
     const forceNames = (request.query as any).forceNames === 'true' || (request.body as any)?.forceNames === true
 
@@ -654,61 +652,84 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }> = {}
       const changeLog: string[] = []
 
-      // Name: update when NVR has real name AND (DB has placeholder OR forceNames=true)
-      if (cam.name && !isPlaceholder(cam.name) && (isPlaceholder(existing.name || '') || forceNames)) {
+      // Only InputProxy carries real IP/port/protocol/status data.
+      // VideoInput and Streaming provide names only; fallback (getNVRChannels) provides nothing reliable.
+      const isFromInputProxy = cam.metadataSource === 'inputproxy'
+      const hasRealName      = cam.metadataSource === 'inputproxy' || cam.metadataSource === 'videoinput' || cam.metadataSource === 'streaming'
+
+      // Name: update when real name available AND (DB has placeholder OR forceNames=true)
+      if (hasRealName && cam.name && !isPlaceholder(cam.name) && (isPlaceholder(existing.name || '') || forceNames)) {
         changes.name = cam.name
         changeLog.push(`name: ${cam.name}`)
       }
 
-      // IP: only update if NVR provides one
-      if (cam.ipAddress && cam.ipAddress !== existing.ipAddress) {
+      // IP: only from InputProxy — other sources don't have IP at all
+      if (isFromInputProxy && cam.ipAddress && cam.ipAddress !== existing.ipAddress) {
         changes.ipAddress = cam.ipAddress
         changeLog.push(`ip: ${cam.ipAddress}`)
       }
 
-      // Port
-      if (cam.managementPort && cam.managementPort !== existing.managementPort) {
+      // Port: only from InputProxy, and only a real non-default value (not the hardcoded 8000)
+      if (isFromInputProxy && cam.managementPort && cam.managementPort !== 8000 && cam.managementPort !== existing.managementPort) {
         changes.managementPort = cam.managementPort
         changeLog.push(`port: ${cam.managementPort}`)
       }
 
-      // Protocol
-      if (cam.protocol && cam.protocol !== existing.protocol) {
+      // Protocol: only from InputProxy
+      if (isFromInputProxy && cam.protocol && cam.protocol !== existing.protocol) {
         changes.protocol = cam.protocol
         changeLog.push(`protocol: ${cam.protocol}`)
       }
 
-      // onlineInNvr: only update when source is reliable (explicit online/offline from InputProxy status).
-      // 'unknown' status (from fallback) must NOT overwrite existing onlineInNvr value.
+      // onlineInNvr: only from InputProxy — status 'online'/'offline' is set by InputProxy status endpoint
       const statusStr = (cam.status || '').toLowerCase()
-      if (statusStr === 'online' || statusStr === 'offline') {
+      if (isFromInputProxy && (statusStr === 'online' || statusStr === 'offline')) {
         changes.onlineInNvr = statusStr === 'online'
         changeLog.push(`onlineInNvr: ${changes.onlineInNvr}`)
       }
-      // securityStatus: prefer PasswordStatus from status endpoint, fallback to chanDetectResult
-      if (cam.passwordStatus || cam.chanDetectResult) {
+
+      // securityStatus: only from InputProxy
+      if (isFromInputProxy && (cam.passwordStatus || cam.chanDetectResult)) {
         changes.securityStatus = cam.passwordStatus || cam.chanDetectResult || ''
         changeLog.push(`securityStatus: ${changes.securityStatus}`)
       }
+
+      // channelCode and lastSyncAt are always written — they're derived from channel number, always reliable
       changes.channelCode = cam.channelCode || `D${cam.channel}`
       changes.lastSyncAt = new Date()
 
       await server.prisma.camera.update({ where: { id: existing.id }, data: changes as any })
 
       if (changeLog.length > 0) {
-        syncLog.push({ channel: cam.channel, changes: changeLog })
+        syncLog.push({ channel: cam.channel, source: cam.metadataSource, changes: changeLog })
         synced++
+        if (isFromInputProxy) updatedMetadata++
+      } else if (!isFromInputProxy) {
+        preservedMetadata++
       }
     }
 
-    server.log.info(`[sync-cameras] ${nvr.name}: ${ipCams.length} cámaras desde NVR, ${synced} actualizadas, isapIStatus=${isapIStatus}`)
-    await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length, isapIStatus })
+    // Determine the best metadata source used across all cameras
+    const sourcePriority = ['inputproxy', 'videoinput', 'streaming', 'fallback'] as const
+    const usedSources = new Set(ipCams.map(c => c.metadataSource))
+    const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
+
+    const warning = sourceUsed !== 'inputproxy'
+      ? `Sin acceso a InputProxy ISAPI (fuente: ${sourceUsed}). IP, puerto, protocolo y estado no se actualizaron — se conservaron datos existentes. Use el diagnóstico de endpoints para identificar el endpoint correcto.`
+      : undefined
+
+    server.log.info(`[sync-cameras] ${nvr.name}: ${ipCams.length} cámaras, ${synced} actualizadas, sourceUsed=${sourceUsed}, isapIStatus=${isapIStatus}`)
+    await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length, isapIStatus, sourceUsed })
 
     return reply.send({
       success: true,
       total: ipCams.length,
       synced,
+      updatedMetadata,
+      preservedMetadata,
+      sourceUsed,
       isapIStatus,
+      warning,
       log: syncLog,
       syncedAt: new Date().toISOString(),
     })

@@ -182,9 +182,14 @@ export function NVRDetailPage() {
     if (!id) return
     try {
       setSyncingCameras(true)
-      const res = await apiPost<{ synced: number; total: number }>(`/nvrs/${id}/sync-cameras`)
-      toast.success(`Cámaras IP sincronizadas: ${res.synced} actualizadas de ${res.total} detectadas`)
-      setCameras(null)
+      const res = await apiPost<{ synced: number; total: number; sourceUsed?: string; warning?: string }>(`/nvrs/${id}/sync-cameras`)
+      if (res.warning) {
+        toast.error(res.warning)
+      } else {
+        toast.success(`Cámaras IP sincronizadas: ${res.synced} actualizadas de ${res.total} detectadas`)
+      }
+      await loadNvr()
+      await loadCameras()
     } catch (e: any) {
       const msg = e?.response?.data?.message || 'Error al sincronizar cámaras IP'
       toast.error(msg)
@@ -198,9 +203,14 @@ export function NVRDetailPage() {
     if (!confirm('¿Reemplazar todos los nombres con los del NVR, incluso si ya tienes nombres personalizados?')) return
     try {
       setSyncingCameras(true)
-      const res = await apiPost<{ synced: number; total: number }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
-      toast.success(`Nombres forzados desde NVR: ${res.synced} actualizadas de ${res.total}`)
-      setCameras(null)
+      const res = await apiPost<{ synced: number; total: number; sourceUsed?: string; warning?: string }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
+      if (res.warning) {
+        toast.error(res.warning)
+      } else {
+        toast.success(`Nombres forzados desde NVR: ${res.synced} actualizadas de ${res.total}`)
+      }
+      await loadNvr()
+      await loadCameras()
     } catch (e: any) {
       const msg = e?.response?.data?.message || 'Error al forzar nombres desde NVR'
       toast.error(msg)
@@ -457,9 +467,12 @@ function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolea
   if (isapIStatus === 'unsupported') {
     return <span className="text-surface-600 text-[11px]">No soportado</span>
   }
-  // When ISAPI is available or status is unknown, show per-camera value
-  if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online</span>
-  if (camOnlineInNvr === false) return <span className="text-surface-500 text-[11px]">Offline</span>
+  // Online/Offline are only reliable when ISAPI InputProxy was actually readable ('available').
+  // For 'unknown'/null/other: we can't trust onlineInNvr (may be stale from a failed sync).
+  if (isapIStatus === 'available') {
+    if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online</span>
+    if (camOnlineInNvr === false) return <span className="text-surface-500 text-[11px]">Offline</span>
+  }
   return <span className="text-surface-600 text-[11px]">No leído</span>
 }
 
@@ -479,6 +492,23 @@ function CamerasTab({
   isapIStatus?: string
 }) {
   const [showAdopt, setShowAdopt] = useState(false)
+  const [isapDebug, setIsapDebug] = useState<any[] | null>(null)
+  const [isapDebugLoading, setIsapDebugLoading] = useState(false)
+  const [showDebug, setShowDebug] = useState(false)
+
+  const handleIsapDebug = async () => {
+    setShowDebug(true)
+    setIsapDebug(null)
+    setIsapDebugLoading(true)
+    try {
+      const res = await apiGet<any[]>(`/nvrs/${nvrId}/ip-camera-sources-debug`)
+      setIsapDebug(res)
+    } catch {
+      setIsapDebug([])
+    } finally {
+      setIsapDebugLoading(false)
+    }
+  }
 
   if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
 
@@ -501,6 +531,11 @@ function CamerasTab({
           <button onClick={onForceSyncNames} disabled={syncingCameras} className="btn-ghost text-xs" title="Reemplaza nombres con los del NVR aunque ya existan nombres personalizados">
             <RefreshCw size={12} /> Forzar nombres NVR
           </button>
+          {isAdmin && (
+            <button onClick={handleIsapDebug} className="btn-ghost text-xs" title="Probar todos los endpoints ISAPI para identificar cuál tiene nombre/IP/puerto real">
+              <Stethoscope size={12} /> Endpoints ISAPI
+            </button>
+          )}
           <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
         </div>
       </div>
@@ -544,9 +579,9 @@ function CamerasTab({
                   <td className="px-3 py-2 text-surface-400 whitespace-nowrap">
                     {(cam.ipAddress || fromNvr?.ipAddress) ? (
                       <span>{cam.ipAddress || fromNvr?.ipAddress}<span className="text-surface-600">:{cam.managementPort || fromNvr?.managementPort || '—'}</span></span>
-                    ) : '—'}
+                    ) : <span className="text-surface-600 text-[11px]">No leído</span>}
                   </td>
-                  <td className="px-3 py-2 text-surface-400">{cam.protocol || fromNvr?.protocol || '—'}</td>
+                  <td className="px-3 py-2 text-surface-400">{cam.protocol || fromNvr?.protocol || <span className="text-surface-600 text-[11px]">No leído</span>}</td>
                   <td className="px-3 py-2">
                     <span
                       className={clsx('inline-flex items-center gap-1.5', status.color)}
@@ -609,6 +644,91 @@ function CamerasTab({
           </div>
         )}
       </div>
+
+      {/* ISAPI endpoint debug panel */}
+      {isAdmin && showDebug && (
+        <div className="card p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-medium text-surface-300 flex items-center gap-2">
+              <Stethoscope size={14} />
+              Diagnóstico de endpoints ISAPI
+            </h3>
+            <div className="flex gap-2">
+              <button onClick={handleIsapDebug} disabled={isapDebugLoading} className="btn-ghost text-xs">
+                <RefreshCw size={11} /> Retestar
+              </button>
+              <button onClick={() => setShowDebug(false)} className="btn-ghost text-xs">Cerrar</button>
+            </div>
+          </div>
+          <p className="text-xs text-surface-500">
+            Identifica qué endpoint contiene nombre, IP, puerto y estado real de la cámara IP.
+            Las celdas verdes indican que el campo fue encontrado en la respuesta.
+          </p>
+          {isapDebugLoading && (
+            <div className="flex items-center gap-2 py-4 text-surface-400 text-sm">
+              <Loader2 size={16} className="animate-spin" /> Probando endpoints... puede tardar hasta 30s
+            </div>
+          )}
+          {!isapDebugLoading && isapDebug && isapDebug.length === 0 && (
+            <p className="text-xs text-red-400">Error al obtener resultados.</p>
+          )}
+          {!isapDebugLoading && isapDebug && isapDebug.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px] min-w-[900px]">
+                <thead>
+                  <tr className="border-b border-surface-700 text-surface-400">
+                    <th className="text-left px-2 py-1.5 font-medium">Endpoint</th>
+                    <th className="text-left px-2 py-1.5 font-medium w-14">HTTP</th>
+                    <th className="text-left px-2 py-1.5 font-medium w-16">Bytes</th>
+                    <th className="text-left px-2 py-1.5 font-medium">Tags encontrados</th>
+                    <th className="text-left px-2 py-1.5 font-medium w-64">Snippet</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-surface-700/40">
+                  {isapDebug.map((ep: any, i: number) => {
+                    const importantTags = ['ipAddress', 'managePortNo', 'proxyProtocol', 'name', 'online', 'chanDetectResult', 'sourceInputPortDescriptor', 'channelName', 'PasswordStatus']
+                    const hf: Record<string, boolean> = ep.hasFields || {}
+                    const foundImportant = importantTags.filter(t => hf[t])
+                    return (
+                      <tr key={i} className={clsx('align-top', ep.ok ? 'hover:bg-surface-700/20' : 'opacity-60')}>
+                        <td className="px-2 py-1.5 font-mono text-surface-300 whitespace-nowrap">
+                          {ep.endpoint}
+                          {ep.note && <div className="text-surface-500 font-sans">{ep.note}</div>}
+                        </td>
+                        <td className="px-2 py-1.5 whitespace-nowrap">
+                          <span className={clsx('font-medium', ep.ok ? 'text-green-400' : 'text-red-400')}>
+                            {ep.status ?? 'ERR'}
+                          </span>
+                          {ep.error && <div className="text-surface-500">{ep.error}</div>}
+                        </td>
+                        <td className="px-2 py-1.5 text-surface-500">{ep.ok ? ep.byteLength : '—'}</td>
+                        <td className="px-2 py-1.5">
+                          <div className="flex flex-wrap gap-1">
+                            {importantTags.map(t => (
+                              <span key={t} className={clsx(
+                                'px-1 py-0.5 rounded text-[10px]',
+                                hf[t] ? 'bg-green-900/40 text-green-400' : 'bg-surface-700/40 text-surface-600'
+                              )}>{t}</span>
+                            ))}
+                          </div>
+                          {ep.ok && ep.detectedFields && ep.detectedFields.length > 0 && (
+                            <div className="mt-1 text-surface-500">
+                              otros: {(ep.detectedFields as string[]).filter((f: string) => !importantTags.includes(f)).slice(0, 8).join(', ')}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-2 py-1.5 font-mono text-surface-500 max-w-[260px] truncate" title={ep.snippet}>
+                          {ep.snippet ? ep.snippet.slice(0, 120) : '—'}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
