@@ -6,7 +6,7 @@ import {
   getStorageInfo, getNVRUsers, getDeviceInfo, rebootDevice,
   adoptIpCamera, getFreeChannels, debugGetCameraNameSources,
   createNVRUser, updateNVRUser, changeNVRUserPassword, deleteNVRUser,
-  testNVRConnection, getIpCameraSourcesDebug,
+  testNVRConnection, getIpCameraSourcesDebug, probeInputProxy,
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -598,31 +598,40 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
-    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
-    if (!nvrDec.password) {
+    const decPass = safeDecrypt(nvr.password)
+    if (!decPass) {
       return reply.status(422).send({ success: false, errorCode: 'DECRYPT_ERROR', message: 'Contraseña no descifrable. Vuelve a guardar las credenciales del NVR.' })
     }
+    const nvrDec = { ...nvr, password: decPass }
 
-    let ipCams: any[] = []
-    let isApiPermissionDenied = false
+    // Probe InputProxy first to determine ISAPI access level.
+    // probeInputProxy never throws — returns semantic status string.
+    const isapIStatus = await probeInputProxy(nvrDec as any)
+    server.log.info(`[sync-cameras] ${nvr.name} InputProxy probe: ${isapIStatus}`)
 
-    try {
-      ipCams = await getIpCameraList(nvrDec as any)
-    } catch (e: any) {
-      if (e?.response?.status === 401 || e?.response?.status === 403) {
-        isApiPermissionDenied = true
-      } else {
-        server.log.warn(`[sync-cameras] ${nvr.name}: ${e.message}`)
-      }
-    }
+    // Persist ISAPI status on NVR so frontend can show semantic states without another API call
+    await server.prisma.nVR.update({ where: { id }, data: { isapIStatus } })
 
-    if (isApiPermissionDenied) {
+    if (isapIStatus === 'no_permission') {
       return reply.status(403).send({
         success: false,
         errorCode: 'ISAPI_PERMISSION_DENIED',
-        message: 'Sin permiso ISAPI para leer Cámara IP. Usa un usuario Administrador del NVR.',
+        isapIStatus,
+        message: 'Sin permiso ISAPI (HTTP 403/401) para leer Cámara IP. Usa un usuario Administrador del NVR.',
       })
     }
+
+    if (isapIStatus === 'unsupported') {
+      return reply.status(422).send({
+        success: false,
+        errorCode: 'ISAPI_UNSUPPORTED',
+        isapIStatus,
+        message: 'Este modelo no soporta el endpoint InputProxy (HTTP 400/404/405). No es posible leer datos de cámara IP via ISAPI.',
+      })
+    }
+
+    // isapIStatus === 'available' | 'error' | 'unknown' — proceed with getIpCameraList
+    const ipCams = await getIpCameraList(nvrDec as any)
 
     const isPlaceholder = (n: string) =>
       !n || /^(IPCamera\s*\d*|Camera\s*\d*|Canal\s*\d+|Channel\s*\d+|D\d+)$/i.test(n.trim()) || /^\d{3,4}$/.test(n.trim())
@@ -685,13 +694,14 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    server.log.info(`[sync-cameras] ${nvr.name}: ${ipCams.length} cámaras desde NVR, ${synced} actualizadas`)
-    await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length })
+    server.log.info(`[sync-cameras] ${nvr.name}: ${ipCams.length} cámaras desde NVR, ${synced} actualizadas, isapIStatus=${isapIStatus}`)
+    await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length, isapIStatus })
 
     return reply.send({
       success: true,
       total: ipCams.length,
       synced,
+      isapIStatus,
       log: syncLog,
       syncedAt: new Date().toISOString(),
     })

@@ -76,6 +76,7 @@ export interface NVR {
   lastSeen?: string
   lastSyncAt?: string
   lastRtspOkAt?: string
+  isapIStatus?: 'available' | 'no_permission' | 'unsupported' | 'error' | 'unknown'
   createdAt: string
   cameras?: Camera[]
   hdds?: NvrHdd[]
