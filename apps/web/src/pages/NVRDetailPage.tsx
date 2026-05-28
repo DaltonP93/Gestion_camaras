@@ -525,7 +525,7 @@ function CamerasTab({
                       ? <span className="text-green-400/70 text-[11px]">Online</span>
                       : (cam as any).onlineInNvr === false
                         ? <span className="text-surface-500 text-[11px]">Offline</span>
-                        : <span className="text-surface-600 text-[11px]">—</span>}
+                        : <span className="text-surface-600 text-[11px]">No leído</span>}
                   </td>
                   <td className="px-3 py-2">
                     {codec ? (
