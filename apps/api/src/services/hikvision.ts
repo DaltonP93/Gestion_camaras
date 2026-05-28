@@ -726,10 +726,11 @@ export async function probeInputProxy(nvr: NVR): Promise<'available' | 'no_permi
 }
 
 // ─── Diagnóstico de fuentes ISAPI para cámaras IP ─────────────
-// Prueba cada endpoint y devuelve status HTTP, content-type, tamaño, snippet
-// sanitizado (sin credenciales), y si el body es XML/JSON parseable.
+// Prueba cada endpoint con Digest Auth y devuelve status HTTP, content-type,
+// tamaño, snippet sanitizado, si es parseable y top-level XML tags detectados.
+// Nunca loguea credenciales ni cookies.
 // Los endpoints marcados con "security=..." son firmados por la UI Hikvision
-// con HMAC interno — no reproducibles desde backend con Digest Auth.
+// con HMAC interno — no reproducibles desde backend con Digest Auth estándar.
 export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
   endpoint: string
   status: number | null
@@ -738,19 +739,21 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
   byteLength: number
   snippet: string
   parseable: boolean
+  detectedFields: string[]   // top-level XML tags or JSON keys found in the response
   note?: string
   error?: string
 }[]> {
   const client = createHikClient(nvr)
   const endpoints: Array<{ ep: string; note?: string }> = [
     { ep: '/ISAPI/System/deviceInfo' },
-    { ep: '/ISAPI/ContentMgmt/InputProxy/channels',        note: 'Fuente principal: IP, nombre, protocolo por canal' },
-    { ep: '/ISAPI/ContentMgmt/InputProxy/channels/status', note: 'Estado online/offline por canal (más confiable)' },
-    { ep: '/ISAPI/System/Video/inputs/channels',           note: 'Nombres de cámara — puede devolver 403 en algunos modelos' },
-    { ep: '/ISAPI/Streaming/channels',                     note: 'Nombres de stream — IDs numéricos (101,102) no son nombres reales' },
+    { ep: '/ISAPI/ContentMgmt/InputProxy/channels',         note: 'Prioridad A: IP, nombre, protocolo por canal' },
+    { ep: '/ISAPI/ContentMgmt/InputProxy/channels/status',  note: 'Prioridad B: estado online/offline real por canal' },
+    { ep: '/ISAPI/ContentMgmt/ZeroVideo/channels',          note: 'Diagnóstico: canales sin video activo (no usar para nombres/IP)' },
+    { ep: '/ISAPI/System/Video/inputs/channels',            note: 'Nombres de cámara — puede devolver 403 en algunos modelos' },
+    { ep: '/ISAPI/Streaming/channels',                      note: 'Prioridad D: solo RTSP/códec — IDs (101,102) no son nombres reales' },
     { ep: '/ISAPI/Streaming/channels/101' },
     { ep: '/ISAPI/ContentMgmt/StreamingProxy/channels' },
-    { ep: '/ISAPI/Security/users',                         note: 'Lista de usuarios configurados' },
+    { ep: '/ISAPI/Security/users',                          note: 'Lista de usuarios configurados' },
   ]
 
   function isParseableBody(body: string, ct: string): boolean {
@@ -758,6 +761,21 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
       try { JSON.parse(body); return true } catch { return false }
     }
     return body.trimStart().startsWith('<') && body.includes('</')
+  }
+
+  // Extract top-level XML tag names or JSON object keys for quick field inspection.
+  function detectFields(body: string, ct: string): string[] {
+    if (ct.includes('json')) {
+      try {
+        const parsed = JSON.parse(body)
+        if (parsed && typeof parsed === 'object') return Object.keys(parsed).slice(0, 20)
+      } catch { /* ignore */ }
+      return []
+    }
+    // XML: find all unique top-level-ish tag names (children of root)
+    const matches = body.match(/<([A-Za-z][A-Za-z0-9]*)[>\s/]/g) || []
+    const tags = [...new Set(matches.map(m => m.replace(/[<>\s/]/g, '')))]
+    return tags.slice(0, 20)
   }
 
   const results = await Promise.allSettled(
@@ -768,13 +786,14 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
         const ct = String(res.headers['content-type'] || '')
         const snippet = body.slice(0, 400).replace(/password[^<"'\s]*/gi, 'password***')
         return {
-          endpoint:    ep,
-          status:      res.status,
-          ok:          true,
-          contentType: ct,
-          byteLength:  body.length,
+          endpoint:       ep,
+          status:         res.status,
+          ok:             true,
+          contentType:    ct,
+          byteLength:     body.length,
           snippet,
-          parseable:   isParseableBody(body, ct),
+          parseable:      isParseableBody(body, ct),
+          detectedFields: detectFields(body, ct),
           ...(note ? { note } : {}),
         }
       } catch (e: any) {
@@ -783,13 +802,14 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
         const ct = String(e?.response?.headers?.['content-type'] || '')
         const snippet = body ? body.slice(0, 200) : ''
         return {
-          endpoint:    ep,
-          status:      httpStatus,
-          ok:          false,
-          contentType: ct,
-          byteLength:  body.length,
+          endpoint:       ep,
+          status:         httpStatus,
+          ok:             false,
+          contentType:    ct,
+          byteLength:     body.length,
           snippet,
-          parseable:   false,
+          parseable:      false,
+          detectedFields: [],
           ...(note ? { note } : {}),
           error: httpStatus ? `HTTP ${httpStatus}` : (e?.code || e?.message || 'Error de red'),
         }
@@ -798,14 +818,15 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
   )
 
   return results.map((r) => r.status === 'fulfilled' ? r.value : {
-    endpoint: 'unknown',
-    status: null,
-    ok: false,
-    contentType: '',
-    byteLength: 0,
-    snippet: '',
-    parseable: false,
-    error: 'Promise rejected',
+    endpoint:       'unknown',
+    status:         null,
+    ok:             false,
+    contentType:    '',
+    byteLength:     0,
+    snippet:        '',
+    parseable:      false,
+    detectedFields: [],
+    error:          'Promise rejected',
   })
 }
 
