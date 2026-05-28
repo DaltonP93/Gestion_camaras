@@ -307,6 +307,7 @@ export function NVRDetailPage() {
           onRestartStream={handleRestartStream}
           onDiagnostics={(cam) => { setDiagCamera(cam.id); setTab('diagnostics'); handleDiagnostics(cam.id) }}
           isAdmin={isAdmin}
+          isapIStatus={nvr.isapIStatus}
         />
       )}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} supported={storageSupported} unsupportedReason={storageUnsupportedReason} onRefresh={loadStorage} />}
@@ -431,8 +432,22 @@ function camStatusDisplay(cam: CameraType): { color: string; dot: string; label:
 
 // ─── Cameras Tab ──────────────────────────────────────────────
 
+function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolean | null | undefined): React.ReactNode {
+  // NVR-level ISAPI status takes precedence when endpoint is unavailable
+  if (isapIStatus === 'no_permission') {
+    return <span className="text-amber-500/70 text-[11px]">Sin permiso</span>
+  }
+  if (isapIStatus === 'unsupported') {
+    return <span className="text-surface-600 text-[11px]">No soportado</span>
+  }
+  // When ISAPI is available or status is unknown, show per-camera value
+  if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online</span>
+  if (camOnlineInNvr === false) return <span className="text-surface-500 text-[11px]">Offline</span>
+  return <span className="text-surface-600 text-[11px]">No leído</span>
+}
+
 function CamerasTab({
-  cameras, loading, onRefresh, onSyncCameras, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId,
+  cameras, loading, onRefresh, onSyncCameras, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus,
 }: {
   cameras: { fromNvr: IpCamera[]; fromDb: CameraType[] } | null
   loading: boolean
@@ -443,6 +458,7 @@ function CamerasTab({
   onDiagnostics: (cam: CameraType) => void
   isAdmin: boolean
   nvrId: string
+  isapIStatus?: string
 }) {
   const [showAdopt, setShowAdopt] = useState(false)
 
@@ -521,11 +537,7 @@ function CamerasTab({
                     </span>
                   </td>
                   <td className="px-3 py-2 text-xs">
-                    {(cam as any).onlineInNvr === true
-                      ? <span className="text-green-400/70 text-[11px]">Online</span>
-                      : (cam as any).onlineInNvr === false
-                        ? <span className="text-surface-500 text-[11px]">Offline</span>
-                        : <span className="text-surface-600 text-[11px]">No leído</span>}
+                    {isapIStatusCell(isapIStatus, (cam as any).onlineInNvr)}
                   </td>
                   <td className="px-3 py-2">
                     {codec ? (
