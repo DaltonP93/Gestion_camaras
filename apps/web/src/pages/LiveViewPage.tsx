@@ -30,6 +30,9 @@ const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; bloc
 }
 
 function isBlockedByHealth(camera: Camera): boolean {
+  // If both RTSP streams confirmed failed (explicit false), block regardless of health status
+  if (camera.rtspSubOk === false && camera.rtspMainOk === false) return true
+
   const status = camera.streamHealthStatus
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
   if (status === 'USING_MAIN_STREAM') {
@@ -350,11 +353,13 @@ export function LiveViewPage() {
 
     // Block cameras with known bad health
     if (isBlockedByHealth(camera)) {
-      const effectiveStatus = camera.streamHealthStatus === 'USING_MAIN_STREAM' ? 'CODEC_UNSUPPORTED_HEVC' : camera.streamHealthStatus!
-      setStreamErrors(prev => ({
-        ...prev,
-        [camera.id]: getHealthError(effectiveStatus, camera.channel),
-      }))
+      let effectiveStatus = camera.streamHealthStatus
+      if (effectiveStatus === 'USING_MAIN_STREAM') effectiveStatus = 'CODEC_UNSUPPORTED_HEVC' as any
+      const blockError: CameraPlaybackError =
+        effectiveStatus && effectiveStatus !== 'UNKNOWN'
+          ? getHealthError(effectiveStatus as StreamHealthStatus, camera.channel)
+          : { code: 'CAMERA_OFFLINE', message: 'Sin señal — cámara offline o sin RTSP disponible' }
+      setStreamErrors(prev => ({ ...prev, [camera.id]: blockError }))
       return
     }
 

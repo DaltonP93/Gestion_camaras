@@ -591,6 +591,112 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({ success: true, ...result, syncedAt: new Date().toISOString() })
   })
 
+  // POST /api/nvrs/:id/sync-cameras — Sincronizar metadatos de cámaras IP desde NVR
+  server.post('/:id/sync-cameras', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
+    if (!nvrDec.password) {
+      return reply.status(422).send({ success: false, errorCode: 'DECRYPT_ERROR', message: 'Contraseña no descifrable. Vuelve a guardar las credenciales del NVR.' })
+    }
+
+    let ipCams: any[] = []
+    let isApiPermissionDenied = false
+
+    try {
+      ipCams = await getIpCameraList(nvrDec as any)
+    } catch (e: any) {
+      if (e?.response?.status === 401 || e?.response?.status === 403) {
+        isApiPermissionDenied = true
+      } else {
+        server.log.warn(`[sync-cameras] ${nvr.name}: ${e.message}`)
+      }
+    }
+
+    if (isApiPermissionDenied) {
+      return reply.status(403).send({
+        success: false,
+        errorCode: 'ISAPI_PERMISSION_DENIED',
+        message: 'Sin permiso ISAPI para leer Cámara IP. Usa un usuario Administrador del NVR.',
+      })
+    }
+
+    const isPlaceholder = (n: string) =>
+      !n || /^(IPCamera\s*\d*|Camera\s*\d*|Canal\s*\d+|Channel\s*\d+|D\d+)$/i.test(n.trim()) || /^\d{3,4}$/.test(n.trim())
+
+    const syncLog: Array<{ channel: number; changes: string[] }> = []
+    let synced = 0
+
+    for (const cam of ipCams) {
+      const existing = await server.prisma.camera.findUnique({
+        where: { nvrId_channel: { nvrId: id, channel: cam.channel } },
+        select: { id: true, name: true, ipAddress: true, managementPort: true, protocol: true },
+      })
+      if (!existing) continue
+
+      const changes: Partial<{
+        name: string; ipAddress: string; managementPort: number
+        protocol: string; securityStatus: string; onlineInNvr: boolean; channelCode: string; lastSyncAt: Date
+      }> = {}
+      const changeLog: string[] = []
+
+      // Name: only update if NVR has a real name AND DB has placeholder or empty
+      if (cam.name && !isPlaceholder(cam.name) && isPlaceholder(existing.name || '')) {
+        changes.name = cam.name
+        changeLog.push(`name: ${cam.name}`)
+      }
+
+      // IP: only update if NVR provides one
+      if (cam.ipAddress && cam.ipAddress !== existing.ipAddress) {
+        changes.ipAddress = cam.ipAddress
+        changeLog.push(`ip: ${cam.ipAddress}`)
+      }
+
+      // Port
+      if (cam.managementPort && cam.managementPort !== existing.managementPort) {
+        changes.managementPort = cam.managementPort
+        changeLog.push(`port: ${cam.managementPort}`)
+      }
+
+      // Protocol
+      if (cam.protocol && cam.protocol !== existing.protocol) {
+        changes.protocol = cam.protocol
+        changeLog.push(`protocol: ${cam.protocol}`)
+      }
+
+      // onlineInNvr from status
+      const onlineInNvr = cam.status?.toLowerCase().includes('online')
+      changes.onlineInNvr = onlineInNvr
+      changes.channelCode = cam.channelCode || `D${cam.channel}`
+      changes.lastSyncAt = new Date()
+
+      if (Object.keys(changes).length > 2) {  // > 2 because onlineInNvr + lastSyncAt always present
+        changeLog.push(`onlineInNvr: ${onlineInNvr}`)
+      }
+
+      await server.prisma.camera.update({ where: { id: existing.id }, data: changes as any })
+
+      if (changeLog.length > 0) {
+        syncLog.push({ channel: cam.channel, changes: changeLog })
+        synced++
+      }
+    }
+
+    server.log.info(`[sync-cameras] ${nvr.name}: ${ipCams.length} cámaras desde NVR, ${synced} actualizadas`)
+    await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length })
+
+    return reply.send({
+      success: true,
+      total: ipCams.length,
+      synced,
+      log: syncLog,
+      syncedAt: new Date().toISOString(),
+    })
+  })
+
   // POST /api/nvrs/:id/sync-streams — Solo re-registrar streams en MediaMTX
   server.post('/:id/sync-streams', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const { id } = request.params as { id: string }

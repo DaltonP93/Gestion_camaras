@@ -380,6 +380,39 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     // InputProxy endpoint not available — fall through to VideoInput or fallback
   }
 
+  // ── Step 1.5: InputProxy channel status (accurate online per channel) ─
+  try {
+    const res = await client.get('/ISAPI/ContentMgmt/InputProxy/channels/status')
+    const data = res.data
+    if (typeof data === 'string') {
+      const blocks = xmlGetAll(data, 'InputProxyChannelStatus')
+      for (const block of blocks) {
+        const ch = parseInt(xmlGet(block, 'id') || '0')
+        if (!ch) continue
+        const onlineStr = xmlGet(block, 'online')
+        const entry = inputProxyMap.get(ch)
+        if (entry) {
+          entry.status = onlineStr === 'true' ? 'online' : 'offline'
+        }
+      }
+    } else {
+      const raw = data?.InputProxyChannelStatusList?.InputProxyChannelStatus
+      if (raw) {
+        const list = Array.isArray(raw) ? raw : [raw]
+        for (const item of list) {
+          const ch = parseInt(item.id || '0')
+          if (!ch) continue
+          const entry = inputProxyMap.get(ch)
+          if (entry) {
+            entry.status = item.online === true || item.online === 'true' ? 'online' : 'offline'
+          }
+        }
+      }
+    }
+  } catch {
+    // Status endpoint may not exist — continue with status from channels endpoint
+  }
+
   // ── Step 2: VideoInput channels (often have custom/real names) ─
   const videoInputNames = new Map<number, string>()
 
