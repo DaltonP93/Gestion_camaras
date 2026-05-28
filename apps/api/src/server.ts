@@ -24,7 +24,15 @@ import { publishStream } from './services/stream'
 import CryptoJS from 'crypto-js'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+
+function decryptPass(p: string): string | null {
+  try {
+    const plain = CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+    return plain || null  // CryptoJS returns '' on wrong key — treat as failure
+  } catch {
+    return null
+  }
+}
 
 const server = Fastify({
   logger: {
@@ -133,14 +141,21 @@ async function main() {
         include: { cameras: { where: { active: true } } },
       })
       let count = 0
+      let skipped = 0
       for (const nvr of nvrs) {
-        const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
+        const plainPass = decryptPass(nvr.password)
+        if (!plainPass) {
+          server.log.error(`[startup] DECRYPT_ERROR para NVR ${nvr.name} (${nvr.id}) — streams omitidos. Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales del NVR.`)
+          skipped++
+          continue
+        }
+        const nvrDecrypted = { ...nvr, password: plainPass }
         for (const camera of nvr.cameras) {
           await publishStream(nvrDecrypted as any, camera)
           count++
         }
       }
-      server.log.info(`[startup] ${count} paths on-demand registrados en MediaMTX (RTSP inactivo hasta primer viewer — sourceOnDemand=true)`)
+      server.log.info(`[startup] ${count} paths on-demand registrados en MediaMTX (RTSP inactivo hasta primer viewer — sourceOnDemand=true)${skipped > 0 ? ` | ${skipped} NVR(s) omitidos por DECRYPT_ERROR` : ''}`)
     } catch (err) {
       server.log.warn(`[startup] Error registrando streams en MediaMTX: ${err}`)
     }
