@@ -639,6 +639,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const syncLog: Array<{ channel: number; changes: string[] }> = []
     let synced = 0
 
+    const forceNames = (request.query as any).forceNames === 'true' || (request.body as any)?.forceNames === true
+
     for (const cam of ipCams) {
       const existing = await server.prisma.camera.findUnique({
         where: { nvrId_channel: { nvrId: id, channel: cam.channel } },
@@ -652,8 +654,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }> = {}
       const changeLog: string[] = []
 
-      // Name: only update if NVR has a real name AND DB has placeholder or empty
-      if (cam.name && !isPlaceholder(cam.name) && isPlaceholder(existing.name || '')) {
+      // Name: update when NVR has real name AND (DB has placeholder OR forceNames=true)
+      if (cam.name && !isPlaceholder(cam.name) && (isPlaceholder(existing.name || '') || forceNames)) {
         changes.name = cam.name
         changeLog.push(`name: ${cam.name}`)
       }
@@ -682,6 +684,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       if (statusStr === 'online' || statusStr === 'offline') {
         changes.onlineInNvr = statusStr === 'online'
         changeLog.push(`onlineInNvr: ${changes.onlineInNvr}`)
+      }
+      // securityStatus: prefer PasswordStatus from status endpoint, fallback to chanDetectResult
+      if (cam.passwordStatus || cam.chanDetectResult) {
+        changes.securityStatus = cam.passwordStatus || cam.chanDetectResult || ''
+        changeLog.push(`securityStatus: ${changes.securityStatus}`)
       }
       changes.channelCode = cam.channelCode || `D${cam.channel}`
       changes.lastSyncAt = new Date()
