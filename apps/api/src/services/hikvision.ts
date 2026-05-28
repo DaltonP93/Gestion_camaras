@@ -677,81 +677,111 @@ export async function debugGetCameraNameSources(nvr: NVR): Promise<{
 // ─── Almacenamiento / HDDs ────────────────────────────────────
 
 export async function getStorageInfo(nvr: NVR): Promise<HikStorageDisk[]> {
-  try {
-    const client = createHikClient(nvr)
-    const res = await client.get('/ISAPI/ContentMgmt/Storage')
-    if (!res) throw new Error('empty response')
-    const disks: HikStorageDisk[] = []
+  const client = createHikClient(nvr)
 
-    const parseDisks = (raw: any) => {
-      const list = Array.isArray(raw) ? raw : [raw]
-      list.forEach((d: any, i: number) => {
-        const capacityKb = parseInt(d.capacity || d.totalCapacity || '0')
-        const freeKb     = parseInt(d.freeSpace || d.remainCapacity || '0')
-        const capGb      = capacityKb / 1024
-        const freeGb     = freeKb / 1024
-        disks.push({
-          diskNumber:  parseInt(d.id || d.hddIndex || `${i + 1}`),
-          capacityGb:  Math.round(capGb * 100) / 100,
-          freeGb:      Math.round(freeGb * 100) / 100,
-          usedPercent: capGb > 0 ? Math.round(((capGb - freeGb) / capGb) * 100) : 0,
-          status:      d.status || d.hddStatus || '',
-          type:        d.type || d.hddType || 'local',
-          property:    d.property || d.hddProperty || '',
-          process:     d.hddProcess || d.process || '',
-        })
+  const parseDisksJson = (raw: any, disks: HikStorageDisk[]) => {
+    const list = Array.isArray(raw) ? raw : [raw]
+    list.forEach((d: any, i: number) => {
+      const capacityKb = parseInt(d.capacity || d.totalCapacity || '0')
+      const freeKb     = parseInt(d.freeSpace || d.remainCapacity || '0')
+      const capGb      = capacityKb / 1024
+      const freeGb     = freeKb / 1024
+      disks.push({
+        diskNumber:  parseInt(d.id || d.hddIndex || `${i + 1}`),
+        capacityGb:  Math.round(capGb * 100) / 100,
+        freeGb:      Math.round(freeGb * 100) / 100,
+        usedPercent: capGb > 0 ? Math.round(((capGb - freeGb) / capGb) * 100) : 0,
+        status:      d.status || d.hddStatus || '',
+        type:        d.type || d.hddType || 'local',
+        property:    d.property || d.hddProperty || '',
+        process:     d.hddProcess || d.process || '',
       })
-    }
-
-    if (typeof res.data === 'string') {
-      const blocks = xmlGetAll(res.data, 'hdd')
-      blocks.forEach((b, i) => {
-        const cap  = parseInt(xmlGet(b, 'capacity') || '0')
-        const free = parseInt(xmlGet(b, 'freeSpace') || '0')
-        const capGb  = cap / 1024
-        const freeGb = free / 1024
-        disks.push({
-          diskNumber:  i + 1,
-          capacityGb:  Math.round(capGb * 100) / 100,
-          freeGb:      Math.round(freeGb * 100) / 100,
-          usedPercent: capGb > 0 ? Math.round(((capGb - freeGb) / capGb) * 100) : 0,
-          status:      xmlGet(b, 'status'),
-          type:        xmlGet(b, 'type') || 'local',
-          property:    xmlGet(b, 'property'),
-          process:     xmlGet(b, 'hddProcess'),
-          // Debug raw values for unit validation
-          _rawCapacity: cap,
-          _rawFree: free,
-        })
-      })
-    } else {
-      const storage = res.data?.StorageList?.storage || res.data?.hddList?.hdd
-      if (storage) parseDisks(storage)
-    }
-
-    return disks
-  } catch (err: any) {
-    const status: number | undefined = err?.response?.status
-    if (status === 403 || status === 404 || status === 405) {
-      const e = new Error(`/ISAPI/ContentMgmt/Storage no soportado (HTTP ${status})`)
-      ;(e as any).unsupported = true
-      ;(e as any).httpStatus  = status
-      throw e
-    }
-    return []  // error de red / parseo — no implica "no soportado"
+    })
   }
+
+  const parseDisksXml = (data: string, disks: HikStorageDisk[]) => {
+    const blocks = xmlGetAll(data, 'hdd')
+    blocks.forEach((b, i) => {
+      const cap  = parseInt(xmlGet(b, 'capacity') || '0')
+      const free = parseInt(xmlGet(b, 'freeSpace') || '0')
+      const capGb  = cap / 1024
+      const freeGb = free / 1024
+      disks.push({
+        diskNumber:  i + 1,
+        capacityGb:  Math.round(capGb * 100) / 100,
+        freeGb:      Math.round(freeGb * 100) / 100,
+        usedPercent: capGb > 0 ? Math.round(((capGb - freeGb) / capGb) * 100) : 0,
+        status:      xmlGet(b, 'status'),
+        type:        xmlGet(b, 'type') || 'local',
+        property:    xmlGet(b, 'property'),
+        process:     xmlGet(b, 'hddProcess'),
+        _rawCapacity: cap,
+        _rawFree: free,
+      })
+    })
+  }
+
+  const tryEndpoint = async (path: string): Promise<HikStorageDisk[] | null> => {
+    try {
+      const res = await client.get(path)
+      if (!res?.data) return null
+      const disks: HikStorageDisk[] = []
+      if (typeof res.data === 'string') {
+        parseDisksXml(res.data, disks)
+      } else {
+        const storage = res.data?.StorageList?.storage || res.data?.hddList?.hdd
+          || res.data?.HDDList?.HDD || res.data?.diskList?.disk
+        if (storage) parseDisksJson(storage, disks)
+      }
+      return disks.length > 0 ? disks : null
+    } catch (err: any) {
+      const status: number | undefined = err?.response?.status
+      // 401/403 → permission error (not just unsupported) — propagate with context
+      if (status === 401 || status === 403) {
+        const e = new Error(`${path} rechazado (HTTP ${status}) — el usuario no tiene permiso`)
+        ;(e as any).unsupported = true
+        ;(e as any).httpStatus = status
+        ;(e as any).permissionDenied = true
+        throw e
+      }
+      return null  // 404/405/network — try next endpoint
+    }
+  }
+
+  // Try endpoints in order; stop if we get a permission error (401/403).
+  // Model-specific fallbacks cover DS-7732NI-K4, DS-7616NI-K2/16P, etc.
+  const storagePaths = [
+    '/ISAPI/ContentMgmt/Storage',
+    '/ISAPI/System/Storage',
+    '/ISAPI/Storage/hdd',
+  ]
+
+  for (const path of storagePaths) {
+    try {
+      const disks = await tryEndpoint(path)
+      if (disks !== null) return disks
+    } catch (e: any) {
+      if ((e as any).permissionDenied) throw e  // 401/403 → stop trying, surface error
+      // 404/405 → continue to next fallback
+    }
+  }
+
+  // All endpoints returned 404/405 → model doesn't support storage ISAPI
+  const e = new Error(`Almacenamiento ISAPI no soportado por este modelo/firmware`)
+  ;(e as any).unsupported = true
+  ;(e as any).httpStatus = 404
+  throw e
 }
 
 // ─── Usuarios del NVR ─────────────────────────────────────────
 
 export async function getNVRUsers(nvr: NVR): Promise<HikNVRUser[]> {
-  try {
-    const client = createHikClient(nvr)
-    const res = await client.get('/ISAPI/Security/users')
-    const users: HikNVRUser[] = []
+  const client = createHikClient(nvr)
 
-    if (typeof res.data === 'string') {
-      const blocks = xmlGetAll(res.data, 'User')
+  const parseUsers = (data: any): HikNVRUser[] => {
+    const users: HikNVRUser[] = []
+    if (typeof data === 'string') {
+      const blocks = xmlGetAll(data, 'User')
       blocks.forEach(b => {
         const enabledStr = xmlGet(b, 'enabled')
         users.push({
@@ -763,7 +793,7 @@ export async function getNVRUsers(nvr: NVR): Promise<HikNVRUser[]> {
         })
       })
     } else {
-      const raw = res.data?.UserList?.User || res.data?.userList?.User
+      const raw = data?.UserList?.User || data?.userList?.User || data?.users?.User
       if (raw) {
         const list = Array.isArray(raw) ? raw : [raw]
         list.forEach((u: any) => {
@@ -778,18 +808,47 @@ export async function getNVRUsers(nvr: NVR): Promise<HikNVRUser[]> {
         })
       }
     }
-
     return users
-  } catch (err: any) {
-    const status: number | undefined = err?.response?.status
-    if (status === 403 || status === 404 || status === 405) {
-      const e = new Error(`/ISAPI/Security/users no soportado (HTTP ${status})`)
-      ;(e as any).unsupported = true
-      ;(e as any).httpStatus  = status
-      throw e
-    }
-    return []
   }
+
+  const tryEndpoint = async (path: string): Promise<HikNVRUser[] | null> => {
+    try {
+      const res = await client.get(path)
+      if (!res?.data) return null
+      const users = parseUsers(res.data)
+      return users.length > 0 ? users : null
+    } catch (err: any) {
+      const status: number | undefined = err?.response?.status
+      if (status === 401 || status === 403) {
+        const e = new Error(`${path} rechazado (HTTP ${status}) — el usuario no tiene permiso para gestión de usuarios`)
+        ;(e as any).unsupported = true
+        ;(e as any).httpStatus = status
+        ;(e as any).permissionDenied = true
+        throw e
+      }
+      return null  // 404/405 → try next
+    }
+  }
+
+  const userPaths = [
+    '/ISAPI/Security/users',
+    '/ISAPI/Security/UserCheck',
+    '/ISAPI/System/userList',
+  ]
+
+  for (const path of userPaths) {
+    try {
+      const users = await tryEndpoint(path)
+      if (users !== null) return users
+    } catch (e: any) {
+      if ((e as any).permissionDenied) throw e
+    }
+  }
+
+  const e = new Error(`Gestión de usuarios ISAPI no soportada por este modelo/firmware`)
+  ;(e as any).unsupported = true
+  ;(e as any).httpStatus = 404
+  throw e
 }
 
 // ─── Gestión de usuarios NVR ─────────────────────────────────
@@ -1120,8 +1179,9 @@ export async function getFreeChannels(nvr: NVR, totalChannels: number): Promise<
 
 export interface HikConnectionTestResult {
   reachable: boolean
-  errorCode?: 'AUTH_FAILED' | 'NETWORK_UNREACHABLE' | 'ENDPOINT_UNSUPPORTED' | 'DEVICE_REACHABLE_PARTIAL_ISAPI'
+  errorCode?: 'AUTH_FAILED' | 'ISAPI_PERMISSION_DENIED' | 'NETWORK_UNREACHABLE' | 'ENDPOINT_UNSUPPORTED' | 'DEVICE_REACHABLE_PARTIAL_ISAPI'
   errorMessage?: string
+  hint?: string        // User-facing guidance (e.g. "use Admin account, not Integration Protocol")
   firmware?: string
   model?: string
   serialNumber?: string
@@ -1172,11 +1232,10 @@ export async function testNVRConnection(
   }
 
   const summary = results.map(r => ({ path: r.path, status: r.status }))
+  const anyOk   = results.some(r => r.status === 'ok')
+  const anyAuth  = results.some(r => r.status === 'auth')
 
-  // All endpoints failed with network errors
-  const anyOk = results.some(r => r.status === 'ok')
-  const anyAuth = results.some(r => r.status === 'auth')
-
+  // Network unreachable: all endpoints had network errors, none responded with any HTTP
   if (!anyOk && networkError && !anyAuth) {
     return {
       reachable: false,
@@ -1186,11 +1245,29 @@ export async function testNVRConnection(
     }
   }
 
+  // All endpoints rejected credentials: distinguish wrong password from ISAPI permission issues.
+  // If the device responded with HTTP 401 to Digest Auth (after retry), it could be:
+  //   a) Wrong password: credentials rejected entirely
+  //   b) User exists but has no ISAPI access (e.g. created under "Integration Protocol" only)
+  // We cannot distinguish these from HTTP code alone, so we surface both possibilities.
   if (!anyOk && allAuth) {
     return {
       reachable: false,
       errorCode: 'AUTH_FAILED',
-      errorMessage: 'Credenciales incorrectas (usuario o contraseña)',
+      errorMessage: `Credenciales rechazadas por el NVR (HTTP 401). El usuario "${nvr.username}" tiene contraseña incorrecta o no tiene acceso ISAPI.`,
+      hint: 'En Hikvision, los usuarios creados sólo en "Protocolo de integración" no tienen acceso a /ISAPI/System/deviceInfo. Usa un usuario creado en "Administración de cuenta" del NVR con nivel Administrador u Operador.',
+      endpoints: summary,
+    }
+  }
+
+  // Some endpoints returned 401 but others succeeded: the user exists but lacks full ISAPI permissions
+  if (anyOk && anyAuth) {
+    const failedPaths = results.filter(r => r.status === 'auth').map(r => r.path)
+    return {
+      reachable: true,
+      errorCode: 'ISAPI_PERMISSION_DENIED',
+      errorMessage: `El usuario "${nvr.username}" tiene acceso parcial: ${failedPaths.length} endpoint(s) devolvieron 401.`,
+      hint: 'Para acceso completo al sistema, usa un usuario Administrador del NVR. Los usuarios de "Protocolo de integración" pueden tener acceso ISAPI limitado.',
       endpoints: summary,
     }
   }

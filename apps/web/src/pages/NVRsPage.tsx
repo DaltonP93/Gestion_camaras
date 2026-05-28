@@ -1,6 +1,6 @@
 // src/pages/NVRsPage.tsx
 import { useEffect, useState } from 'react'
-import { Plus, Pencil, Trash2, RefreshCw, Server, Wifi, WifiOff, Zap, Search, CheckCircle2, XCircle, Radar, Lock, ChevronRight } from 'lucide-react'
+import { Plus, Pencil, Trash2, RefreshCw, Server, Wifi, WifiOff, Zap, Search, CheckCircle2, XCircle, Radar, Lock, ChevronRight, AlertTriangle } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiPut, apiDelete, apiGet } from '@/lib/api'
@@ -18,7 +18,7 @@ const EMPTY: NVRFormData = {
   username: 'admin', password: '', channels: 16, hddCount: 1, location: '',
 }
 
-type TestStatus = 'idle' | 'testing' | 'ok' | 'fail'
+type TestStatus = 'idle' | 'testing' | 'ok' | 'fail' | 'warn'
 
 interface DiscoveredDevice {
   ip: string
@@ -42,6 +42,7 @@ export function NVRsPage() {
   const [syncing, setSyncing] = useState<string | null>(null)
   const [testStatus, setTestStatus] = useState<TestStatus>('idle')
   const [testMsg, setTestMsg] = useState('')
+  const [testHint, setTestHint] = useState('')
   const [detecting, setDetecting] = useState(false)
   const [search, setSearch] = useState('')
 
@@ -59,11 +60,12 @@ export function NVRsPage() {
   useEffect(() => { loadNVRs() }, [])
   useEffect(() => { nvrs.forEach((n) => loadNVRStatus(n.id)) }, [nvrs.length])
 
+  const resetTest = () => { setTestStatus('idle'); setTestMsg(''); setTestHint('') }
+
   const openCreate = () => {
     setEditingNVR(null)
     setForm(EMPTY)
-    setTestStatus('idle')
-    setTestMsg('')
+    resetTest()
     setShowModal(true)
   }
   const openEdit = (nvr: NVR) => {
@@ -73,8 +75,7 @@ export function NVRsPage() {
       rtspPort: nvr.rtspPort, username: nvr.username || 'admin', password: '',
       channels: nvr.channels, hddCount: nvr.hddCount, location: nvr.location || '',
     })
-    setTestStatus('idle')
-    setTestMsg('')
+    resetTest()
     setShowModal(true)
   }
 
@@ -85,24 +86,38 @@ export function NVRsPage() {
     }
     setTestStatus('testing')
     setTestMsg('')
+    setTestHint('')
     try {
-      const res = await apiPost<{ success: boolean; firmware?: string }>('/nvrs/test-connection', {
-        ipAddress: form.ipAddress,
-        port: form.port,
-        username: form.username,
-        password: form.password,
+      const res = await apiPost<{
+        success: boolean; firmware?: string; model?: string
+        errorCode?: string; warning?: string; hint?: string
+      }>('/nvrs/test-connection', {
+        ipAddress: form.ipAddress, port: form.port, username: form.username, password: form.password,
       })
       if (res.success) {
-        setTestStatus('ok')
-        setTestMsg(res.firmware ? `Conectado — Firmware: ${res.firmware}` : 'Conexión exitosa')
+        // ISAPI_PERMISSION_DENIED: reachable but some endpoints restricted → warn, not fail
+        if (res.errorCode === 'ISAPI_PERMISSION_DENIED') {
+          setTestStatus('warn')
+          setTestMsg(res.warning || 'Acceso parcial al NVR')
+          setTestHint(res.hint || '')
+        } else {
+          setTestStatus('ok')
+          const parts = ['Conexión exitosa']
+          if (res.model)    parts.push(`Modelo: ${res.model}`)
+          if (res.firmware) parts.push(`Firmware: ${res.firmware}`)
+          setTestMsg(parts.join(' · '))
+          setTestHint('')
+        }
       } else {
         setTestStatus('fail')
         setTestMsg('Sin respuesta del NVR')
+        setTestHint('')
       }
     } catch (err: any) {
       setTestStatus('fail')
-      const msg = err?.response?.data?.message || 'No se pudo conectar. Verifica IP, puerto y credenciales.'
-      setTestMsg(msg)
+      const data = err?.response?.data || {}
+      setTestMsg(data.message || 'No se pudo conectar. Verifica IP, puerto y credenciales.')
+      setTestHint(data.hint || '')
     }
   }
 
@@ -112,15 +127,14 @@ export function NVRsPage() {
       return
     }
     setDetecting(true)
+    setTestMsg('')
+    setTestHint('')
     try {
       const res = await apiPost<{
         success: boolean; model?: string; serialNumber?: string
-        firmware?: string; channels?: number
+        firmware?: string; channels?: number; warning?: string; hint?: string
       }>('/nvrs/detect', {
-        ipAddress: form.ipAddress,
-        port: form.port,
-        username: form.username,
-        password: form.password,
+        ipAddress: form.ipAddress, port: form.port, username: form.username, password: form.password,
       })
       if (res.success) {
         setForm((prev) => ({
@@ -128,14 +142,24 @@ export function NVRsPage() {
           model: res.model || prev.model,
           channels: res.channels || prev.channels,
         }))
-        toast.success(`Detectado: ${res.model || 'NVR'} · ${res.channels || '?'} canales`)
-        setTestStatus('ok')
-        setTestMsg(res.firmware ? `Firmware: ${res.firmware}` : 'Conectado')
+        const parts = [`Detectado: ${res.model || 'NVR'} · ${res.channels || '?'} canales`]
+        if (res.firmware) parts.push(`Firmware: ${res.firmware}`)
+        toast.success(parts.join(' · '))
+        setTestStatus(res.warning ? 'warn' : 'ok')
+        setTestMsg(res.warning || (res.firmware ? `Firmware: ${res.firmware}` : 'Conectado'))
+        setTestHint(res.hint || '')
       } else {
-        toast.error('No se pudo detectar el NVR')
+        setTestStatus('fail')
+        setTestMsg('No se pudo detectar el NVR')
+        setTestHint('')
       }
-    } catch {
-      toast.error('Error al intentar detectar el NVR')
+    } catch (err: any) {
+      setTestStatus('fail')
+      const data = err?.response?.data || {}
+      const msg = data.message || 'No se pudo detectar el NVR. Verifica IP, usuario y contraseña.'
+      setTestMsg(msg)
+      setTestHint(data.hint || '')
+      toast.error(msg)
     } finally {
       setDetecting(false)
     }
@@ -579,11 +603,22 @@ export function NVRsPage() {
                 {/* Resultado test */}
                 {testStatus !== 'idle' && (
                   <div className={clsx(
-                    'flex items-center gap-2 text-xs px-3 py-2 rounded-lg',
-                    testStatus === 'ok' ? 'bg-green-900/30 text-green-400' : 'bg-red-900/30 text-red-400'
+                    'flex flex-col gap-1.5 text-xs px-3 py-2 rounded-lg',
+                    testStatus === 'ok'      ? 'bg-green-900/30 text-green-400' :
+                    testStatus === 'warn'    ? 'bg-amber-900/30 text-amber-400' :
+                    testStatus === 'testing' ? 'bg-surface-700 text-surface-400' :
+                                               'bg-red-900/30 text-red-400'
                   )}>
-                    {testStatus === 'ok' ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
-                    {testStatus === 'testing' ? 'Probando conexión...' : testMsg}
+                    <div className="flex items-center gap-2">
+                      {testStatus === 'ok'      ? <CheckCircle2 size={12} /> :
+                       testStatus === 'warn'    ? <AlertTriangle size={12} /> :
+                       testStatus === 'testing' ? <RefreshCw size={12} className="animate-spin" /> :
+                                                  <XCircle size={12} />}
+                      <span>{testStatus === 'testing' ? 'Probando conexión...' : testMsg}</span>
+                    </div>
+                    {testHint && (
+                      <p className="text-[10px] leading-tight opacity-80 pl-5">{testHint}</p>
+                    )}
                   </div>
                 )}
               </div>

@@ -53,11 +53,14 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const result = await testNVRConnection(data)
 
     if (!result.reachable) {
-      server.log.warn(`[test-connection] ${data.ipAddress}:${data.port} errorCode=${result.errorCode} endpoints=${JSON.stringify(result.endpoints)}`)
-      return reply.status(503).send({
+      server.log.warn(`[test-connection] ${data.ipAddress}:${data.port} errorCode=${result.errorCode} user=${data.username}`)
+      // Use 401 for auth errors so the frontend can distinguish them
+      const httpStatus = (result.errorCode === 'AUTH_FAILED') ? 401 : 503
+      return reply.status(httpStatus).send({
         success: false,
         errorCode: result.errorCode,
         message: result.errorMessage,
+        hint: result.hint,
         endpoints: result.endpoints,
       })
     }
@@ -68,7 +71,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       firmware: result.firmware,
       model: result.model,
       serialNumber: result.serialNumber,
-      ...(result.errorCode ? { errorCode: result.errorCode, warning: result.errorMessage } : {}),
+      // Partial permission issues are surfaced as warnings (reachable=true but restricted)
+      ...(result.errorCode ? { errorCode: result.errorCode, warning: result.errorMessage, hint: result.hint } : {}),
       endpoints: result.endpoints,
     })
   })
@@ -90,8 +94,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       if (!conn?.reachable) {
         const errorCode = conn?.errorCode ?? 'NETWORK_UNREACHABLE'
         const message   = conn?.errorMessage ?? 'No se pudo conectar al NVR'
-        server.log.warn(`[detect] ${data.ipAddress}:${data.port} errorCode=${errorCode}`)
-        return reply.status(503).send({ success: false, errorCode, message, endpoints: conn?.endpoints })
+        server.log.warn(`[detect] ${data.ipAddress}:${data.port} errorCode=${errorCode} user=${data.username}`)
+        const httpStatus = errorCode === 'AUTH_FAILED' ? 401 : 503
+        return reply.status(httpStatus).send({
+          success: false, errorCode, message, hint: conn?.hint, endpoints: conn?.endpoints,
+        })
       }
 
       const d = info.status === 'fulfilled' ? info.value : null
@@ -107,7 +114,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         webVersion:      d?.webVersion || '',
         channels:        c.length || d?.channelCount || conn.channelCount || 0,
         hddCount:        d?.hddCount || 0,
-        ...(conn.errorCode ? { warning: conn.errorMessage } : {}),
+        ...(conn.errorCode ? { warning: conn.errorMessage, hint: conn.hint } : {}),
       })
     } catch (err: any) {
       return reply.status(503).send({ success: false, message: err.message })
@@ -272,7 +279,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     } catch (e: any) {
       if ((e as any).unsupported) {
         storageSupported = false
-        storageReason = `No soportado por este modelo/firmware (HTTP ${(e as any).httpStatus})`
+        const httpSt = (e as any).httpStatus
+        const permDenied = (e as any).permissionDenied
+        storageReason = permDenied
+          ? `Usuario sin permiso para leer almacenamiento (HTTP ${httpSt}) — usa un usuario Administrador del NVR`
+          : `No soportado por este modelo/firmware (HTTP ${httpSt})`
         server.log.warn(`[storage] ${nvr.name} (${nvr.ipAddress}): ${e.message}`)
       } else {
         server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
@@ -305,7 +316,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     } catch (e: any) {
       if ((e as any).unsupported) {
         usersSupported = false
-        usersReason = `No soportado por este modelo/firmware (HTTP ${(e as any).httpStatus})`
+        const httpSt = (e as any).httpStatus
+        const permDenied = (e as any).permissionDenied
+        usersReason = permDenied
+          ? `Usuario sin permiso para gestión de usuarios (HTTP ${httpSt}) — usa un usuario Administrador del NVR`
+          : `No soportado por este modelo/firmware (HTTP ${httpSt})`
         server.log.warn(`[users] ${nvr.name} (${nvr.ipAddress}): ${e.message}`)
       } else {
         throw e

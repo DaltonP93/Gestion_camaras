@@ -36,6 +36,21 @@ const server = Fastify({
 })
 
 async function main() {
+  // ─── Validación de variables de entorno críticas ──────────
+  if (!process.env.JWT_SECRET) {
+    server.log.error('[startup] FATAL: JWT_SECRET no está definido. La autenticación no funcionará. Define JWT_SECRET en .env')
+    process.exit(1)
+  }
+  if (!process.env.JWT_REFRESH_SECRET) {
+    server.log.warn('[startup] JWT_REFRESH_SECRET no definido — se usará JWT_SECRET como fallback. Define JWT_REFRESH_SECRET en .env para mayor seguridad.')
+  }
+  if (!process.env.NVR_CREDENTIAL_KEY) {
+    server.log.warn('[startup] NVR_CREDENTIAL_KEY no definido — se usará JWT_SECRET para cifrar credenciales del NVR. Define NVR_CREDENTIAL_KEY en .env.')
+  }
+  if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
+    server.log.warn('[startup] JWT_SECRET parece muy corto (< 32 chars). Usa un secreto de al menos 32 caracteres aleatorios.')
+  }
+
   // ─── Plugins de seguridad ──────────────────────────────────
   await server.register(helmet, {
     contentSecurityPolicy: {
