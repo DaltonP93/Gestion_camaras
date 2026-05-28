@@ -568,6 +568,7 @@ function StorageTab({ hdds, loading, supported, unsupportedReason, onRefresh }: 
   if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
 
   if (supported === false) {
+    const isPermission = unsupportedReason?.includes('permiso') || unsupportedReason?.includes('HTTP 401') || unsupportedReason?.includes('HTTP 403')
     return (
       <div className="space-y-3">
         <div className="flex justify-end">
@@ -575,9 +576,11 @@ function StorageTab({ hdds, loading, supported, unsupportedReason, onRefresh }: 
         </div>
         <div className="card p-8 text-center space-y-2">
           <HardDrive size={20} className="mx-auto text-surface-500" />
-          <p className="text-sm text-surface-400 font-medium">No soportado por este modelo/firmware</p>
+          <p className="text-sm text-surface-400 font-medium">
+            {isPermission ? 'Sin permiso para leer almacenamiento' : 'No soportado por este modelo/firmware'}
+          </p>
           {unsupportedReason && <p className="text-xs text-surface-500">{unsupportedReason}</p>}
-          <p className="text-xs text-surface-600">El NVR no expone la API ISAPI de almacenamiento.</p>
+          {!isPermission && <p className="text-xs text-surface-600">El NVR no expone la API ISAPI de almacenamiento.</p>}
         </div>
       </div>
     )
@@ -705,6 +708,7 @@ function UsersTab({
   if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
 
   if (supported === false) {
+    const isPermission = unsupportedReason?.includes('permiso') || unsupportedReason?.includes('HTTP 401') || unsupportedReason?.includes('HTTP 403')
     return (
       <div className="space-y-3">
         <div className="flex justify-end">
@@ -712,9 +716,11 @@ function UsersTab({
         </div>
         <div className="card p-8 text-center space-y-2">
           <Users size={20} className="mx-auto text-surface-500" />
-          <p className="text-sm text-surface-400 font-medium">No soportado por este modelo/firmware</p>
+          <p className="text-sm text-surface-400 font-medium">
+            {isPermission ? 'Sin permiso para gestión de usuarios' : 'No soportado por este modelo/firmware'}
+          </p>
           {unsupportedReason && <p className="text-xs text-surface-500">{unsupportedReason}</p>}
-          <p className="text-xs text-surface-600">El NVR no expone la API ISAPI de usuarios.</p>
+          {!isPermission && <p className="text-xs text-surface-600">El NVR no expone la API ISAPI de usuarios.</p>}
         </div>
       </div>
     )
