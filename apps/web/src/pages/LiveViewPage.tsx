@@ -30,6 +30,9 @@ const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; bloc
 }
 
 function isBlockedByHealth(camera: Camera): boolean {
+  // If both RTSP streams confirmed failed (explicit false), block regardless of health status
+  if (camera.rtspSubOk === false && camera.rtspMainOk === false) return true
+
   const status = camera.streamHealthStatus
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
   if (status === 'USING_MAIN_STREAM') {

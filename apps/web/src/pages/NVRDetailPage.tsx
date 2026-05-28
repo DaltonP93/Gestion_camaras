@@ -27,6 +27,7 @@ export function NVRDetailPage() {
   const [syncing, setSyncing] = useState(false)
   const [rebooting, setRebooting] = useState(false)
   const [validatingHealth, setValidatingHealth] = useState(false)
+  const [syncingCameras, setSyncingCameras] = useState(false)
 
   // Tabs data
   const [cameras, setCameras] = useState<{ fromNvr: IpCamera[]; fromDb: CameraType[] } | null>(null)
@@ -177,6 +178,21 @@ export function NVRDetailPage() {
     }
   }
 
+  const handleSyncCameras = async () => {
+    if (!id) return
+    try {
+      setSyncingCameras(true)
+      const res = await apiPost<{ synced: number; total: number }>(`/nvrs/${id}/sync-cameras`)
+      toast.success(`Cámaras IP sincronizadas: ${res.synced} actualizadas de ${res.total} detectadas`)
+      setCameras(null)
+    } catch (e: any) {
+      const msg = e?.response?.data?.message || 'Error al sincronizar cámaras IP'
+      toast.error(msg)
+    } finally {
+      setSyncingCameras(false)
+    }
+  }
+
   const handleRestartStream = async (cameraId: string, cameraName: string) => {
     try {
       await apiPost(`/cameras/${cameraId}/restart-stream`)
@@ -286,6 +302,8 @@ export function NVRDetailPage() {
           cameras={cameras}
           loading={loadingCameras}
           onRefresh={loadCameras}
+          onSyncCameras={handleSyncCameras}
+          syncingCameras={syncingCameras}
           onRestartStream={handleRestartStream}
           onDiagnostics={(cam) => { setDiagCamera(cam.id); setTab('diagnostics'); handleDiagnostics(cam.id) }}
           isAdmin={isAdmin}
@@ -414,11 +432,13 @@ function camStatusDisplay(cam: CameraType): { color: string; dot: string; label:
 // ─── Cameras Tab ──────────────────────────────────────────────
 
 function CamerasTab({
-  cameras, loading, onRefresh, onRestartStream, onDiagnostics, isAdmin, nvrId,
+  cameras, loading, onRefresh, onSyncCameras, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId,
 }: {
   cameras: { fromNvr: IpCamera[]; fromDb: CameraType[] } | null
   loading: boolean
   onRefresh: () => void
+  onSyncCameras: () => void
+  syncingCameras: boolean
   onRestartStream: (id: string, name: string) => void
   onDiagnostics: (cam: CameraType) => void
   isAdmin: boolean
@@ -440,6 +460,10 @@ function CamerasTab({
               <Plus size={12} /> Adoptar cámara
             </button>
           )}
+          <button onClick={onSyncCameras} disabled={syncingCameras} className="btn-secondary text-xs" title="Sincroniza nombre, IP, puerto, protocolo y estado desde el NVR via ISAPI">
+            {syncingCameras ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            Sincronizar cámaras IP
+          </button>
           <button onClick={onRefresh} className="btn-ghost text-xs"><RefreshCw size={12} /> Actualizar</button>
         </div>
       </div>
@@ -456,7 +480,7 @@ function CamerasTab({
         <table className="w-full text-xs min-w-[900px]">
           <thead>
             <tr className="border-b border-surface-700 bg-surface-800/50">
-              {['Canal', 'Nombre', 'IP / Puerto', 'Protocolo', 'NVR', 'RTSP', 'Codec', 'Resolución', 'Última validación', 'Acciones'].map(h => (
+              {['Canal', 'Nombre', 'IP / Puerto', 'Protocolo', 'Estado', 'NVR/ISAPI', 'Codec', 'Resolución', 'Última validación', 'Acciones'].map(h => (
                 <th key={h} className="text-left px-3 py-2 text-surface-400 font-medium whitespace-nowrap">{h}</th>
               ))}
             </tr>
@@ -487,13 +511,6 @@ function CamerasTab({
                   </td>
                   <td className="px-3 py-2 text-surface-400">{cam.protocol || fromNvr?.protocol || '—'}</td>
                   <td className="px-3 py-2">
-                    {(cam as any).onlineInNvr === true
-                      ? <span className="text-green-400 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-green-400" />Online</span>
-                      : (cam as any).onlineInNvr === false
-                        ? <span className="text-red-400 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-red-500" />Offline</span>
-                        : <span className="text-surface-600">—</span>}
-                  </td>
-                  <td className="px-3 py-2">
                     <span
                       className={clsx('inline-flex items-center gap-1.5', status.color)}
                       title={lastError || undefined}
@@ -502,6 +519,13 @@ function CamerasTab({
                       {status.label}
                       {lastError && <span title={lastError}><AlertTriangle size={9} className="text-amber-500 ml-0.5" /></span>}
                     </span>
+                  </td>
+                  <td className="px-3 py-2 text-xs">
+                    {(cam as any).onlineInNvr === true
+                      ? <span className="text-green-400/70 text-[11px]">Online</span>
+                      : (cam as any).onlineInNvr === false
+                        ? <span className="text-surface-500 text-[11px]">Offline</span>
+                        : <span className="text-surface-600 text-[11px]">—</span>}
                   </td>
                   <td className="px-3 py-2">
                     {codec ? (
