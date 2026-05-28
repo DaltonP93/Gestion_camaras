@@ -500,7 +500,7 @@ function CamerasTab({
                     >
                       <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0', status.dot)} />
                       {status.label}
-                      {lastError && <AlertTriangle size={9} className="text-amber-500 ml-0.5" title={lastError} />}
+                      {lastError && <span title={lastError}><AlertTriangle size={9} className="text-amber-500 ml-0.5" /></span>}
                     </span>
                   </td>
                   <td className="px-3 py-2">
