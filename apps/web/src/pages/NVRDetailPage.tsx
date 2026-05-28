@@ -182,11 +182,15 @@ export function NVRDetailPage() {
     if (!id) return
     try {
       setSyncingCameras(true)
-      const res = await apiPost<{ synced: number; total: number; sourceUsed?: string; warning?: string }>(`/nvrs/${id}/sync-cameras`)
+      const res = await apiPost<{ synced: number; total: number; ipUpdated?: number; nameUpdated?: number; statusUpdated?: number; sourceUsed?: string; warning?: string }>(`/nvrs/${id}/sync-cameras`)
       if (res.warning) {
         toast.error(res.warning)
       } else {
-        toast.success(`Cámaras IP sincronizadas: ${res.synced} actualizadas de ${res.total} detectadas`)
+        const parts = [`${res.total} detectadas`]
+        if ((res.ipUpdated ?? 0) > 0)     parts.push(`${res.ipUpdated} con IP`)
+        if ((res.nameUpdated ?? 0) > 0)   parts.push(`${res.nameUpdated} con nombre`)
+        if ((res.statusUpdated ?? 0) > 0) parts.push(`${res.statusUpdated} con estado`)
+        toast.success(`Cámaras IP sincronizadas: ${parts.join(' · ')} [${res.sourceUsed ?? '?'}]`)
       }
       await loadNvr()
       await loadCameras()
@@ -203,11 +207,11 @@ export function NVRDetailPage() {
     if (!confirm('¿Reemplazar todos los nombres con los del NVR, incluso si ya tienes nombres personalizados?')) return
     try {
       setSyncingCameras(true)
-      const res = await apiPost<{ synced: number; total: number; sourceUsed?: string; warning?: string }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
+      const res = await apiPost<{ synced: number; total: number; nameUpdated?: number; sourceUsed?: string; warning?: string }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
       if (res.warning) {
         toast.error(res.warning)
       } else {
-        toast.success(`Nombres forzados desde NVR: ${res.synced} actualizadas de ${res.total}`)
+        toast.success(`Nombres forzados desde NVR: ${res.nameUpdated ?? res.synced} nombres actualizados de ${res.total} detectadas [${res.sourceUsed ?? '?'}]`)
       }
       await loadNvr()
       await loadCameras()

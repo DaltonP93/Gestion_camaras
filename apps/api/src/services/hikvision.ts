@@ -48,10 +48,11 @@ export interface HikIpCamera {
   passwordStatus?: string
   // Tracks which ISAPI endpoint actually provided this camera's metadata.
   // sync-cameras uses this to decide which fields are safe to write to the DB.
-  // 'inputproxy' = real IP/port/protocol/status available
+  // 'inputproxy_channels' = real IP/port/protocol/status from /InputProxy/channels
+  // 'inputproxy_status'   = real IP/port/protocol/status from /InputProxy/channels/status (fallback when channels returns 400)
   // 'videoinput' | 'streaming' = name only (no IP/port/status)
   // 'fallback' = getNVRChannels — channel number only, no reliable metadata
-  metadataSource: 'inputproxy' | 'videoinput' | 'streaming' | 'fallback'
+  metadataSource: 'inputproxy_channels' | 'inputproxy_status' | 'videoinput' | 'streaming' | 'fallback'
 }
 
 export interface HikStorageDisk {
@@ -347,6 +348,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     status: string
     chanDetectResult?: string
     passwordStatus?: string
+    _source: 'channels' | 'status'  // which endpoint this entry came from
   }
 
   const inputProxyMap = new Map<number, InputProxyEntry>()
@@ -356,15 +358,18 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     const data = res.data
     let items: any[] = []
 
-    if (typeof data === 'string') {
-      const blocks = xmlGetAll(data, 'InputProxyChannel')
+    // Hikvision sometimes returns XML with content-type: application/json — detect by body content
+    const bodyStr = typeof data === 'string' ? data : ''
+    const isXmlBody = bodyStr.trimStart().startsWith('<')
+
+    if (isXmlBody) {
+      const blocks = xmlGetAll(bodyStr, 'InputProxyChannel')
       items = blocks.map(block => ({
         id:             parseInt(xmlGet(block, 'id') || '0'),
-        // customName is the user-set label; name may be auto-generated
         name:           xmlGet(block, 'customName') || xmlGet(block, 'name'),
         ipAddress:      xmlGet(block, 'ipAddress'),
         protocol:       xmlGet(block, 'proxyProtocol') || xmlGet(block, 'protocolType'),
-        port:           parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '8000'),
+        port:           parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '0'),
         securityStatus: xmlGet(block, 'securityStatus'),
         status:         xmlGet(block, 'status'),
       }))
@@ -380,33 +385,66 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         channel:        ch,
         name:           item.customName || item.name || '',
         ipAddress:      item.ipAddress || item.ip || '',
-        protocol:       item.protocol || item.protocolType || item.proxyProtocol || 'HIKVISION',
-        managementPort: parseInt(item.port || item.managementPortNo || '8000'),
+        protocol:       item.protocol || item.protocolType || item.proxyProtocol || '',
+        managementPort: parseInt(item.port || item.managementPortNo || '0'),
         securityStatus: item.securityStatus || '',
         status:         item.status || '',
+        _source:        'channels',
       })
     }
   } catch {
-    // InputProxy endpoint not available — fall through to VideoInput or fallback
+    // InputProxy/channels not available (404/400/405) — Step 1.5 will try /channels/status
   }
 
-  // ── Step 1.5: InputProxy channel status (accurate online per channel) ─
+  // ── Step 1.5: InputProxy channel status ────────────────────
+  // This endpoint returns IP/port/protocol PLUS online status per channel.
+  // CRITICAL: On models where /channels returns HTTP 400 (e.g. DS-9664NI-I8),
+  // /channels/status still returns HTTP 200 with full sourceInputPortDescriptor data.
+  // When inputProxyMap is empty (Step 1 failed), we CREATE entries from status data.
+  // xmlGet() scans the whole block string, so it finds nested tags like
+  // <sourceInputPortDescriptor><ipAddress>...</ipAddress></sourceInputPortDescriptor>.
   try {
     const res = await client.get('/ISAPI/ContentMgmt/InputProxy/channels/status')
     const data = res.data
-    if (typeof data === 'string') {
-      const blocks = xmlGetAll(data, 'InputProxyChannelStatus')
+
+    // Body-content detection: Hikvision sometimes sends XML with Content-Type: application/json
+    const bodyStr  = typeof data === 'string' ? data : ''
+    const isXmlBody = bodyStr.trimStart().startsWith('<')
+
+    if (isXmlBody) {
+      const blocks = xmlGetAll(bodyStr, 'InputProxyChannelStatus')
       for (const block of blocks) {
-        const ch = parseInt(xmlGet(block, 'id') || '0')
+        const ch        = parseInt(xmlGet(block, 'id') || '0')
         if (!ch) continue
-        const onlineStr = xmlGet(block, 'online')
-        const entry = inputProxyMap.get(ch)
+        const onlineStr  = xmlGet(block, 'online')
+        const chanDetect = xmlGet(block, 'chanDetectResult')
+        const pwdStatus  = xmlGet(block, 'PasswordStatus')
+        const entry      = inputProxyMap.get(ch)
+
         if (entry) {
-          entry.status = onlineStr === 'true' ? 'online' : 'offline'
-          const chanDetect = xmlGet(block, 'chanDetectResult')
-          const pwdStatus = xmlGet(block, 'PasswordStatus')
+          // Update existing entry from Step 1 with online status and security fields
+          const s = onlineStr === 'true' ? 'online' : onlineStr === 'false' ? 'offline' : entry.status
+          entry.status = s
           if (chanDetect) entry.chanDetectResult = chanDetect
           if (pwdStatus) entry.passwordStatus = pwdStatus
+        } else {
+          // Step 1 failed — build full entry from status data.
+          // sourceInputPortDescriptor contains ipAddress, managePortNo, proxyProtocol.
+          const ipAddr  = xmlGet(block, 'ipAddress')
+          const portStr = xmlGet(block, 'managePortNo')
+          const proto   = xmlGet(block, 'proxyProtocol')
+          inputProxyMap.set(ch, {
+            channel:          ch,
+            name:             '',   // status endpoint carries no camera name
+            ipAddress:        ipAddr,
+            protocol:         proto,
+            managementPort:   portStr ? parseInt(portStr) : 0,
+            securityStatus:   pwdStatus || '',
+            status:           onlineStr === 'true' ? 'online' : onlineStr === 'false' ? 'offline' : 'unknown',
+            chanDetectResult: chanDetect || undefined,
+            passwordStatus:   pwdStatus || undefined,
+            _source:          'status',
+          })
         }
       }
     } else {
@@ -416,18 +454,35 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         for (const item of list) {
           const ch = parseInt(item.id || '0')
           if (!ch) continue
-          const entry = inputProxyMap.get(ch)
+          const entry     = inputProxyMap.get(ch)
+          const isOnline  = item.online === true || item.online === 'true'
+          const isOffline = item.online === false || item.online === 'false'
+          const pwd       = item.SecurityStatus?.PasswordStatus || item.PasswordStatus || ''
+
           if (entry) {
-            entry.status = item.online === true || item.online === 'true' ? 'online' : 'offline'
+            entry.status = isOnline ? 'online' : isOffline ? 'offline' : entry.status
             if (item.chanDetectResult) entry.chanDetectResult = item.chanDetectResult
-            if (item.SecurityStatus?.PasswordStatus) entry.passwordStatus = item.SecurityStatus.PasswordStatus
-            else if (item.PasswordStatus) entry.passwordStatus = item.PasswordStatus
+            if (pwd) entry.passwordStatus = pwd
+          } else {
+            const src = item.sourceInputPortDescriptor || {}
+            inputProxyMap.set(ch, {
+              channel:          ch,
+              name:             '',
+              ipAddress:        src.ipAddress || item.ipAddress || '',
+              protocol:         src.proxyProtocol || item.proxyProtocol || '',
+              managementPort:   parseInt(src.managePortNo || item.managePortNo || '0'),
+              securityStatus:   pwd,
+              status:           isOnline ? 'online' : isOffline ? 'offline' : 'unknown',
+              chanDetectResult: item.chanDetectResult || undefined,
+              passwordStatus:   pwd || undefined,
+              _source:          'status',
+            })
           }
         }
       }
     }
   } catch {
-    // Status endpoint may not exist — continue with status from channels endpoint
+    // Status endpoint not available — continue with what Step 1 gave us
   }
 
   // ── Step 2: VideoInput channels (often have custom/real names) ─
@@ -559,7 +614,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
       status:           entry.status,
       chanDetectResult: entry.chanDetectResult,
       passwordStatus:   entry.passwordStatus,
-      metadataSource:   'inputproxy',
+      metadataSource:   entry._source === 'status' ? 'inputproxy_status' : 'inputproxy_channels',
     })
   }
 
@@ -779,26 +834,29 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
     { ep: '/ISAPI/Security/users',                          note: 'Lista de usuarios configurados' },
   ]
 
-  function isParseableBody(body: string, ct: string): boolean {
-    if (ct.includes('json')) {
-      try { JSON.parse(body); return true } catch { return false }
-    }
-    return body.trimStart().startsWith('<') && body.includes('</')
+  // IMPORTANT: Hikvision sometimes sends XML with Content-Type: application/json.
+  // All detection functions below use body content, NOT the content-type header.
+  function bodyIsXml(body: string): boolean {
+    return body.trimStart().startsWith('<')
   }
 
-  // Extract top-level XML tag names or JSON object keys for quick field inspection.
-  function detectFields(body: string, ct: string): string[] {
-    if (ct.includes('json')) {
-      try {
-        const parsed = JSON.parse(body)
-        if (parsed && typeof parsed === 'object') return Object.keys(parsed).slice(0, 20)
-      } catch { /* ignore */ }
-      return []
+  function isParseableBody(body: string, _ct: string): boolean {
+    if (bodyIsXml(body)) return body.includes('</')
+    try { JSON.parse(body); return true } catch { return false }
+  }
+
+  // Extract unique tag names (XML) or top-level keys (JSON) from the response body.
+  function detectFields(body: string, _ct: string): string[] {
+    if (bodyIsXml(body)) {
+      const matches = body.match(/<([A-Za-z][A-Za-z0-9]*)[>\s/]/g) || []
+      const tags = [...new Set(matches.map(m => m.replace(/[<>\s/]/g, '')))]
+      return tags.slice(0, 30)
     }
-    // XML: find all unique top-level-ish tag names (children of root)
-    const matches = body.match(/<([A-Za-z][A-Za-z0-9]*)[>\s/]/g) || []
-    const tags = [...new Set(matches.map(m => m.replace(/[<>\s/]/g, '')))]
-    return tags.slice(0, 20)
+    try {
+      const parsed = JSON.parse(body)
+      if (parsed && typeof parsed === 'object') return Object.keys(parsed).slice(0, 20)
+    } catch { /* ignore */ }
+    return []
   }
 
   const IMPORTANT_FIELDS = [
@@ -807,14 +865,14 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
     'dynVideoInputChannelID', 'id', 'PasswordStatus', 'securityStatus',
   ]
 
-  function checkHasFields(body: string, ct: string): Record<string, boolean> {
+  function checkHasFields(body: string, _ct: string): Record<string, boolean> {
     const result: Record<string, boolean> = {}
-    if (ct.includes('json')) {
+    if (bodyIsXml(body)) {
+      for (const f of IMPORTANT_FIELDS) result[f] = new RegExp(`<${f}[>\\s/]`).test(body)
+    } else {
       let flat = ''
       try { flat = JSON.stringify(JSON.parse(body)) } catch { flat = body }
       for (const f of IMPORTANT_FIELDS) result[f] = flat.includes(`"${f}"`)
-    } else {
-      for (const f of IMPORTANT_FIELDS) result[f] = new RegExp(`<${f}[>\\s/]`).test(body)
     }
     return result
   }

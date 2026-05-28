@@ -636,6 +636,10 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     let synced = 0
     let updatedMetadata = 0
     let preservedMetadata = 0
+    let ipUpdated = 0
+    let nameUpdated = 0
+    let statusUpdated = 0
+    let skipped = 0
 
     const forceNames = (request.query as any).forceNames === 'true' || (request.body as any)?.forceNames === true
 
@@ -652,25 +656,27 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }> = {}
       const changeLog: string[] = []
 
-      // Only InputProxy carries real IP/port/protocol/status data.
-      // VideoInput and Streaming provide names only; fallback (getNVRChannels) provides nothing reliable.
-      const isFromInputProxy = cam.metadataSource === 'inputproxy'
-      const hasRealName      = cam.metadataSource === 'inputproxy' || cam.metadataSource === 'videoinput' || cam.metadataSource === 'streaming'
+      // Only InputProxy (channels or status endpoint) carries real IP/port/protocol/status data.
+      // VideoInput and Streaming provide names only; fallback provides nothing reliable.
+      const isFromInputProxy = cam.metadataSource === 'inputproxy_channels' || cam.metadataSource === 'inputproxy_status'
+      const hasRealName      = isFromInputProxy || cam.metadataSource === 'videoinput' || cam.metadataSource === 'streaming'
 
       // Name: update when real name available AND (DB has placeholder OR forceNames=true)
       if (hasRealName && cam.name && !isPlaceholder(cam.name) && (isPlaceholder(existing.name || '') || forceNames)) {
         changes.name = cam.name
         changeLog.push(`name: ${cam.name}`)
+        nameUpdated++
       }
 
       // IP: only from InputProxy — other sources don't have IP at all
       if (isFromInputProxy && cam.ipAddress && cam.ipAddress !== existing.ipAddress) {
         changes.ipAddress = cam.ipAddress
         changeLog.push(`ip: ${cam.ipAddress}`)
+        ipUpdated++
       }
 
-      // Port: only from InputProxy, and only a real non-default value (not the hardcoded 8000)
-      if (isFromInputProxy && cam.managementPort && cam.managementPort !== 8000 && cam.managementPort !== existing.managementPort) {
+      // Port: only from InputProxy — use any non-zero value including 8000 (it's valid for HIKVISION)
+      if (isFromInputProxy && cam.managementPort > 0 && cam.managementPort !== existing.managementPort) {
         changes.managementPort = cam.managementPort
         changeLog.push(`port: ${cam.managementPort}`)
       }
@@ -681,11 +687,12 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         changeLog.push(`protocol: ${cam.protocol}`)
       }
 
-      // onlineInNvr: only from InputProxy — status 'online'/'offline' is set by InputProxy status endpoint
+      // onlineInNvr: only from InputProxy (status is set by InputProxy status endpoint)
       const statusStr = (cam.status || '').toLowerCase()
       if (isFromInputProxy && (statusStr === 'online' || statusStr === 'offline')) {
         changes.onlineInNvr = statusStr === 'online'
         changeLog.push(`onlineInNvr: ${changes.onlineInNvr}`)
+        statusUpdated++
       }
 
       // securityStatus: only from InputProxy
@@ -694,7 +701,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         changeLog.push(`securityStatus: ${changes.securityStatus}`)
       }
 
-      // channelCode and lastSyncAt are always written — they're derived from channel number, always reliable
+      // channelCode and lastSyncAt are always written — derived from channel number, always reliable
       changes.channelCode = cam.channelCode || `D${cam.channel}`
       changes.lastSyncAt = new Date()
 
@@ -704,27 +711,33 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         syncLog.push({ channel: cam.channel, source: cam.metadataSource, changes: changeLog })
         synced++
         if (isFromInputProxy) updatedMetadata++
-      } else if (!isFromInputProxy) {
-        preservedMetadata++
+      } else {
+        if (!isFromInputProxy) preservedMetadata++
+        skipped++
       }
     }
 
     // Determine the best metadata source used across all cameras
-    const sourcePriority = ['inputproxy', 'videoinput', 'streaming', 'fallback'] as const
+    const sourcePriority = ['inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
     const usedSources = new Set(ipCams.map(c => c.metadataSource))
     const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
 
-    const warning = sourceUsed !== 'inputproxy'
-      ? `Sin acceso a InputProxy ISAPI (fuente: ${sourceUsed}). IP, puerto, protocolo y estado no se actualizaron — se conservaron datos existentes. Use el diagnóstico de endpoints para identificar el endpoint correcto.`
+    const hasRealIpSource = sourceUsed === 'inputproxy_channels' || sourceUsed === 'inputproxy_status'
+    const warning = !hasRealIpSource
+      ? `Sin acceso a datos IP desde ISAPI (fuente: ${sourceUsed}). IP, puerto, protocolo y estado no se actualizaron — se conservaron datos existentes. Use el diagnóstico de endpoints para identificar el endpoint correcto.`
       : undefined
 
-    server.log.info(`[sync-cameras] ${nvr.name}: ${ipCams.length} cámaras, ${synced} actualizadas, sourceUsed=${sourceUsed}, isapIStatus=${isapIStatus}`)
-    await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length, isapIStatus, sourceUsed })
+    server.log.info(`[sync-cameras] ${nvr.name}: total=${ipCams.length} synced=${synced} ip=${ipUpdated} name=${nameUpdated} status=${statusUpdated} skipped=${skipped} sourceUsed=${sourceUsed} isapIStatus=${isapIStatus}`)
+    await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length, isapIStatus, sourceUsed, ipUpdated, nameUpdated })
 
     return reply.send({
       success: true,
       total: ipCams.length,
       synced,
+      ipUpdated,
+      nameUpdated,
+      statusUpdated,
+      skipped,
       updatedMetadata,
       preservedMetadata,
       sourceUsed,
