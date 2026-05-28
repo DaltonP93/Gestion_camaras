@@ -491,7 +491,8 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
   // ── Step 4: Merge — prefer InputProxy data, use best available name ─
   // Priority: InputProxy name > VideoInput name > Streaming channel name > placeholder fallback
   if (inputProxyMap.size === 0 && videoInputNames.size === 0 && streamingChannelNames.size === 0) {
-    // No endpoint worked — fall back to getNVRChannels
+    // No ISAPI camera-management endpoint worked — fall back to VideoInput channel list.
+    // Status is NOT reliable from this fallback (only VideoInput connectivity, not IP camera state).
     try {
       const fallback = await getNVRChannels(nvr)
       return fallback.map(ch => ({
@@ -502,7 +503,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         protocol:       'HIKVISION',
         managementPort: 8000,
         securityStatus: '',
-        status:         ch.online ? 'online' : 'offline',
+        status:         'unknown',  // fallback doesn't know real IP camera status
       }))
     } catch {
       return []
@@ -705,6 +706,71 @@ export async function debugGetCameraNameSources(nvr: NVR): Promise<{
   }
 
   return { inputProxy, videoInput, streaming, streamingProxy }
+}
+
+// ─── Diagnóstico de fuentes ISAPI para cámaras IP ─────────────
+// Prueba cada endpoint y devuelve status HTTP, tipo y primer fragmento (sin credenciales).
+export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
+  endpoint: string
+  status: number | null
+  ok: boolean
+  contentType: string
+  byteLength: number
+  snippet: string
+  error?: string
+}[]> {
+  const client = createHikClient(nvr, 8000)
+  const endpoints = [
+    '/ISAPI/System/deviceInfo',
+    '/ISAPI/ContentMgmt/InputProxy/channels',
+    '/ISAPI/ContentMgmt/InputProxy/channels/status',
+    '/ISAPI/System/Video/inputs/channels',
+    '/ISAPI/Streaming/channels',
+    '/ISAPI/Streaming/channels/101',
+    '/ISAPI/ContentMgmt/StreamingProxy/channels',
+    '/ISAPI/Security/users',
+  ]
+
+  const results = await Promise.allSettled(
+    endpoints.map(async (ep) => {
+      try {
+        const res = await client.get(ep)
+        const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data)
+        const snippet = body.slice(0, 300).replace(/password[^<"]*[<"]/gi, 'password***<')
+        return {
+          endpoint:    ep,
+          status:      res.status,
+          ok:          true,
+          contentType: String(res.headers['content-type'] || ''),
+          byteLength:  body.length,
+          snippet,
+        }
+      } catch (e: any) {
+        const httpStatus: number | null = e?.response?.status ?? null
+        const body = typeof e?.response?.data === 'string' ? e.response.data : JSON.stringify(e?.response?.data || '')
+        const snippet = body ? body.slice(0, 200) : ''
+        return {
+          endpoint:    ep,
+          status:      httpStatus,
+          ok:          false,
+          contentType: String(e?.response?.headers?.['content-type'] || ''),
+          byteLength:  body.length,
+          snippet,
+          error:       httpStatus ? `HTTP ${httpStatus}` : (e?.code || e?.message || 'Error'),
+        }
+      }
+    })
+  )
+
+  return results.map((r) => r.status === 'fulfilled' ? r.value : {
+    endpoint: 'unknown',
+    status: null,
+    ok: false,
+    contentType: '',
+    byteLength: 0,
+    snippet: '',
+    error: 'Promise rejected',
+  })
 }
 
 // ─── Almacenamiento / HDDs ────────────────────────────────────

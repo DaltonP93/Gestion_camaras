@@ -6,7 +6,7 @@ import {
   getStorageInfo, getNVRUsers, getDeviceInfo, rebootDevice,
   adoptIpCamera, getFreeChannels, debugGetCameraNameSources,
   createNVRUser, updateNVRUser, changeNVRUserPassword, deleteNVRUser,
-  testNVRConnection,
+  testNVRConnection, getIpCameraSourcesDebug,
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -667,15 +667,15 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         changeLog.push(`protocol: ${cam.protocol}`)
       }
 
-      // onlineInNvr from status
-      const onlineInNvr = cam.status?.toLowerCase().includes('online')
-      changes.onlineInNvr = onlineInNvr
+      // onlineInNvr: only update when source is reliable (explicit online/offline from InputProxy status).
+      // 'unknown' status (from fallback) must NOT overwrite existing onlineInNvr value.
+      const statusStr = (cam.status || '').toLowerCase()
+      if (statusStr === 'online' || statusStr === 'offline') {
+        changes.onlineInNvr = statusStr === 'online'
+        changeLog.push(`onlineInNvr: ${changes.onlineInNvr}`)
+      }
       changes.channelCode = cam.channelCode || `D${cam.channel}`
       changes.lastSyncAt = new Date()
-
-      if (Object.keys(changes).length > 2) {  // > 2 because onlineInNvr + lastSyncAt always present
-        changeLog.push(`onlineInNvr: ${onlineInNvr}`)
-      }
 
       await server.prisma.camera.update({ where: { id: existing.id }, data: changes as any })
 
@@ -695,6 +695,24 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       log: syncLog,
       syncedAt: new Date().toISOString(),
     })
+  })
+
+  // GET /api/nvrs/:id/ip-camera-sources-debug — Diagnóstico de endpoints ISAPI
+  server.get('/:id/ip-camera-sources-debug', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const plain = safeDecrypt(nvr.password)
+    if (!plain) {
+      return reply.status(422).send({ success: false, errorCode: 'DECRYPT_ERROR', message: 'Contraseña no descifrable. Vuelve a guardar las credenciales del NVR.' })
+    }
+
+    const nvrDec = { ...nvr, password: plain }
+    const results = await getIpCameraSourcesDebug(nvrDec as any)
+
+    return reply.send({ nvr: { id: nvr.id, name: nvr.name, ipAddress: nvr.ipAddress, port: nvr.port }, endpoints: results })
   })
 
   // POST /api/nvrs/:id/sync-streams — Solo re-registrar streams en MediaMTX

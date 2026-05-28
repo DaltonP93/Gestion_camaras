@@ -257,14 +257,11 @@ export function LiveViewPage() {
     const tooRecent = expiredIds.filter(id => (now - (lastRestartAt.current[id] ?? 0)) < 30_000)
 
     if (tooRecent.length > 0) {
+      // Too soon to restart via heartbeat — remount the player so HLS.js
+      // re-establishes its session cookie against the still-running MediaMTX source.
+      // Don't show error; let VideoPlayer recover silently or report a different error.
+      bumpPlayerKeys(tooRecent)
       setLoadingStreams(prev => { const n = { ...prev }; tooRecent.forEach(id => { n[id] = false }); return n })
-      setStreamErrors(prev => {
-        const n = { ...prev }
-        tooRecent.forEach(id => {
-          n[id] = { code: 'HLS_SESSION_EXPIRED', message: 'Sesión HLS expirada. Haz clic en Reintentar.' }
-        })
-        return n
-      })
     }
 
     if (toRestart.length === 0) return
@@ -541,16 +538,10 @@ export function LiveViewPage() {
   const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
     console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
 
-    if (activeSessions.current.has(cameraId)) {
-      apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
-      activeSessions.current.delete(cameraId)
-    }
-
     if (err.code === 'HLS_SESSION_EXPIRED') {
-      // Coalesce simultaneous 401s (all muxers expire at the same time) into
-      // a single heartbeat after a 2s window — prevents N individual restarts
-      // from looking like a full-grid restart.
-      setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+      // HLS session cookie expired — backend RTSP→MediaMTX source is still running.
+      // Do NOT stop the backend stream; just coalesce and remount the player so
+      // HLS.js re-establishes its session against the running source.
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
       hlsExpiryQueue.current.add(cameraId)
@@ -558,9 +549,14 @@ export function LiveViewPage() {
         hlsExpiryTimerRef.current = setTimeout(flushHlsExpiry, 2_000)
       }
       return
-    } else {
-      setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
     }
+
+    // For all other fatal errors, stop the backend stream
+    if (activeSessions.current.has(cameraId)) {
+      apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
+      activeSessions.current.delete(cameraId)
+    }
+    setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
   }, [cameras, bumpPlayerKeys, flushHlsExpiry])
 
   // ─── Exit fullscreen/focus view ──────────────────────────────
