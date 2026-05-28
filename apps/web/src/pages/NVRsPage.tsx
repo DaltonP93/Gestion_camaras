@@ -45,6 +45,8 @@ export function NVRsPage() {
   const [testHint, setTestHint] = useState('')
   const [detecting, setDetecting] = useState(false)
   const [search, setSearch] = useState('')
+  // NVR IDs con credencial inválida detectada (DECRYPT_ERROR)
+  const [decryptErrors, setDecryptErrors] = useState<Set<string>>(new Set())
 
   // ── Discovery (escaneo de red) ──────────────────────────────
   const [showScan, setShowScan] = useState(false)
@@ -80,22 +82,33 @@ export function NVRsPage() {
   }
 
   const handleTestConnection = async () => {
-    if (!form.ipAddress || !form.username || !form.password) {
+    // En modo edición sin contraseña: el backend usa la credencial guardada (vía nvrId)
+    // En modo creación: la contraseña es obligatoria
+    if (!editingNVR && (!form.ipAddress || !form.username || !form.password)) {
       toast.error('Ingresa IP, usuario y contraseña para probar')
+      return
+    }
+    if (!form.ipAddress || !form.username) {
+      toast.error('Ingresa IP y usuario para probar')
       return
     }
     setTestStatus('testing')
     setTestMsg('')
     setTestHint('')
     try {
+      const payload: Record<string, unknown> = {
+        ipAddress: form.ipAddress, port: form.port, username: form.username,
+      }
+      if (form.password) {
+        payload.password = form.password
+      } else if (editingNVR) {
+        payload.nvrId = editingNVR.id  // backend usará la credencial guardada
+      }
       const res = await apiPost<{
         success: boolean; firmware?: string; model?: string
         errorCode?: string; warning?: string; hint?: string
-      }>('/nvrs/test-connection', {
-        ipAddress: form.ipAddress, port: form.port, username: form.username, password: form.password,
-      })
+      }>('/nvrs/test-connection', payload)
       if (res.success) {
-        // ISAPI_PERMISSION_DENIED: reachable but some endpoints restricted → warn, not fail
         if (res.errorCode === 'ISAPI_PERMISSION_DENIED') {
           setTestStatus('warn')
           setTestMsg(res.warning || 'Acceso parcial al NVR')
@@ -116,26 +129,40 @@ export function NVRsPage() {
     } catch (err: any) {
       setTestStatus('fail')
       const data = err?.response?.data || {}
+      const code = data.errorCode || ''
+      if (code === 'DECRYPT_ERROR' && editingNVR) {
+        setDecryptErrors((prev) => new Set(prev).add(editingNVR.id))
+      }
       setTestMsg(data.message || 'No se pudo conectar. Verifica IP, puerto y credenciales.')
       setTestHint(data.hint || '')
     }
   }
 
   const handleAutoDetect = async () => {
-    if (!form.ipAddress || !form.username || !form.password) {
+    if (!editingNVR && (!form.ipAddress || !form.username || !form.password)) {
       toast.error('Ingresa IP, usuario y contraseña para detectar')
+      return
+    }
+    if (!form.ipAddress || !form.username) {
+      toast.error('Ingresa IP y usuario para detectar')
       return
     }
     setDetecting(true)
     setTestMsg('')
     setTestHint('')
     try {
+      const payload: Record<string, unknown> = {
+        ipAddress: form.ipAddress, port: form.port, username: form.username,
+      }
+      if (form.password) {
+        payload.password = form.password
+      } else if (editingNVR) {
+        payload.nvrId = editingNVR.id
+      }
       const res = await apiPost<{
         success: boolean; model?: string; serialNumber?: string
         firmware?: string; channels?: number; warning?: string; hint?: string
-      }>('/nvrs/detect', {
-        ipAddress: form.ipAddress, port: form.port, username: form.username, password: form.password,
-      })
+      }>('/nvrs/detect', payload)
       if (res.success) {
         setForm((prev) => ({
           ...prev,
@@ -156,6 +183,10 @@ export function NVRsPage() {
     } catch (err: any) {
       setTestStatus('fail')
       const data = err?.response?.data || {}
+      const code = data.errorCode || ''
+      if (code === 'DECRYPT_ERROR' && editingNVR) {
+        setDecryptErrors((prev) => new Set(prev).add(editingNVR.id))
+      }
       const msg = data.message || 'No se pudo detectar el NVR. Verifica IP, usuario y contraseña.'
       setTestMsg(msg)
       setTestHint(data.hint || '')
@@ -182,8 +213,19 @@ export function NVRsPage() {
     try {
       if (editingNVR) {
         const payload: Partial<NVRFormData> = { ...form }
-        if (!payload.password) delete payload.password
+        // Solo enviar password si fue realmente escrita (no vacío, no máscara)
+        if (!payload.password?.trim()) {
+          delete payload.password
+        }
         await apiPut(`/nvrs/${editingNVR.id}`, payload)
+        // Si se guardó nueva contraseña, limpiar el flag de decrypt error
+        if (payload.password) {
+          setDecryptErrors((prev) => {
+            const next = new Set(prev)
+            next.delete(editingNVR.id)
+            return next
+          })
+        }
         toast.success('NVR actualizado')
       } else {
         await apiPost('/nvrs', form)
@@ -516,6 +558,12 @@ export function NVRsPage() {
                   Última conexión: {format(new Date(nvr.lastSeen), 'dd/MM HH:mm')}
                 </div>
               )}
+              {decryptErrors.has(nvr.id) && (
+                <div className="flex items-center gap-1.5 mt-1.5 px-2 py-1 rounded bg-red-900/30 text-red-400 text-xs">
+                  <AlertTriangle size={11} />
+                  Credencial guardada inválida — vuelva a guardar la contraseña del NVR
+                </div>
+              )}
 
               <div className="mt-3 pt-3 border-t border-surface-700">
                 <Link
@@ -565,9 +613,27 @@ export function NVRsPage() {
                   </div>
                   <div>
                     <label className="label">{editingNVR ? 'Contraseña (vacío = no cambiar)' : 'Contraseña *'}</label>
-                    <input className="input" type="password" placeholder="••••••••" value={form.password} onChange={f('password')} />
+                    <input
+                      className="input"
+                      type="password"
+                      placeholder={editingNVR ? 'Dejar vacío para conservar la contraseña actual' : 'Contraseña del NVR'}
+                      value={form.password}
+                      onChange={f('password')}
+                      autoComplete="new-password"
+                    />
                   </div>
                 </div>
+
+                {/* Alerta DECRYPT_ERROR en el modal */}
+                {editingNVR && decryptErrors.has(editingNVR.id) && (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-red-900/30 border border-red-700/40 text-red-400 text-xs">
+                    <AlertTriangle size={13} className="mt-0.5 flex-shrink-0" />
+                    <span>
+                      La contraseña guardada no se puede descifrar (clave de cifrado cambiada).
+                      <strong className="block mt-0.5">Reingresa la contraseña real del NVR y pulsa Actualizar.</strong>
+                    </span>
+                  </div>
+                )}
 
                 {/* Botones probar/detectar */}
                 <div className="flex gap-2">
