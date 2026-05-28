@@ -860,7 +860,7 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
   }
 
   const IMPORTANT_FIELDS = [
-    'ipAddress', 'managePortNo', 'proxyProtocol', 'name', 'online',
+    'ipAddress', 'managePortNo', 'proxyProtocol', 'name', 'customName', 'online',
     'chanDetectResult', 'sourceInputPortDescriptor', 'channelName',
     'dynVideoInputChannelID', 'id', 'PasswordStatus', 'securityStatus',
   ]

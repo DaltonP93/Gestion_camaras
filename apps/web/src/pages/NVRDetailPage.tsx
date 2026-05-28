@@ -498,17 +498,21 @@ function CamerasTab({
   const [showAdopt, setShowAdopt] = useState(false)
   const [isapDebug, setIsapDebug] = useState<any[] | null>(null)
   const [isapDebugLoading, setIsapDebugLoading] = useState(false)
+  const [isapDebugError, setIsapDebugError] = useState<string | null>(null)
   const [showDebug, setShowDebug] = useState(false)
 
   const handleIsapDebug = async () => {
     setShowDebug(true)
     setIsapDebug(null)
+    setIsapDebugError(null)
     setIsapDebugLoading(true)
     try {
-      const res = await apiGet<any[]>(`/nvrs/${nvrId}/ip-camera-sources-debug`)
-      setIsapDebug(res)
-    } catch {
-      setIsapDebug([])
+      // Backend returns { nvr: {...}, endpoints: [...] }
+      const res = await apiGet<{ nvr: any; endpoints: any[] }>(`/nvrs/${nvrId}/ip-camera-sources-debug`)
+      setIsapDebug(res.endpoints ?? [])
+    } catch (e: any) {
+      const msg = e?.response?.data?.message || e?.message || 'Error al obtener diagnóstico ISAPI'
+      setIsapDebugError(msg)
     } finally {
       setIsapDebugLoading(false)
     }
@@ -673,8 +677,11 @@ function CamerasTab({
               <Loader2 size={16} className="animate-spin" /> Probando endpoints... puede tardar hasta 30s
             </div>
           )}
-          {!isapDebugLoading && isapDebug && isapDebug.length === 0 && (
-            <p className="text-xs text-red-400">Error al obtener resultados.</p>
+          {!isapDebugLoading && isapDebugError && (
+            <p className="text-xs text-red-400 p-2 bg-red-900/20 rounded">{isapDebugError}</p>
+          )}
+          {!isapDebugLoading && !isapDebugError && isapDebug && isapDebug.length === 0 && (
+            <p className="text-xs text-surface-500">Sin resultados (respuesta vacía del servidor).</p>
           )}
           {!isapDebugLoading && isapDebug && isapDebug.length > 0 && (
             <div className="overflow-x-auto">
@@ -690,22 +697,22 @@ function CamerasTab({
                 </thead>
                 <tbody className="divide-y divide-surface-700/40">
                   {isapDebug.map((ep: any, i: number) => {
-                    const importantTags = ['ipAddress', 'managePortNo', 'proxyProtocol', 'name', 'online', 'chanDetectResult', 'sourceInputPortDescriptor', 'channelName', 'PasswordStatus']
+                    const importantTags = ['ipAddress', 'managePortNo', 'proxyProtocol', 'name', 'customName', 'online', 'chanDetectResult', 'sourceInputPortDescriptor', 'channelName', 'PasswordStatus']
                     const hf: Record<string, boolean> = ep.hasFields || {}
-                    const foundImportant = importantTags.filter(t => hf[t])
+                    const bodyType = ep.snippet?.trimStart().startsWith('<') ? 'XML' : ep.snippet?.trimStart().startsWith('{') ? 'JSON' : ep.ok ? 'raw' : ''
                     return (
                       <tr key={i} className={clsx('align-top', ep.ok ? 'hover:bg-surface-700/20' : 'opacity-60')}>
                         <td className="px-2 py-1.5 font-mono text-surface-300 whitespace-nowrap">
                           {ep.endpoint}
-                          {ep.note && <div className="text-surface-500 font-sans">{ep.note}</div>}
+                          {ep.note && <div className="text-[10px] text-surface-500 font-sans mt-0.5">{ep.note}</div>}
                         </td>
                         <td className="px-2 py-1.5 whitespace-nowrap">
                           <span className={clsx('font-medium', ep.ok ? 'text-green-400' : 'text-red-400')}>
                             {ep.status ?? 'ERR'}
                           </span>
-                          {ep.error && <div className="text-surface-500">{ep.error}</div>}
+                          {bodyType && <div className="text-[10px] text-surface-500">{bodyType} · {ep.byteLength}b</div>}
+                          {ep.error && <div className="text-[10px] text-red-400/70">{ep.error}</div>}
                         </td>
-                        <td className="px-2 py-1.5 text-surface-500">{ep.ok ? ep.byteLength : '—'}</td>
                         <td className="px-2 py-1.5">
                           <div className="flex flex-wrap gap-1">
                             {importantTags.map(t => (
@@ -716,13 +723,15 @@ function CamerasTab({
                             ))}
                           </div>
                           {ep.ok && ep.detectedFields && ep.detectedFields.length > 0 && (
-                            <div className="mt-1 text-surface-500">
-                              otros: {(ep.detectedFields as string[]).filter((f: string) => !importantTags.includes(f)).slice(0, 8).join(', ')}
+                            <div className="mt-1 text-[10px] text-surface-500">
+                              {(ep.detectedFields as string[]).filter((f: string) => !importantTags.includes(f)).slice(0, 10).join(' · ')}
                             </div>
                           )}
                         </td>
-                        <td className="px-2 py-1.5 font-mono text-surface-500 max-w-[260px] truncate" title={ep.snippet}>
-                          {ep.snippet ? ep.snippet.slice(0, 120) : '—'}
+                        <td className="px-2 py-1.5">
+                          <pre className="font-mono text-[10px] text-surface-500 whitespace-pre-wrap break-all max-w-[300px] max-h-24 overflow-auto">
+                            {ep.snippet ? ep.snippet.slice(0, 300) : '—'}
+                          </pre>
                         </td>
                       </tr>
                     )
