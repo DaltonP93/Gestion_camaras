@@ -10,7 +10,15 @@ import { cleanupIdleSessions } from '../services/stream-manager'
 import CryptoJS from 'crypto-js'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+
+function decryptPass(p: string): string | null {
+  try {
+    const plain = CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+    return plain || null  // CryptoJS returns '' on wrong key — treat as failure
+  } catch {
+    return null
+  }
+}
 
 export function startHealthWorker(server: FastifyInstance) {
   // Verificar estado de NVRs cada 60 segundos
@@ -23,7 +31,12 @@ export function startHealthWorker(server: FastifyInstance) {
 
       for (const nvr of nvrs) {
         try {
-          const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
+          const plainPass = decryptPass(nvr.password)
+          if (!plainPass) {
+            server.log.error(`[healthWorker] DECRYPT_ERROR para NVR ${nvr.name} (${nvr.id}) — contraseña no descifrable. Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales del NVR.`)
+            continue
+          }
+          const nvrDecrypted = { ...nvr, password: plainPass }
           const status = await getNVRStatus(nvrDecrypted as any)
 
           if (!status.online) {
@@ -160,7 +173,12 @@ export function startHealthWorker(server: FastifyInstance) {
 
       let registered = 0
       for (const nvr of nvrs) {
-        const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
+        const plainPass = decryptPass(nvr.password)
+        if (!plainPass) {
+          server.log.error(`[healthWorker] DECRYPT_ERROR en re-registro de streams para NVR ${nvr.name} (${nvr.id}) — omitiendo.`)
+          continue
+        }
+        const nvrDecrypted = { ...nvr, password: plainPass }
         for (const camera of nvr.cameras) {
           const path = getStreamPath(nvrDecrypted as any, camera)
           if (!mediamtxPaths.has(path)) {

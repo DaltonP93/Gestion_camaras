@@ -54,8 +54,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     if (!result.reachable) {
       server.log.warn(`[test-connection] ${data.ipAddress}:${data.port} errorCode=${result.errorCode} user=${data.username}`)
-      // Use 401 for auth errors so the frontend can distinguish them
-      const httpStatus = (result.errorCode === 'AUTH_FAILED') ? 401 : 503
+      // Use 422 for auth errors (not 401 — that triggers the frontend token-refresh interceptor)
+      const httpStatus = (result.errorCode === 'AUTH_FAILED') ? 422 : 503
       return reply.status(httpStatus).send({
         success: false,
         errorCode: result.errorCode,
@@ -95,7 +95,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         const errorCode = conn?.errorCode ?? 'NETWORK_UNREACHABLE'
         const message   = conn?.errorMessage ?? 'No se pudo conectar al NVR'
         server.log.warn(`[detect] ${data.ipAddress}:${data.port} errorCode=${errorCode} user=${data.username}`)
-        const httpStatus = errorCode === 'AUTH_FAILED' ? 401 : 503
+        const httpStatus = errorCode === 'AUTH_FAILED' ? 422 : 503
         return reply.status(httpStatus).send({
           success: false, errorCode, message, hint: conn?.hint, endpoints: conn?.endpoints,
         })
@@ -681,22 +681,6 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const updateData: any = { ...data }
 
     if (data.password) {
-      // Validate new credentials before saving
-      const ipToTest = data.ipAddress || existing.ipAddress
-      const portToTest = data.port || existing.port
-      const connTest = await testNVRConnection({
-        ipAddress: ipToTest,
-        port: portToTest,
-        username: data.username || existing.username,
-        password: data.password,
-      })
-      if (!connTest.reachable && connTest.errorCode === 'AUTH_FAILED') {
-        return reply.status(400).send({
-          success: false,
-          errorCode: 'AUTH_FAILED',
-          message: 'La nueva contraseña no es válida — las credenciales fueron rechazadas por el NVR',
-        })
-      }
       updateData.password = encryptPassword(data.password)
     } else {
       // Never overwrite existing password if field is blank
@@ -708,9 +692,13 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     const cameras  = await server.prisma.camera.findMany({ where: { nvrId: id, active: true } })
     const plainPass = data.password ? data.password : decryptPassword(nvr.password)
-    publishAllStreams({ ...nvr, password: plainPass } as any, cameras).catch(() => {})
+    if (plainPass) {
+      publishAllStreams({ ...nvr, password: plainPass } as any, cameras).catch(() => {})
+    } else {
+      server.log.error(`[nvr-update] DECRYPT_ERROR para NVR ${nvr.id} — streams no re-publicados. Verifica NVR_CREDENTIAL_KEY.`)
+    }
 
-    return reply.send({ ...nvr, password: undefined })
+    return reply.send({ ...nvr, password: undefined, passwordSaved: !!data.password })
   })
 
   // DELETE /api/nvrs/:id

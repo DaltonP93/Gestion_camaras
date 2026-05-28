@@ -57,11 +57,24 @@ export function getWebRtcUrl(streamPath: string): string {
 export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> {
   const streamPath = getStreamPath(nvr, camera)
 
+  // Bloquear publicación si la contraseña está vacía (credencial no descifrada o no configurada)
+  const pass: string = (nvr as any).password ?? ''
+  if (!pass) {
+    console.error(`[stream] PASSWORD_EMPTY — omitiendo path ${streamPath} (nvr=${nvr.id} ip=${nvr.ipAddress}). Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales.`)
+    return false
+  }
+
   // Evitar solicitudes concurrentes duplicadas para el mismo path
   if (inFlightPaths.has(streamPath)) return true
 
   const useSub = (camera as any).preferredStream !== 'main'
   const rtspUrl = buildRtspUrl(nvr, camera.channel, useSub)
+
+  // Guardia de seguridad: rechazar URLs con contraseña vacía (rtsp://user:@host)
+  if (/:@/.test(rtspUrl)) {
+    console.error(`[stream] RTSP_EMPTY_CREDENTIALS — URL contiene contraseña vacía para ${streamPath}. Abortando publicación.`)
+    return false
+  }
 
   const pathConfig = {
     source: rtspUrl,
