@@ -753,6 +753,7 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
   snippet: string
   parseable: boolean
   detectedFields: string[]   // top-level XML tags or JSON keys found in the response
+  hasFields: Record<string, boolean>  // presence check for specific important tags
   note?: string
   error?: string
 }[]> {
@@ -791,6 +792,24 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
     return tags.slice(0, 20)
   }
 
+  const IMPORTANT_FIELDS = [
+    'ipAddress', 'managePortNo', 'proxyProtocol', 'name', 'online',
+    'chanDetectResult', 'sourceInputPortDescriptor', 'channelName',
+    'dynVideoInputChannelID', 'id', 'PasswordStatus', 'securityStatus',
+  ]
+
+  function checkHasFields(body: string, ct: string): Record<string, boolean> {
+    const result: Record<string, boolean> = {}
+    if (ct.includes('json')) {
+      let flat = ''
+      try { flat = JSON.stringify(JSON.parse(body)) } catch { flat = body }
+      for (const f of IMPORTANT_FIELDS) result[f] = flat.includes(`"${f}"`)
+    } else {
+      for (const f of IMPORTANT_FIELDS) result[f] = new RegExp(`<${f}[>\\s/]`).test(body)
+    }
+    return result
+  }
+
   const results = await Promise.allSettled(
     endpoints.map(async ({ ep, note }) => {
       try {
@@ -807,6 +826,7 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
           snippet,
           parseable:      isParseableBody(body, ct),
           detectedFields: detectFields(body, ct),
+          hasFields:      checkHasFields(body, ct),
           ...(note ? { note } : {}),
         }
       } catch (e: any) {
@@ -823,6 +843,7 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
           snippet,
           parseable:      false,
           detectedFields: [],
+          hasFields:      {},
           ...(note ? { note } : {}),
           error: httpStatus ? `HTTP ${httpStatus}` : (e?.code || e?.message || 'Error de red'),
         }

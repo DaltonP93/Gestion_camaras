@@ -622,15 +622,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     }
 
     if (isapIStatus === 'unsupported') {
-      return reply.status(422).send({
-        success: false,
-        errorCode: 'ISAPI_UNSUPPORTED',
-        isapIStatus,
-        message: 'Este modelo no soporta el endpoint InputProxy (HTTP 400/404/405). No es posible leer datos de cámara IP via ISAPI.',
-      })
+      server.log.info(`[sync-cameras] ${nvr.name} InputProxy no soportado — continuando con fallbacks (VideoInput / Streaming / getNVRChannels)`)
     }
 
-    // isapIStatus === 'available' | 'error' | 'unknown' — proceed with getIpCameraList
+    // isapIStatus === 'available' | 'unsupported' | 'error' | 'unknown' — proceed with getIpCameraList
+    // getIpCameraList has its own fallback chain: InputProxy → VideoInput → Streaming → getNVRChannels
     const ipCams = await getIpCameraList(nvrDec as any)
 
     const isPlaceholder = (n: string) =>

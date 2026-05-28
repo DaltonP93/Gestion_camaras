@@ -184,7 +184,8 @@ export function NVRDetailPage() {
       setSyncingCameras(true)
       const res = await apiPost<{ synced: number; total: number }>(`/nvrs/${id}/sync-cameras`)
       toast.success(`Cámaras IP sincronizadas: ${res.synced} actualizadas de ${res.total} detectadas`)
-      setCameras(null)
+      await loadNvr()
+      await loadCameras()
     } catch (e: any) {
       const msg = e?.response?.data?.message || 'Error al sincronizar cámaras IP'
       toast.error(msg)
@@ -200,7 +201,8 @@ export function NVRDetailPage() {
       setSyncingCameras(true)
       const res = await apiPost<{ synced: number; total: number }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
       toast.success(`Nombres forzados desde NVR: ${res.synced} actualizadas de ${res.total}`)
-      setCameras(null)
+      await loadNvr()
+      await loadCameras()
     } catch (e: any) {
       const msg = e?.response?.data?.message || 'Error al forzar nombres desde NVR'
       toast.error(msg)
