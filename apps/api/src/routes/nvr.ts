@@ -658,7 +658,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
       // Only InputProxy (channels or status endpoint) carries real IP/port/protocol/status data.
       // VideoInput and Streaming provide names only; fallback provides nothing reliable.
-      const isFromInputProxy = cam.metadataSource === 'inputproxy_channels' || cam.metadataSource === 'inputproxy_status'
+      const isFromInputProxy = cam.metadataSource === 'inputproxy_channels_secure' || cam.metadataSource === 'inputproxy_channels' || cam.metadataSource === 'inputproxy_status'
       const hasRealName      = isFromInputProxy || cam.metadataSource === 'videoinput' || cam.metadataSource === 'streaming'
 
       // Name: update when real name available AND (DB has placeholder OR forceNames=true)
@@ -719,11 +719,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     }
 
     // Determine the best metadata source used across all cameras
-    const sourcePriority = ['inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
+    const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
     const usedSources = new Set(ipCams.map(c => c.metadataSource))
     const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
 
-    const hasRealIpSource = sourceUsed === 'inputproxy_channels' || sourceUsed === 'inputproxy_status'
+    const hasRealIpSource = sourceUsed === 'inputproxy_channels_secure' || sourceUsed === 'inputproxy_channels' || sourceUsed === 'inputproxy_status'
     const warning = !hasRealIpSource
       ? `Sin acceso a datos IP desde ISAPI (fuente: ${sourceUsed}). IP, puerto, protocolo y estado no se actualizaron — se conservaron datos existentes. Use el diagnóstico de endpoints para identificar el endpoint correcto.`
       : undefined
@@ -734,7 +734,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     if (nameSource === 'none') {
       if (sourceUsed === 'inputproxy_status') {
         nameReason = '/InputProxy/channels/status no incluye nombres de cámara. /InputProxy/channels devuelve error en este modelo. VideoInput/inputs/channels no está disponible. Los nombres deben configurarse manualmente.'
-      } else if (sourceUsed === 'inputproxy_channels') {
+      } else if (sourceUsed === 'inputproxy_channels_secure' || sourceUsed === 'inputproxy_channels') {
         nameReason = 'Los nombres en el NVR son genéricos (Canal 1, D1…). Configure nombres reales en la interfaz del NVR.'
       } else if (sourceUsed === 'videoinput' || sourceUsed === 'streaming') {
         nameReason = 'VideoInput/Streaming solo devuelven nombres genéricos en este modelo.'

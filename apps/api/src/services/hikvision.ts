@@ -48,11 +48,12 @@ export interface HikIpCamera {
   passwordStatus?: string
   // Tracks which ISAPI endpoint actually provided this camera's metadata.
   // sync-cameras uses this to decide which fields are safe to write to the DB.
-  // 'inputproxy_channels' = real IP/port/protocol/status from /InputProxy/channels
-  // 'inputproxy_status'   = real IP/port/protocol/status from /InputProxy/channels/status (fallback when channels returns 400)
+  // 'inputproxy_channels_secure' = name+IP+port+protocol from /InputProxy/channels?security=1&iv=... (best)
+  // 'inputproxy_channels' = name+IP+port+protocol from /InputProxy/channels (plain)
+  // 'inputproxy_status'   = IP+port+protocol+status from /InputProxy/channels/status (fallback when channels returns 400)
   // 'videoinput' | 'streaming' = name only (no IP/port/status)
   // 'fallback' = getNVRChannels — channel number only, no reliable metadata
-  metadataSource: 'inputproxy_channels' | 'inputproxy_status' | 'videoinput' | 'streaming' | 'fallback'
+  metadataSource: 'inputproxy_channels_secure' | 'inputproxy_channels' | 'inputproxy_status' | 'videoinput' | 'streaming' | 'fallback'
 }
 
 export interface HikStorageDisk {
@@ -351,7 +352,11 @@ function isPlaceholderName(name: string): boolean {
 export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
   const client = createHikClient(nvr)
 
-  // ── Step 1: InputProxy channels ────────────────────────────
+  // ── Step 1: InputProxy channels — try secure variants first ──
+  // Priority A: ?security=1&iv=<randomHex> (DS-9664NI-I8, DS-7604 and others require this)
+  // Priority B: ?security=1 (fallback)
+  // Priority C: plain path (oldest firmware)
+  // All variants use the same headers required by newer Hikvision firmware.
   interface InputProxyEntry {
     channel: number
     name: string
@@ -362,22 +367,30 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     status: string
     chanDetectResult?: string
     passwordStatus?: string
-    _source: 'channels' | 'status'  // which endpoint this entry came from
+    _source: 'channels_secure' | 'channels' | 'status'
   }
 
   const inputProxyMap = new Map<number, InputProxyEntry>()
 
-  try {
-    const res = await client.get('/ISAPI/ContentMgmt/InputProxy/channels')
-    const data = res.data
-    let items: any[] = []
+  // Headers required by newer Hikvision firmware for InputProxy endpoints
+  const hikHeaders = {
+    'X-Requested-With': 'XMLHttpRequest',
+    'If-Modified-Since': '0',
+    'Cache-Control': 'max-age=0',
+    'Accept': '*/*',
+  }
 
-    // Hikvision sometimes returns XML with content-type: application/json — detect by body content
+  // Parse an /InputProxy/channels XML or JSON body into the inputProxyMap.
+  // Returns the _source value for entries added by this parse.
+  function parseInputProxyBody(data: unknown, source: 'channels_secure' | 'channels'): void {
     const bodyStr = typeof data === 'string' ? data : ''
     const isXmlBody = bodyStr.trimStart().startsWith('<')
 
+    let items: any[] = []
     if (isXmlBody) {
       const blocks = xmlGetAll(bodyStr, 'InputProxyChannel')
+      // ipAddress and managePortNo are nested inside <sourceInputPortDescriptor> but
+      // xmlGet scans the whole block string, so nested tags are found correctly.
       items = blocks.map(block => ({
         id:             parseInt(xmlGet(block, 'id') || '0'),
         name:           xmlGet(block, 'customName') || xmlGet(block, 'name'),
@@ -387,12 +400,13 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         securityStatus: xmlGet(block, 'securityStatus'),
         status:         xmlGet(block, 'status'),
       }))
-    } else if (data?.InputProxyChannelList?.InputProxyChannel) {
-      const raw = data.InputProxyChannelList.InputProxyChannel
+    } else if ((data as any)?.InputProxyChannelList?.InputProxyChannel) {
+      const raw = (data as any).InputProxyChannelList.InputProxyChannel
       items = Array.isArray(raw) ? raw : [raw]
     }
 
     for (const item of items) {
+      // Always use <id> as channel number — never use array index
       const ch = parseInt(item.id || item.channelNo || '0')
       if (!ch) continue
       inputProxyMap.set(ch, {
@@ -403,11 +417,26 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         managementPort: parseInt(item.port || item.managementPortNo || '0'),
         securityStatus: item.securityStatus || '',
         status:         item.status || '',
-        _source:        'channels',
+        _source:        source,
       })
     }
-  } catch {
-    // InputProxy/channels not available (404/400/405) — Step 1.5 will try /channels/status
+  }
+
+  // Try each variant until one succeeds or all fail
+  const channelVariants: Array<{ path: string; source: 'channels_secure' | 'channels' }> = [
+    { path: `/ISAPI/ContentMgmt/InputProxy/channels?security=1&iv=${crypto.randomBytes(16).toString('hex')}`, source: 'channels_secure' },
+    { path: '/ISAPI/ContentMgmt/InputProxy/channels?security=1', source: 'channels_secure' },
+    { path: '/ISAPI/ContentMgmt/InputProxy/channels', source: 'channels' },
+  ]
+
+  for (const variant of channelVariants) {
+    try {
+      const res = await client.get(variant.path, { headers: hikHeaders })
+      parseInputProxyBody(res.data, variant.source)
+      break  // success — stop trying variants
+    } catch {
+      // Try next variant
+    }
   }
 
   // ── Step 1.5: InputProxy channel status ────────────────────
@@ -632,7 +661,9 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
       status:           entry.status,
       chanDetectResult: entry.chanDetectResult,
       passwordStatus:   entry.passwordStatus,
-      metadataSource:   entry._source === 'status' ? 'inputproxy_status' : 'inputproxy_channels',
+      metadataSource:   entry._source === 'status' ? 'inputproxy_status'
+                      : entry._source === 'channels_secure' ? 'inputproxy_channels_secure'
+                      : 'inputproxy_channels',
     })
   }
 
@@ -808,25 +839,38 @@ export async function debugGetCameraNameSources(nvr: NVR): Promise<{
 // Returns a semantic status string without throwing.
 export async function probeInputProxy(nvr: NVR): Promise<'available' | 'no_permission' | 'unsupported' | 'error' | 'unknown'> {
   const client = createHikClient(nvr)
+  const hikHeaders = {
+    'X-Requested-With': 'XMLHttpRequest',
+    'If-Modified-Since': '0',
+    'Cache-Control': 'max-age=0',
+    'Accept': '*/*',
+  }
+
+  // Try secure variant first (DS-9664NI-I8 pattern), then plain, then status fallback
+  const probePaths = [
+    `/ISAPI/ContentMgmt/InputProxy/channels?security=1&iv=${crypto.randomBytes(16).toString('hex')}`,
+    '/ISAPI/ContentMgmt/InputProxy/channels',
+  ]
+
+  for (const path of probePaths) {
+    try {
+      await client.get(path, { headers: hikHeaders })
+      return 'available'
+    } catch (e: any) {
+      const s: number | undefined = e?.response?.status
+      if (s === 401 || s === 403) return 'no_permission'
+      // 400/404/405/501 → try next variant
+    }
+  }
+
+  // All /channels variants failed — try /channels/status as last resort
   try {
-    await client.get('/ISAPI/ContentMgmt/InputProxy/channels')
+    await client.get('/ISAPI/ContentMgmt/InputProxy/channels/status', { headers: hikHeaders })
     return 'available'
   } catch (e: any) {
     const s: number | undefined = e?.response?.status
     if (s === 401 || s === 403) return 'no_permission'
-    // /channels returned 400/404/405/501 — try /channels/status before giving up.
-    // DS-9664NI-I8 and similar models reject /channels but accept /channels/status.
-    if (s === 400 || s === 404 || s === 405 || s === 501) {
-      try {
-        await client.get('/ISAPI/ContentMgmt/InputProxy/channels/status')
-        return 'available'  // /channels/status works — IP/port/status data is accessible
-      } catch (e2: any) {
-        const s2: number | undefined = e2?.response?.status
-        if (s2 === 401 || s2 === 403) return 'no_permission'
-        return 'unsupported'
-      }
-    }
-    if (s) return 'error'
+    if (s) return 'unsupported'
     return 'unknown'
   }
 }
@@ -853,8 +897,10 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
   error?: string
 }[]> {
   const client = createHikClient(nvr)
+  const secureIv = crypto.randomBytes(16).toString('hex')
   const endpoints: Array<{ ep: string; note?: string }> = [
     { ep: '/ISAPI/System/deviceInfo' },
+    { ep: `/ISAPI/ContentMgmt/InputProxy/channels?security=1&iv=${secureIv}`, note: 'Fuente principal: nombre, IP, puerto y protocolo (variante segura DS-9664NI-I8)' },
     { ep: '/ISAPI/ContentMgmt/InputProxy/channels',         note: 'Prioridad A: IP, nombre, protocolo por canal' },
     { ep: '/ISAPI/ContentMgmt/InputProxy/channels/status',  note: 'Prioridad B: estado online/offline real por canal' },
     { ep: '/ISAPI/ContentMgmt/ZeroVideo/channels',          note: 'Diagnóstico: canales sin video activo (no usar para nombres/IP)' },
@@ -910,7 +956,7 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
       return 'Disponible pero sin campos IP/puerto reconocidos'
     }
     if (ep.includes('/InputProxy/channels')) {
-      if (hf['ipAddress'] || hf['name']) return 'Fuente activa: IP, puerto, nombre y protocolo ✓'
+      if (hf['ipAddress'] || hf['name'] || hf['customName']) return 'Fuente principal activa: nombre, IP, puerto y protocolo ✓'
       return 'Disponible pero sin campos IP/nombre reconocidos'
     }
     if (ep.includes('/Video/inputs/channels')) {
@@ -938,10 +984,18 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
     return result
   }
 
+  const debugHikHeaders = {
+    'X-Requested-With': 'XMLHttpRequest',
+    'If-Modified-Since': '0',
+    'Cache-Control': 'max-age=0',
+    'Accept': '*/*',
+  }
+
   const results = await Promise.allSettled(
     endpoints.map(async ({ ep, note }) => {
       try {
-        const res = await client.get(ep)
+        const useHikHeaders = ep.includes('/InputProxy/')
+        const res = await client.get(ep, useHikHeaders ? { headers: debugHikHeaders } : undefined)
         const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data)
         const ct = String(res.headers['content-type'] || '')
         const sanitized = body.replace(/(<Password>)[^<]*/gi, '$1***').replace(/password[^<"'\s]*/gi, 'password***')
