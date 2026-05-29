@@ -727,6 +727,21 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       ? `Sin acceso a datos IP desde ISAPI (fuente: ${sourceUsed}). IP, puerto, protocolo y estado no se actualizaron — se conservaron datos existentes. Use el diagnóstico de endpoints para identificar el endpoint correcto.`
       : undefined
 
+    // Determine if real names were synced or if this model lacks a name source
+    const nameSource: 'real' | 'none' = nameUpdated > 0 ? 'real' : 'none'
+    let nameReason: string | undefined
+    if (nameSource === 'none') {
+      if (sourceUsed === 'inputproxy_status') {
+        nameReason = '/InputProxy/channels/status no incluye nombres de cámara. /InputProxy/channels devuelve error en este modelo. VideoInput/inputs/channels no está disponible. Los nombres deben configurarse manualmente.'
+      } else if (sourceUsed === 'inputproxy_channels') {
+        nameReason = 'Los nombres en el NVR son genéricos (Canal 1, D1…). Configure nombres reales en la interfaz del NVR.'
+      } else if (sourceUsed === 'videoinput' || sourceUsed === 'streaming') {
+        nameReason = 'VideoInput/Streaming solo devuelven nombres genéricos en este modelo.'
+      } else {
+        nameReason = 'Ningún endpoint ISAPI disponible expone nombres reales de cámara.'
+      }
+    }
+
     server.log.info(`[sync-cameras] ${nvr.name}: total=${ipCams.length} synced=${synced} ip=${ipUpdated} name=${nameUpdated} status=${statusUpdated} skipped=${skipped} sourceUsed=${sourceUsed} isapIStatus=${isapIStatus}`)
     await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length, isapIStatus, sourceUsed, ipUpdated, nameUpdated })
 
@@ -742,6 +757,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       preservedMetadata,
       sourceUsed,
       isapIStatus,
+      nameSource,
+      nameReason,
       warning,
       log: syncLog,
       syncedAt: new Date().toISOString(),

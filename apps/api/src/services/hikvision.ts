@@ -815,9 +815,11 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
   contentType: string
   byteLength: number
   snippet: string
+  fullBody: string           // full body, passwords scrubbed, for admin copy/download
   parseable: boolean
   detectedFields: string[]   // top-level XML tags or JSON keys found in the response
   hasFields: Record<string, boolean>  // presence check for specific important tags
+  conclusion: string         // human-readable summary of what this endpoint provides
   note?: string
   error?: string
 }[]> {
@@ -865,6 +867,36 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
     'dynVideoInputChannelID', 'id', 'PasswordStatus', 'securityStatus',
   ]
 
+  function deriveConclusion(ep: string, status: number | null, ok: boolean, hf: Record<string, boolean>): string {
+    if (!ok) {
+      if (status === 401 || status === 403) return 'Sin permiso en este modelo/firmware (HTTP ' + status + ')'
+      if (status === 400) return 'No soportado en este modelo (HTTP 400 badXmlContent)'
+      if (status === 404) return 'Endpoint no disponible en este firmware'
+      if (!status) return 'Error de red o timeout'
+      return `No disponible (HTTP ${status})`
+    }
+    if (ep.includes('/System/deviceInfo')) return 'Info del NVR — no contiene datos por cámara'
+    if (ep.includes('/InputProxy/channels/status')) {
+      if (hf['ipAddress'] || hf['managePortNo']) return 'Fuente activa: IP, puerto y protocolo ✓'
+      return 'Disponible pero sin campos IP/puerto reconocidos'
+    }
+    if (ep.includes('/InputProxy/channels')) {
+      if (hf['ipAddress'] || hf['name']) return 'Fuente activa: IP, puerto, nombre y protocolo ✓'
+      return 'Disponible pero sin campos IP/nombre reconocidos'
+    }
+    if (ep.includes('/Video/inputs/channels')) {
+      if (hf['customName']) return 'Tiene customName — posible fuente de nombres reales ✓'
+      if (hf['name']) return 'Tiene campo name — verificar si son nombres reales'
+      return 'Sin customName/name detectados — no sirve para nombres'
+    }
+    if (ep.match(/\/Streaming\/channels\/\d/)) return 'Canal individual — solo RTSP/códec'
+    if (ep.includes('/Streaming/channels')) return 'Solo IDs técnicos (101, 102) — no usar como nombre real'
+    if (ep.includes('/StreamingProxy/channels')) return 'Streaming proxy — solo IDs técnicos, no sirve para nombres'
+    if (ep.includes('/ZeroVideo/channels')) return 'Diagnóstico canales sin video — no usar para nombres/IP'
+    if (ep.includes('/Security/users')) return 'Lista de usuarios — no relevante para cámaras IP'
+    return 'Disponible'
+  }
+
   function checkHasFields(body: string, _ct: string): Record<string, boolean> {
     const result: Record<string, boolean> = {}
     if (bodyIsXml(body)) {
@@ -883,34 +915,39 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
         const res = await client.get(ep)
         const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data)
         const ct = String(res.headers['content-type'] || '')
-        const snippet = body.slice(0, 400).replace(/password[^<"'\s]*/gi, 'password***')
+        const sanitized = body.replace(/(<Password>)[^<]*/gi, '$1***').replace(/password[^<"'\s]*/gi, 'password***')
+        const hf = checkHasFields(body, ct)
         return {
           endpoint:       ep,
           status:         res.status,
           ok:             true,
           contentType:    ct,
           byteLength:     body.length,
-          snippet,
+          snippet:        sanitized.slice(0, 500),
+          fullBody:       sanitized.slice(0, 50000),
           parseable:      isParseableBody(body, ct),
           detectedFields: detectFields(body, ct),
-          hasFields:      checkHasFields(body, ct),
+          hasFields:      hf,
+          conclusion:     deriveConclusion(ep, res.status, true, hf),
           ...(note ? { note } : {}),
         }
       } catch (e: any) {
         const httpStatus: number | null = e?.response?.status ?? null
         const body = typeof e?.response?.data === 'string' ? e.response.data : JSON.stringify(e?.response?.data || '')
         const ct = String(e?.response?.headers?.['content-type'] || '')
-        const snippet = body ? body.slice(0, 200) : ''
+        const hf: Record<string, boolean> = {}
         return {
           endpoint:       ep,
           status:         httpStatus,
           ok:             false,
           contentType:    ct,
           byteLength:     body.length,
-          snippet,
+          snippet:        body ? body.slice(0, 200) : '',
+          fullBody:       body ? body.slice(0, 5000) : '',
           parseable:      false,
           detectedFields: [],
-          hasFields:      {},
+          hasFields:      hf,
+          conclusion:     deriveConclusion(ep, httpStatus, false, hf),
           ...(note ? { note } : {}),
           error: httpStatus ? `HTTP ${httpStatus}` : (e?.code || e?.message || 'Error de red'),
         }
@@ -925,9 +962,11 @@ export async function getIpCameraSourcesDebug(nvr: NVR): Promise<{
     contentType:    '',
     byteLength:     0,
     snippet:        '',
+    fullBody:       '',
     parseable:      false,
     detectedFields: [],
     hasFields:      {} as Record<string, boolean>,
+    conclusion:     'Error interno inesperado',
     error:          'Promise rejected',
   })
 }

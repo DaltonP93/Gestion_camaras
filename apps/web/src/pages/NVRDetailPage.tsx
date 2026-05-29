@@ -7,6 +7,7 @@ import {
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
   Loader2, Play, RotateCcw, Stethoscope, Plus, X,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
+  Copy, Download, ChevronDown,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
@@ -28,6 +29,7 @@ export function NVRDetailPage() {
   const [rebooting, setRebooting] = useState(false)
   const [validatingHealth, setValidatingHealth] = useState(false)
   const [syncingCameras, setSyncingCameras] = useState(false)
+  const [lastSyncResult, setLastSyncResult] = useState<{ nameSource?: 'real' | 'none'; nameReason?: string; sourceUsed?: string } | null>(null)
 
   // Tabs data
   const [cameras, setCameras] = useState<{ fromNvr: IpCamera[]; fromDb: CameraType[] } | null>(null)
@@ -182,15 +184,24 @@ export function NVRDetailPage() {
     if (!id) return
     try {
       setSyncingCameras(true)
-      const res = await apiPost<{ synced: number; total: number; ipUpdated?: number; nameUpdated?: number; statusUpdated?: number; sourceUsed?: string; warning?: string }>(`/nvrs/${id}/sync-cameras`)
+      const res = await apiPost<{
+        synced: number; total: number; ipUpdated?: number; nameUpdated?: number
+        statusUpdated?: number; sourceUsed?: string; warning?: string
+        nameSource?: 'real' | 'none'; nameReason?: string
+      }>(`/nvrs/${id}/sync-cameras`)
+      setLastSyncResult(res)
       if (res.warning) {
         toast.error(res.warning)
       } else {
         const parts = [`${res.total} detectadas`]
         if ((res.ipUpdated ?? 0) > 0)     parts.push(`${res.ipUpdated} con IP`)
-        if ((res.nameUpdated ?? 0) > 0)   parts.push(`${res.nameUpdated} con nombre`)
         if ((res.statusUpdated ?? 0) > 0) parts.push(`${res.statusUpdated} con estado`)
-        toast.success(`Cámaras IP sincronizadas: ${parts.join(' · ')} [${res.sourceUsed ?? '?'}]`)
+        if (res.nameSource === 'none') {
+          toast.success(`Sincronizadas: ${parts.join(' · ')} [${res.sourceUsed ?? '?'}] · Nombres: no disponibles por ISAPI`)
+        } else {
+          if ((res.nameUpdated ?? 0) > 0) parts.push(`${res.nameUpdated} con nombre`)
+          toast.success(`Cámaras IP sincronizadas: ${parts.join(' · ')} [${res.sourceUsed ?? '?'}]`)
+        }
       }
       await loadNvr()
       await loadCameras()
@@ -339,6 +350,7 @@ export function NVRDetailPage() {
           onDiagnostics={(cam) => { setDiagCamera(cam.id); setTab('diagnostics'); handleDiagnostics(cam.id) }}
           isAdmin={isAdmin}
           isapIStatus={nvr.isapIStatus}
+          lastSyncResult={lastSyncResult}
         />
       )}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} supported={storageSupported} unsupportedReason={storageUnsupportedReason} onRefresh={loadStorage} />}
@@ -461,6 +473,198 @@ function camStatusDisplay(cam: CameraType): { color: string; dot: string; label:
   return { color: 'text-surface-500', dot: 'bg-surface-600', label: 'Offline' }
 }
 
+// ─── ISAPI Debug Modal ────────────────────────────────────────
+
+const IMPORTANT_TAGS = ['ipAddress', 'managePortNo', 'proxyProtocol', 'name', 'customName', 'online', 'chanDetectResult', 'sourceInputPortDescriptor', 'channelName', 'PasswordStatus', 'securityStatus']
+
+function IsapDebugModal({ loading, error, data, onRetest, onClose }: {
+  loading: boolean
+  error: string | null
+  data: any[] | null
+  onRetest: () => void
+  onClose: () => void
+}) {
+  const [expanded, setExpanded] = useState<number | null>(null)
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const copyAll = () => {
+    navigator.clipboard.writeText(JSON.stringify(data, null, 2))
+    toast.success('JSON copiado al portapapeles')
+  }
+
+  const downloadAll = () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = `isapi-debug-${Date.now()}.json`; a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const copyRow = (ep: any) => {
+    navigator.clipboard.writeText(ep.fullBody || ep.snippet || '')
+    toast.success(`Respuesta de ${ep.endpoint} copiada`)
+  }
+
+  // Summary derivation
+  const hasIpSource  = data?.some((ep: any) => ep.ok && (ep.hasFields?.ipAddress || ep.hasFields?.managePortNo))
+  const hasNameSource = data?.some((ep: any) => ep.ok && (ep.hasFields?.customName || ep.hasFields?.name) && !ep.endpoint.includes('/Streaming/'))
+  const hasStatus    = data?.some((ep: any) => ep.ok && ep.hasFields?.online)
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="card flex flex-col w-full max-w-[min(95vw,1200px)] max-h-[85vh] shadow-2xl">
+        {/* Sticky header */}
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-surface-700 flex-shrink-0">
+          <h3 className="text-sm font-semibold text-surface-100 flex items-center gap-2">
+            <Stethoscope size={15} /> Diagnóstico de endpoints ISAPI
+          </h3>
+          <div className="flex items-center gap-2">
+            <button onClick={onRetest} disabled={loading} className="btn-ghost text-xs">
+              {loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />} Retestar
+            </button>
+            {data && data.length > 0 && (
+              <>
+                <button onClick={copyAll} className="btn-ghost text-xs"><Copy size={11} /> Copiar JSON</button>
+                <button onClick={downloadAll} className="btn-ghost text-xs"><Download size={11} /> Descargar</button>
+              </>
+            )}
+            <button onClick={onClose} className="p-1.5 rounded text-surface-400 hover:text-surface-200 hover:bg-surface-700 transition-colors" title="Cerrar (Esc)">
+              <X size={15} />
+            </button>
+          </div>
+        </div>
+
+        {/* Scrollable body */}
+        <div className="overflow-y-auto flex-1 p-5 space-y-4">
+          <p className="text-xs text-surface-500">
+            Prueba todos los endpoints ISAPI del NVR con autenticación Digest.
+            Identifica cuál endpoint contiene IP, puerto, nombre y estado real de la cámara.
+          </p>
+
+          {/* Summary badges */}
+          {data && data.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              <span className={clsx('flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium', hasIpSource ? 'bg-green-900/30 text-green-400 border border-green-900/50' : 'bg-surface-700/50 text-surface-500 border border-surface-600/50')}>
+                {hasIpSource ? <CheckCircle2 size={11} /> : <XCircle size={11} />} IP / Puerto
+              </span>
+              <span className={clsx('flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium', hasNameSource ? 'bg-green-900/30 text-green-400 border border-green-900/50' : 'bg-amber-900/20 text-amber-500/80 border border-amber-900/30')}>
+                {hasNameSource ? <CheckCircle2 size={11} /> : <AlertTriangle size={11} />} Nombres reales
+              </span>
+              <span className={clsx('flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium', hasStatus ? 'bg-green-900/30 text-green-400 border border-green-900/50' : 'bg-surface-700/50 text-surface-500 border border-surface-600/50')}>
+                {hasStatus ? <CheckCircle2 size={11} /> : <XCircle size={11} />} Estado online/offline
+              </span>
+            </div>
+          )}
+
+          {loading && (
+            <div className="flex items-center gap-3 py-6 text-surface-400">
+              <Loader2 size={18} className="animate-spin" />
+              <span className="text-sm">Probando endpoints ISAPI... puede tardar hasta 30 segundos</span>
+            </div>
+          )}
+          {!loading && error && (
+            <div className="flex items-start gap-2 p-3 bg-red-900/20 border border-red-900/40 rounded-lg text-xs text-red-400">
+              <XCircle size={13} className="flex-shrink-0 mt-0.5" /> {error}
+            </div>
+          )}
+          {!loading && !error && data && data.length === 0 && (
+            <p className="text-xs text-surface-500 py-4 text-center">Sin resultados (respuesta vacía del servidor).</p>
+          )}
+
+          {!loading && data && data.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px] min-w-[900px]">
+                <thead>
+                  <tr className="border-b border-surface-700 text-surface-400">
+                    <th className="text-left px-3 py-2 font-medium w-56">Endpoint</th>
+                    <th className="text-left px-3 py-2 font-medium w-24">HTTP / Tipo</th>
+                    <th className="text-left px-3 py-2 font-medium w-20">Bytes</th>
+                    <th className="text-left px-3 py-2 font-medium">Campos detectados</th>
+                    <th className="text-left px-3 py-2 font-medium w-48">Conclusión</th>
+                    <th className="text-left px-3 py-2 font-medium w-8"></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-surface-700/40">
+                  {data.map((ep: any, i: number) => {
+                    const hf: Record<string, boolean> = ep.hasFields || {}
+                    const bodyType = (ep.fullBody || ep.snippet)?.trimStart().startsWith('<') ? 'XML' : (ep.fullBody || ep.snippet)?.trimStart().startsWith('{') ? 'JSON' : 'raw'
+                    const isExpanded = expanded === i
+                    const foundTags = IMPORTANT_TAGS.filter(t => hf[t])
+                    const otherFields = (ep.detectedFields || []).filter((f: string) => !IMPORTANT_TAGS.includes(f))
+                    return (
+                      <>
+                        <tr key={i} className={clsx('align-top', ep.ok ? 'hover:bg-surface-700/20' : 'opacity-60 hover:opacity-80')}>
+                          <td className="px-3 py-2">
+                            <span className="font-mono text-surface-300 break-all">{ep.endpoint}</span>
+                            {ep.note && <div className="text-[10px] text-surface-500 font-sans mt-0.5">{ep.note}</div>}
+                          </td>
+                          <td className="px-3 py-2 whitespace-nowrap">
+                            <span className={clsx('font-semibold', ep.ok ? 'text-green-400' : 'text-red-400')}>{ep.status ?? 'ERR'}</span>
+                            {ep.ok && <div className="text-[10px] text-surface-500">{bodyType}</div>}
+                            {ep.error && <div className="text-[10px] text-red-400/70">{ep.error}</div>}
+                          </td>
+                          <td className="px-3 py-2 text-surface-500">{ep.byteLength > 0 ? ep.byteLength.toLocaleString() : '—'}</td>
+                          <td className="px-3 py-2">
+                            {foundTags.length > 0 ? (
+                              <div className="flex flex-wrap gap-1">
+                                {foundTags.map(t => (
+                                  <span key={t} className="px-1.5 py-0.5 rounded text-[10px] bg-green-900/40 text-green-400 font-medium">{t}</span>
+                                ))}
+                              </div>
+                            ) : ep.ok ? (
+                              <span className="text-surface-600">Sin campos relevantes</span>
+                            ) : null}
+                            {otherFields.length > 0 && (
+                              <div className="mt-1 text-[10px] text-surface-600">{otherFields.slice(0, 8).join(' · ')}</div>
+                            )}
+                          </td>
+                          <td className="px-3 py-2">
+                            <span className={clsx('text-[10px]', ep.ok && (ep.conclusion?.includes('✓') || ep.conclusion?.includes('activa')) ? 'text-green-400/80' : ep.ok ? 'text-surface-400' : 'text-surface-600')}>
+                              {ep.conclusion || '—'}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2">
+                            <div className="flex gap-1">
+                              {(ep.fullBody || ep.snippet) && (
+                                <button onClick={() => copyRow(ep)} className="p-1 rounded text-surface-500 hover:text-surface-300 hover:bg-surface-700" title="Copiar respuesta completa">
+                                  <Copy size={10} />
+                                </button>
+                              )}
+                              {(ep.fullBody || ep.snippet) && (
+                                <button onClick={() => setExpanded(isExpanded ? null : i)} className="p-1 rounded text-surface-500 hover:text-surface-300 hover:bg-surface-700" title="Ver snippet">
+                                  <ChevronDown size={10} className={clsx('transition-transform', isExpanded && 'rotate-180')} />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                        {isExpanded && (
+                          <tr key={`${i}-exp`} className="bg-surface-900/50">
+                            <td colSpan={6} className="px-3 pb-3 pt-1">
+                              <pre className="font-mono text-[10px] text-surface-400 whitespace-pre-wrap break-all bg-surface-950/50 rounded p-3 max-h-64 overflow-auto border border-surface-700/50">
+                                {(ep.fullBody || ep.snippet || '').slice(0, 8000)}
+                              </pre>
+                            </td>
+                          </tr>
+                        )}
+                      </>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Cameras Tab ──────────────────────────────────────────────
 
 function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolean | null | undefined): React.ReactNode {
@@ -481,7 +685,7 @@ function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolea
 }
 
 function CamerasTab({
-  cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus,
+  cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus, lastSyncResult,
 }: {
   cameras: { fromNvr: IpCamera[]; fromDb: CameraType[] } | null
   loading: boolean
@@ -494,6 +698,7 @@ function CamerasTab({
   isAdmin: boolean
   nvrId: string
   isapIStatus?: string
+  lastSyncResult?: { nameSource?: 'real' | 'none'; nameReason?: string; sourceUsed?: string } | null
 }) {
   const [showAdopt, setShowAdopt] = useState(false)
   const [isapDebug, setIsapDebug] = useState<any[] | null>(null)
@@ -653,94 +858,26 @@ function CamerasTab({
         )}
       </div>
 
-      {/* ISAPI endpoint debug panel */}
-      {isAdmin && showDebug && (
-        <div className="card p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-medium text-surface-300 flex items-center gap-2">
-              <Stethoscope size={14} />
-              Diagnóstico de endpoints ISAPI
-            </h3>
-            <div className="flex gap-2">
-              <button onClick={handleIsapDebug} disabled={isapDebugLoading} className="btn-ghost text-xs">
-                <RefreshCw size={11} /> Retestar
-              </button>
-              <button onClick={() => setShowDebug(false)} className="btn-ghost text-xs">Cerrar</button>
-            </div>
-          </div>
-          <p className="text-xs text-surface-500">
-            Identifica qué endpoint contiene nombre, IP, puerto y estado real de la cámara IP.
-            Las celdas verdes indican que el campo fue encontrado en la respuesta.
-          </p>
-          {isapDebugLoading && (
-            <div className="flex items-center gap-2 py-4 text-surface-400 text-sm">
-              <Loader2 size={16} className="animate-spin" /> Probando endpoints... puede tardar hasta 30s
-            </div>
-          )}
-          {!isapDebugLoading && isapDebugError && (
-            <p className="text-xs text-red-400 p-2 bg-red-900/20 rounded">{isapDebugError}</p>
-          )}
-          {!isapDebugLoading && !isapDebugError && isapDebug && isapDebug.length === 0 && (
-            <p className="text-xs text-surface-500">Sin resultados (respuesta vacía del servidor).</p>
-          )}
-          {!isapDebugLoading && isapDebug && isapDebug.length > 0 && (
-            <div className="overflow-x-auto">
-              <table className="w-full text-[11px] min-w-[900px]">
-                <thead>
-                  <tr className="border-b border-surface-700 text-surface-400">
-                    <th className="text-left px-2 py-1.5 font-medium">Endpoint</th>
-                    <th className="text-left px-2 py-1.5 font-medium w-14">HTTP</th>
-                    <th className="text-left px-2 py-1.5 font-medium w-16">Bytes</th>
-                    <th className="text-left px-2 py-1.5 font-medium">Tags encontrados</th>
-                    <th className="text-left px-2 py-1.5 font-medium w-64">Snippet</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-surface-700/40">
-                  {isapDebug.map((ep: any, i: number) => {
-                    const importantTags = ['ipAddress', 'managePortNo', 'proxyProtocol', 'name', 'customName', 'online', 'chanDetectResult', 'sourceInputPortDescriptor', 'channelName', 'PasswordStatus']
-                    const hf: Record<string, boolean> = ep.hasFields || {}
-                    const bodyType = ep.snippet?.trimStart().startsWith('<') ? 'XML' : ep.snippet?.trimStart().startsWith('{') ? 'JSON' : ep.ok ? 'raw' : ''
-                    return (
-                      <tr key={i} className={clsx('align-top', ep.ok ? 'hover:bg-surface-700/20' : 'opacity-60')}>
-                        <td className="px-2 py-1.5 font-mono text-surface-300 whitespace-nowrap">
-                          {ep.endpoint}
-                          {ep.note && <div className="text-[10px] text-surface-500 font-sans mt-0.5">{ep.note}</div>}
-                        </td>
-                        <td className="px-2 py-1.5 whitespace-nowrap">
-                          <span className={clsx('font-medium', ep.ok ? 'text-green-400' : 'text-red-400')}>
-                            {ep.status ?? 'ERR'}
-                          </span>
-                          {bodyType && <div className="text-[10px] text-surface-500">{bodyType} · {ep.byteLength}b</div>}
-                          {ep.error && <div className="text-[10px] text-red-400/70">{ep.error}</div>}
-                        </td>
-                        <td className="px-2 py-1.5">
-                          <div className="flex flex-wrap gap-1">
-                            {importantTags.map(t => (
-                              <span key={t} className={clsx(
-                                'px-1 py-0.5 rounded text-[10px]',
-                                hf[t] ? 'bg-green-900/40 text-green-400' : 'bg-surface-700/40 text-surface-600'
-                              )}>{t}</span>
-                            ))}
-                          </div>
-                          {ep.ok && ep.detectedFields && ep.detectedFields.length > 0 && (
-                            <div className="mt-1 text-[10px] text-surface-500">
-                              {(ep.detectedFields as string[]).filter((f: string) => !importantTags.includes(f)).slice(0, 10).join(' · ')}
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-2 py-1.5">
-                          <pre className="font-mono text-[10px] text-surface-500 whitespace-pre-wrap break-all max-w-[300px] max-h-24 overflow-auto">
-                            {ep.snippet ? ep.snippet.slice(0, 300) : '—'}
-                          </pre>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
+      {/* nameSource notice — shown after a sync that found no real names */}
+      {lastSyncResult?.nameSource === 'none' && (
+        <div className="flex items-start gap-2 px-3 py-2 text-xs text-amber-500/80 bg-amber-900/10 border border-amber-900/20 rounded-lg">
+          <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+          <span>
+            <span className="font-medium">Nombres no disponibles por ISAPI.</span>{' '}
+            {lastSyncResult.nameReason || 'Este modelo no expone nombres reales de cámara por los endpoints disponibles — se conservan los nombres locales existentes.'}
+          </span>
         </div>
+      )}
+
+      {/* ISAPI debug modal */}
+      {isAdmin && showDebug && (
+        <IsapDebugModal
+          loading={isapDebugLoading}
+          error={isapDebugError}
+          data={isapDebug}
+          onRetest={handleIsapDebug}
+          onClose={() => setShowDebug(false)}
+        />
       )}
     </div>
   )
