@@ -668,18 +668,18 @@ function IsapDebugModal({ loading, error, data, onRetest, onClose }: {
 // ─── Cameras Tab ──────────────────────────────────────────────
 
 function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolean | null | undefined): React.ReactNode {
-  // NVR-level ISAPI status takes precedence when endpoint is unavailable
   if (isapIStatus === 'no_permission') {
     return <span className="text-amber-500/70 text-[11px]">Sin permiso</span>
   }
   if (isapIStatus === 'unsupported') {
     return <span className="text-surface-600 text-[11px]">No soportado</span>
   }
-  // Online/Offline are only reliable when ISAPI InputProxy was actually readable ('available').
-  // For 'unknown'/null/other: we can't trust onlineInNvr (may be stale from a failed sync).
+  // Show per-camera NVR state only when InputProxy endpoint was accessible
   if (isapIStatus === 'available') {
-    if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online</span>
-    if (camOnlineInNvr === false) return <span className="text-surface-500 text-[11px]">Offline</span>
+    if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online NVR</span>
+    if (camOnlineInNvr === false) return <span className="text-surface-500 text-[11px]">Offline NVR</span>
+    // null = InputProxy returned unknown state — don't claim camera is offline
+    return <span className="text-surface-600 text-[11px]">No leído</span>
   }
   return <span className="text-surface-600 text-[11px]">No leído</span>
 }

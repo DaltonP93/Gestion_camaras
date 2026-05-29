@@ -313,6 +313,20 @@ export async function getNVRChannels(nvr: NVR): Promise<HikChannel[]> {
 
 // ─── Lista de cámaras IP conectadas (con nombres reales) ──────
 
+// Helper: parse Hikvision online/offline status from InputProxy XML fields.
+// Combines <online> tag and <chanDetectResult> for robustness.
+// Returns null when the value is absent or unrecognized — caller must NOT write onlineInNvr in that case.
+function parseHikOnlineStatus(rawOnline: string, rawChanDetect?: string): 'online' | 'offline' | null {
+  const o = (rawOnline || '').toLowerCase().trim()
+  if (o === 'true' || o === '1' || o === 'yes' || o === 'online') return 'online'
+  if (o === 'false' || o === '0' || o === 'no' || o === 'offline') return 'offline'
+  // <online> is absent or unrecognized — try chanDetectResult
+  const c = (rawChanDetect || '').toLowerCase().trim()
+  if (c === 'online') return 'online'
+  if (c === 'offline' || c === 'channelerr' || c === 'error') return 'offline'
+  return null
+}
+
 // Helper: decides whether a name looks like an auto-generated placeholder.
 // Only matches PURELY auto-generated names — real names like "Box 7" or "Ingreso UTI" return false.
 function isPlaceholderName(name: string): boolean {
@@ -419,12 +433,12 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
         const onlineStr  = xmlGet(block, 'online')
         const chanDetect = xmlGet(block, 'chanDetectResult')
         const pwdStatus  = xmlGet(block, 'PasswordStatus')
+        const parsed     = parseHikOnlineStatus(onlineStr, chanDetect)
         const entry      = inputProxyMap.get(ch)
 
         if (entry) {
           // Update existing entry from Step 1 with online status and security fields
-          const s = onlineStr === 'true' ? 'online' : onlineStr === 'false' ? 'offline' : entry.status
-          entry.status = s
+          if (parsed !== null) entry.status = parsed
           if (chanDetect) entry.chanDetectResult = chanDetect
           if (pwdStatus) entry.passwordStatus = pwdStatus
         } else {
@@ -440,7 +454,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
             protocol:         proto,
             managementPort:   portStr ? parseInt(portStr) : 0,
             securityStatus:   pwdStatus || '',
-            status:           onlineStr === 'true' ? 'online' : onlineStr === 'false' ? 'offline' : 'unknown',
+            status:           parsed ?? 'unknown',
             chanDetectResult: chanDetect || undefined,
             passwordStatus:   pwdStatus || undefined,
             _source:          'status',
@@ -459,8 +473,12 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
           const isOffline = item.online === false || item.online === 'false'
           const pwd       = item.SecurityStatus?.PasswordStatus || item.PasswordStatus || ''
 
+          const parsed2 = parseHikOnlineStatus(
+            String(item.online ?? ''),
+            String(item.chanDetectResult ?? ''),
+          )
           if (entry) {
-            entry.status = isOnline ? 'online' : isOffline ? 'offline' : entry.status
+            if (parsed2 !== null) entry.status = parsed2
             if (item.chanDetectResult) entry.chanDetectResult = item.chanDetectResult
             if (pwd) entry.passwordStatus = pwd
           } else {
@@ -472,7 +490,7 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
               protocol:         src.proxyProtocol || item.proxyProtocol || '',
               managementPort:   parseInt(src.managePortNo || item.managePortNo || '0'),
               securityStatus:   pwd,
-              status:           isOnline ? 'online' : isOffline ? 'offline' : 'unknown',
+              status:           parsed2 ?? 'unknown',
               chanDetectResult: item.chanDetectResult || undefined,
               passwordStatus:   pwd || undefined,
               _source:          'status',
@@ -796,9 +814,20 @@ export async function probeInputProxy(nvr: NVR): Promise<'available' | 'no_permi
   } catch (e: any) {
     const s: number | undefined = e?.response?.status
     if (s === 401 || s === 403) return 'no_permission'
-    if (s === 400 || s === 404 || s === 405 || s === 501) return 'unsupported'
+    // /channels returned 400/404/405/501 — try /channels/status before giving up.
+    // DS-9664NI-I8 and similar models reject /channels but accept /channels/status.
+    if (s === 400 || s === 404 || s === 405 || s === 501) {
+      try {
+        await client.get('/ISAPI/ContentMgmt/InputProxy/channels/status')
+        return 'available'  // /channels/status works — IP/port/status data is accessible
+      } catch (e2: any) {
+        const s2: number | undefined = e2?.response?.status
+        if (s2 === 401 || s2 === 403) return 'no_permission'
+        return 'unsupported'
+      }
+    }
     if (s) return 'error'
-    return 'unknown'  // network error / no response
+    return 'unknown'
   }
 }
 

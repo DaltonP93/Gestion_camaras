@@ -675,8 +675,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         ipUpdated++
       }
 
-      // Port: only from InputProxy — use any non-zero value including 8000 (it's valid for HIKVISION)
-      if (isFromInputProxy && cam.managementPort > 0 && cam.managementPort !== existing.managementPort) {
+      // Port: only from InputProxy AND only when an ipAddress is also known
+      // (port alone without IP is meaningless and would show "—:8000" in UI)
+      if (isFromInputProxy && cam.managementPort > 0 && cam.ipAddress && cam.managementPort !== existing.managementPort) {
         changes.managementPort = cam.managementPort
         changeLog.push(`port: ${cam.managementPort}`)
       }
