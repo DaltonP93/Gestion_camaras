@@ -374,7 +374,7 @@ function normalizeBodyToString(data: unknown): string {
 // Remove characters invalid in XML (null bytes, control chars except tab/LF/CR)
 function sanitizeXmlChars(str: string): string {
   // eslint-disable-next-line no-control-regex
-  return str.replace(/ /g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F]/g, '')
+  return str.replace(/\x00/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F]/g, '')
 }
 
 // Parse InputProxyChannel XML or JSON body into an array of entries.
