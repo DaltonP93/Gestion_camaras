@@ -429,15 +429,23 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
     { path: '/ISAPI/ContentMgmt/InputProxy/channels', source: 'channels' },
   ]
 
+  let channelVariantUsed: string | null = null
   for (const variant of channelVariants) {
     try {
       const res = await client.get(variant.path, { headers: hikHeaders })
+      const sizeBefore = inputProxyMap.size
       parseInputProxyBody(res.data, variant.source)
+      channelVariantUsed = `${variant.path.split('?')[0]}?${variant.path.includes('security=1') ? 'security=1' : 'plain'} → parsed ${inputProxyMap.size - sizeBefore} entries (dataType=${typeof res.data})`
       break  // success — stop trying variants
-    } catch {
-      // Try next variant
+    } catch (e: any) {
+      const status = e?.response?.status
+      channelVariantUsed = `${variant.path.split('?')[0]} FAILED HTTP ${status ?? e?.code ?? 'err'}`
+      // try next variant
     }
   }
+
+  // Log which channel variant was used (visible in docker logs)
+  console.info(`[getIpCameraList] ${nvr.ipAddress} channelVariant: ${channelVariantUsed ?? 'none tried'} inputProxyMap.size=${inputProxyMap.size}`)
 
   // ── Step 1.5: InputProxy channel status ────────────────────
   // This endpoint returns IP/port/protocol PLUS online status per channel.

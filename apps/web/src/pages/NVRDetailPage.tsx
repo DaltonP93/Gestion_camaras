@@ -185,9 +185,9 @@ export function NVRDetailPage() {
     try {
       setSyncingCameras(true)
       const res = await apiPost<{
-        synced: number; total: number; ipUpdated?: number; nameUpdated?: number
-        statusUpdated?: number; sourceUsed?: string; warning?: string
-        nameSource?: 'real' | 'none'; nameReason?: string
+        synced: number; total: number; ipUpdated?: number; portUpdated?: number; nameUpdated?: number
+        nameCandidates?: number; skippedNameBecauseEmpty?: number; statusUpdated?: number
+        sourceUsed?: string; warning?: string; nameSource?: 'real' | 'none'; nameReason?: string
       }>(`/nvrs/${id}/sync-cameras`)
       setLastSyncResult(res)
       if (res.warning) {
@@ -218,11 +218,26 @@ export function NVRDetailPage() {
     if (!confirm('¿Reemplazar todos los nombres con los del NVR, incluso si ya tienes nombres personalizados?')) return
     try {
       setSyncingCameras(true)
-      const res = await apiPost<{ synced: number; total: number; nameUpdated?: number; sourceUsed?: string; warning?: string }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
+      const res = await apiPost<{
+        synced: number; total: number; sourceUsed?: string; warning?: string
+        nameUpdated?: number; nameCandidates?: number; skippedNameBecauseEmpty?: number; skippedNameBecauseNotPlaceholder?: number
+        ipUpdated?: number; portUpdated?: number
+      }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
       if (res.warning) {
         toast.error(res.warning)
+      } else if ((res.nameUpdated ?? 0) === 0) {
+        const empty = res.skippedNameBecauseEmpty ?? 0
+        const notPH = res.skippedNameBecauseNotPlaceholder ?? 0
+        toast.error(
+          `Sin nombres actualizados — fuente: ${res.sourceUsed ?? '?'}` +
+          (empty > 0 ? ` | ${empty} cámaras sin nombre en ISAPI` : '') +
+          (notPH > 0 ? ` | ${notPH} ya con nombre real` : '')
+        )
       } else {
-        toast.success(`Nombres forzados desde NVR: ${res.nameUpdated ?? res.synced} nombres actualizados de ${res.total} detectadas [${res.sourceUsed ?? '?'}]`)
+        toast.success(
+          `${res.nameUpdated} de ${res.total} nombres actualizados desde NVR [${res.sourceUsed ?? '?'}]` +
+          (res.ipUpdated ? ` · ${res.ipUpdated} IPs` : '')
+        )
       }
       await loadNvr()
       await loadCameras()

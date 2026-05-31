@@ -629,15 +629,36 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     // getIpCameraList has its own fallback chain: InputProxy → VideoInput → Streaming → getNVRChannels
     const ipCams = await getIpCameraList(nvrDec as any)
 
-    const isPlaceholder = (n: string) =>
-      !n || /^(IPCamera\s*\d*|Camera\s*\d*|Canal\s*\d+|Channel\s*\d+|D\d+)$/i.test(n.trim()) || /^\d{3,4}$/.test(n.trim())
+    // Log first 5 cameras so we can diagnose name/source issues from server logs
+    server.log.info(
+      `[sync-cameras] ${nvr.name} ipCams sample: ${ipCams.slice(0, 5).map(c => `ch${c.channel}:src=${c.metadataSource}:name="${c.name}"`).join(', ')}`
+    )
+
+    const isPlaceholder = (name?: string | null): boolean => {
+      if (!name) return true
+      const n = name.trim()
+      return (
+        /^canal\s+\d+$/i.test(n) ||
+        /^c[aá]mara\s+\d+$/i.test(n) ||
+        /^camera\s*\d*$/i.test(n) ||
+        /^ipcamera\s*\d*$/i.test(n) ||
+        /^d\d+$/i.test(n) ||
+        /^channel\s+\d+$/i.test(n) ||
+        /^\d{3,4}$/.test(n) ||
+        n === ''
+      )
+    }
 
     const syncLog: Array<{ channel: number; source: string; changes: string[] }> = []
     let synced = 0
     let updatedMetadata = 0
     let preservedMetadata = 0
     let ipUpdated = 0
+    let portUpdated = 0
     let nameUpdated = 0
+    let nameCandidates = 0
+    let skippedNameBecauseEmpty = 0
+    let skippedNameBecauseNotPlaceholder = 0
     let statusUpdated = 0
     let skipped = 0
 
@@ -662,10 +683,20 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       const hasRealName      = isFromInputProxy || cam.metadataSource === 'videoinput' || cam.metadataSource === 'streaming'
 
       // Name: update when real name available AND (DB has placeholder OR forceNames=true)
-      if (hasRealName && cam.name && !isPlaceholder(cam.name) && (isPlaceholder(existing.name || '') || forceNames)) {
-        changes.name = cam.name
-        changeLog.push(`name: ${cam.name}`)
-        nameUpdated++
+      if (hasRealName) {
+        if (!cam.name || isPlaceholder(cam.name)) {
+          skippedNameBecauseEmpty++
+          server.log.debug(`[sync-cameras] ch${cam.channel} name skip: cam.name="${cam.name}" is empty/placeholder (src=${cam.metadataSource})`)
+        } else if (!isPlaceholder(existing.name) && !forceNames) {
+          skippedNameBecauseNotPlaceholder++
+          server.log.debug(`[sync-cameras] ch${cam.channel} name skip: existing="${existing.name}" not placeholder, forceNames=${forceNames}`)
+        } else {
+          nameCandidates++
+          changes.name = cam.name
+          changeLog.push(`name: "${cam.name}"`)
+          nameUpdated++
+          server.log.info(`[sync-cameras] ch${cam.channel} name: "${existing.name}" → "${cam.name}" (src=${cam.metadataSource} forceNames=${forceNames})`)
+        }
       }
 
       // IP: only from InputProxy — other sources don't have IP at all
@@ -680,6 +711,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       if (isFromInputProxy && cam.managementPort > 0 && cam.ipAddress && cam.managementPort !== existing.managementPort) {
         changes.managementPort = cam.managementPort
         changeLog.push(`port: ${cam.managementPort}`)
+        portUpdated++
       }
 
       // Protocol: only from InputProxy
@@ -743,7 +775,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    server.log.info(`[sync-cameras] ${nvr.name}: total=${ipCams.length} synced=${synced} ip=${ipUpdated} name=${nameUpdated} status=${statusUpdated} skipped=${skipped} sourceUsed=${sourceUsed} isapIStatus=${isapIStatus}`)
+    server.log.info(`[sync-cameras] ${nvr.name}: total=${ipCams.length} synced=${synced} ip=${ipUpdated} port=${portUpdated} name=${nameUpdated} nameCandidates=${nameCandidates} skippedEmpty=${skippedNameBecauseEmpty} skippedNotPlaceholder=${skippedNameBecauseNotPlaceholder} status=${statusUpdated} skipped=${skipped} sourceUsed=${sourceUsed} isapIStatus=${isapIStatus} forceNames=${forceNames}`)
     await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length, isapIStatus, sourceUsed, ipUpdated, nameUpdated })
 
     return reply.send({
@@ -751,7 +783,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       total: ipCams.length,
       synced,
       ipUpdated,
+      portUpdated,
       nameUpdated,
+      nameCandidates,
+      skippedNameBecauseEmpty,
+      skippedNameBecauseNotPlaceholder,
       statusUpdated,
       skipped,
       updatedMetadata,
