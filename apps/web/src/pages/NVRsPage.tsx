@@ -1,7 +1,7 @@
 // src/pages/NVRsPage.tsx
 import { useEffect, useState } from 'react'
 import { Plus, Pencil, Trash2, RefreshCw, Server, Wifi, WifiOff, Zap, Search, CheckCircle2, XCircle, Radar, Lock, ChevronRight, AlertTriangle } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiPut, apiDelete, apiGet } from '@/lib/api'
 import { clsx } from 'clsx'
@@ -34,6 +34,7 @@ interface DiscoveredDevice {
 
 export function NVRsPage() {
   const { nvrs, nvrStatuses, loadNVRs, loadNVRStatus } = useCameraStore()
+  const navigate = useNavigate()
   const [showModal, setShowModal] = useState(false)
   const [editingNVR, setEditingNVR] = useState<NVR | null>(null)
   const [form, setForm] = useState<NVRFormData>(EMPTY)
@@ -228,8 +229,12 @@ export function NVRsPage() {
         }
         toast.success('NVR actualizado')
       } else {
-        await apiPost('/nvrs', form)
-        toast.success('NVR agregado correctamente')
+        const created = await apiPost<{ id: string; name: string }>('/nvrs', form)
+        setShowModal(false)
+        loadNVRs()
+        toast.success(`NVR "${created.name}" agregado — sincronizando cámaras en segundo plano...`)
+        navigate(`/nvrs/${created.id}`)
+        return
       }
       setShowModal(false)
       loadNVRs()

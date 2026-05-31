@@ -7,7 +7,7 @@ import {
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
   Loader2, Play, RotateCcw, Stethoscope, Plus, X,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
-  Copy, Download, ChevronDown,
+  Copy, Download, ChevronDown, Zap,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
@@ -30,6 +30,14 @@ export function NVRDetailPage() {
   const [validatingHealth, setValidatingHealth] = useState(false)
   const [syncingCameras, setSyncingCameras] = useState(false)
   const [lastSyncResult, setLastSyncResult] = useState<{ nameSource?: 'real' | 'none'; nameReason?: string; sourceUsed?: string } | null>(null)
+  const [onboarding, setOnboarding] = useState(false)
+  const [lastSyncStats, setLastSyncStats] = useState<{
+    sourceUsed?: string; nameUpdated?: number; ipUpdated?: number
+    portUpdated?: number; statusUpdated?: number; total?: number; synced?: number
+  } | null>(null)
+  const [isapDebugModal, setIsapDebugModal] = useState(false)
+  const [isapDebugData, setIsapDebugData] = useState<any>(null)
+  const [loadingIsapDebug, setLoadingIsapDebug] = useState(false)
 
   // Tabs data
   const [cameras, setCameras] = useState<{ fromNvr: IpCamera[]; fromDb: CameraType[] } | null>(null)
@@ -180,6 +188,44 @@ export function NVRDetailPage() {
     }
   }
 
+  const handleOnboard = async () => {
+    if (!id) return
+    try {
+      setOnboarding(true)
+      const res = await apiPost<any>(`/nvrs/${id}/onboard`)
+      const sc = res.syncCameras || {}
+      toast.success(
+        `Onboarding completado: ${sc.synced ?? 0} cámaras` +
+        (sc.nameUpdated ? ` · ${sc.nameUpdated} nombres` : '') +
+        (sc.ipUpdated ? ` · ${sc.ipUpdated} IPs` : '') +
+        ` [${sc.sourceUsed ?? '?'}]`
+      )
+      setLastSyncStats({ sourceUsed: sc.sourceUsed, nameUpdated: sc.nameUpdated, ipUpdated: sc.ipUpdated, portUpdated: sc.portUpdated, total: sc.total, synced: sc.synced })
+      await loadNvr()
+      setCameras(null)
+    } catch (e: any) {
+      const msg = e?.response?.data?.message || 'Error en onboarding'
+      toast.error(msg)
+    } finally {
+      setOnboarding(false)
+    }
+  }
+
+  const handleIsapDebug = async () => {
+    if (!id) return
+    setIsapDebugModal(true)
+    if (isapDebugData) return  // already loaded
+    try {
+      setLoadingIsapDebug(true)
+      const res = await apiGet<any>(`/nvrs/${id}/ip-camera-sources-debug`)
+      setIsapDebugData(res)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.message || 'Error al cargar diagnóstico ISAPI')
+    } finally {
+      setLoadingIsapDebug(false)
+    }
+  }
+
   const handleSyncCameras = async () => {
     if (!id) return
     try {
@@ -190,6 +236,7 @@ export function NVRDetailPage() {
         sourceUsed?: string; warning?: string; nameSource?: 'real' | 'none'; nameReason?: string
       }>(`/nvrs/${id}/sync-cameras`)
       setLastSyncResult(res)
+      setLastSyncStats({ sourceUsed: res.sourceUsed, nameUpdated: res.nameUpdated, ipUpdated: res.ipUpdated, portUpdated: res.portUpdated, statusUpdated: res.statusUpdated, total: res.total, synced: res.synced })
       if (res.warning) {
         toast.error(res.warning)
       } else {
@@ -238,6 +285,9 @@ export function NVRDetailPage() {
           `${res.nameUpdated} de ${res.total} nombres actualizados desde NVR [${res.sourceUsed ?? '?'}]` +
           (res.ipUpdated ? ` · ${res.ipUpdated} IPs` : '')
         )
+      }
+      if (!res.warning && (res.nameUpdated ?? 0) > 0) {
+        setLastSyncStats({ sourceUsed: res.sourceUsed, nameUpdated: res.nameUpdated, ipUpdated: res.ipUpdated, portUpdated: res.portUpdated, total: res.total, synced: res.synced })
       }
       await loadNvr()
       await loadCameras()
@@ -309,13 +359,17 @@ export function NVRDetailPage() {
         <div className="flex items-center gap-2">
           {isSupervisor && (
             <>
-              <button onClick={handleSync} disabled={syncing} className="btn-secondary text-xs">
+              <button onClick={handleOnboard} disabled={onboarding || syncing} className="btn-secondary text-xs" title="Detectar + sincronizar cámaras + validar RTSP">
+                {onboarding ? <Loader2 size={12} className="animate-spin" /> : <Zap size={12} />}
+                {onboarding ? 'Onboarding...' : 'Onboarding'}
+              </button>
+              <button onClick={handleSync} disabled={syncing || onboarding} className="btn-ghost text-xs">
                 {syncing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
                 {syncing ? 'Sincronizando...' : 'Sincronizar'}
               </button>
-              <button onClick={handleForceNamesSync} disabled={syncing} className="btn-ghost text-xs" title="Forzar resincronización de nombres reales desde el NVR">
-                <RefreshCw size={11} />
-                Nombres
+              <button onClick={handleIsapDebug} className="btn-ghost text-xs" title="Ver diagnóstico de endpoints ISAPI">
+                <Stethoscope size={11} />
+                Endpoints ISAPI
               </button>
               <button onClick={handleValidateHealth} disabled={validatingHealth} className="btn-ghost text-xs" title="Validar salud RTSP de todas las cámaras (detecta HEVC, 404, offline)">
                 {validatingHealth ? <Loader2 size={11} className="animate-spin" /> : <Activity size={11} />}
@@ -350,6 +404,22 @@ export function NVRDetailPage() {
         ))}
       </div>
 
+      {/* Sync stats banner */}
+      {lastSyncStats && (
+        <div className="flex items-center gap-3 px-3 py-1.5 bg-surface-800 border border-surface-700 rounded-lg text-xs text-surface-400">
+          <span className="font-medium text-surface-300">Último sync:</span>
+          {lastSyncStats.sourceUsed && <span className="font-mono text-brand-400">{lastSyncStats.sourceUsed}</span>}
+          {lastSyncStats.total != null && <span>{lastSyncStats.total} detectadas</span>}
+          {(lastSyncStats.nameUpdated ?? 0) > 0 && <span className="text-green-400">{lastSyncStats.nameUpdated} nombres</span>}
+          {(lastSyncStats.ipUpdated ?? 0) > 0 && <span className="text-green-400">{lastSyncStats.ipUpdated} IPs</span>}
+          {(lastSyncStats.portUpdated ?? 0) > 0 && <span>{lastSyncStats.portUpdated} puertos</span>}
+          {(lastSyncStats.statusUpdated ?? 0) > 0 && <span>{lastSyncStats.statusUpdated} estados</span>}
+          <button onClick={() => setLastSyncStats(null)} className="ml-auto text-surface-600 hover:text-surface-400">
+            <X size={10} />
+          </button>
+        </div>
+      )}
+
       {/* Tab Content */}
       {tab === 'summary' && <SummaryTab nvr={nvr} />}
       {tab === 'cameras' && (
@@ -379,6 +449,66 @@ export function NVRDetailPage() {
           result={diagResult}
           loading={diagLoading}
         />
+      )}
+
+      {/* Modal ISAPI Debug */}
+      {isapDebugModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="card w-full max-w-3xl p-6 animate-slide-in shadow-2xl max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-semibold text-surface-100">Diagnóstico de Endpoints ISAPI</h3>
+              <button onClick={() => setIsapDebugModal(false)} className="btn-ghost p-1"><X size={14} /></button>
+            </div>
+            {loadingIsapDebug ? (
+              <div className="flex-1 flex items-center justify-center py-12">
+                <Loader2 size={20} className="animate-spin text-surface-400" />
+                <span className="ml-2 text-sm text-surface-400">Probando endpoints...</span>
+              </div>
+            ) : isapDebugData ? (
+              <div className="overflow-auto flex-1 space-y-3">
+                <p className="text-xs text-surface-500">
+                  NVR: <span className="text-surface-300 font-mono">{isapDebugData.nvr?.ipAddress}:{isapDebugData.nvr?.port}</span>
+                </p>
+                {(isapDebugData.endpoints || []).map((ep: any, i: number) => (
+                  <div key={i} className={clsx(
+                    'rounded-lg p-3 border text-xs',
+                    ep.status === 200 ? 'border-green-800/50 bg-green-900/10' :
+                    ep.status === 401 || ep.status === 403 ? 'border-amber-800/50 bg-amber-900/10' :
+                    'border-surface-700 bg-surface-800/50'
+                  )}>
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className={clsx(
+                        'font-mono font-medium',
+                        ep.status === 200 ? 'text-green-400' : ep.status === 401 || ep.status === 403 ? 'text-amber-400' : 'text-red-400'
+                      )}>HTTP {ep.status ?? 'ERR'}</span>
+                      <span className="text-surface-300 font-mono truncate flex-1">{ep.endpoint}</span>
+                      {ep.count != null && <span className="text-surface-400">{ep.count} canales</span>}
+                    </div>
+                    {ep.conclusion && <p className="text-surface-400 mt-0.5">{ep.conclusion}</p>}
+                    {ep.error && <p className="text-red-400 mt-0.5">{ep.error}</p>}
+                    {ep.fields && ep.fields.length > 0 && (
+                      <p className="text-surface-500 mt-0.5">Campos: {ep.fields.join(', ')}</p>
+                    )}
+                    {ep.sample && (
+                      <p className="text-surface-500 mt-0.5 font-mono text-[10px] truncate">Muestra: {ep.sample}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-surface-500 py-8 text-center">No se pudo cargar el diagnóstico</p>
+            )}
+            <div className="mt-4 flex justify-end">
+              <button
+                onClick={() => { setIsapDebugData(null); handleIsapDebug() }}
+                className="btn-secondary text-xs mr-2"
+              >
+                <RefreshCw size={11} /> Re-probar
+              </button>
+              <button onClick={() => setIsapDebugModal(false)} className="btn-ghost text-xs">Cerrar</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

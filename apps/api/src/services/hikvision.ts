@@ -364,6 +364,19 @@ interface InputProxyEntry {
   _source: 'channels_secure' | 'channels' | 'status'
 }
 
+// Normalize body from any type (string, Buffer, object) to string
+function normalizeBodyToString(data: unknown): string {
+  if (Buffer.isBuffer(data)) return data.toString('utf8')
+  if (typeof data === 'string') return data
+  return ''
+}
+
+// Remove characters invalid in XML (null bytes, control chars except tab/LF/CR)
+function sanitizeXmlChars(str: string): string {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/ /g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F]/g, '')
+}
+
 // Parse InputProxyChannel XML or JSON body into an array of entries.
 // xmlGet() scans the whole block string so nested tags (e.g. inside
 // <sourceInputPortDescriptor>) are found correctly.
@@ -371,7 +384,7 @@ function parseInputProxyChannelBody(
   data: unknown,
   source: 'channels_secure' | 'channels',
 ): InputProxyEntry[] {
-  const bodyStr = typeof data === 'string' ? data : ''
+  const bodyStr = sanitizeXmlChars(normalizeBodyToString(data))
   const isXmlBody = bodyStr.trimStart().startsWith('<')
   const entries: InputProxyEntry[] = []
 
@@ -453,7 +466,7 @@ async function fetchInputProxyChannels(
         validateStatus: () => true,  // never throw on 4xx/5xx
         maxRedirects:   0,
       })
-      let body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '')
+      let body = sanitizeXmlChars(normalizeBodyToString(res.data) || JSON.stringify(res.data ?? ''))
 
       if (res.status === 401) {
         const wwwAuth = String(res.headers['www-authenticate'] || '')
@@ -467,7 +480,7 @@ async function fetchInputProxyChannels(
             validateStatus: () => true,
             maxRedirects:   0,
           })
-          body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '')
+          body = sanitizeXmlChars(normalizeBodyToString(res.data) || JSON.stringify(res.data ?? ''))
           console.info(`[InputProxy] ${label} digest→${res.status} bytes=${body.length} ct="${res.headers['content-type']}"`)
         } else if (wwwAuth.toLowerCase().startsWith('basic')) {
           // Basic auth fallback (rare)
@@ -478,7 +491,7 @@ async function fetchInputProxyChannels(
             validateStatus: () => true,
             maxRedirects:   0,
           })
-          body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '')
+          body = sanitizeXmlChars(normalizeBodyToString(res.data) || JSON.stringify(res.data ?? ''))
           console.info(`[InputProxy] ${label} basic→${res.status} bytes=${body.length}`)
         } else {
           console.warn(`[InputProxy] ${label} 401 but no Digest/Basic challenge: ${wwwAuth.slice(0, 100)}`)
@@ -489,20 +502,22 @@ async function fetchInputProxyChannels(
       }
 
       if (res.status !== 200) {
-        console.warn(`[InputProxy] ${label} HTTP ${res.status}: ${body.slice(0, 300)}`)
+        console.warn(`[InputProxy] ${nvr.ipAddress} ${label} HTTP=${res.status}: ${body.slice(0, 200)}`)
         continue
       }
 
       const hasChannels = body.includes('InputProxyChannel')
       if (!hasChannels) {
-        console.warn(`[InputProxy] ${label} 200 but no InputProxyChannel in body (bytes=${body.length}): ${body.slice(0, 300)}`)
+        console.warn(`[InputProxy] ${nvr.ipAddress} ${label} HTTP=200 bodyXml=${body.trimStart().startsWith('<')} bytes=${body.length} no InputProxyChannel: ${body.slice(0, 200)}`)
         continue
       }
 
+      const isXmlContent = body.trimStart().startsWith('<')
       const entries = parseInputProxyChannelBody(body, source)
       console.info(
-        `[InputProxy] ${label} OK: parsed=${entries.length}` +
-        ` first: ch${entries[0]?.channel ?? '?'} name="${entries[0]?.name ?? ''}" ip="${entries[0]?.ipAddress ?? ''}"`
+        `[InputProxy] ${nvr.ipAddress} ${label} HTTP=${res.status} bytes=${body.length}` +
+        ` bodyXml=${isXmlContent} channelsParsed=${entries.length}` +
+        (entries.length > 0 ? ` firstName="${entries[0]?.name ?? ''}" firstIp="${entries[0]?.ipAddress ?? ''}"` : '')
       )
       return { entries, variantUsed: label }
     } catch (e: any) {
