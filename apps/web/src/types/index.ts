@@ -76,6 +76,7 @@ export interface NVR {
   lastSeen?: string
   lastSyncAt?: string
   lastRtspOkAt?: string
+  isapIStatus?: 'available' | 'no_permission' | 'unsupported' | 'error' | 'unknown'
   createdAt: string
   cameras?: Camera[]
   hdds?: NvrHdd[]
@@ -162,6 +163,13 @@ export interface StreamInfo {
   channel: number
   nvrName: string
   warning?: { code: string; message: string }
+}
+
+export interface HeartbeatResponse {
+  streams: Record<string, { hls: string; webrtc: string; streamPath: string; channel?: number; nvrName?: string; warning?: { code: string; message: string } }>
+  errors: Record<string, { code: string; message: string; details?: string }>
+  startedIds: string[]   // cámaras iniciadas en este heartbeat (necesitan nuevo player key)
+  stoppedIds: string[]   // cámaras detenidas (ya no visibles en el view)
 }
 
 export interface CameraDiagnostics {

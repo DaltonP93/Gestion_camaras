@@ -80,6 +80,7 @@ model NVR {
   lastSyncAt     DateTime?
   lastErrorCode  String?
   lastError      String?
+  isapIStatus    String?  @default("unknown") // available | no_permission | unsupported | error | unknown
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 

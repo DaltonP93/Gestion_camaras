@@ -6,6 +6,7 @@ import {
   getStorageInfo, getNVRUsers, getDeviceInfo, rebootDevice,
   adoptIpCamera, getFreeChannels, debugGetCameraNameSources,
   createNVRUser, updateNVRUser, changeNVRUserPassword, deleteNVRUser,
+  testNVRConnection, getIpCameraSourcesDebug, probeInputProxy,
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -17,6 +18,25 @@ const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET 
 const encryptPassword = (p: string) => CryptoJS.AES.encrypt(p, ENCRYPTION_KEY).toString()
 const decryptPassword = (enc: string) => CryptoJS.AES.decrypt(enc, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
+function safeDecrypt(enc: string): string | null {
+  try {
+    const plain = CryptoJS.AES.decrypt(enc, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+    return plain || null
+  } catch {
+    return null
+  }
+}
+
+// Rechaza valores que claramente son máscaras/placeholders, no contraseñas reales.
+function isMaskedPassword(value: string): boolean {
+  if (!value) return false
+  // Solo puntos, bullets o asteriscos → placeholder visual
+  if (/^[•\*•]+$/.test(value)) return true
+  // 8 caracteres o menos, todos iguales → placeholder
+  if (value.length <= 12 && new Set(value.split('')).size === 1) return true
+  return false
+}
+
 // Strip debug/non-schema fields before passing a HikStorageDisk to Prisma
 function sanitizeDiskForDb(disk: any) {
   const { _rawCapacity, _rawFree, rawCapacity, rawFree, ...dbDisk } = disk
@@ -24,10 +44,11 @@ function sanitizeDiskForDb(disk: any) {
 }
 
 const connectionTestSchema = z.object({
+  nvrId:     z.string().optional(),   // Si está presente y no hay password, usa credencial guardada
   ipAddress: z.string().min(1),
   port:      z.number().int().min(1).max(65535).default(80),
   username:  z.string().min(1),
-  password:  z.string().min(1),
+  password:  z.string().optional(),
 })
 
 const nvrSchema = z.object({
@@ -48,47 +69,132 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
   // POST /api/nvrs/test-connection
   server.post('/test-connection', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
-    const data = connectionTestSchema.parse(request.body)
-    const fakeNvr = { id: 'test', ...data, rtspPort: 554, channels: 0, hddCount: 0, firmware: null } as any
+    const raw = connectionTestSchema.parse(request.body)
 
-    const status = await getNVRStatus(fakeNvr)
-    if (!status.online) {
-      const message = status.errorReason === 'auth'    ? 'Credenciales incorrectas (usuario o contraseña)'
-                    : status.errorReason === 'network' ? `No se pudo alcanzar ${data.ipAddress}:${data.port} — verifica IP, puerto y que el NVR esté encendido`
-                    :                                    'No se pudo conectar al NVR. Verifica IP, puerto y credenciales.'
-      return reply.status(503).send({ success: false, message })
+    // Resolve password: use provided value, or load from stored NVR when editing
+    let password = raw.password || ''
+    let passwordSource: 'provided' | 'stored' | 'missing' = 'provided'
+
+    if (isMaskedPassword(password)) {
+      server.log.warn(`[test-connection] contraseña con valor de máscara recibida — ignorando`)
+      password = ''
     }
 
-    return reply.send({ success: true, firmware: status.firmware, diskUsage: status.diskUsage })
+    if (!password && raw.nvrId) {
+      const storedNvr = await server.prisma.nVR.findUnique({ where: { id: raw.nvrId } })
+      if (!storedNvr) return reply.status(404).send({ success: false, message: 'NVR no encontrado' })
+      const dec = safeDecrypt(storedNvr.password)
+      if (!dec) {
+        server.log.error(`[test-connection] DECRYPT_ERROR nvrId=${raw.nvrId} name=${storedNvr.name}`)
+        return reply.status(422).send({
+          success: false,
+          errorCode: 'DECRYPT_ERROR',
+          message: 'La contraseña guardada no se puede descifrar. Vuelva a guardar la contraseña real del NVR.',
+        })
+      }
+      password = dec
+      passwordSource = 'stored'
+    }
+
+    if (!password) {
+      return reply.status(400).send({ success: false, errorCode: 'PASSWORD_MISSING', message: 'Ingresa la contraseña para probar la conexión' })
+    }
+
+    const data = { ipAddress: raw.ipAddress, port: raw.port, username: raw.username, password }
+    const result = await testNVRConnection(data)
+
+    server.log.info(`[test-connection] ${data.ipAddress}:${data.port} errorCode=${result.errorCode ?? 'none'} user=${data.username} passwordSource=${passwordSource} reachable=${result.reachable}`)
+
+    if (!result.reachable) {
+      const httpStatus = (result.errorCode === 'AUTH_FAILED') ? 422 : 503
+      return reply.status(httpStatus).send({
+        success: false,
+        errorCode: result.errorCode,
+        message: result.errorMessage,
+        hint: result.hint,
+        endpoints: result.endpoints,
+      })
+    }
+
+    return reply.send({
+      success: true,
+      firmware: result.firmware,
+      model: result.model,
+      serialNumber: result.serialNumber,
+      ...(result.errorCode ? { errorCode: result.errorCode, warning: result.errorMessage, hint: result.hint } : {}),
+      endpoints: result.endpoints,
+    })
   })
 
   // POST /api/nvrs/detect — Auto-detectar info del NVR
   server.post('/detect', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
-    const data = connectionTestSchema.parse(request.body)
+    const raw = connectionTestSchema.parse(request.body)
+
+    // Resolve password: use provided value, or load from stored NVR when editing
+    let password = raw.password || ''
+    let passwordSource: 'provided' | 'stored' | 'missing' = 'provided'
+
+    if (isMaskedPassword(password)) {
+      server.log.warn(`[detect] contraseña con valor de máscara recibida — ignorando`)
+      password = ''
+    }
+
+    if (!password && raw.nvrId) {
+      const storedNvr = await server.prisma.nVR.findUnique({ where: { id: raw.nvrId } })
+      if (!storedNvr) return reply.status(404).send({ success: false, message: 'NVR no encontrado' })
+      const dec = safeDecrypt(storedNvr.password)
+      if (!dec) {
+        server.log.error(`[detect] DECRYPT_ERROR nvrId=${raw.nvrId} name=${storedNvr.name}`)
+        return reply.status(422).send({
+          success: false,
+          errorCode: 'DECRYPT_ERROR',
+          message: 'La contraseña guardada no se puede descifrar. Vuelva a guardar la contraseña real del NVR.',
+        })
+      }
+      password = dec
+      passwordSource = 'stored'
+    }
+
+    if (!password) {
+      return reply.status(400).send({ success: false, errorCode: 'PASSWORD_MISSING', message: 'Ingresa la contraseña para auto-detectar' })
+    }
+
+    const data = { ipAddress: raw.ipAddress, port: raw.port, username: raw.username, password }
     const fakeNvr = { id: 'detect', ...data, rtspPort: 554, channels: 0, hddCount: 0, firmware: null } as any
 
     try {
-      const [status, info, channels] = await Promise.allSettled([
-        getNVRStatus(fakeNvr),
+      const [connResult, info, channels] = await Promise.allSettled([
+        testNVRConnection(data),
         getDeviceInfo(fakeNvr),
         getIpCameraList(fakeNvr),
       ])
 
-      const s = status.status === 'fulfilled' ? status.value : null
-      if (!s?.online) return reply.status(503).send({ success: false, message: 'No se pudo conectar' })
+      const conn = connResult.status === 'fulfilled' ? connResult.value : null
+
+      if (!conn?.reachable) {
+        const errorCode = conn?.errorCode ?? 'NETWORK_UNREACHABLE'
+        const message   = conn?.errorMessage ?? 'No se pudo conectar al NVR'
+        server.log.warn(`[detect] ${data.ipAddress}:${data.port} errorCode=${errorCode} user=${data.username} passwordSource=${passwordSource}`)
+        const httpStatus = errorCode === 'AUTH_FAILED' ? 422 : 503
+        return reply.status(httpStatus).send({
+          success: false, errorCode, message, hint: conn?.hint, endpoints: conn?.endpoints,
+        })
+      }
 
       const d = info.status === 'fulfilled' ? info.value : null
       const c = channels.status === 'fulfilled' ? channels.value : []
 
+      server.log.info(`[detect] ${data.ipAddress}:${data.port} ok model=${conn.model || d?.model} channels=${c.length || d?.channelCount}`)
       return reply.send({
         success: true,
-        model:           d?.model || '',
-        serialNumber:    d?.serialNumber || '',
-        firmware:        d?.firmware || s.firmware || '',
+        model:           d?.model || conn.model || '',
+        serialNumber:    d?.serialNumber || conn.serialNumber || '',
+        firmware:        d?.firmware || conn.firmware || '',
         encodingVersion: d?.encodingVersion || '',
         webVersion:      d?.webVersion || '',
-        channels:        c.length || d?.channelCount || 0,
+        channels:        c.length || d?.channelCount || conn.channelCount || 0,
         hddCount:        d?.hddCount || 0,
+        ...(conn.errorCode ? { warning: conn.errorMessage, hint: conn.hint } : {}),
       })
     } catch (err: any) {
       return reply.status(503).send({ success: false, message: err.message })
@@ -237,9 +343,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
     let disks: any[] = []
+    let storageSupported = true
+    let storageReason: string | undefined
+
     try {
       disks = await getStorageInfo(nvrDec as any)
-
       for (const disk of disks) {
         const dbDisk = sanitizeDiskForDb(disk)
         await server.prisma.nvrHdd.upsert({
@@ -249,11 +357,26 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         })
       }
     } catch (e: any) {
-      server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
-      return reply.status(500).send({ message: 'No se pudo sincronizar almacenamiento del NVR. Ver logs del servidor.' })
+      if ((e as any).unsupported) {
+        storageSupported = false
+        const httpSt = (e as any).httpStatus
+        const permDenied = (e as any).permissionDenied
+        storageReason = permDenied
+          ? `Usuario sin permiso para leer almacenamiento (HTTP ${httpSt}) — usa un usuario Administrador del NVR`
+          : `No soportado por este modelo/firmware (HTTP ${httpSt})`
+        server.log.warn(`[storage] ${nvr.name} (${nvr.ipAddress}): ${e.message}`)
+      } else {
+        server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
+        return reply.status(500).send({ message: 'No se pudo sincronizar almacenamiento del NVR. Ver logs del servidor.' })
+      }
     }
 
-    return reply.send({ disks, syncedAt: new Date().toISOString() })
+    return reply.send({
+      disks,
+      supported: storageSupported,
+      ...(storageReason ? { reason: storageReason } : {}),
+      syncedAt: new Date().toISOString(),
+    })
   })
 
   // GET /api/nvrs/:id/users — Usuarios configurados en el NVR
@@ -264,9 +387,31 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
     const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
-    const users  = await getNVRUsers(nvrDec as any)
+    let users: any[] = []
+    let usersSupported = true
+    let usersReason: string | undefined
 
-    return reply.send({ users })
+    try {
+      users = await getNVRUsers(nvrDec as any)
+    } catch (e: any) {
+      if ((e as any).unsupported) {
+        usersSupported = false
+        const httpSt = (e as any).httpStatus
+        const permDenied = (e as any).permissionDenied
+        usersReason = permDenied
+          ? `Usuario sin permiso para gestión de usuarios (HTTP ${httpSt}) — usa un usuario Administrador del NVR`
+          : `No soportado por este modelo/firmware (HTTP ${httpSt})`
+        server.log.warn(`[users] ${nvr.name} (${nvr.ipAddress}): ${e.message}`)
+      } else {
+        throw e
+      }
+    }
+
+    return reply.send({
+      users,
+      supported: usersSupported,
+      ...(usersReason ? { reason: usersReason } : {}),
+    })
   })
 
   // GET /api/nvrs/:id/cameras — Cámaras IP del NVR desde ISAPI
@@ -394,18 +539,25 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    // 6. HDDs
-    const disks = await getStorageInfo(nvrDec as any)
-    for (const disk of disks) {
-      try {
-        const dbDisk = sanitizeDiskForDb(disk)
-        await server.prisma.nvrHdd.upsert({
-          where:  { nvrId_diskNumber: { nvrId: id, diskNumber: dbDisk.diskNumber } },
-          create: { nvrId: id, ...dbDisk, lastSyncAt: new Date() },
-          update: { ...dbDisk, lastSyncAt: new Date() },
-        })
-        result.hdds++
-      } catch {}
+    // 6. HDDs — algunos modelos no soportan /ISAPI/ContentMgmt/Storage (403/404/405)
+    try {
+      const disks = await getStorageInfo(nvrDec as any)
+      for (const disk of disks) {
+        try {
+          const dbDisk = sanitizeDiskForDb(disk)
+          await server.prisma.nvrHdd.upsert({
+            where:  { nvrId_diskNumber: { nvrId: id, diskNumber: dbDisk.diskNumber } },
+            create: { nvrId: id, ...dbDisk, lastSyncAt: new Date() },
+            update: { ...dbDisk, lastSyncAt: new Date() },
+          })
+          result.hdds++
+        } catch {}
+      }
+    } catch (e: any) {
+      if (!(e as any).unsupported) {
+        result.errors.push(`HDDs: ${e.message}`)
+      }
+      // unsupported: modelo no soporta storage ISAPI — continuar sync sin HDDs
     }
 
     // 7. Trigger async RTSP health check for cameras that need it (fire and forget).
@@ -437,6 +589,235 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     await AuditAction(server.prisma, request.user.sub, 'NVR_SYNCED', id, request, result)
 
     return reply.send({ success: true, ...result, syncedAt: new Date().toISOString() })
+  })
+
+  // POST /api/nvrs/:id/sync-cameras — Sincronizar metadatos de cámaras IP desde NVR
+  server.post('/:id/sync-cameras', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const decPass = safeDecrypt(nvr.password)
+    if (!decPass) {
+      return reply.status(422).send({ success: false, errorCode: 'DECRYPT_ERROR', message: 'Contraseña no descifrable. Vuelve a guardar las credenciales del NVR.' })
+    }
+    const nvrDec = { ...nvr, password: decPass }
+
+    // Probe InputProxy first to determine ISAPI access level.
+    // probeInputProxy never throws — returns semantic status string.
+    const isapIStatus = await probeInputProxy(nvrDec as any)
+    server.log.info(`[sync-cameras] ${nvr.name} InputProxy probe: ${isapIStatus}`)
+
+    // Persist ISAPI status on NVR so frontend can show semantic states without another API call
+    await server.prisma.nVR.update({ where: { id }, data: { isapIStatus } })
+
+    if (isapIStatus === 'no_permission') {
+      return reply.status(403).send({
+        success: false,
+        errorCode: 'ISAPI_PERMISSION_DENIED',
+        isapIStatus,
+        message: 'Sin permiso ISAPI (HTTP 403/401) para leer Cámara IP. Usa un usuario Administrador del NVR.',
+      })
+    }
+
+    if (isapIStatus === 'unsupported') {
+      server.log.info(`[sync-cameras] ${nvr.name} InputProxy no soportado — continuando con fallbacks (VideoInput / Streaming / getNVRChannels)`)
+    }
+
+    // isapIStatus === 'available' | 'unsupported' | 'error' | 'unknown' — proceed with getIpCameraList
+    // getIpCameraList has its own fallback chain: InputProxy → VideoInput → Streaming → getNVRChannels
+    const ipCams = await getIpCameraList(nvrDec as any)
+
+    // Log first 5 cameras so we can diagnose name/source issues from server logs
+    server.log.info(
+      `[sync-cameras] ${nvr.name} ipCams sample: ${ipCams.slice(0, 5).map(c => `ch${c.channel}:src=${c.metadataSource}:name="${c.name}"`).join(', ')}`
+    )
+
+    const isPlaceholder = (name?: string | null): boolean => {
+      if (!name) return true
+      const n = name.trim()
+      return (
+        /^canal\s+\d+$/i.test(n) ||
+        /^c[aá]mara\s+\d+$/i.test(n) ||
+        /^camera\s*\d*$/i.test(n) ||
+        /^ipcamera\s*\d*$/i.test(n) ||
+        /^d\d+$/i.test(n) ||
+        /^channel\s+\d+$/i.test(n) ||
+        /^\d{3,4}$/.test(n) ||
+        n === ''
+      )
+    }
+
+    const syncLog: Array<{ channel: number; source: string; changes: string[] }> = []
+    let synced = 0
+    let updatedMetadata = 0
+    let preservedMetadata = 0
+    let ipUpdated = 0
+    let portUpdated = 0
+    let nameUpdated = 0
+    let nameCandidates = 0
+    let skippedNameBecauseEmpty = 0
+    let skippedNameBecauseNotPlaceholder = 0
+    let statusUpdated = 0
+    let skipped = 0
+
+    const forceNames = (request.query as any).forceNames === 'true' || (request.body as any)?.forceNames === true
+
+    for (const cam of ipCams) {
+      const existing = await server.prisma.camera.findUnique({
+        where: { nvrId_channel: { nvrId: id, channel: cam.channel } },
+        select: { id: true, name: true, ipAddress: true, managementPort: true, protocol: true },
+      })
+      if (!existing) continue
+
+      const changes: Partial<{
+        name: string; ipAddress: string; managementPort: number
+        protocol: string; securityStatus: string; onlineInNvr: boolean; channelCode: string; lastSyncAt: Date
+      }> = {}
+      const changeLog: string[] = []
+
+      // Only InputProxy (channels or status endpoint) carries real IP/port/protocol/status data.
+      // VideoInput and Streaming provide names only; fallback provides nothing reliable.
+      const isFromInputProxy = cam.metadataSource === 'inputproxy_channels_secure' || cam.metadataSource === 'inputproxy_channels' || cam.metadataSource === 'inputproxy_status'
+      const hasRealName      = isFromInputProxy || cam.metadataSource === 'videoinput' || cam.metadataSource === 'streaming'
+
+      // Name: update when real name available AND (DB has placeholder OR forceNames=true)
+      if (hasRealName) {
+        if (!cam.name || isPlaceholder(cam.name)) {
+          skippedNameBecauseEmpty++
+          server.log.debug(`[sync-cameras] ch${cam.channel} name skip: cam.name="${cam.name}" is empty/placeholder (src=${cam.metadataSource})`)
+        } else if (!isPlaceholder(existing.name) && !forceNames) {
+          skippedNameBecauseNotPlaceholder++
+          server.log.debug(`[sync-cameras] ch${cam.channel} name skip: existing="${existing.name}" not placeholder, forceNames=${forceNames}`)
+        } else {
+          nameCandidates++
+          changes.name = cam.name
+          changeLog.push(`name: "${cam.name}"`)
+          nameUpdated++
+          server.log.info(`[sync-cameras] ch${cam.channel} name: "${existing.name}" → "${cam.name}" (src=${cam.metadataSource} forceNames=${forceNames})`)
+        }
+      }
+
+      // IP: only from InputProxy — other sources don't have IP at all
+      if (isFromInputProxy && cam.ipAddress && cam.ipAddress !== existing.ipAddress) {
+        changes.ipAddress = cam.ipAddress
+        changeLog.push(`ip: ${cam.ipAddress}`)
+        ipUpdated++
+      }
+
+      // Port: only from InputProxy AND only when an ipAddress is also known
+      // (port alone without IP is meaningless and would show "—:8000" in UI)
+      if (isFromInputProxy && cam.managementPort > 0 && cam.ipAddress && cam.managementPort !== existing.managementPort) {
+        changes.managementPort = cam.managementPort
+        changeLog.push(`port: ${cam.managementPort}`)
+        portUpdated++
+      }
+
+      // Protocol: only from InputProxy
+      if (isFromInputProxy && cam.protocol && cam.protocol !== existing.protocol) {
+        changes.protocol = cam.protocol
+        changeLog.push(`protocol: ${cam.protocol}`)
+      }
+
+      // onlineInNvr: only from InputProxy (status is set by InputProxy status endpoint)
+      const statusStr = (cam.status || '').toLowerCase()
+      if (isFromInputProxy && (statusStr === 'online' || statusStr === 'offline')) {
+        changes.onlineInNvr = statusStr === 'online'
+        changeLog.push(`onlineInNvr: ${changes.onlineInNvr}`)
+        statusUpdated++
+      }
+
+      // securityStatus: only from InputProxy
+      if (isFromInputProxy && (cam.passwordStatus || cam.chanDetectResult)) {
+        changes.securityStatus = cam.passwordStatus || cam.chanDetectResult || ''
+        changeLog.push(`securityStatus: ${changes.securityStatus}`)
+      }
+
+      // channelCode and lastSyncAt are always written — derived from channel number, always reliable
+      changes.channelCode = cam.channelCode || `D${cam.channel}`
+      changes.lastSyncAt = new Date()
+
+      await server.prisma.camera.update({ where: { id: existing.id }, data: changes as any })
+
+      if (changeLog.length > 0) {
+        syncLog.push({ channel: cam.channel, source: cam.metadataSource, changes: changeLog })
+        synced++
+        if (isFromInputProxy) updatedMetadata++
+      } else {
+        if (!isFromInputProxy) preservedMetadata++
+        skipped++
+      }
+    }
+
+    // Determine the best metadata source used across all cameras
+    const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
+    const usedSources = new Set(ipCams.map(c => c.metadataSource))
+    const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
+
+    const hasRealIpSource = sourceUsed === 'inputproxy_channels_secure' || sourceUsed === 'inputproxy_channels' || sourceUsed === 'inputproxy_status'
+    const warning = !hasRealIpSource
+      ? `Sin acceso a datos IP desde ISAPI (fuente: ${sourceUsed}). IP, puerto, protocolo y estado no se actualizaron — se conservaron datos existentes. Use el diagnóstico de endpoints para identificar el endpoint correcto.`
+      : undefined
+
+    // Determine if real names were synced or if this model lacks a name source
+    const nameSource: 'real' | 'none' = nameUpdated > 0 ? 'real' : 'none'
+    let nameReason: string | undefined
+    if (nameSource === 'none') {
+      if (sourceUsed === 'inputproxy_status') {
+        nameReason = '/InputProxy/channels/status no incluye nombres de cámara. /InputProxy/channels devuelve error en este modelo. VideoInput/inputs/channels no está disponible. Los nombres deben configurarse manualmente.'
+      } else if (sourceUsed === 'inputproxy_channels_secure' || sourceUsed === 'inputproxy_channels') {
+        nameReason = 'Los nombres en el NVR son genéricos (Canal 1, D1…). Configure nombres reales en la interfaz del NVR.'
+      } else if (sourceUsed === 'videoinput' || sourceUsed === 'streaming') {
+        nameReason = 'VideoInput/Streaming solo devuelven nombres genéricos en este modelo.'
+      } else {
+        nameReason = 'Ningún endpoint ISAPI disponible expone nombres reales de cámara.'
+      }
+    }
+
+    server.log.info(`[sync-cameras] ${nvr.name} sourceUsed=${sourceUsed} nameCandidates=${nameCandidates} nameUpdated=${nameUpdated} ipUpdated=${ipUpdated} portUpdated=${portUpdated} statusUpdated=${statusUpdated} skipped=${skipped} total=${ipCams.length} isapIStatus=${isapIStatus} forceNames=${forceNames}`)
+    await AuditAction(server.prisma, request.user.sub, 'NVR_CAMERAS_SYNCED', id, request, { synced, total: ipCams.length, isapIStatus, sourceUsed, ipUpdated, nameUpdated })
+
+    return reply.send({
+      success: true,
+      total: ipCams.length,
+      synced,
+      ipUpdated,
+      portUpdated,
+      nameUpdated,
+      nameCandidates,
+      skippedNameBecauseEmpty,
+      skippedNameBecauseNotPlaceholder,
+      statusUpdated,
+      skipped,
+      updatedMetadata,
+      preservedMetadata,
+      sourceUsed,
+      isapIStatus,
+      nameSource,
+      nameReason,
+      warning,
+      log: syncLog,
+      syncedAt: new Date().toISOString(),
+    })
+  })
+
+  // GET /api/nvrs/:id/ip-camera-sources-debug — Diagnóstico de endpoints ISAPI
+  server.get('/:id/ip-camera-sources-debug', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const plain = safeDecrypt(nvr.password)
+    if (!plain) {
+      return reply.status(422).send({ success: false, errorCode: 'DECRYPT_ERROR', message: 'Contraseña no descifrable. Vuelve a guardar las credenciales del NVR.' })
+    }
+
+    const nvrDec = { ...nvr, password: plain }
+    const results = await getIpCameraSourcesDebug(nvrDec as any)
+
+    return reply.send({ nvr: { id: nvr.id, name: nvr.name, ipAddress: nvr.ipAddress, port: nvr.port }, endpoints: results })
   })
 
   // POST /api/nvrs/:id/sync-streams — Solo re-registrar streams en MediaMTX
@@ -577,6 +958,155 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({ success: true, message: 'NVR reiniciando...' })
   })
 
+  // POST /api/nvrs/:id/onboard — Pipeline completo de onboarding (detect + sync + validate)
+  // Llamado automáticamente tras crear una NVR nueva, o manualmente desde el detalle.
+  server.post('/:id/onboard', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const decPass = safeDecrypt(nvr.password)
+    if (!decPass) {
+      return reply.status(422).send({ success: false, errorCode: 'DECRYPT_ERROR', message: 'Contraseña no descifrable. Vuelve a guardar las credenciales del NVR.' })
+    }
+    const nvrDec = { ...nvr, password: decPass }
+    const result: Record<string, any> = {}
+
+    // Step 1: Connection test
+    const conn = await testNVRConnection(nvrDec as any).catch(() => null)
+    result.connection = { ok: conn?.reachable ?? false, errorCode: conn?.errorCode }
+    if (!conn?.reachable) {
+      server.log.warn(`[onboard] ${nvr.name} (${nvr.ipAddress}) connection failed: ${conn?.errorCode ?? 'NETWORK_UNREACHABLE'}`)
+    }
+
+    // Step 2: Device info
+    const info = await getDeviceInfo(nvrDec as any).catch(() => null)
+    if (info) {
+      await server.prisma.nVR.update({
+        where: { id },
+        data: {
+          firmware:        info.firmware        || undefined,
+          encodingVersion: info.encodingVersion || undefined,
+          webVersion:      info.webVersion      || undefined,
+          online:          conn?.reachable ?? true,
+          lastSeen:        conn?.reachable ? new Date() : undefined,
+          lastSyncAt:      new Date(),
+          lastError:       conn?.reachable ? null : undefined,
+        },
+      })
+      result.deviceInfo = { model: info.model, firmware: info.firmware, channels: info.channelCount, hdds: info.hddCount }
+    }
+
+    // Step 3: ISAPI probe
+    const isapIStatus = await probeInputProxy(nvrDec as any)
+    await server.prisma.nVR.update({ where: { id }, data: { isapIStatus } })
+    result.isapIStatus = isapIStatus
+
+    // Step 4: Sync cameras from ISAPI
+    const ipCams = await getIpCameraList(nvrDec as any)
+    const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
+    const usedSources = new Set(ipCams.map((c: any) => c.metadataSource))
+    const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
+
+    const isPlaceholder = (name?: string | null): boolean => {
+      if (!name) return true
+      const n = name.trim()
+      return /^canal\s+\d+$/i.test(n) || /^c[aá]mara\s+\d+$/i.test(n) || /^camera\s*\d*$/i.test(n) ||
+             /^ipcamera\s*\d*$/i.test(n) || /^d\d+$/i.test(n) || /^channel\s+\d+$/i.test(n) ||
+             /^\d{3,4}$/.test(n) || n === ''
+    }
+
+    let nameUpdated = 0, ipUpdated = 0, portUpdated = 0, camerasSynced = 0
+
+    for (const cam of ipCams) {
+      const onlineInNvr = (cam.status || '').toLowerCase() === 'online'
+      const isFromInputProxy = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status'].includes(cam.metadataSource)
+
+      try {
+        const existing = await server.prisma.camera.findUnique({
+          where: { nvrId_channel: { nvrId: id, channel: cam.channel } },
+        })
+
+        const updates: any = { channelCode: cam.channelCode || `D${cam.channel}`, lastSyncAt: new Date() }
+
+        if (cam.name && !isPlaceholder(cam.name)) {
+          updates.name = cam.name
+          if (!existing || isPlaceholder(existing.name)) nameUpdated++
+        }
+        if (isFromInputProxy) {
+          if (cam.ipAddress && cam.ipAddress !== existing?.ipAddress) { updates.ipAddress = cam.ipAddress; if (existing) ipUpdated++ }
+          if (cam.managementPort > 0 && cam.ipAddress) { updates.managementPort = cam.managementPort; if (existing && cam.managementPort !== existing.managementPort) portUpdated++ }
+          if (cam.protocol) updates.protocol = cam.protocol
+          if (cam.securityStatus) updates.securityStatus = cam.securityStatus
+          updates.onlineInNvr = onlineInNvr
+          if (onlineInNvr) updates.online = true
+        }
+
+        if (existing) {
+          await server.prisma.camera.update({ where: { id: existing.id }, data: updates })
+        } else {
+          await server.prisma.camera.create({
+            data: {
+              nvrId: id, channel: cam.channel,
+              name: (!cam.name || isPlaceholder(cam.name)) ? `Canal ${cam.channel}` : cam.name,
+              ...updates,
+            },
+          })
+        }
+        camerasSynced++
+      } catch {}
+    }
+
+    // If no cameras from ISAPI and none in DB, create placeholders
+    const dbCameraCount = await server.prisma.camera.count({ where: { nvrId: id } })
+    if (dbCameraCount === 0) {
+      const channelCount = info?.channelCount || nvr.channels
+      const cameraData = Array.from({ length: channelCount }, (_, i) => ({
+        nvrId: id, channel: i + 1, channelCode: `D${i + 1}`, name: `Canal ${i + 1}`,
+      }))
+      await server.prisma.camera.createMany({ data: cameraData, skipDuplicates: true })
+      camerasSynced = channelCount
+    }
+
+    result.syncCameras = { total: ipCams.length, synced: camerasSynced, nameUpdated, ipUpdated, portUpdated, sourceUsed }
+
+    // Step 5: HDDs
+    try {
+      const disks = await getStorageInfo(nvrDec as any)
+      for (const disk of disks) {
+        const dbDisk = sanitizeDiskForDb(disk)
+        await server.prisma.nvrHdd.upsert({
+          where:  { nvrId_diskNumber: { nvrId: id, diskNumber: dbDisk.diskNumber } },
+          create: { nvrId: id, ...dbDisk, lastSyncAt: new Date() },
+          update: { ...dbDisk, lastSyncAt: new Date() },
+        })
+      }
+      result.storage = { hdds: disks.length }
+    } catch {
+      result.storage = { hdds: 0, reason: 'No soportado por este modelo' }
+    }
+
+    // Step 6: RTSP health validation (async)
+    const camerasToProbe = await server.prisma.camera.findMany({ where: { nvrId: id, active: true }, include: { nvr: true } })
+    if (camerasToProbe.length > 0) {
+      Promise.all(camerasToProbe.map(cam =>
+        validateAndUpdateCameraHealth(server.prisma, cam.nvr as any, cam as any).catch(() => {})
+      )).catch(() => {})
+    }
+    result.rtspValidation = { validating: camerasToProbe.length, async: true }
+
+    // Step 7: Publish streams
+    const allCameras = await server.prisma.camera.findMany({ where: { nvrId: id, active: true } })
+    publishAllStreams(nvrDec as any, allCameras).catch(() => {})
+    result.streams = { published: allCameras.length }
+
+    server.log.info(`[onboard] ${nvr.name} (${nvr.ipAddress}): cameras=${camerasSynced} names=${nameUpdated} ips=${ipUpdated} ports=${portUpdated} source=${sourceUsed} isapi=${isapIStatus}`)
+    await AuditAction(server.prisma, request.user.sub, 'NVR_ONBOARDED', id, request, result)
+
+    return reply.send({ success: true, nvrId: id, ...result })
+  })
+
   // POST /api/nvrs — Crear NVR
   server.post('/', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const data = nvrSchema.parse(request.body)
@@ -585,16 +1115,61 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       data: { ...data, password: encryptPassword(data.password), location: data.location || null },
     })
 
+    // Create placeholder cameras immediately so the NVR is usable right away.
+    // The onboarding pipeline (async below) will overwrite them with real ISAPI data.
     const cameraData = Array.from({ length: data.channels }, (_, i) => ({
       nvrId: nvr.id, channel: i + 1, channelCode: `D${i + 1}`, name: `Canal ${i + 1}`,
     }))
     await server.prisma.camera.createMany({ data: cameraData })
 
-    const cameras   = await server.prisma.camera.findMany({ where: { nvrId: nvr.id } })
-    const nvrDec    = { ...nvr, password: data.password }
-    publishAllStreams(nvrDec as any, cameras).catch(() => {})
-
     await AuditAction(server.prisma, request.user.sub, 'NVR_CREATED', nvr.id, request)
+
+    // Fire-and-forget onboarding: sync real camera data, HDDs, RTSP health.
+    // Uses the plaintext password from the current request (no decrypt needed).
+    const nvrDec = { ...nvr, password: data.password }
+    ;(async () => {
+      try {
+        const ipCams = await getIpCameraList(nvrDec as any)
+        const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
+        const usedSources = new Set(ipCams.map((c: any) => c.metadataSource))
+        const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
+
+        const isPlaceholder = (n?: string | null) => !n || /^canal\s+\d+$/i.test(n.trim()) || /^d\d+$/i.test(n.trim()) || /^camera\s*\d*$/i.test(n.trim()) || /^ipcamera\s*\d*$/i.test(n.trim()) || /^channel\s+\d+$/i.test(n.trim()) || /^\d{3,4}$/.test(n.trim())
+        const isFromInputProxy = (src: string) => ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status'].includes(src)
+
+        for (const cam of ipCams) {
+          const existing = await server.prisma.camera.findUnique({
+            where: { nvrId_channel: { nvrId: nvr.id, channel: cam.channel } },
+          })
+          if (!existing) continue
+          const updates: any = { channelCode: cam.channelCode || `D${cam.channel}`, lastSyncAt: new Date() }
+          if (cam.name && !isPlaceholder(cam.name)) updates.name = cam.name
+          if (isFromInputProxy(cam.metadataSource)) {
+            if (cam.ipAddress) updates.ipAddress = cam.ipAddress
+            if (cam.managementPort > 0 && cam.ipAddress) updates.managementPort = cam.managementPort
+            if (cam.protocol) updates.protocol = cam.protocol
+            if (cam.securityStatus) updates.securityStatus = cam.securityStatus
+            const online = (cam.status || '').toLowerCase() === 'online'
+            updates.onlineInNvr = online
+            if (online) updates.online = true
+          }
+          await server.prisma.camera.update({ where: { id: existing.id }, data: updates }).catch(() => {})
+        }
+
+        const cameras = await server.prisma.camera.findMany({ where: { nvrId: nvr.id, active: true }, include: { nvr: true } })
+        await publishAllStreams(nvrDec as any, cameras).catch(() => {})
+
+        // RTSP health validation
+        await Promise.all(cameras.map(cam =>
+          validateAndUpdateCameraHealth(server.prisma, cam.nvr as any, cam as any).catch(() => {})
+        )).catch(() => {})
+
+        server.log.info(`[nvr-create] ${nvr.name} (${nvr.ipAddress}) onboarding done: ipCams=${ipCams.length} source=${sourceUsed}`)
+      } catch (err: any) {
+        server.log.warn(`[nvr-create] ${nvr.name} onboarding error: ${err?.message}`)
+      }
+    })()
+
     return reply.status(201).send({ ...nvr, password: undefined })
   })
 
@@ -603,17 +1178,37 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const { id } = request.params as { id: string }
     const data = nvrSchema.partial().parse(request.body)
 
+    const existing = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!existing) return reply.status(404).send({ message: 'NVR no encontrado' })
+
     const updateData: any = { ...data }
-    if (data.password) updateData.password = encryptPassword(data.password)
+
+    if (data.password) {
+      if (isMaskedPassword(data.password)) {
+        return reply.status(400).send({
+          success: false,
+          errorCode: 'MASKED_PASSWORD',
+          message: 'Se recibió un valor de máscara como contraseña. Ingresa la contraseña real o deja el campo vacío.',
+        })
+      }
+      updateData.password = encryptPassword(data.password)
+    } else {
+      // Never overwrite existing password if field is blank
+      delete updateData.password
+    }
 
     const nvr = await server.prisma.nVR.update({ where: { id }, data: updateData })
     await AuditAction(server.prisma, request.user.sub, 'NVR_UPDATED', nvr.id, request)
 
     const cameras  = await server.prisma.camera.findMany({ where: { nvrId: id, active: true } })
     const plainPass = data.password ? data.password : decryptPassword(nvr.password)
-    publishAllStreams({ ...nvr, password: plainPass } as any, cameras).catch(() => {})
+    if (plainPass) {
+      publishAllStreams({ ...nvr, password: plainPass } as any, cameras).catch(() => {})
+    } else {
+      server.log.error(`[nvr-update] DECRYPT_ERROR para NVR ${nvr.id} — streams no re-publicados. Verifica NVR_CREDENTIAL_KEY.`)
+    }
 
-    return reply.send({ ...nvr, password: undefined })
+    return reply.send({ ...nvr, password: undefined, passwordSaved: !!data.password })
   })
 
   // DELETE /api/nvrs/:id

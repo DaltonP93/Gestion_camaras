@@ -4,13 +4,34 @@ import cron from 'node-cron'
 import type { FastifyInstance } from 'fastify'
 import { getNVRStatus, getNVRChannels } from '../services/hikvision'
 import { broadcastAlert } from '../routes/websocket'
-import { publishAllStreams } from '../services/stream'
+import { publishStream, getStreamPath, listRegisteredConfigPaths, clearRegisteredPath } from '../services/stream'
 import { sendAlertNotification } from '../services/notification.service'
 import { cleanupIdleSessions } from '../services/stream-manager'
 import CryptoJS from 'crypto-js'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+
+function decryptPass(p: string): string | null {
+  try {
+    const plain = CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+    return plain || null  // CryptoJS returns '' on wrong key — treat as failure
+  } catch {
+    return null
+  }
+}
+
+// Throttle DECRYPT_ERROR logs: solo una vez cada 10 minutos por NVR
+const decryptErrorLastLog = new Map<string, number>()
+const DECRYPT_ERROR_LOG_INTERVAL_MS = 10 * 60 * 1000
+
+function logDecryptError(server: FastifyInstance, nvrId: string, nvrName: string, context: string) {
+  const now = Date.now()
+  const last = decryptErrorLastLog.get(nvrId) ?? 0
+  if (now - last >= DECRYPT_ERROR_LOG_INTERVAL_MS) {
+    decryptErrorLastLog.set(nvrId, now)
+    server.log.error(`[${context}] DECRYPT_ERROR para NVR ${nvrName} (${nvrId}) — contraseña no descifrable. Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales del NVR.`)
+  }
+}
 
 export function startHealthWorker(server: FastifyInstance) {
   // Verificar estado de NVRs cada 60 segundos
@@ -23,7 +44,12 @@ export function startHealthWorker(server: FastifyInstance) {
 
       for (const nvr of nvrs) {
         try {
-          const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
+          const plainPass = decryptPass(nvr.password)
+          if (!plainPass) {
+            logDecryptError(server, nvr.id, nvr.name, 'healthWorker')
+            continue
+          }
+          const nvrDecrypted = { ...nvr, password: plainPass }
           const status = await getNVRStatus(nvrDecrypted as any)
 
           if (!status.online) {
@@ -144,15 +170,41 @@ export function startHealthWorker(server: FastifyInstance) {
   })
 
   // Re-registrar paths en MediaMTX cada 5 minutos (recupera reinicios de mediamtx)
+  // Solo registra paths que faltan en MediaMTX — evita spam "path already exists" /
+  // "reloading configuration" cuando los paths ya existen con la config correcta.
   cron.schedule('*/5 * * * *', async () => {
     try {
+      // Obtener qué paths tiene MediaMTX configurados actualmente.
+      // Si la API no responde (null), saltar este ciclo sin hacer nada.
+      const mediamtxPaths = await listRegisteredConfigPaths()
+      if (mediamtxPaths === null) return  // MediaMTX no disponible
+
       const nvrs = await server.prisma.nVR.findMany({
         where: { active: true },
         include: { cameras: { where: { active: true } } },
       })
+
+      let registered = 0
       for (const nvr of nvrs) {
-        const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
-        await publishAllStreams(nvrDecrypted as any, nvr.cameras)
+        const plainPass = decryptPass(nvr.password)
+        if (!plainPass) {
+          logDecryptError(server, nvr.id, nvr.name, 'healthWorker:streams')
+          continue
+        }
+        const nvrDecrypted = { ...nvr, password: plainPass }
+        for (const camera of nvr.cameras) {
+          const path = getStreamPath(nvrDecrypted as any, camera)
+          if (!mediamtxPaths.has(path)) {
+            // Path ausente en MediaMTX (p.ej. reinicio de MediaMTX) — re-registrar
+            clearRegisteredPath(path)  // invalidar cache local para forzar POST
+            await publishStream(nvrDecrypted as any, camera)
+            registered++
+          }
+        }
+      }
+
+      if (registered > 0) {
+        server.log.info(`[healthWorker] ${registered} path(s) re-registrados en MediaMTX tras reinicio`)
       }
     } catch {
       // Silencioso — mediamtx puede estar temporalmente caído

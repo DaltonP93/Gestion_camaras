@@ -51,7 +51,7 @@ api.interceptors.response.use(
     // Estos endpoints manejan sus propios errores — no mostrar toast global
     const isSilentEndpoint = url.includes('/nvrs/test-connection') || url.includes('/nvrs/detect')
 
-    if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint) {
+    if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint && !isSilentEndpoint) {
       originalRequest._retry = true
       try {
         await refreshAccessToken()

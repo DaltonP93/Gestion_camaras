@@ -25,16 +25,27 @@ const BLOCKED_HEALTH_STATUSES = new Set([
 interface StreamSession {
   cameraId: string
   userId: string
+  viewId: string                  // identificador de pestaña/view del navegador
+  streamType: 'sub' | 'main'      // sub = grid (H264 640p), main = focus/fullscreen (HD, puede ser HEVC)
   streamPath: string
   startedAt: Date
-  lastSeenAt: Date
+  lastHeartbeat: Date             // actualizado por touchSession o touchView
 }
 
 // En memoria — se pierde al reiniciar (intencional: el frontend reconecta)
-const sessions = new Map<string, StreamSession>() // key: `${userId}:${cameraId}`
+// key: `${userId}:${cameraId}:${streamType}` — permite sub y main simultáneos
+const sessions = new Map<string, StreamSession>()
 
-function sessionKey(userId: string, cameraId: string) {
-  return `${userId}:${cameraId}`
+// Per-view tracking: qué cámaras pertenecen a qué view (solo sub streams — main es explícito)
+const viewCameras   = new Map<string, Set<string>>() // key: `${userId}:${viewId}`
+const viewHeartbeat = new Map<string, Date>()         // key: `${userId}:${viewId}` → last heartbeat
+
+function sessionKey(userId: string, cameraId: string, streamType: 'sub' | 'main' = 'sub') {
+  return `${userId}:${cameraId}:${streamType}`
+}
+
+function vKey(userId: string, viewId: string) {
+  return `${userId}:${viewId}`
 }
 
 export function getActiveSessions(): StreamSession[] {
@@ -45,10 +56,24 @@ export function getSessionsForUser(userId: string): StreamSession[] {
   return Array.from(sessions.values()).filter(s => s.userId === userId)
 }
 
-export function touchSession(userId: string, cameraId: string) {
-  const key = sessionKey(userId, cameraId)
+// Tocar una sola sesión (backward compat para touch-stream endpoint individual)
+export function touchSession(userId: string, cameraId: string, streamType: 'sub' | 'main' = 'sub') {
+  const key = sessionKey(userId, cameraId, streamType)
   const s = sessions.get(key)
-  if (s) s.lastSeenAt = new Date()
+  if (s) s.lastHeartbeat = new Date()
+}
+
+// Tocar todas las sesiones de un view de una vez (solo sub streams del heartbeat)
+export function touchView(userId: string, viewId: string) {
+  const vk = vKey(userId, viewId)
+  viewHeartbeat.set(vk, new Date())
+  const vCams = viewCameras.get(vk)
+  if (!vCams) return
+  const now = new Date()
+  for (const cameraId of vCams) {
+    const s = sessions.get(sessionKey(userId, cameraId, 'sub'))
+    if (s) s.lastHeartbeat = now
+  }
 }
 
 // Iniciar stream para un usuario
@@ -70,6 +95,8 @@ export async function startStream(
   server: FastifyInstance,
   userId: string,
   cameraId: string,
+  viewId?: string,
+  streamType: 'sub' | 'main' = 'sub',
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; error?: StreamError; warning?: StreamError }> {
   // Buscar cámara en DB con NVR
   const camera = await server.prisma.camera.findUnique({
@@ -85,37 +112,43 @@ export async function startStream(
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_DISABLED', message: 'Cámara desactivada' } }
   }
 
-  // Rechazar cámaras con estado de salud bloqueante
+  // Rechazar cámaras con estado de salud bloqueante.
+  // Para streamType='main': HEVC en main stream es válido — el frontend mostrará aviso al usuario.
+  // Solo bloquear CODEC_UNSUPPORTED_HEVC si es sub stream (substream debería ser H264 siempre).
   const healthStatus = (camera as any).streamHealthStatus as string | undefined
-  if (healthStatus && BLOCKED_HEALTH_STATUSES.has(healthStatus)) {
-    const knownError = HEALTH_STATUS_ERRORS[healthStatus]
+  const effectiveBlocked = healthStatus && BLOCKED_HEALTH_STATUSES.has(healthStatus)
+    && !(streamType === 'main' && healthStatus === 'CODEC_UNSUPPORTED_HEVC')
+  if (effectiveBlocked) {
+    const knownError = HEALTH_STATUS_ERRORS[healthStatus!]
     return {
       hlsUrl: '',
       webrtcUrl: '',
       streamPath: '',
-      error: knownError ?? { code: healthStatus, message: `Stream no disponible: ${healthStatus}` },
+      error: knownError ?? { code: healthStatus!, message: `Stream no disponible: ${healthStatus}` },
     }
   }
 
-  // USING_MAIN_STREAM is allowed but returns a warning
-  const usingMainStream = (camera as any).streamHealthStatus === 'USING_MAIN_STREAM'
+  // USING_MAIN_STREAM: sub no disponible — si piden main, es correcto; si piden sub, aviso
+  const usingMainStream = streamType === 'sub' && (camera as any).streamHealthStatus === 'USING_MAIN_STREAM'
 
-  // Verificar límites
+  // Verificar límites (main streams no cuentan contra el límite por cámara si ya tiene una sub sesión)
   const userSessions = getSessionsForUser(userId)
-  if (userSessions.length >= MAX_STREAMS_PER_USER && !userSessions.some(s => s.cameraId === cameraId)) {
+  const hasSameCamera = userSessions.some(s => s.cameraId === cameraId)
+  if (userSessions.length >= MAX_STREAMS_PER_USER && !hasSameCamera) {
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_REACHED', message: 'Límite de streams por usuario alcanzado' } }
   }
 
+  const key = sessionKey(userId, cameraId, streamType)
   const totalSessions = sessions.size
-  if (totalSessions >= MAX_STREAMS_GLOBAL && !sessions.has(sessionKey(userId, cameraId))) {
+  if (totalSessions >= MAX_STREAMS_GLOBAL && !sessions.has(key)) {
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado' } }
   }
 
   const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
-  const streamPath = getStreamPath(nvr as NVR, camera as Camera)
+  const streamPath = getStreamPath(nvr as NVR, camera as Camera, streamType)
 
   // Registrar en MediaMTX — si falla, NO registrar sesión
-  const published = await publishStream(nvr as NVR, camera as Camera)
+  const published = await publishStream(nvr as NVR, camera as Camera, streamType)
   if (!published) {
     return {
       hlsUrl: '',
@@ -126,14 +159,24 @@ export async function startStream(
   }
 
   // Registrar sesión solo si publishStream tuvo éxito
-  const key = sessionKey(userId, cameraId)
+  const effectiveViewId = viewId || 'default'
   sessions.set(key, {
     cameraId,
     userId,
+    viewId: effectiveViewId,
+    streamType,
     streamPath,
     startedAt: sessions.get(key)?.startedAt || new Date(),
-    lastSeenAt: new Date(),
+    lastHeartbeat: new Date(),
   })
+
+  // Asociar cámara a su view solo para sub streams — main streams son explícitos (no gestionados por heartbeat)
+  if (streamType === 'sub') {
+    const vk = vKey(userId, effectiveViewId)
+    if (!viewCameras.has(vk)) viewCameras.set(vk, new Set())
+    viewCameras.get(vk)!.add(cameraId)
+    viewHeartbeat.set(vk, new Date())
+  }
 
   return {
     hlsUrl: getHlsUrl(streamPath),
@@ -148,17 +191,108 @@ export async function stopStream(
   server: FastifyInstance,
   userId: string,
   cameraId: string,
+  streamType: 'sub' | 'main' = 'sub',
 ): Promise<void> {
-  const key = sessionKey(userId, cameraId)
-  sessions.delete(key)
+  const key = sessionKey(userId, cameraId, streamType)
+  const session = sessions.get(key)
+  if (session) {
+    // Quitar de viewCameras (solo relevante para sub streams)
+    if (streamType === 'sub') {
+      const vk = vKey(userId, session.viewId)
+      viewCameras.get(vk)?.delete(cameraId)
+    }
+    sessions.delete(key)
+  }
 
-  // Si nadie más está mirando, verificar viewers en MediaMTX
+  // Si nadie más está mirando, MediaMTX cerrará automáticamente vía sourceOnDemandCloseAfter
   const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === cameraId)
   if (!othersWatching) {
-    // MediaMTX con sourceOnDemand cierra el RTSP automáticamente cuando no hay readers HLS
-    // No hace falta hacer nada más aquí — el cierre es gestionado por sourceOnDemandCloseAfter
     server.log.info(`[stream-manager] Todos los viewers salieron de cámara ${cameraId}`)
   }
+}
+
+// ─── Heartbeat de viewport: reconciliar cámaras visibles ────
+// Recibe el set de cámaras visibles para un viewId.
+// - Detiene cámaras que ese view ya no necesita
+// - Inicia cámaras que ese view necesita pero no tienen sesión
+// - Toca todas las sesiones existentes (keepalive)
+// - Devuelve URLs para todas las cámaras visibles
+export interface ReconcileResult {
+  streams: Record<string, { hls: string; webrtc: string; streamPath: string; channel?: number; nvrName?: string; warning?: { code: string; message: string } }>
+  errors: Record<string, { code: string; message: string }>
+  startedIds: string[]  // cámaras que se iniciaron ahora (necesitan nuevo player)
+  stoppedIds: string[]  // cámaras que se detuvieron
+}
+
+export async function reconcileView(
+  server: FastifyInstance,
+  userId: string,
+  viewId: string,
+  visibleCameraIds: string[],
+): Promise<ReconcileResult> {
+  const visibleSet = new Set(visibleCameraIds)
+  const vk = vKey(userId, viewId)
+
+  // Actualizar heartbeat del view
+  viewHeartbeat.set(vk, new Date())
+
+  const streams: ReconcileResult['streams'] = {}
+  const errors: ReconcileResult['errors']  = {}
+  const startedIds: string[] = []
+  const stoppedIds: string[] = []
+
+  // Determinar qué cámaras tenía este view antes
+  const previousCams = viewCameras.get(vk) || new Set<string>()
+
+  // Detener cámaras que ya no son visibles en este view
+  const toStop = Array.from(previousCams).filter(id => !visibleSet.has(id))
+  for (const cameraId of toStop) {
+    await stopStream(server, userId, cameraId)
+    stoppedIds.push(cameraId)
+  }
+
+  // Para cada cámara visible: iniciar si no tiene sesión sub, o tocar si ya existe
+  for (const cameraId of visibleCameraIds) {
+    const key = sessionKey(userId, cameraId, 'sub')
+    const existing = sessions.get(key)
+
+    if (existing) {
+      // Ya está corriendo — tocar y devolver URL
+      existing.lastHeartbeat = new Date()
+      existing.viewId = viewId  // actualizar viewId por si cambió
+      streams[cameraId] = {
+        hls: getHlsUrl(existing.streamPath),
+        webrtc: getWebRtcUrl(existing.streamPath),
+        streamPath: existing.streamPath,
+      }
+    } else {
+      // No tiene sesión — iniciar
+      const result = await startStream(server, userId, cameraId, viewId)
+      if (result.error) {
+        errors[cameraId] = result.error
+      } else {
+        // Lookup channel + nvrName for complete StreamInfo
+        const cam = await server.prisma.camera.findUnique({
+          where: { id: cameraId },
+          select: { channel: true, nvr: { select: { name: true } } },
+        })
+        streams[cameraId] = {
+          hls: result.hlsUrl,
+          webrtc: result.webrtcUrl,
+          streamPath: result.streamPath,
+          channel: cam?.channel,
+          nvrName: cam?.nvr?.name,
+          warning: result.warning,
+        }
+        startedIds.push(cameraId)
+      }
+    }
+  }
+
+  // Actualizar viewCameras con el nuevo conjunto visible
+  viewCameras.set(vk, new Set(visibleCameraIds.filter(id => streams[id])))
+
+  return { streams, errors, startedIds, stoppedIds }
 }
 
 // Limpiar todas las sesiones de un usuario y liberar streams sin otros viewers
@@ -174,7 +308,6 @@ export async function cleanupUserSessions(
     sessions.delete(key)
     removed++
 
-    // Si nadie más está mirando esta cámara, remover el stream de MediaMTX
     const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === session.cameraId)
     if (!othersWatching) {
       const camera = await server.prisma.camera.findUnique({
@@ -187,20 +320,45 @@ export async function cleanupUserSessions(
     }
   }
 
+  // Limpiar view maps para este usuario
+  for (const key of viewCameras.keys()) {
+    if (key.startsWith(`${userId}:`)) {
+      viewCameras.delete(key)
+      viewHeartbeat.delete(key)
+    }
+  }
+
   return removed
 }
 
 // Limpiar sesiones inactivas (llamar desde un cron)
+// Una sesión es idle si su view no ha hecho heartbeat en STREAM_IDLE_TIMEOUT segundos
 export async function cleanupIdleSessions(server: FastifyInstance): Promise<number> {
   const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
   let removed = 0
 
+  // Detectar views con heartbeat expirado
+  const staleViews = new Set<string>()
+  for (const [vk, lastBeat] of viewHeartbeat.entries()) {
+    if (lastBeat < cutoff) {
+      staleViews.add(vk)
+    }
+  }
+
+  // Eliminar sesiones de views expirados o con lastHeartbeat expirado
   for (const [key, session] of sessions.entries()) {
-    if (session.lastSeenAt < cutoff) {
+    const vk = vKey(session.userId, session.viewId)
+    if (staleViews.has(vk) || session.lastHeartbeat < cutoff) {
       sessions.delete(key)
       removed++
-      server.log.info(`[stream-manager] Sesión idle eliminada: ${key}`)
+      server.log.info(`[stream-manager] Sesión idle eliminada: ${key} (view: ${session.viewId})`)
     }
+  }
+
+  // Limpiar view maps para views expirados
+  for (const vk of staleViews) {
+    viewCameras.delete(vk)
+    viewHeartbeat.delete(vk)
   }
 
   return removed
@@ -210,16 +368,18 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
 export function getAdminSessionsSummary(): Array<{
   cameraId: string
   userId: string
+  viewId: string
   streamPath: string
   startedAt: Date
-  lastSeenAt: Date
+  lastHeartbeat: Date
 }> {
   return Array.from(sessions.values()).map(s => ({
-    cameraId:   s.cameraId,
-    userId:     s.userId,
-    streamPath: s.streamPath,
-    startedAt:  s.startedAt,
-    lastSeenAt: s.lastSeenAt,
+    cameraId:      s.cameraId,
+    userId:        s.userId,
+    viewId:        s.viewId,
+    streamPath:    s.streamPath,
+    startedAt:     s.startedAt,
+    lastHeartbeat: s.lastHeartbeat,
   }))
 }
 
@@ -228,7 +388,6 @@ export async function getStreamManagerStatus(server: FastifyInstance) {
   const activeSessions = getActiveSessions()
   const uniqueCameras = new Set(activeSessions.map(s => s.cameraId))
 
-  // Obtener viewers reales de MediaMTX para las cámaras activas
   const cameraStatuses: Record<string, { readers: number; ready: boolean }> = {}
   for (const camId of uniqueCameras) {
     const session = activeSessions.find(s => s.cameraId === camId)
@@ -241,15 +400,17 @@ export async function getStreamManagerStatus(server: FastifyInstance) {
   return {
     totalSessions: activeSessions.length,
     uniqueCameras: uniqueCameras.size,
+    activeViews: viewHeartbeat.size,
     maxPerUser: MAX_STREAMS_PER_USER,
     maxGlobal: MAX_STREAMS_GLOBAL,
     sessions: activeSessions.map(s => ({
-      cameraId: s.cameraId,
-      userId: s.userId,
-      streamPath: s.streamPath,
-      startedAt: s.startedAt,
-      lastSeenAt: s.lastSeenAt,
-      mediaStatus: cameraStatuses[s.cameraId],
+      cameraId:     s.cameraId,
+      userId:       s.userId,
+      viewId:       s.viewId,
+      streamPath:   s.streamPath,
+      startedAt:    s.startedAt,
+      lastHeartbeat: s.lastHeartbeat,
+      mediaStatus:  cameraStatuses[s.cameraId],
     })),
   }
 }

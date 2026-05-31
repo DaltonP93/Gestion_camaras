@@ -295,7 +295,10 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).send({ message: 'Sin permiso para ver esta cámara' })
     }
 
-    const result = await startStream(server, user.sub, id)
+    const body = request.body as any
+    const streamType: 'sub' | 'main' = body?.streamType === 'main' ? 'main' : 'sub'
+
+    const result = await startStream(server, user.sub, id, undefined, streamType)
     if (result.error) {
       // Si el error es del servidor de medios (no de límites ni de estado de salud),
       // marcar la cámara como MEDIA_SERVER_ERROR
@@ -338,7 +341,9 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
   server.post('/:id/stop-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const user = request.user
-    await stopStream(server, user.sub, id)
+    const body = request.body as any
+    const streamType: 'sub' | 'main' = body?.streamType === 'main' ? 'main' : 'sub'
+    await stopStream(server, user.sub, id, streamType)
     return reply.send({ ok: true })
   })
 

@@ -18,12 +18,21 @@ import viewsPlugin from './routes/views'
 import appearancePlugin from './routes/appearance'
 import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
+import { liveViewRoutes } from './routes/liveView'
 import { startHealthWorker } from './jobs/healthWorker'
 import { publishStream } from './services/stream'
 import CryptoJS from 'crypto-js'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+
+function decryptPass(p: string): string | null {
+  try {
+    const plain = CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+    return plain || null  // CryptoJS returns '' on wrong key — treat as failure
+  } catch {
+    return null
+  }
+}
 
 const server = Fastify({
   logger: {
@@ -35,6 +44,21 @@ const server = Fastify({
 })
 
 async function main() {
+  // ─── Validación de variables de entorno críticas ──────────
+  if (!process.env.JWT_SECRET) {
+    server.log.error('[startup] FATAL: JWT_SECRET no está definido. La autenticación no funcionará. Define JWT_SECRET en .env')
+    process.exit(1)
+  }
+  if (!process.env.JWT_REFRESH_SECRET) {
+    server.log.warn('[startup] JWT_REFRESH_SECRET no definido — se usará JWT_SECRET como fallback. Define JWT_REFRESH_SECRET en .env para mayor seguridad.')
+  }
+  if (!process.env.NVR_CREDENTIAL_KEY) {
+    server.log.warn('[startup] NVR_CREDENTIAL_KEY no definido — se usará JWT_SECRET para cifrar credenciales del NVR. Define NVR_CREDENTIAL_KEY en .env.')
+  }
+  if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
+    server.log.warn('[startup] JWT_SECRET parece muy corto (< 32 chars). Usa un secreto de al menos 32 caracteres aleatorios.')
+  }
+
   // ─── Plugins de seguridad ──────────────────────────────────
   await server.register(helmet, {
     contentSecurityPolicy: {
@@ -88,6 +112,7 @@ async function main() {
   await server.register(appearancePlugin, { prefix: '/api/appearance' })
   await server.register(profileRoutes, { prefix: '/api/profile' })
   await server.register(alertSettingsRoutes, { prefix: '/api/alerts' })
+  await server.register(liveViewRoutes, { prefix: '/api/live-view' })
   await server.register(wsHandler, { prefix: '/ws' })
 
   // ─── Health check ─────────────────────────────────────────
@@ -116,14 +141,21 @@ async function main() {
         include: { cameras: { where: { active: true } } },
       })
       let count = 0
+      let skipped = 0
       for (const nvr of nvrs) {
-        const nvrDecrypted = { ...nvr, password: decryptPass(nvr.password) }
+        const plainPass = decryptPass(nvr.password)
+        if (!plainPass) {
+          server.log.error(`[startup] DECRYPT_ERROR para NVR ${nvr.name} (${nvr.id}) — streams omitidos. Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales del NVR.`)
+          skipped++
+          continue
+        }
+        const nvrDecrypted = { ...nvr, password: plainPass }
         for (const camera of nvr.cameras) {
           await publishStream(nvrDecrypted as any, camera)
           count++
         }
       }
-      server.log.info(`[startup] ${count} paths de stream registrados en MediaMTX`)
+      server.log.info(`[startup] ${count} paths on-demand registrados en MediaMTX (RTSP inactivo hasta primer viewer — sourceOnDemand=true)${skipped > 0 ? ` | ${skipped} NVR(s) omitidos por DECRYPT_ERROR` : ''}`)
     } catch (err) {
       server.log.warn(`[startup] Error registrando streams en MediaMTX: ${err}`)
     }

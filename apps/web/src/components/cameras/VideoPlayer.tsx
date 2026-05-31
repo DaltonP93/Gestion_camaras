@@ -5,7 +5,7 @@ import type { ErrorData } from 'hls.js'
 import {
   Maximize2, Volume2, VolumeX, RefreshCw,
   Circle, AlertTriangle, Loader2, Stethoscope,
-  WifiOff, Lock, Clock, Film, Server
+  WifiOff, Lock, Clock, Film, Server,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 
@@ -48,6 +48,24 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   UNKNOWN:                 { icon: <AlertTriangle size={16} />, label: 'Error desconocido',          color: 'text-surface-400' },
 }
 
+function isHevcCodec(codec?: string): boolean {
+  if (!codec) return false
+  const c = codec.toLowerCase()
+  return c.includes('hevc') || c.includes('h265') || c.includes('h.265') || c.includes('265')
+}
+
+function formatBadgeCodec(codec?: string): string {
+  if (!codec) return ''
+  const c = codec.toLowerCase()
+  if (c.includes('hevc') || c.includes('h265') || c.includes('h.265')) return 'H.265'
+  if (c.includes('h264') || c.includes('h.264') || c.includes('avc')) return 'H.264'
+  return codec.toUpperCase()
+}
+
+function formatResolution(res?: string): string {
+  return res ? res.replace(/x/i, '×') : ''
+}
+
 function classifyHlsError(data: ErrorData): CameraPlaybackErrorCode {
   if (data.response?.code === 401) return 'HLS_SESSION_EXPIRED'
   if (data.response?.code === 404) return 'HLS_MANIFEST_NOT_FOUND'
@@ -64,9 +82,13 @@ interface Props {
   onFullscreen?: () => void
   onDiagnostic?: (cameraId: string) => void
   onStreamError?: (cameraId: string, err: CameraPlaybackError) => void
+  onQualitySwitch?: (quality: 'sub' | 'main') => void
   className?: string
   error?: boolean
   playbackError?: CameraPlaybackError
+  streamType?: 'sub' | 'main'
+  streamCodec?: string        // e.g. "hevc", "h264"
+  streamResolution?: string   // e.g. "1920×1080", "640×360"
 }
 
 type Status = 'loading' | 'playing' | 'error' | 'offline'
@@ -79,9 +101,13 @@ export function VideoPlayer({
   onFullscreen,
   onDiagnostic,
   onStreamError,
+  onQualitySwitch,
   className,
   error,
   playbackError: externalError,
+  streamType,
+  streamCodec,
+  streamResolution,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
@@ -246,7 +272,7 @@ export function VideoPlayer({
       hlsRef.current?.destroy()
       hlsRef.current = null
     }
-  }, [hlsUrl, error, initPlayer])
+  }, [hlsUrl, error, externalError, initPlayer])
 
   const handleRetry = () => {
     setRetryCount(0)
@@ -274,38 +300,85 @@ export function VideoPlayer({
       )}
 
       {/* Error overlay — muestra causa técnica real */}
-      {(status === 'error' || (error && status !== 'playing')) && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-surface-900/95 gap-2 px-3">
-          <div className={clsx('flex items-center gap-1.5', errCfg?.color || 'text-surface-500')}>
-            {errCfg?.icon || <AlertTriangle size={16} />}
-            <span className="text-xs font-medium">{errCfg?.label || 'Sin señal'}</span>
-          </div>
-          {activeError?.message && (
-            <p className="text-[10px] text-surface-500 text-center leading-tight max-w-[180px]">
-              {activeError.message}
-            </p>
-          )}
-          <div className="flex gap-1.5 mt-1">
-            <button onClick={handleRetry} className="btn-ghost text-[10px] px-2 py-1">
-              <RefreshCw size={10} /> Reintentar
-            </button>
-            {onDiagnostic && cameraId && (
-              <button
-                onClick={() => onDiagnostic(cameraId)}
-                className="btn-ghost text-[10px] px-2 py-1 text-brand-400 hover:text-brand-300"
-              >
-                <Stethoscope size={10} /> Diagnóstico
-              </button>
+      {(status === 'error' || !!activeError || (error && status !== 'playing')) && (() => {
+        const isHevcMain = streamType === 'main' && (
+          activeError?.code === 'CODEC_UNSUPPORTED' ||
+          (streamCodec || '').toLowerCase().includes('hevc') ||
+          (streamCodec || '').toLowerCase().includes('h.265') ||
+          (streamCodec || '').toLowerCase().includes('h265')
+        )
+        return (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-surface-900/95 gap-2 px-3">
+            {isHevcMain ? (
+              <>
+                <Film size={18} className="text-amber-400" />
+                <p className="text-xs font-medium text-amber-300 text-center">H.265/HEVC no compatible</p>
+                <p className="text-[10px] text-surface-400 text-center leading-snug max-w-[200px]">
+                  El flujo principal está en H.265/HEVC. Para alta calidad web se requiere H.264 o transcodificación.
+                </p>
+                <div className="flex gap-1.5 mt-1">
+                  {onQualitySwitch && (
+                    <button
+                      onClick={() => onQualitySwitch('sub')}
+                      className="btn-ghost text-[10px] px-2 py-1 text-brand-400 hover:text-brand-300"
+                    >
+                      Usar baja calidad
+                    </button>
+                  )}
+                  <button
+                    onClick={() => onQualitySwitch ? onQualitySwitch('main') : handleRetry()}
+                    className="btn-ghost text-[10px] px-2 py-1"
+                  >
+                    <RefreshCw size={10} /> Reintentar alta calidad
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className={clsx('flex items-center gap-1.5', errCfg?.color || 'text-surface-500')}>
+                  {errCfg?.icon || <AlertTriangle size={16} />}
+                  <span className="text-xs font-medium">{errCfg?.label || 'Sin señal'}</span>
+                </div>
+                {activeError?.message && (
+                  <p className="text-[10px] text-surface-500 text-center leading-tight max-w-[180px]">
+                    {activeError.message}
+                  </p>
+                )}
+                <div className="flex gap-1.5 mt-1">
+                  <button onClick={handleRetry} className="btn-ghost text-[10px] px-2 py-1">
+                    <RefreshCw size={10} /> Reintentar
+                  </button>
+                  {onDiagnostic && cameraId && (
+                    <button
+                      onClick={() => onDiagnostic(cameraId)}
+                      className="btn-ghost text-[10px] px-2 py-1 text-brand-400 hover:text-brand-300"
+                    >
+                      <Stethoscope size={10} /> Diagnóstico
+                    </button>
+                  )}
+                </div>
+              </>
             )}
           </div>
-        </div>
-      )}
+        )
+      })()}
 
-      {/* REC indicator */}
-      {isRecording && status === 'playing' && (
+      {/* Top-right: quality badge + REC */}
+      {(streamType || (isRecording && status === 'playing')) && (
         <div className="absolute top-2 right-2 flex items-center gap-1 bg-black/60 px-1.5 py-0.5 rounded">
-          <Circle size={6} className="fill-brand-500 text-brand-500 rec-indicator" />
-          <span className="text-xs text-brand-400 font-medium">REC</span>
+          {isRecording && status === 'playing' && (
+            <>
+              <Circle size={6} className="fill-brand-500 text-brand-500 rec-indicator" />
+              <span className="text-xs text-brand-400 font-medium">REC</span>
+            </>
+          )}
+          {streamType && status === 'playing' && (
+            <span className="text-[9px] text-surface-300 font-medium leading-none">
+              {streamType === 'main' ? 'Main' : 'Sub'}
+              {streamResolution && ` ${formatResolution(streamResolution)}`}
+              {streamCodec && ` ${formatBadgeCodec(streamCodec)}`}
+            </span>
+          )}
         </div>
       )}
 
@@ -342,6 +415,26 @@ export function VideoPlayer({
           <button onClick={onFullscreen} className="p-1 rounded bg-black/60 text-white hover:bg-black/80 transition-colors" title="Pantalla completa">
             <Maximize2 size={12} />
           </button>
+        )}
+        {onQualitySwitch && streamType && (
+          <div className="flex bg-black/60 rounded overflow-hidden">
+            <button
+              onClick={() => onQualitySwitch('sub')}
+              className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
+                streamType === 'sub' ? 'bg-brand-600 text-white' : 'text-surface-300 hover:text-white')}
+              title="Baja calidad (substream H.264)"
+            >
+              Baja
+            </button>
+            <button
+              onClick={() => onQualitySwitch('main')}
+              className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
+                streamType === 'main' ? 'bg-brand-600 text-white' : 'text-surface-300 hover:text-white')}
+              title="Alta calidad (stream principal)"
+            >
+              Alta
+            </button>
+          </div>
         )}
       </div>
     </div>
