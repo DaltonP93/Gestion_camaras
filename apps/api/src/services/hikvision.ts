@@ -176,19 +176,16 @@ function createHikClient(nvr: { ipAddress: string; port: number; username: strin
 // ─── Helper XML ───────────────────────────────────────────────
 
 function xmlGet(xml: string, tag: string): string {
-  // Support optional namespace prefix (ns:Tag) and attributes on the opening tag
-  return xml.match(
-    new RegExp(`<(?:[A-Za-z0-9_-]+:)?${tag}(?:\\s[^>]*)?>([^<]*)<\\/(?:[A-Za-z0-9_-]+:)?${tag}>`)
-  )?.[1]?.trim() || ''
+  // Backreference (\1) ensures opening/closing tags match exactly.
+  // [A-Za-z0-9_:-]* allows optional namespace prefix (e.g. ns:Tag).
+  // \b prevents matching tags where Tag is a prefix (InputProxyChannel won't match InputProxyChannelStatus).
+  const m = xml.match(new RegExp(`<([A-Za-z0-9_:-]*${tag})\\b[^>]*>([^<]*)<\\/\\1>`))
+  return m?.[2]?.trim() || ''
 }
 
 function xmlGetAll(xml: string, tag: string): string[] {
-  // Support optional namespace prefix and attributes on the opening tag.
-  // Uses exec loop instead of match() so we can return full match strings.
-  const re = new RegExp(
-    `<(?:[A-Za-z0-9_-]+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:[A-Za-z0-9_-]+:)?${tag}>`,
-    'g'
-  )
+  // Same pattern as xmlGet but captures full block content (including outer tags) for block-level parsing.
+  const re = new RegExp(`<([A-Za-z0-9_:-]*${tag})\\b[^>]*>([\\s\\S]*?)<\\/\\1>`, 'g')
   const results: string[] = []
   let m: RegExpExecArray | null
   while ((m = re.exec(xml)) !== null) results.push(m[0])
@@ -410,15 +407,22 @@ function parseInputProxyChannelBody(
       for (const block of blocks) {
         const ch = parseInt(xmlGet(block, 'id') || xmlGet(block, 'channelNo') || '0')
         if (!ch) continue
+        // online/chanDetectResult/PasswordStatus may appear in both block types on some firmware
+        const onlineStr  = xmlGet(block, 'online')
+        const chanDetect = xmlGet(block, 'chanDetectResult')
+        const pwdStatus  = xmlGet(block, 'PasswordStatus')
+        const parsed     = onlineStr || chanDetect ? parseHikOnlineStatus(onlineStr, chanDetect) : null
         entries.push({
-          channel:        ch,
-          name:           xmlGet(block, 'customName') || xmlGet(block, 'name') || xmlGet(block, 'channelName') || '',
-          ipAddress:      xmlGet(block, 'ipAddress') || '',
-          protocol:       xmlGet(block, 'proxyProtocol') || xmlGet(block, 'protocolType') || '',
-          managementPort: parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '0'),
-          securityStatus: xmlGet(block, 'securityStatus') || '',
-          status:         xmlGet(block, 'status') || '',
-          _source:        source,
+          channel:          ch,
+          name:             xmlGet(block, 'customName') || xmlGet(block, 'name') || xmlGet(block, 'channelName') || '',
+          ipAddress:        xmlGet(block, 'ipAddress') || '',
+          protocol:         xmlGet(block, 'proxyProtocol') || xmlGet(block, 'protocolType') || '',
+          managementPort:   parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '0'),
+          securityStatus:   xmlGet(block, 'securityStatus') || pwdStatus || '',
+          status:           parsed ?? xmlGet(block, 'status') ?? '',
+          chanDetectResult: chanDetect || undefined,
+          passwordStatus:   pwdStatus || undefined,
+          _source:          source,
         })
       }
       return entries
@@ -589,7 +593,8 @@ async function fetchInputProxyChannels(
         ` channelTag=${channelTag} channelsParsed=${entries.length}` +
         (entries.length > 0 ? ` firstName="${entries[0]?.name ?? ''}" firstIp="${entries[0]?.ipAddress ?? ''}"` : '')
       )
-      return { entries, variantUsed: label }
+      // Only return if we actually parsed something — otherwise try next variant
+      if (entries.length > 0) return { entries, variantUsed: label }
     } catch (e: any) {
       console.warn(`[InputProxy] ${label} network error: ${e?.code || e?.message}`)
     }
