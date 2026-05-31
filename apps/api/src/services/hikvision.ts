@@ -349,103 +349,183 @@ function isPlaceholderName(name: string): boolean {
   return false
 }
 
+// ─── InputProxy channels — module-level types and helpers ────────────────────
+
+interface InputProxyEntry {
+  channel: number
+  name: string
+  ipAddress: string
+  protocol: string
+  managementPort: number
+  securityStatus: string
+  status: string
+  chanDetectResult?: string
+  passwordStatus?: string
+  _source: 'channels_secure' | 'channels' | 'status'
+}
+
+// Parse InputProxyChannel XML or JSON body into an array of entries.
+// xmlGet() scans the whole block string so nested tags (e.g. inside
+// <sourceInputPortDescriptor>) are found correctly.
+function parseInputProxyChannelBody(
+  data: unknown,
+  source: 'channels_secure' | 'channels',
+): InputProxyEntry[] {
+  const bodyStr = typeof data === 'string' ? data : ''
+  const isXmlBody = bodyStr.trimStart().startsWith('<')
+  const entries: InputProxyEntry[] = []
+
+  let items: any[] = []
+  if (isXmlBody) {
+    const blocks = xmlGetAll(bodyStr, 'InputProxyChannel')
+    items = blocks.map(block => ({
+      id:             parseInt(xmlGet(block, 'id') || '0'),
+      name:           xmlGet(block, 'customName') || xmlGet(block, 'name'),
+      ipAddress:      xmlGet(block, 'ipAddress'),
+      protocol:       xmlGet(block, 'proxyProtocol') || xmlGet(block, 'protocolType'),
+      port:           parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '0'),
+      securityStatus: xmlGet(block, 'securityStatus'),
+      status:         xmlGet(block, 'status'),
+    }))
+  } else {
+    const raw = (data as any)?.InputProxyChannelList?.InputProxyChannel
+    if (raw) items = Array.isArray(raw) ? raw : [raw]
+  }
+
+  for (const item of items) {
+    const ch = parseInt(item.id || item.channelNo || '0')
+    if (!ch) continue
+    entries.push({
+      channel:        ch,
+      name:           item.customName || item.name || '',
+      ipAddress:      item.ipAddress || item.ip || '',
+      protocol:       item.protocol || item.protocolType || item.proxyProtocol || '',
+      managementPort: parseInt(item.port || item.managementPortNo || '0'),
+      securityStatus: item.securityStatus || '',
+      status:         item.status || '',
+      _source:        source,
+    })
+  }
+  return entries
+}
+
+// Standalone InputProxy /channels fetch that bypasses the shared axios client.
+// The shared client sends Content-Type: application/json by default, which some
+// Hikvision firmware (DS-9664NI-I8) rejects with HTTP 400 before even issuing
+// a Digest Auth challenge. This function uses axios.get() directly with only the
+// headers required by the NVR, and handles Digest Auth explicitly in two steps.
+async function fetchInputProxyChannels(
+  nvr: { ipAddress: string; port: number; username: string; password: string },
+): Promise<{ entries: InputProxyEntry[]; variantUsed: string | null }> {
+  const baseUrl = `http://${nvr.ipAddress}:${nvr.port}`
+  const hikHeaders = {
+    'X-Requested-With': 'XMLHttpRequest',
+    'If-Modified-Since': '0',
+    'Cache-Control':    'max-age=0',
+    'Accept':           '*/*',
+    // Deliberately no Content-Type for GET — some NVR firmware return 400 when it's present
+  }
+
+  const variants: Array<{ path: string; source: 'channels_secure' | 'channels'; label: string }> = [
+    {
+      path:   `/ISAPI/ContentMgmt/InputProxy/channels?security=1&iv=${crypto.randomBytes(16).toString('hex')}`,
+      source: 'channels_secure',
+      label:  'secure_iv',
+    },
+    {
+      path:   '/ISAPI/ContentMgmt/InputProxy/channels?security=1',
+      source: 'channels_secure',
+      label:  'secure',
+    },
+    {
+      path:   '/ISAPI/ContentMgmt/InputProxy/channels',
+      source: 'channels',
+      label:  'plain',
+    },
+  ]
+
+  for (const { path, source, label } of variants) {
+    try {
+      // Step A: unauthenticated request — expect 401 Digest challenge
+      let res = await axios.get(`${baseUrl}${path}`, {
+        headers:        hikHeaders,
+        timeout:        10000,
+        validateStatus: () => true,  // never throw on 4xx/5xx
+        maxRedirects:   0,
+      })
+      let body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '')
+
+      if (res.status === 401) {
+        const wwwAuth = String(res.headers['www-authenticate'] || '')
+        if (wwwAuth.toLowerCase().startsWith('digest')) {
+          // Step B: compute Digest response and retry
+          // uri must include the query string — critical for Digest Auth correctness
+          const authHeader = buildDigestAuth(nvr.username, nvr.password, 'GET', path, wwwAuth)
+          res = await axios.get(`${baseUrl}${path}`, {
+            headers:        { ...hikHeaders, Authorization: authHeader },
+            timeout:        10000,
+            validateStatus: () => true,
+            maxRedirects:   0,
+          })
+          body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '')
+          console.info(`[InputProxy] ${label} digest→${res.status} bytes=${body.length} ct="${res.headers['content-type']}"`)
+        } else if (wwwAuth.toLowerCase().startsWith('basic')) {
+          // Basic auth fallback (rare)
+          res = await axios.get(`${baseUrl}${path}`, {
+            headers:        hikHeaders,
+            auth:           { username: nvr.username, password: nvr.password },
+            timeout:        10000,
+            validateStatus: () => true,
+            maxRedirects:   0,
+          })
+          body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '')
+          console.info(`[InputProxy] ${label} basic→${res.status} bytes=${body.length}`)
+        } else {
+          console.warn(`[InputProxy] ${label} 401 but no Digest/Basic challenge: ${wwwAuth.slice(0, 100)}`)
+          continue
+        }
+      } else {
+        console.info(`[InputProxy] ${label} no-auth→${res.status} bytes=${body.length} ct="${res.headers['content-type']}"`)
+      }
+
+      if (res.status !== 200) {
+        console.warn(`[InputProxy] ${label} HTTP ${res.status}: ${body.slice(0, 300)}`)
+        continue
+      }
+
+      const hasChannels = body.includes('InputProxyChannel')
+      if (!hasChannels) {
+        console.warn(`[InputProxy] ${label} 200 but no InputProxyChannel in body (bytes=${body.length}): ${body.slice(0, 300)}`)
+        continue
+      }
+
+      const entries = parseInputProxyChannelBody(body, source)
+      console.info(
+        `[InputProxy] ${label} OK: parsed=${entries.length}` +
+        ` first: ch${entries[0]?.channel ?? '?'} name="${entries[0]?.name ?? ''}" ip="${entries[0]?.ipAddress ?? ''}"`
+      )
+      return { entries, variantUsed: label }
+    } catch (e: any) {
+      console.warn(`[InputProxy] ${label} network error: ${e?.code || e?.message}`)
+    }
+  }
+
+  console.warn(`[InputProxy] all variants failed for ${nvr.ipAddress}`)
+  return { entries: [], variantUsed: null }
+}
+
 export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
   const client = createHikClient(nvr)
 
   // ── Step 1: InputProxy channels — try secure variants first ──
-  // Priority A: ?security=1&iv=<randomHex> (DS-9664NI-I8, DS-7604 and others require this)
-  // Priority B: ?security=1 (fallback)
-  // Priority C: plain path (oldest firmware)
-  // All variants use the same headers required by newer Hikvision firmware.
-  interface InputProxyEntry {
-    channel: number
-    name: string
-    ipAddress: string
-    protocol: string
-    managementPort: number
-    securityStatus: string
-    status: string
-    chanDetectResult?: string
-    passwordStatus?: string
-    _source: 'channels_secure' | 'channels' | 'status'
-  }
-
+  // Uses fetchInputProxyChannels() which bypasses the shared axios client (avoids
+  // Content-Type: application/json default header that causes HTTP 400 on DS-9664NI-I8).
   const inputProxyMap = new Map<number, InputProxyEntry>()
 
-  // Headers required by newer Hikvision firmware for InputProxy endpoints
-  const hikHeaders = {
-    'X-Requested-With': 'XMLHttpRequest',
-    'If-Modified-Since': '0',
-    'Cache-Control': 'max-age=0',
-    'Accept': '*/*',
-  }
+  const { entries: ipEntries, variantUsed: ipVariant } = await fetchInputProxyChannels(nvr as any)
+  for (const e of ipEntries) inputProxyMap.set(e.channel, e)
 
-  // Parse an /InputProxy/channels XML or JSON body into the inputProxyMap.
-  // Returns the _source value for entries added by this parse.
-  function parseInputProxyBody(data: unknown, source: 'channels_secure' | 'channels'): void {
-    const bodyStr = typeof data === 'string' ? data : ''
-    const isXmlBody = bodyStr.trimStart().startsWith('<')
-
-    let items: any[] = []
-    if (isXmlBody) {
-      const blocks = xmlGetAll(bodyStr, 'InputProxyChannel')
-      // ipAddress and managePortNo are nested inside <sourceInputPortDescriptor> but
-      // xmlGet scans the whole block string, so nested tags are found correctly.
-      items = blocks.map(block => ({
-        id:             parseInt(xmlGet(block, 'id') || '0'),
-        name:           xmlGet(block, 'customName') || xmlGet(block, 'name'),
-        ipAddress:      xmlGet(block, 'ipAddress'),
-        protocol:       xmlGet(block, 'proxyProtocol') || xmlGet(block, 'protocolType'),
-        port:           parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '0'),
-        securityStatus: xmlGet(block, 'securityStatus'),
-        status:         xmlGet(block, 'status'),
-      }))
-    } else if ((data as any)?.InputProxyChannelList?.InputProxyChannel) {
-      const raw = (data as any).InputProxyChannelList.InputProxyChannel
-      items = Array.isArray(raw) ? raw : [raw]
-    }
-
-    for (const item of items) {
-      // Always use <id> as channel number — never use array index
-      const ch = parseInt(item.id || item.channelNo || '0')
-      if (!ch) continue
-      inputProxyMap.set(ch, {
-        channel:        ch,
-        name:           item.customName || item.name || '',
-        ipAddress:      item.ipAddress || item.ip || '',
-        protocol:       item.protocol || item.protocolType || item.proxyProtocol || '',
-        managementPort: parseInt(item.port || item.managementPortNo || '0'),
-        securityStatus: item.securityStatus || '',
-        status:         item.status || '',
-        _source:        source,
-      })
-    }
-  }
-
-  // Try each variant until one succeeds or all fail
-  const channelVariants: Array<{ path: string; source: 'channels_secure' | 'channels' }> = [
-    { path: `/ISAPI/ContentMgmt/InputProxy/channels?security=1&iv=${crypto.randomBytes(16).toString('hex')}`, source: 'channels_secure' },
-    { path: '/ISAPI/ContentMgmt/InputProxy/channels?security=1', source: 'channels_secure' },
-    { path: '/ISAPI/ContentMgmt/InputProxy/channels', source: 'channels' },
-  ]
-
-  let channelVariantUsed: string | null = null
-  for (const variant of channelVariants) {
-    try {
-      const res = await client.get(variant.path, { headers: hikHeaders })
-      const sizeBefore = inputProxyMap.size
-      parseInputProxyBody(res.data, variant.source)
-      channelVariantUsed = `${variant.path.split('?')[0]}?${variant.path.includes('security=1') ? 'security=1' : 'plain'} → parsed ${inputProxyMap.size - sizeBefore} entries (dataType=${typeof res.data})`
-      break  // success — stop trying variants
-    } catch (e: any) {
-      const status = e?.response?.status
-      channelVariantUsed = `${variant.path.split('?')[0]} FAILED HTTP ${status ?? e?.code ?? 'err'}`
-      // try next variant
-    }
-  }
-
-  // Log which channel variant was used (visible in docker logs)
-  console.info(`[getIpCameraList] ${nvr.ipAddress} channelVariant: ${channelVariantUsed ?? 'none tried'} inputProxyMap.size=${inputProxyMap.size}`)
+  console.info(`[getIpCameraList] ${nvr.ipAddress} inputProxyVariant=${ipVariant ?? 'none'} channels=${inputProxyMap.size}`)
 
   // ── Step 1.5: InputProxy channel status ────────────────────
   // This endpoint returns IP/port/protocol PLUS online status per channel.
