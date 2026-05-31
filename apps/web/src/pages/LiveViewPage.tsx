@@ -102,6 +102,9 @@ export function LiveViewPage() {
   const [focusCamera, setFocusCamera]      = useState<string | null>(null)
   const [focusStreamInfo, setFocusStreamInfo]   = useState<StreamInfo | null>(null)
   const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
+  // Track the intended stream type separately — focusStreamInfo alone can't tell us 'main'
+  // when HEVC blocks the stream before the API call (focusStreamInfo stays null).
+  const [focusStreamType, setFocusStreamType]   = useState<'sub' | 'main'>('sub')
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
 
   // playerKeys forces VideoPlayer remount (new HLS instance) when incremented for a camera
@@ -572,6 +575,7 @@ export function LiveViewPage() {
     setFocusCamera(camera.id)
     setFocusStreamInfo(null)
     setFocusStreamError(null)
+    setFocusStreamType('main')  // always targeting main in focus view
 
     // Proactively block known HEVC main stream before wasting a backend call
     if (isHevcCodec(camera.mainCodec)) {
@@ -611,10 +615,12 @@ export function LiveViewPage() {
       apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main' }).catch(() => {})
       setFocusStreamInfo(null)
       setFocusStreamError(null)
+      setFocusStreamType('sub')
       bumpPlayerKeys([focusCamera])
     } else {
       setFocusStreamInfo(null)
       setFocusStreamError(null)
+      setFocusStreamType('main')
       try {
         const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: 'main' })
         setFocusStreamInfo(info)
@@ -644,6 +650,7 @@ export function LiveViewPage() {
     setFocusCamera(null)
     setFocusStreamInfo(null)
     setFocusStreamError(null)
+    setFocusStreamType('sub')
 
     // Stop main stream only — sub stream stays alive for the grid
     if (prevFocusId) {
@@ -743,10 +750,12 @@ export function LiveViewPage() {
               const stream = streams[focusCamera]
               if (!cam) return null
               const isMain     = !!focusStreamInfo
+              // Use focusStreamType (not isMain) so HEVC overlay shows even when
+              // the stream was blocked before the API call (focusStreamInfo=null).
+              const focusType  = focusStreamType
               const focusHls   = isMain ? focusStreamInfo!.hls : (stream?.hls || '')
-              const focusType  = isMain ? 'main' : 'sub'
-              const focusCodec = isMain ? cam.mainCodec : cam.subCodec
-              const focusRes   = isMain ? cam.mainResolution : cam.subResolution
+              const focusCodec = focusStreamType === 'main' ? cam.mainCodec : cam.subCodec
+              const focusRes   = focusStreamType === 'main' ? cam.mainResolution : cam.subResolution
               return (
                 <div className="h-full flex gap-2">
                   <VideoPlayer

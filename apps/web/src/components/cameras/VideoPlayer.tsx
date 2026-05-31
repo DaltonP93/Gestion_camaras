@@ -71,6 +71,16 @@ function classifyHlsError(data: ErrorData): CameraPlaybackErrorCode {
   if (data.response?.code === 404) return 'HLS_MANIFEST_NOT_FOUND'
   if (data.response?.code === 500) return 'MEDIAMTX_NOT_READY'
   if (data.type === Hls.ErrorTypes.NETWORK_ERROR) return 'MEDIAMTX_NOT_READY'
+  // HEVC codec not supported in browser (hvc1/hev1 — Chrome/Firefox without HW HEVC)
+  const detail = data.details || ''
+  const reason = (data.reason || '').toLowerCase()
+  if (
+    detail === 'manifestIncompatibleCodecsError' ||
+    detail === 'bufferIncompatibleCodecsError' ||
+    reason.includes('codec') ||
+    reason.includes('hvc') ||
+    reason.includes('hev')
+  ) return 'CODEC_UNSUPPORTED'
   return 'UNKNOWN'
 }
 
@@ -219,14 +229,22 @@ export function VideoPlayer({
               return r + 1
             })
           } else {
+            const message = errorCode === 'CODEC_UNSUPPORTED'
+              ? 'H.265/HEVC no es compatible con este navegador'
+              : data.reason || 'Error fatal del player'
             const err: CameraPlaybackError = {
               code: errorCode,
-              message: data.reason || 'Error fatal del player',
+              message,
               technicalDetail: `${data.type} / ${data.details}`,
             }
             setStatus('error')
             setInternalError(err)
             if (cameraId) onStreamError?.(cameraId, err)
+            // Destroy HLS immediately on codec error — no point retrying an unsupported codec
+            if (errorCode === 'CODEC_UNSUPPORTED') {
+              hls.destroy()
+              hlsRef.current = null
+            }
           }
         }
       })

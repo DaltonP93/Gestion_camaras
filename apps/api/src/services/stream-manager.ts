@@ -112,9 +112,20 @@ export async function startStream(
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_DISABLED', message: 'Cámara desactivada' } }
   }
 
-  // Rechazar cámaras con estado de salud bloqueante.
-  // Para streamType='main': HEVC en main stream es válido — el frontend mostrará aviso al usuario.
-  // Solo bloquear CODEC_UNSUPPORTED_HEVC si es sub stream (substream debería ser H264 siempre).
+  // Block HEVC main stream when codec is known — browsers can't decode H.265.
+  // This is a belt-and-suspenders check: the frontend proactively blocks too, but
+  // only when camera.mainCodec is populated. When it's null, the backend is the last guard.
+  if (streamType === 'main') {
+    const mainCodecStr = ((camera as any).mainCodec || '').toLowerCase()
+    if (mainCodecStr && (mainCodecStr.includes('hevc') || mainCodecStr.includes('h265') || mainCodecStr.includes('h.265'))) {
+      return {
+        hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'CODEC_UNSUPPORTED_HEVC', message: 'El flujo principal está en H.265/HEVC. Los navegadores no pueden reproducir H.265 sin transcodificación.' },
+      }
+    }
+  }
+
+  // Rechazar cámaras con estado de salud bloqueante (sub stream).
   const healthStatus = (camera as any).streamHealthStatus as string | undefined
   const effectiveBlocked = healthStatus && BLOCKED_HEALTH_STATUSES.has(healthStatus)
     && !(streamType === 'main' && healthStatus === 'CODEC_UNSUPPORTED_HEVC')
