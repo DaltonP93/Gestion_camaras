@@ -29,7 +29,10 @@ export function NVRDetailPage() {
   const [rebooting, setRebooting] = useState(false)
   const [validatingHealth, setValidatingHealth] = useState(false)
   const [syncingCameras, setSyncingCameras] = useState(false)
-  const [lastSyncResult, setLastSyncResult] = useState<{ nameSource?: 'real' | 'none'; nameReason?: string; sourceUsed?: string } | null>(null)
+  const [lastSyncResult, setLastSyncResult] = useState<{
+    nameSource?: 'real' | 'none'; nameReason?: string; sourceUsed?: string
+    nameCandidates?: number; nameUpdated?: number; warning?: string
+  } | null>(null)
   const [onboarding, setOnboarding] = useState(false)
   const [lastSyncStats, setLastSyncStats] = useState<{
     sourceUsed?: string; nameUpdated?: number; ipUpdated?: number
@@ -436,6 +439,8 @@ export function NVRDetailPage() {
           isAdmin={isAdmin}
           isapIStatus={nvr.isapIStatus}
           lastSyncResult={lastSyncResult}
+          onValidateHealth={handleValidateHealth}
+          validatingHealth={validatingHealth}
         />
       )}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} supported={storageSupported} unsupportedReason={storageUnsupportedReason} onRefresh={loadStorage} />}
@@ -812,6 +817,22 @@ function IsapDebugModal({ loading, error, data, onRetest, onClose }: {
 
 // ─── Cameras Tab ──────────────────────────────────────────────
 
+function hasRealCameraNames(cameras: CameraType[]): boolean {
+  return cameras.some(c => {
+    if (!c.name?.trim()) return false
+    const n = c.name.trim()
+    return !(
+      /^canal\s+\d+$/i.test(n) ||
+      /^c[aá]mara\s+\d+$/i.test(n) ||
+      /^camera\s*\d*$/i.test(n) ||
+      /^ipcamera\s*\d*$/i.test(n) ||
+      /^d\d+$/i.test(n) ||
+      /^channel\s+\d+$/i.test(n) ||
+      /^\d{3,4}$/.test(n)
+    )
+  })
+}
+
 function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolean | null | undefined): React.ReactNode {
   if (isapIStatus === 'no_permission') {
     return <span className="text-amber-500/70 text-[11px]">Sin permiso</span>
@@ -830,7 +851,7 @@ function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolea
 }
 
 function CamerasTab({
-  cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus, lastSyncResult,
+  cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus, lastSyncResult, onValidateHealth, validatingHealth,
 }: {
   cameras: { fromNvr: IpCamera[]; fromDb: CameraType[] } | null
   loading: boolean
@@ -843,7 +864,9 @@ function CamerasTab({
   isAdmin: boolean
   nvrId: string
   isapIStatus?: string
-  lastSyncResult?: { nameSource?: 'real' | 'none'; nameReason?: string; sourceUsed?: string } | null
+  lastSyncResult?: { nameSource?: 'real' | 'none'; nameReason?: string; sourceUsed?: string; nameCandidates?: number; nameUpdated?: number; warning?: string } | null
+  onValidateHealth: () => void
+  validatingHealth?: boolean
 }) {
   const [showAdopt, setShowAdopt] = useState(false)
   const [isapDebug, setIsapDebug] = useState<any[] | null>(null)
@@ -888,6 +911,10 @@ function CamerasTab({
           </button>
           <button onClick={onForceSyncNames} disabled={syncingCameras} className="btn-ghost text-xs" title="Reemplaza nombres con los del NVR aunque ya existan nombres personalizados">
             <RefreshCw size={12} /> Forzar nombres NVR
+          </button>
+          <button onClick={onValidateHealth} disabled={validatingHealth} className="btn-ghost text-xs" title="Re-probe RTSP por cámara: actualiza mainCodec, subCodec, resolución, compatibilidad H.264/H.265">
+            {validatingHealth ? <Loader2 size={12} className="animate-spin" /> : <Activity size={12} />}
+            Revalidar RTSP
           </button>
           {isAdmin && (
             <button onClick={handleIsapDebug} className="btn-ghost text-xs" title="Probar todos los endpoints ISAPI para identificar cuál tiene nombre/IP/puerto real">
@@ -1003,8 +1030,12 @@ function CamerasTab({
         )}
       </div>
 
-      {/* nameSource notice — shown after a sync that found no real names */}
-      {lastSyncResult?.nameSource === 'none' && (
+      {/* nameSource notice — shown after a sync that found no real names AND cameras don't already have real names */}
+      {lastSyncResult?.nameSource === 'none' &&
+       (lastSyncResult?.nameCandidates ?? 0) === 0 &&
+       !hasRealCameraNames(list) &&
+       lastSyncResult?.sourceUsed !== 'inputproxy_channels_secure' &&
+       lastSyncResult?.sourceUsed !== 'inputproxy_channels' && (
         <div className="flex items-start gap-2 px-3 py-2 text-xs text-amber-500/80 bg-amber-900/10 border border-amber-900/20 rounded-lg">
           <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
           <span>
