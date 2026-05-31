@@ -18,8 +18,8 @@ const registeredPaths = new Map<string, string>()
 // Evita solicitudes concurrentes duplicadas para el mismo path
 const inFlightPaths   = new Set<string>()
 
-function configFingerprint(source: string, useSub: boolean): string {
-  return `${source}|tcp|10m|${useSub ? 'sub' : 'main'}`
+function configFingerprint(source: string, streamType: 'sub' | 'main'): string {
+  return `${source}|tcp|10m|${streamType}`
 }
 
 export function clearRegisteredPath(streamPath: string): void {
@@ -38,9 +38,10 @@ export async function listRegisteredConfigPaths(): Promise<Set<string> | null> {
   }
 }
 
-// Nombre del path en MediaMTX para una cámara
-export function getStreamPath(nvr: NVR, camera: Camera): string {
-  return `nvr_${nvr.id}_ch${String(camera.channel).padStart(2, '0')}`
+// Nombre del path en MediaMTX para una cámara.
+// streamType='sub' → Channels/102,1202 (H264); 'main' → Channels/101,1201 (puede ser HEVC)
+export function getStreamPath(nvr: NVR, camera: Camera, streamType: 'sub' | 'main' = 'sub'): string {
+  return `nvr_${nvr.id}_ch${String(camera.channel).padStart(2, '0')}_${streamType}`
 }
 
 // URL HLS relativa para el frontend (pasa por Nginx /hls/ → mediamtx:8888)
@@ -54,8 +55,8 @@ export function getWebRtcUrl(streamPath: string): string {
 }
 
 // ─── Publicar stream desde NVR a MediaMTX ───────────────────
-export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> {
-  const streamPath = getStreamPath(nvr, camera)
+export async function publishStream(nvr: NVR, camera: Camera, streamType: 'sub' | 'main' = 'sub'): Promise<boolean> {
+  const streamPath = getStreamPath(nvr, camera, streamType)
 
   // Bloquear publicación si la contraseña está vacía (credencial no descifrada o no configurada)
   const pass: string = (nvr as any).password ?? ''
@@ -67,7 +68,7 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
   // Evitar solicitudes concurrentes duplicadas para el mismo path
   if (inFlightPaths.has(streamPath)) return true
 
-  const useSub = (camera as any).preferredStream !== 'main'
+  const useSub = streamType === 'sub'
   const rtspUrl = buildRtspUrl(nvr, camera.channel, useSub)
 
   // Guardia de seguridad: rechazar URLs con contraseña vacía (rtsp://user:@host)
@@ -86,14 +87,14 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
     overridePublisher: true,
   }
 
-  const fp = configFingerprint(rtspUrl, useSub)
+  const fp = configFingerprint(rtspUrl, streamType)
 
   // Si el path ya fue registrado con la misma config, no repetir POST/PATCH.
   // Esto elimina el spam de "path already exists" y "reloading configuration".
   if (registeredPaths.get(streamPath) === fp) return true
 
   const sourceMasked = rtspUrl.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
-  console.info(`[stream] publish path=${streamPath} stream=${useSub ? 'sub' : 'main'} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} source=${sourceMasked}`)
+  console.info(`[stream] publish path=${streamPath} type=${streamType} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} source=${sourceMasked}`)
 
   inFlightPaths.add(streamPath)
   try {
@@ -148,13 +149,16 @@ export async function publishStream(nvr: NVR, camera: Camera): Promise<boolean> 
 }
 
 // ─── Eliminar stream de MediaMTX ────────────────────────────
-export async function removeStream(nvr: NVR, camera: Camera): Promise<void> {
-  try {
-    const streamPath = getStreamPath(nvr, camera)
-    registeredPaths.delete(streamPath)  // invalidar cache
-    await mediamtxApi.delete('/v3/config/paths/delete/' + streamPath)
-  } catch {
-    // Ignorar errores al eliminar
+export async function removeStream(nvr: NVR, camera: Camera, streamType?: 'sub' | 'main'): Promise<void> {
+  const typesToRemove: ('sub' | 'main')[] = streamType ? [streamType] : ['sub', 'main']
+  for (const t of typesToRemove) {
+    try {
+      const streamPath = getStreamPath(nvr, camera, t)
+      registeredPaths.delete(streamPath)
+      await mediamtxApi.delete('/v3/config/paths/delete/' + streamPath)
+    } catch {
+      // Ignorar errores al eliminar
+    }
   }
 }
 

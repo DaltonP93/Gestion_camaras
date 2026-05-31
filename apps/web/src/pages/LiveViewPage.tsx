@@ -14,6 +14,12 @@ import { apiPost } from '@/lib/api'
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
 
+function isHevcCodec(codec?: string): boolean {
+  if (!codec) return false
+  const c = codec.toLowerCase()
+  return c.includes('hevc') || c.includes('h265') || c.includes('h.265')
+}
+
 // ─── Stagger delay per layout ────────────────────────────────
 const STAGGER_MS: Record<GridLayout, number> = { 1: 0, 4: 250, 9: 400, 16: 500, 25: 600 }
 
@@ -94,6 +100,8 @@ export function LiveViewPage() {
   const [loadingStreams, setLoadingStreams] = useState<Record<string, boolean>>({})
   const [streamErrors, setStreamErrors]    = useState<Record<string, CameraPlaybackError>>({})
   const [focusCamera, setFocusCamera]      = useState<string | null>(null)
+  const [focusStreamInfo, setFocusStreamInfo]   = useState<StreamInfo | null>(null)
+  const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
 
   // playerKeys forces VideoPlayer remount (new HLS instance) when incremented for a camera
@@ -559,16 +567,87 @@ export function LiveViewPage() {
     setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
   }, [cameras, bumpPlayerKeys, flushHlsExpiry])
 
+  // ─── Enter focus/fullscreen — start main stream ─────────────
+  const handleEnterFocus = useCallback(async (camera: Camera) => {
+    setFocusCamera(camera.id)
+    setFocusStreamInfo(null)
+    setFocusStreamError(null)
+
+    // Proactively block known HEVC main stream before wasting a backend call
+    if (isHevcCodec(camera.mainCodec)) {
+      setFocusStreamError({
+        code: 'CODEC_UNSUPPORTED',
+        message: 'El flujo principal está en H.265/HEVC. Los navegadores no pueden reproducir H.265.',
+        technicalDetail: `Codec: ${camera.mainCodec}${camera.mainResolution ? `, Resolución: ${camera.mainResolution}` : ''}`,
+      })
+      return
+    }
+
+    try {
+      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main' })
+      setFocusStreamInfo(info)
+      bumpPlayerKeys([camera.id])
+    } catch (err: any) {
+      const body = err?.response?.data || {}
+      const errCodeMap: Record<string, CameraPlaybackError['code']> = {
+        CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
+        AUTH_FAILED:            'AUTH_FAILED',
+        OFFLINE:                'CAMERA_OFFLINE',
+        MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
+        RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
+      }
+      setFocusStreamError({
+        code: errCodeMap[body.error] || 'UNKNOWN',
+        message: body.message || 'Error al iniciar stream principal',
+        technicalDetail: body.details,
+      })
+    }
+  }, [bumpPlayerKeys])
+
+  // ─── Quality switch from VideoPlayer (Baja/Alta buttons) ────
+  const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main') => {
+    if (!focusCamera) return
+    if (quality === 'sub') {
+      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      setFocusStreamInfo(null)
+      setFocusStreamError(null)
+      bumpPlayerKeys([focusCamera])
+    } else {
+      setFocusStreamInfo(null)
+      setFocusStreamError(null)
+      try {
+        const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: 'main' })
+        setFocusStreamInfo(info)
+        bumpPlayerKeys([focusCamera])
+      } catch (err: any) {
+        const body = err?.response?.data || {}
+        const errCodeMap: Record<string, CameraPlaybackError['code']> = {
+          CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
+          AUTH_FAILED:            'AUTH_FAILED',
+          OFFLINE:                'CAMERA_OFFLINE',
+          MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
+        }
+        setFocusStreamError({
+          code: errCodeMap[body.error] || 'UNKNOWN',
+          message: body.message || 'Error al iniciar stream principal',
+          technicalDetail: body.details,
+        })
+      }
+    }
+  }, [focusCamera, bumpPlayerKeys])
+
   // ─── Exit fullscreen/focus view ──────────────────────────────
   // On return from fullscreen, stop the focus camera and restart the grid cameras.
   // We do NOT restart cameras that weren't affected by the fullscreen.
   const handleExitFocus = useCallback(async () => {
     const prevFocusId = focusCamera
     setFocusCamera(null)
+    setFocusStreamInfo(null)
+    setFocusStreamError(null)
 
-    if (prevFocusId && activeSessions.current.has(prevFocusId)) {
-      apiPost(`/cameras/${prevFocusId}/stop-stream`, {}).catch(() => {})
-      activeSessions.current.delete(prevFocusId)
+    // Stop main stream only — sub stream stays alive for the grid
+    if (prevFocusId) {
+      apiPost(`/cameras/${prevFocusId}/stop-stream`, { streamType: 'main' }).catch(() => {})
     }
 
     // Reconcile the grid cameras after returning from fullscreen.
@@ -663,19 +742,28 @@ export function LiveViewPage() {
               const cam    = cameras.find(c => c.id === focusCamera)
               const stream = streams[focusCamera]
               if (!cam) return null
+              const isMain     = !!focusStreamInfo
+              const focusHls   = isMain ? focusStreamInfo!.hls : (stream?.hls || '')
+              const focusType  = isMain ? 'main' : 'sub'
+              const focusCodec = isMain ? cam.mainCodec : cam.subCodec
+              const focusRes   = isMain ? cam.mainResolution : cam.subResolution
               return (
                 <div className="h-full flex gap-2">
                   <VideoPlayer
-                    key={`focus-${focusCamera}-${playerKeys[focusCamera] ?? 0}`}
-                    hlsUrl={stream?.hls || ''}
+                    key={`focus-${focusCamera}-${focusType}-${playerKeys[focusCamera] ?? 0}`}
+                    hlsUrl={focusHls}
                     cameraName={`${cam.nvr?.name} — ${cam.name}`}
                     cameraId={cam.id}
                     isRecording={cam.online}
                     onFullscreen={handleExitFocus}
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
+                    onQualitySwitch={handleQualitySwitch}
                     className="flex-1 h-full"
-                    playbackError={streamErrors[focusCamera]}
+                    playbackError={focusStreamError || streamErrors[focusCamera]}
+                    streamType={focusType}
+                    streamCodec={focusCodec}
+                    streamResolution={focusRes}
                   />
                   {(user?.role === 'ADMIN' || user?.role === 'SUPERVISOR') && cam.ptzEnabled && (
                     <PTZControls cameraId={cam.id} />
@@ -717,11 +805,14 @@ export function LiveViewPage() {
                     cameraName={`${camera.nvr?.name || ''} · ${camera.name}`}
                     cameraId={camera.id}
                     isRecording={camera.online}
-                    onFullscreen={() => setFocusCamera(camera.id)}
+                    onFullscreen={() => handleEnterFocus(camera)}
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
                     className="w-full h-full"
                     playbackError={streamErrors[camera.id]}
+                    streamType="sub"
+                    streamCodec={camera.subCodec}
+                    streamResolution={camera.subResolution}
                   />
                 </div>
               )
