@@ -679,8 +679,16 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
       // Only InputProxy (channels or status endpoint) carries real IP/port/protocol/status data.
       // VideoInput and Streaming provide names only; fallback provides nothing reliable.
-      const isFromInputProxy = cam.metadataSource === 'inputproxy_channels_secure' || cam.metadataSource === 'inputproxy_channels' || cam.metadataSource === 'inputproxy_status'
-      const hasRealName      = isFromInputProxy || cam.metadataSource === 'videoinput' || cam.metadataSource === 'streaming'
+      // inputproxy_status_secure = status-only response from /channels?security=1 (IP/port/online but no name)
+      const isFromInputProxy = cam.metadataSource === 'inputproxy_channels_secure' ||
+                               cam.metadataSource === 'inputproxy_channels' ||
+                               cam.metadataSource === 'inputproxy_status_secure' ||
+                               cam.metadataSource === 'inputproxy_status'
+      // Name candidates: sources that can actually supply real camera names
+      const hasRealName      = cam.metadataSource === 'inputproxy_channels_secure' ||
+                               cam.metadataSource === 'inputproxy_channels' ||
+                               cam.metadataSource === 'videoinput' ||
+                               cam.metadataSource === 'streaming'
 
       // Name: update when real name available AND (DB has placeholder OR forceNames=true)
       if (hasRealName) {
@@ -751,11 +759,12 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     }
 
     // Determine the best metadata source used across all cameras
-    const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
+    const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status_secure', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
     const usedSources = new Set(ipCams.map(c => c.metadataSource))
     const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
 
-    const hasRealIpSource = sourceUsed === 'inputproxy_channels_secure' || sourceUsed === 'inputproxy_channels' || sourceUsed === 'inputproxy_status'
+    const hasRealIpSource = sourceUsed === 'inputproxy_channels_secure' || sourceUsed === 'inputproxy_channels' ||
+                            sourceUsed === 'inputproxy_status_secure' || sourceUsed === 'inputproxy_status'
     const warning = !hasRealIpSource
       ? `Sin acceso a datos IP desde ISAPI (fuente: ${sourceUsed}). IP, puerto, protocolo y estado no se actualizaron — se conservaron datos existentes. Use el diagnóstico de endpoints para identificar el endpoint correcto.`
       : undefined
@@ -764,8 +773,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const nameSource: 'real' | 'none' = nameUpdated > 0 ? 'real' : 'none'
     let nameReason: string | undefined
     if (nameSource === 'none') {
-      if (sourceUsed === 'inputproxy_status') {
-        nameReason = '/InputProxy/channels/status no incluye nombres de cámara. /InputProxy/channels devuelve error en este modelo. VideoInput/inputs/channels no está disponible. Los nombres deben configurarse manualmente.'
+      if (sourceUsed === 'inputproxy_status_secure' || sourceUsed === 'inputproxy_status') {
+        nameReason = '/InputProxy/channels devuelve estructura de estado sin nombres. Los nombres deben configurarse manualmente en el NVR o vía interfaz web.'
       } else if (sourceUsed === 'inputproxy_channels_secure' || sourceUsed === 'inputproxy_channels') {
         nameReason = 'Los nombres en el NVR son genéricos (Canal 1, D1…). Configure nombres reales en la interfaz del NVR.'
       } else if (sourceUsed === 'videoinput' || sourceUsed === 'streaming') {
@@ -1005,7 +1014,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     // Step 4: Sync cameras from ISAPI
     const ipCams = await getIpCameraList(nvrDec as any)
-    const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
+    const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status_secure', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
     const usedSources = new Set(ipCams.map((c: any) => c.metadataSource))
     const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
 
@@ -1021,7 +1030,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     for (const cam of ipCams) {
       const onlineInNvr = (cam.status || '').toLowerCase() === 'online'
-      const isFromInputProxy = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status'].includes(cam.metadataSource)
+      const isFromInputProxy = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status_secure', 'inputproxy_status'].includes(cam.metadataSource)
 
       try {
         const existing = await server.prisma.camera.findUnique({
@@ -1130,12 +1139,12 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     ;(async () => {
       try {
         const ipCams = await getIpCameraList(nvrDec as any)
-        const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
+        const sourcePriority = ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status_secure', 'inputproxy_status', 'videoinput', 'streaming', 'fallback'] as const
         const usedSources = new Set(ipCams.map((c: any) => c.metadataSource))
         const sourceUsed = sourcePriority.find(s => usedSources.has(s)) ?? 'none'
 
         const isPlaceholder = (n?: string | null) => !n || /^canal\s+\d+$/i.test(n.trim()) || /^d\d+$/i.test(n.trim()) || /^camera\s*\d*$/i.test(n.trim()) || /^ipcamera\s*\d*$/i.test(n.trim()) || /^channel\s+\d+$/i.test(n.trim()) || /^\d{3,4}$/.test(n.trim())
-        const isFromInputProxy = (src: string) => ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status'].includes(src)
+        const isFromInputProxy = (src: string) => ['inputproxy_channels_secure', 'inputproxy_channels', 'inputproxy_status_secure', 'inputproxy_status'].includes(src)
 
         for (const cam of ipCams) {
           const existing = await server.prisma.camera.findUnique({

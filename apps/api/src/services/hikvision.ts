@@ -48,12 +48,13 @@ export interface HikIpCamera {
   passwordStatus?: string
   // Tracks which ISAPI endpoint actually provided this camera's metadata.
   // sync-cameras uses this to decide which fields are safe to write to the DB.
-  // 'inputproxy_channels_secure' = name+IP+port+protocol from /InputProxy/channels?security=1&iv=... (best)
-  // 'inputproxy_channels' = name+IP+port+protocol from /InputProxy/channels (plain)
-  // 'inputproxy_status'   = IP+port+protocol+status from /InputProxy/channels/status (fallback when channels returns 400)
-  // 'videoinput' | 'streaming' = name only (no IP/port/status)
-  // 'fallback' = getNVRChannels — channel number only, no reliable metadata
-  metadataSource: 'inputproxy_channels_secure' | 'inputproxy_channels' | 'inputproxy_status' | 'videoinput' | 'streaming' | 'fallback'
+  // 'inputproxy_channels_secure'        = name+IP+port+protocol from /InputProxy/channels?security=1&iv=... (best)
+  // 'inputproxy_channels'               = name+IP+port+protocol from /InputProxy/channels (plain)
+  // 'inputproxy_status_secure'          = IP+port+protocol+status from /InputProxy/channels?security=1&iv (status-only response — no name)
+  // 'inputproxy_status'                 = IP+port+protocol+status from /InputProxy/channels/status
+  // 'videoinput' | 'streaming'          = name only (no IP/port/status)
+  // 'fallback'                          = getNVRChannels — channel number only, no reliable metadata
+  metadataSource: 'inputproxy_channels_secure' | 'inputproxy_channels' | 'inputproxy_status_secure' | 'inputproxy_status' | 'videoinput' | 'streaming' | 'fallback'
 }
 
 export interface HikStorageDisk {
@@ -175,12 +176,23 @@ function createHikClient(nvr: { ipAddress: string; port: number; username: strin
 // ─── Helper XML ───────────────────────────────────────────────
 
 function xmlGet(xml: string, tag: string): string {
-  return xml.match(new RegExp(`<${tag}>([^<]*)</${tag}>`))?.[1]?.trim() || ''
+  // Support optional namespace prefix (ns:Tag) and attributes on the opening tag
+  return xml.match(
+    new RegExp(`<(?:[A-Za-z0-9_-]+:)?${tag}(?:\\s[^>]*)?>([^<]*)<\\/(?:[A-Za-z0-9_-]+:)?${tag}>`)
+  )?.[1]?.trim() || ''
 }
 
 function xmlGetAll(xml: string, tag: string): string[] {
-  const re = new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, 'g')
-  return (xml.match(re) || [])
+  // Support optional namespace prefix and attributes on the opening tag.
+  // Uses exec loop instead of match() so we can return full match strings.
+  const re = new RegExp(
+    `<(?:[A-Za-z0-9_-]+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:[A-Za-z0-9_-]+:)?${tag}>`,
+    'g'
+  )
+  const results: string[] = []
+  let m: RegExpExecArray | null
+  while ((m = re.exec(xml)) !== null) results.push(m[0])
+  return results
 }
 
 // ─── Estado general del NVR ───────────────────────────────────
@@ -361,7 +373,7 @@ interface InputProxyEntry {
   status: string
   chanDetectResult?: string
   passwordStatus?: string
-  _source: 'channels_secure' | 'channels' | 'status'
+  _source: 'channels_secure' | 'channels' | 'status' | 'channels_secure_status'
 }
 
 // Normalize body from any type (string, Buffer, object) to string
@@ -380,44 +392,97 @@ function sanitizeXmlChars(str: string): string {
 // Parse InputProxyChannel XML or JSON body into an array of entries.
 // xmlGet() scans the whole block string so nested tags (e.g. inside
 // <sourceInputPortDescriptor>) are found correctly.
+// Falls back to InputProxyChannelStatus blocks when InputProxyChannel blocks
+// are absent — some models return status-style data from the channels URL.
 function parseInputProxyChannelBody(
   data: unknown,
   source: 'channels_secure' | 'channels',
+  logContext?: string,
 ): InputProxyEntry[] {
   const bodyStr = sanitizeXmlChars(normalizeBodyToString(data))
   const isXmlBody = bodyStr.trimStart().startsWith('<')
   const entries: InputProxyEntry[] = []
 
-  let items: any[] = []
   if (isXmlBody) {
+    // Primary: InputProxyChannel blocks (have name + IP + port + protocol)
     const blocks = xmlGetAll(bodyStr, 'InputProxyChannel')
-    items = blocks.map(block => ({
-      id:             parseInt(xmlGet(block, 'id') || '0'),
-      name:           xmlGet(block, 'customName') || xmlGet(block, 'name'),
-      ipAddress:      xmlGet(block, 'ipAddress'),
-      protocol:       xmlGet(block, 'proxyProtocol') || xmlGet(block, 'protocolType'),
-      port:           parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '0'),
-      securityStatus: xmlGet(block, 'securityStatus'),
-      status:         xmlGet(block, 'status'),
-    }))
-  } else {
-    const raw = (data as any)?.InputProxyChannelList?.InputProxyChannel
-    if (raw) items = Array.isArray(raw) ? raw : [raw]
+    if (blocks.length > 0) {
+      for (const block of blocks) {
+        const ch = parseInt(xmlGet(block, 'id') || xmlGet(block, 'channelNo') || '0')
+        if (!ch) continue
+        entries.push({
+          channel:        ch,
+          name:           xmlGet(block, 'customName') || xmlGet(block, 'name') || xmlGet(block, 'channelName') || '',
+          ipAddress:      xmlGet(block, 'ipAddress') || '',
+          protocol:       xmlGet(block, 'proxyProtocol') || xmlGet(block, 'protocolType') || '',
+          managementPort: parseInt(xmlGet(block, 'managePortNo') || xmlGet(block, 'managementPortNo') || '0'),
+          securityStatus: xmlGet(block, 'securityStatus') || '',
+          status:         xmlGet(block, 'status') || '',
+          _source:        source,
+        })
+      }
+      return entries
+    }
+
+    // Fallback: InputProxyChannelStatus blocks (IP+port+protocol+online but no name)
+    // Some models return this structure at /channels?security=1 instead of InputProxyChannel.
+    const statusBlocks = xmlGetAll(bodyStr, 'InputProxyChannelStatus')
+    if (statusBlocks.length > 0) {
+      for (const block of statusBlocks) {
+        const ch = parseInt(xmlGet(block, 'id') || '0')
+        if (!ch) continue
+        const onlineStr  = xmlGet(block, 'online')
+        const chanDetect = xmlGet(block, 'chanDetectResult')
+        const pwdStatus  = xmlGet(block, 'PasswordStatus')
+        const parsed     = parseHikOnlineStatus(onlineStr, chanDetect)
+        entries.push({
+          channel:          ch,
+          name:             '',   // status structure never has camera name
+          ipAddress:        xmlGet(block, 'ipAddress') || '',
+          protocol:         xmlGet(block, 'proxyProtocol') || '',
+          managementPort:   parseInt(xmlGet(block, 'managePortNo') || '0'),
+          securityStatus:   pwdStatus || '',
+          status:           parsed ?? 'unknown',
+          chanDetectResult: chanDetect || undefined,
+          passwordStatus:   pwdStatus || undefined,
+          _source:          source === 'channels_secure' ? 'channels_secure_status' : 'status',
+        })
+      }
+      return entries
+    }
+
+    // Neither block type found — log diagnostics to help identify the actual XML structure
+    if (logContext) {
+      const rootTagMatch = bodyStr.match(/<([A-Za-z0-9_:-]+)[\s>]/)
+      const rootTag = rootTagMatch?.[1] ?? 'unknown'
+      const fieldMatches = [...bodyStr.matchAll(/<([A-Za-z0-9_:-]+)>/g)].map(m => m[1])
+      const uniqueFields = [...new Set(fieldMatches)].slice(0, 20).join(', ')
+      console.warn(
+        `[InputProxy] ${logContext} channelsParsed=0 rootTag="${rootTag}" detectedFields=[${uniqueFields}]` +
+        ` first1000=${bodyStr.slice(0, 1000).replace(/\s+/g, ' ')}`
+      )
+    }
+    return entries
   }
 
-  for (const item of items) {
-    const ch = parseInt(item.id || item.channelNo || '0')
-    if (!ch) continue
-    entries.push({
-      channel:        ch,
-      name:           item.customName || item.name || '',
-      ipAddress:      item.ipAddress || item.ip || '',
-      protocol:       item.protocol || item.protocolType || item.proxyProtocol || '',
-      managementPort: parseInt(item.port || item.managementPortNo || '0'),
-      securityStatus: item.securityStatus || '',
-      status:         item.status || '',
-      _source:        source,
-    })
+  // JSON path
+  const raw = (data as any)?.InputProxyChannelList?.InputProxyChannel
+  if (raw) {
+    const items = Array.isArray(raw) ? raw : [raw]
+    for (const item of items) {
+      const ch = parseInt(item.id || item.channelNo || '0')
+      if (!ch) continue
+      entries.push({
+        channel:        ch,
+        name:           item.customName || item.name || '',
+        ipAddress:      item.ipAddress || item.ip || '',
+        protocol:       item.protocol || item.protocolType || item.proxyProtocol || '',
+        managementPort: parseInt(item.port || item.managementPortNo || '0'),
+        securityStatus: item.securityStatus || '',
+        status:         item.status || '',
+        _source:        source,
+      })
+    }
   }
   return entries
 }
@@ -513,10 +578,15 @@ async function fetchInputProxyChannels(
       }
 
       const isXmlContent = body.trimStart().startsWith('<')
-      const entries = parseInputProxyChannelBody(body, source)
+      const logCtx = `${nvr.ipAddress} ${label} HTTP=${res.status} bytes=${body.length} bodyXml=${isXmlContent}`
+      const entries = parseInputProxyChannelBody(body, source, logCtx)
+      const usedStatusFallback = entries.length > 0 && entries[0]?._source === 'channels_secure_status'
+      const channelTag = entries.length > 0
+        ? (usedStatusFallback ? 'InputProxyChannelStatus' : 'InputProxyChannel')
+        : '?'
       console.info(
-        `[InputProxy] ${nvr.ipAddress} ${label} HTTP=${res.status} bytes=${body.length}` +
-        ` bodyXml=${isXmlContent} channelsParsed=${entries.length}` +
+        `[InputProxy] ${logCtx}` +
+        ` channelTag=${channelTag} channelsParsed=${entries.length}` +
         (entries.length > 0 ? ` firstName="${entries[0]?.name ?? ''}" firstIp="${entries[0]?.ipAddress ?? ''}"` : '')
       )
       return { entries, variantUsed: label }
@@ -764,8 +834,9 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
       status:           entry.status,
       chanDetectResult: entry.chanDetectResult,
       passwordStatus:   entry.passwordStatus,
-      metadataSource:   entry._source === 'status' ? 'inputproxy_status'
-                      : entry._source === 'channels_secure' ? 'inputproxy_channels_secure'
+      metadataSource:   entry._source === 'status'                  ? 'inputproxy_status'
+                      : entry._source === 'channels_secure_status' ? 'inputproxy_status_secure'
+                      : entry._source === 'channels_secure'        ? 'inputproxy_channels_secure'
                       : 'inputproxy_channels',
     })
   }
