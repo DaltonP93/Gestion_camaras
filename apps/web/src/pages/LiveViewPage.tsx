@@ -25,10 +25,10 @@ const STAGGER_MS: Record<GridLayout, number> = { 1: 0, 4: 250, 9: 400, 16: 500, 
 
 // ─── Health status config ────────────────────────────────────
 const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; blockStream: boolean }> = {
-  USING_MAIN_STREAM:       { icon: <Film size={12} />,          label: 'Sub no disponible',     blockStream: true },
+  USING_MAIN_STREAM:       { icon: <Film size={12} />,          label: 'Sub no disponible',     blockStream: false },
   RTSP_SUB_NOT_FOUND:      { icon: <AlertTriangle size={12} />, label: 'Substream 404',         blockStream: true },
   RTSP_MAIN_NOT_FOUND:     { icon: <AlertTriangle size={12} />, label: 'RTSP no encontrado',    blockStream: true },
-  CODEC_UNSUPPORTED_HEVC:  { icon: <Film size={12} />,          label: 'HEVC no compatible',    blockStream: true },
+  CODEC_UNSUPPORTED_HEVC:  { icon: <Film size={12} />,          label: 'HEVC no compatible',    blockStream: false },
   STREAM_UNSTABLE:         { icon: <AlertTriangle size={12} />, label: 'Stream inestable',      blockStream: false },
   MEDIA_SERVER_ERROR:      { icon: <AlertTriangle size={12} />, label: 'Error servidor',        blockStream: false },
   AUTH_FAILED:             { icon: <Lock size={12} />,          label: 'Auth fallida',          blockStream: true },
@@ -38,9 +38,11 @@ const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; bloc
 function isBlockedByHealth(camera: Camera): boolean {
   // RTSP validator confirmed camera unreachable
   if (camera.online === false) return true
+  const status = camera.streamHealthStatus
+  // USING_MAIN_STREAM: sub is down but main H264 works — backend auto-redirects, never block
+  if (status === 'USING_MAIN_STREAM') return false
   // Sub RTSP specifically confirmed down — grid always requests sub
   if (camera.rtspSubOk === false) return true
-  const status = camera.streamHealthStatus
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
   return HEALTH_CONFIG[status]?.blockStream ?? false
 }
@@ -135,7 +137,12 @@ export function LiveViewPage() {
   // without a forward-reference compile error.
   const loadStreamRef = useRef<((camera: Camera) => Promise<void>) | null>(null)
 
-  useEffect(() => { loadNVRs(); loadCameras() }, [])
+  useEffect(() => {
+    loadNVRs()
+    loadCameras()
+    // Clear any stale sessions from a previous page visit
+    apiPost('/cameras/cleanup-my-sessions', {}).catch(() => {})
+  }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
 
   useEffect(() => {
@@ -382,11 +389,9 @@ export function LiveViewPage() {
 
     // Block cameras with known bad health
     if (isBlockedByHealth(camera)) {
-      let effectiveStatus = camera.streamHealthStatus
-      if (effectiveStatus === 'USING_MAIN_STREAM') effectiveStatus = 'CODEC_UNSUPPORTED_HEVC' as any
       const blockError: CameraPlaybackError =
-        effectiveStatus && effectiveStatus !== 'UNKNOWN'
-          ? getHealthError(effectiveStatus as StreamHealthStatus, camera.channel)
+        camera.streamHealthStatus && camera.streamHealthStatus !== 'UNKNOWN'
+          ? getHealthError(camera.streamHealthStatus as StreamHealthStatus, camera.channel)
           : { code: 'CAMERA_OFFLINE', message: 'Sin señal — cámara offline o sin RTSP disponible' }
       setStreamErrors(prev => ({ ...prev, [camera.id]: blockError }))
       return
@@ -410,7 +415,7 @@ export function LiveViewPage() {
       const rawMsg: string = body.message || body.error || ''
 
       if (code === 'STREAM_LIMIT_REACHED' || code === 'STREAM_LIMIT_GLOBAL') {
-        await handleLimitHit(camera)
+        await handleLimitHit(camera, body.current as number | undefined, body.max as number | undefined)
         return
       }
 
@@ -444,7 +449,7 @@ export function LiveViewPage() {
   loadStreamRef.current = loadStream  // keep ref current for flushHlsExpiry
 
   // ─── Handle stream limit: cleanup non-visible then retry ────
-  const handleLimitHit = useCallback(async (camera: Camera) => {
+  const handleLimitHit = useCallback(async (camera: Camera, current?: number, max?: number) => {
     const visibleIds = new Set(filteredCameras.map(c => c.id))
     const nonVisible = Array.from(activeSessions.current).filter(id => !visibleIds.has(id))
 
@@ -458,13 +463,16 @@ export function LiveViewPage() {
       pendingStarts.current.delete(camera.id)
       await loadStream(camera)
     } else {
+      const limitMsg = current !== undefined && max !== undefined
+        ? `Límite de streams alcanzado (${current}/${max} activos)`
+        : `Límite de streams alcanzado`
       setStreamErrors(prev => ({
         ...prev,
-        [camera.id]: { code: 'UNKNOWN', message: `Límite de streams alcanzado (${gridLayout} máx)` },
+        [camera.id]: { code: 'UNKNOWN', message: limitMsg },
       }))
       setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
     }
-  }, [filteredCameras, gridLayout, stopSessions, loadStream])
+  }, [filteredCameras, stopSessions, loadStream])
 
   // ─── Start visible streams with stagger ─────────────────────
   // Blocked cameras (offline / known bad health) are loaded immediately without stagger

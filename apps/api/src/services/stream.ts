@@ -20,7 +20,8 @@ const registeredPaths = new Map<string, string>()
 const inFlightPaths   = new Set<string>()
 
 // Transcoding config — read once at module load, no runtime overhead
-const ENABLE_HEVC_TRANSCODING  = process.env.ENABLE_HEVC_TRANSCODING  === 'true'
+// Accept both ENABLE_HEVC_TRANSCODING and the legacy alias ENABLE_HEVC_TRANSCODE
+const ENABLE_HEVC_TRANSCODING  = process.env.ENABLE_HEVC_TRANSCODING === 'true' || process.env.ENABLE_HEVC_TRANSCODE === 'true'
 const HEVC_TRANSCODE_PRESET    = process.env.HEVC_TRANSCODE_PRESET    || 'ultrafast'
 const HEVC_TRANSCODE_WIDTH     = process.env.HEVC_TRANSCODE_WIDTH     || '1280'
 const HEVC_TRANSCODE_FPS       = process.env.HEVC_TRANSCODE_FPS       || '15'
