@@ -135,6 +135,8 @@ export function VideoPlayer({
   const isPlayingRef = useRef(false)
   const [status, setStatus] = useState<Status>('loading')
   const [internalError, setInternalError] = useState<CameraPlaybackError | null>(null)
+  // Message shown in the loading overlay during transcoding startup (HLS 500 retry window)
+  const [transcodeStartMsg, setTranscodeStartMsg] = useState<string | null>(null)
   const [muted, setMuted] = useState(true)
   const [showControls, setShowControls] = useState(false)
   const [retryCount, setRetryCount] = useState(0)
@@ -149,6 +151,7 @@ export function VideoPlayer({
     isPlayingRef.current = false
     setStatus('loading')
     setInternalError(null)
+    setTranscodeStartMsg(null)
 
     if (Hls.isSupported()) {
       const hls = new Hls({
@@ -187,6 +190,7 @@ export function VideoPlayer({
         isPlayingRef.current = true
         setStatus('playing')
         setInternalError(null)
+        setTranscodeStartMsg(null)
       })
 
       hls.on(Hls.Events.ERROR, (_, data) => {
@@ -220,16 +224,25 @@ export function VideoPlayer({
             const is404 = statusCode === 404
             const isTranscodedStream = streamTypeRef.current === 'main_h264'
             if (is500) console.warn('[VideoPlayer] HLS 500', { cameraId, isTranscoded: isTranscodedStream, details: data.details })
-            // Transcoded 500: retry 8 times × 800ms = 6.4s safety net in case backend wait wasn't enough
-            const maxRetries = is500 ? (isTranscodedStream ? 8 : 0) : is404 ? 1 : 5
+            // Transcoded 500: retry 15×800ms = 12s while FFmpeg starts up.
+            // Show "Preparando transcodificación..." in loading overlay during wait.
+            // Normal 500: fail immediately (source/muxer error, not a startup delay).
+            // 404: stream still registering → 1 retry.
+            const maxRetries = is500 ? (isTranscodedStream ? 15 : 0) : is404 ? 1 : 5
             setRetryCount((r) => {
+              if (r === 0 && is500 && isTranscodedStream) {
+                // First 500 on a transcoded stream — show startup message, keep loading
+                setTranscodeStartMsg('Preparando transcodificación...')
+              }
               if (r >= maxRetries) {
+                setTranscodeStartMsg(null)
                 const err: CameraPlaybackError = {
                   code: errorCode,
-                  message: is500 && isTranscodedStream ? 'Transcodificación en progreso — intenta de nuevo en unos segundos'
-                          : is500 ? 'Stream no disponible'
-                          : is404 ? 'Stream no disponible en el servidor'
-                          :         'Sin respuesta del servidor de streaming',
+                  message: is500 && isTranscodedStream
+                    ? 'Transcodificación no disponible — el stream no pudo iniciarse a tiempo'
+                    : is500 ? 'Stream no disponible'
+                    : is404 ? 'Stream no disponible en el servidor'
+                    :         'Sin respuesta del servidor de streaming',
                   technicalDetail: `HTTP ${statusCode ?? 'err'} ${data.details}. URL: ${hlsUrl}`,
                 }
                 setStatus('error')
@@ -335,8 +348,13 @@ export function VideoPlayer({
 
       {/* Loading */}
       {status === 'loading' && !activeError && (
-        <div className="absolute inset-0 flex items-center justify-center bg-surface-900/80">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-surface-900/80">
           <Loader2 size={24} className="text-surface-400 animate-spin" />
+          {transcodeStartMsg && (
+            <p className="text-[10px] text-purple-300 text-center max-w-[160px] leading-snug">
+              {transcodeStartMsg}
+            </p>
+          )}
         </div>
       )}
 

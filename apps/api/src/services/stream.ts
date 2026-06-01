@@ -34,37 +34,63 @@ const MEDIAMTX_RTSP_PORT       = process.env.MEDIAMTX_RTSP_PORT       || '8554'
 
 export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
 
-// ─── Wait for HLS manifest to become available ──────────────
-// Polls the internal MediaMTX HLS endpoint after registering a path.
-// The first poll also triggers runOnDemand (starts FFmpeg).
-// Returns true when the manifest responds 200, false if timeout.
+// ─── Wait for HLS manifest with real segment data ───────────
+// Polls the internal MediaMTX HLS port after registering a path.
+// The first poll triggers runOnDemand (starts FFmpeg).
+// Validates body — requires #EXTM3U + at least one segment reference
+// so we don't return "ready" on a placeholder manifest without video data.
+// Logs each attempt at 1s intervals to avoid spam.
 export async function waitForHlsReady(
   streamPath: string,
-  maxWaitMs = 10_000,
+  maxWaitMs = 12_000,
   intervalMs = 300,
-): Promise<boolean> {
+): Promise<{ ready: boolean; lastStatus: number; elapsedMs: number }> {
   const url = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`
-  const attempts = Math.ceil(maxWaitMs / intervalMs)
+  const startTime = Date.now()
+  const attempts   = Math.ceil(maxWaitMs / intervalMs)
+  let lastStatus   = 0
+  let lastLoggedAt = 0
+
   console.info(`[transcode] waiting_hls path=${streamPath}`)
+
   for (let i = 0; i < attempts; i++) {
+    const now = Date.now()
     try {
-      const res = await axios.get(url, { timeout: 2500, validateStatus: () => true })
-      if (res.status === 200) {
-        console.info(`[transcode] hls_ready path=${streamPath} attempt=${i + 1}`)
-        return true
+      const res = await axios.get(url, {
+        timeout: 2000,
+        validateStatus: () => true,
+        responseType: 'text',
+      })
+      lastStatus = res.status
+      const body = typeof res.data === 'string' ? res.data : ''
+
+      // A valid, usable HLS manifest must have both the header AND at least one
+      // media segment reference. MediaMTX sometimes returns #EXTM3U-only stubs
+      // while FFmpeg is still starting — those would cause immediate 500 for
+      // the first segment request. Wait until real content is present.
+      const hasHeader  = body.includes('#EXTM3U')
+      const hasSegment = body.includes('#EXTINF') || body.includes('.ts') || body.includes('.m4s')
+
+      if (res.status === 200 && hasHeader && hasSegment) {
+        const elapsed = now - startTime
+        console.info(`[transcode] hls_ready path=${streamPath} attempt=${i + 1} elapsedMs=${elapsed}`)
+        return { ready: true, lastStatus, elapsedMs: elapsed }
       }
-      if (i === attempts - 1) {
-        console.warn(`[transcode] hls_not_ready path=${streamPath} status=${res.status} timeout=true`)
+
+      // Log at most once per second — avoid spamming when polling every 300ms
+      if (now - lastLoggedAt >= 1000) {
+        console.info(`[transcode] waiting_hls path=${streamPath} attempt=${i + 1} status=${res.status} header=${hasHeader} segment=${hasSegment}`)
+        lastLoggedAt = now
       }
-    } catch (err: any) {
-      const status = err.response?.status ?? 'timeout'
-      if (i === attempts - 1) {
-        console.warn(`[transcode] hls_not_ready path=${streamPath} status=${status} timeout=true`)
-      }
+    } catch {
+      // network/timeout — keep polling
     }
     if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs))
   }
-  return false
+
+  const elapsed = Date.now() - startTime
+  console.warn(`[transcode] hls_timeout path=${streamPath} lastStatus=${lastStatus} elapsedMs=${elapsed}`)
+  return { ready: false, lastStatus, elapsedMs: elapsed }
 }
 
 // ─── FFmpeg capability detection ────────────────────────────
