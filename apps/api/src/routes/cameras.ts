@@ -312,6 +312,13 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
           data: { streamHealthStatus: 'MEDIA_SERVER_ERROR' } as any,
         }).catch(() => {})
       }
+      // Persist RTSP_SUB_NOT_FOUND to DB so future requests are blocked at the frontend
+      if (result.error.code === 'RTSP_SUB_NOT_FOUND') {
+        await server.prisma.camera.update({
+          where: { id },
+          data: { rtspSubOk: false, streamHealthStatus: 'RTSP_SUB_NOT_FOUND' } as any,
+        }).catch(() => {})
+      }
       return reply.status(400).send(result.error)
     }
 
