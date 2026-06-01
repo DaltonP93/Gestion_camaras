@@ -341,11 +341,12 @@ export function LiveViewPage() {
   }, [sendHeartbeat])
 
   // ─── Stop sessions for a set of cameraIds ───────────────────
-  const stopSessions = useCallback(async (cameraIds: string[]) => {
+  const stopSessions = useCallback(async (cameraIds: string[], reason?: string) => {
     const toStop = cameraIds.filter(id => activeSessions.current.has(id))
     if (toStop.length === 0) return
+    console.info(`[LiveView] stopSessions reason=${reason || 'unspecified'} count=${toStop.length} ids=[${toStop.join(',')}]`)
     await Promise.allSettled(
-      toStop.map(id => apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {}))
+      toStop.map(id => apiPost(`/cameras/${id}/stop-stream`, { streamType: 'sub' }).catch(() => {}))
     )
     toStop.forEach(id => {
       activeSessions.current.delete(id)
@@ -360,10 +361,10 @@ export function LiveViewPage() {
   }, [])
 
   // ─── Stop ALL current sessions + clear state ────────────────
-  const stopAllSessions = useCallback(async () => {
+  const stopAllSessions = useCallback(async (reason?: string) => {
     clearStaggerTimers()
     const allActive = Array.from(activeSessions.current)
-    await stopSessions(allActive)
+    await stopSessions(allActive, reason || 'stop_all')
     setStreams({})
     setStreamErrors({})
     setLoadingStreams({})
@@ -539,7 +540,7 @@ export function LiveViewPage() {
 
     clearStaggerTimers()
 
-    stopSessions(leaving).then(() => {
+    stopSessions(leaving, 'viewport_change').then(() => {
       if (leaving.length > 0) {
         setStreams(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
         setStreamErrors(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
@@ -552,21 +553,21 @@ export function LiveViewPage() {
 
   // ─── Layout / NVR / page selection → stop all + restart ─────
   const handleLayoutChange = useCallback(async (layout: GridLayout) => {
-    await stopAllSessions()
+    await stopAllSessions('layout_change')
     prevVisibleIds.current = []
     setGridLayout(layout)
     setPage(0)
   }, [stopAllSessions])
 
   const handleNVRChange = useCallback(async (nvrId: string) => {
-    await stopAllSessions()
+    await stopAllSessions('nvr_change')
     prevVisibleIds.current = []
     setSelectedNVR(nvrId)
     setPage(0)
   }, [stopAllSessions])
 
   const handlePageChange = useCallback(async (newPage: number) => {
-    await stopAllSessions()
+    await stopAllSessions('page_change')
     prevVisibleIds.current = []
     setPage(newPage)
   }, [stopAllSessions])
@@ -590,7 +591,8 @@ export function LiveViewPage() {
 
   // ─── Retry a single grid camera (full stream restart) ───────
   const handleGridCameraRetry = useCallback((cameraId: string) => {
-    apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
+    console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=sub reason=grid_retry`)
+    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'sub' }).catch(() => {})
     activeSessions.current.delete(cameraId)
     setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
     setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
@@ -607,9 +609,6 @@ export function LiveViewPage() {
     console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
 
     if (err.code === 'HLS_SESSION_EXPIRED') {
-      // HLS session cookie expired — backend RTSP→MediaMTX source is still running.
-      // Do NOT stop the backend stream; just coalesce and remount the player so
-      // HLS.js re-establishes its session against the running source.
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
       hlsExpiryQueue.current.add(cameraId)
@@ -619,13 +618,17 @@ export function LiveViewPage() {
       return
     }
 
-    // For all other fatal errors, stop the backend stream
+    // For all other fatal errors, stop the backend stream using the correct type.
+    // Focus camera: use focusStreamType (may be main_h264, not sub).
+    // Grid camera: always sub.
     if (activeSessions.current.has(cameraId)) {
-      apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
+      const st = cameraId === focusCamera ? focusStreamType : 'sub'
+      console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${st} reason=stream_error code=${err.code}`)
+      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: st }).catch(() => {})
       activeSessions.current.delete(cameraId)
     }
     setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
-  }, [cameras, bumpPlayerKeys, flushHlsExpiry])
+  }, [flushHlsExpiry, focusCamera, focusStreamType])
 
   // ─── Enter focus/fullscreen — start main stream ─────────────
   const handleEnterFocus = useCallback(async (camera: Camera) => {
@@ -648,6 +651,17 @@ export function LiveViewPage() {
 
     try {
       const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main' })
+      // Backend may auto-redirect main→main_h264 (HEVC camera + transcoding enabled).
+      // Detect the actual stream type from the response so stop-stream/quality-switch
+      // use the correct type key.
+      const actualType: 'sub' | 'main' | 'main_h264' =
+        (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
+          ? 'main_h264'
+          : 'main'
+      if (actualType !== focusStreamType) {
+        console.info(`[LiveView] enterFocus redirect cameraId=${camera.id} requested=main actual=${actualType}`)
+        setFocusStreamType(actualType)
+      }
       setFocusStreamInfo(info)
       bumpPlayerKeys([camera.id])
     } catch (err: any) {
@@ -665,13 +679,15 @@ export function LiveViewPage() {
         technicalDetail: body.details,
       })
     }
-  }, [bumpPlayerKeys, streamCapabilities])
+  }, [bumpPlayerKeys, streamCapabilities, focusStreamType])
 
   // ─── Quality switch from VideoPlayer (Baja/Alta/Trans buttons) ─
   const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main' | 'main_h264') => {
     if (!focusCamera) return
     if (quality === 'sub') {
-      // Stop both main and main_h264 streams if any were started
+      // Stop BOTH main and main_h264 — focusStreamType might say 'main' even when backend
+      // redirected to main_h264 (fixed going forward, but guard for existing sessions too).
+      console.info(`[LiveView] qualitySwitch cameraId=${focusCamera} from=${focusStreamType} to=sub`)
       apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main' }).catch(() => {})
       apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main_h264' }).catch(() => {})
       setFocusStreamInfo(null)
@@ -679,16 +695,28 @@ export function LiveViewPage() {
       setFocusStreamType('sub')
       bumpPlayerKeys([focusCamera])
     } else {
-      // Stop whichever focus stream was running before switching
+      // Stop whichever focus stream was running before switching.
+      // Always stop both main and main_h264 to avoid FFmpeg orphans.
       const prevType = focusStreamType
+      console.info(`[LiveView] qualitySwitch cameraId=${focusCamera} from=${prevType} to=${quality}`)
       if (prevType !== 'sub') {
-        apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: prevType }).catch(() => {})
+        apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main' }).catch(() => {})
+        apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main_h264' }).catch(() => {})
       }
       setFocusStreamInfo(null)
       setFocusStreamError(null)
       setFocusStreamType(quality)
       try {
         const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality })
+        // Detect actual type (backend may redirect main→main_h264)
+        const actualType: 'sub' | 'main' | 'main_h264' =
+          (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
+            ? 'main_h264'
+            : quality
+        if (actualType !== quality) {
+          console.info(`[LiveView] qualitySwitch redirect cameraId=${focusCamera} requested=${quality} actual=${actualType}`)
+          setFocusStreamType(actualType)
+        }
         setFocusStreamInfo(info)
         bumpPlayerKeys([focusCamera])
       } catch (err: any) {
@@ -698,6 +726,9 @@ export function LiveViewPage() {
           AUTH_FAILED:            'AUTH_FAILED',
           OFFLINE:                'CAMERA_OFFLINE',
           MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
+          TRANSCODE_NOT_READY:    'MEDIAMTX_NOT_READY',
+          TRANSCODE_PROCESS_EXITED: 'MEDIAMTX_NOT_READY',
+          TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
         }
         setFocusStreamError({
           code: errCodeMap[body.error] || 'UNKNOWN',
@@ -720,7 +751,9 @@ export function LiveViewPage() {
 
     // Stop main/main_h264 streams — sub stream stays alive for the grid
     if (prevFocusId) {
+      console.info(`[LiveView] stop-stream cameraId=${prevFocusId} streamType=main reason=exit_focus`)
       apiPost(`/cameras/${prevFocusId}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      console.info(`[LiveView] stop-stream cameraId=${prevFocusId} streamType=main_h264 reason=exit_focus`)
       apiPost(`/cameras/${prevFocusId}/stop-stream`, { streamType: 'main_h264' }).catch(() => {})
     }
 

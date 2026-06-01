@@ -136,24 +136,26 @@ export function getTranscodeStderr(streamPath: string): string {
 export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
 
 // ─── Wait for HLS manifest with real segment data ───────────
-// Polls internal MediaMTX HLS port waiting for FFmpeg (spawned by API) to start
-// publishing. Validates body — requires #EXTM3U + a segment reference (#EXTINF,
-// .ts, .m4s) to avoid accepting a stub manifest MediaMTX emits before FFmpeg data.
-// isAlive: optional callback checked each interval — if it returns false the
-// wait aborts immediately (FFmpeg exited early) instead of waiting full timeout.
+// Polls internal MediaMTX HLS port waiting for FFmpeg to start publishing.
+// Returns { ready, lastStatus, elapsedMs, processExited, manifestVisible }.
+// manifestVisible=true means status=200 + #EXTM3U was seen; used by the caller
+// to decide whether to kill FFmpeg on timeout (if manifest is visible, FFmpeg is
+// alive — don't kill it; let VideoPlayer retry on 500/stub).
 export async function waitForHlsReady(
   streamPath: string,
   maxWaitMs = 12_000,
   intervalMs = 300,
   isAlive?: () => boolean,
-): Promise<{ ready: boolean; lastStatus: number; elapsedMs: number; processExited: boolean }> {
+): Promise<{ ready: boolean; lastStatus: number; elapsedMs: number; processExited: boolean; manifestVisible: boolean }> {
   const url      = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`
   const startMs  = Date.now()
   const attempts = Math.ceil(maxWaitMs / intervalMs)
-  let lastStatus   = 0
-  let lastLoggedAt = 0
+  let lastStatus      = 0
+  let lastLoggedAt    = 0
+  let manifestVisible = false
+  let bodyLoggedOnce  = false  // log manifest body once when header=true segment=false
 
-  console.info(`[transcode] waiting_hls path=${streamPath}`)
+  console.info(`[transcode] waiting_hls path=${streamPath} maxWaitMs=${maxWaitMs}`)
 
   for (let i = 0; i < attempts; i++) {
     const now = Date.now()
@@ -162,7 +164,7 @@ export async function waitForHlsReady(
     if (isAlive && !isAlive()) {
       const elapsed = now - startMs
       console.warn(`[transcode] waiting_hls aborted path=${streamPath} reason=process_exited elapsedMs=${elapsed}`)
-      return { ready: false, lastStatus, elapsedMs: elapsed, processExited: true }
+      return { ready: false, lastStatus, elapsedMs: elapsed, processExited: true, manifestVisible }
     }
 
     try {
@@ -174,21 +176,52 @@ export async function waitForHlsReady(
       lastStatus = res.status
       const body = typeof res.data === 'string' ? res.data : ''
 
-      // A valid, playable manifest must have the M3U8 header AND at least one
-      // segment reference. MediaMTX emits #EXTM3U-only stubs before FFmpeg
-      // data arrives; those cause immediate 500 on the first segment fetch.
-      const hasHeader  = body.includes('#EXTM3U')
-      const hasSegment = body.includes('#EXTINF') || body.includes('.ts') || body.includes('.m4s')
+      const hasHeader = body.includes('#EXTM3U')
+
+      // Expanded segment detection: covers TS, fMP4 (.m4s, .mp4), LL-HLS (#EXT-X-PART),
+      // and proper media-playlist headers (#EXT-X-TARGETDURATION, #EXT-X-MEDIA-SEQUENCE,
+      // #EXT-X-MAP). MediaMTX may use any of these depending on HLS variant config.
+      const hasSegment =
+        body.includes('#EXTINF')                 ||  // MPEG-TS & fMP4 segments
+        body.includes('#EXT-X-PART')             ||  // LL-HLS parts
+        body.includes('#EXT-X-MAP')              ||  // fMP4 initialization segment ref
+        body.includes('#EXT-X-TARGETDURATION')   ||  // any proper media playlist
+        body.includes('#EXT-X-MEDIA-SEQUENCE')   ||  // any proper media playlist
+        body.includes('.ts')                     ||  // .ts segment URIs
+        body.includes('.m4s')                    ||  // fMP4 segment URIs
+        body.includes('.mp4')                       // fMP4 segment/init URIs
+
+      if (hasHeader) manifestVisible = true
 
       if (res.status === 200 && hasHeader && hasSegment) {
         const elapsed = now - startMs
         console.info(`[transcode] hls_ready path=${streamPath} attempt=${i + 1} elapsedMs=${elapsed}`)
-        return { ready: true, lastStatus, elapsedMs: elapsed, processExited: false }
+        return { ready: true, lastStatus, elapsedMs: elapsed, processExited: false, manifestVisible: true }
+      }
+
+      // Log manifest body ONCE when header=true but no segment detected — helps diagnose format
+      if (res.status === 200 && hasHeader && !hasSegment && !bodyLoggedOnce) {
+        bodyLoggedOnce = true
+        const snippet = body.slice(0, 500).replace(/\n/g, '\\n')
+        console.warn(`[transcode] waiting_hls manifest_no_segment path=${streamPath} bodyLen=${body.length} first500=${snippet}`)
       }
 
       // Throttle per-attempt logs to once per second
       if (now - lastLoggedAt >= 1000) {
-        console.info(`[transcode] waiting_hls path=${streamPath} attempt=${i + 1} status=${res.status} header=${hasHeader} segment=${hasSegment}`)
+        const hasTargetDuration = body.includes('#EXT-X-TARGETDURATION')
+        const hasMediaSeq       = body.includes('#EXT-X-MEDIA-SEQUENCE')
+        const hasMap            = body.includes('#EXT-X-MAP')
+        const hasExtinf         = body.includes('#EXTINF')
+        const hasPart           = body.includes('#EXT-X-PART')
+        const hasTs             = body.includes('.ts')
+        const hasM4s            = body.includes('.m4s')
+        const hasMp4            = body.includes('.mp4')
+        console.info(
+          `[transcode] waiting_hls path=${streamPath} attempt=${i + 1} status=${res.status}` +
+          ` header=${hasHeader} segment=${hasSegment} bodyLen=${body.length}` +
+          ` targetDuration=${hasTargetDuration} mediaSeq=${hasMediaSeq} map=${hasMap}` +
+          ` extinf=${hasExtinf} part=${hasPart} ts=${hasTs} m4s=${hasM4s} mp4=${hasMp4}`
+        )
         lastLoggedAt = now
       }
     } catch {
@@ -198,8 +231,8 @@ export async function waitForHlsReady(
   }
 
   const elapsed = Date.now() - startMs
-  console.warn(`[transcode] hls_timeout path=${streamPath} lastStatus=${lastStatus} elapsedMs=${elapsed}`)
-  return { ready: false, lastStatus, elapsedMs: elapsed, processExited: false }
+  console.warn(`[transcode] hls_timeout path=${streamPath} lastStatus=${lastStatus} elapsedMs=${elapsed} manifestVisible=${manifestVisible}`)
+  return { ready: false, lastStatus, elapsedMs: elapsed, processExited: false, manifestVisible }
 }
 
 // ─── FFmpeg capability detection ────────────────────────────
