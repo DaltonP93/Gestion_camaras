@@ -296,14 +296,16 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const body = request.body as any
-    const streamType: 'sub' | 'main' = body?.streamType === 'main' ? 'main' : 'sub'
+    const streamType: 'sub' | 'main' | 'main_h264' =
+      body?.streamType === 'main'      ? 'main'      :
+      body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
 
     const result = await startStream(server, user.sub, id, undefined, streamType)
     if (result.error) {
       // Si el error es del servidor de medios (no de límites ni de estado de salud),
       // marcar la cámara como MEDIA_SERVER_ERROR
       const isLimitError = result.error.code === 'STREAM_LIMIT_REACHED' || result.error.code === 'STREAM_LIMIT_GLOBAL'
-      const isHealthError = Object.prototype.hasOwnProperty.call({ RTSP_SUB_NOT_FOUND: 1, CODEC_UNSUPPORTED_HEVC: 1, AUTH_FAILED: 1, OFFLINE: 1, RTSP_MAIN_NOT_FOUND: 1 }, result.error.code)
+      const isHealthError = Object.prototype.hasOwnProperty.call({ RTSP_SUB_NOT_FOUND: 1, CODEC_UNSUPPORTED_HEVC: 1, AUTH_FAILED: 1, OFFLINE: 1, RTSP_MAIN_NOT_FOUND: 1, TRANSCODING_DISABLED: 1 }, result.error.code)
       if (!isLimitError && !isHealthError) {
         await server.prisma.camera.update({
           where: { id },
@@ -342,7 +344,9 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const { id } = request.params as { id: string }
     const user = request.user
     const body = request.body as any
-    const streamType: 'sub' | 'main' = body?.streamType === 'main' ? 'main' : 'sub'
+    const streamType: 'sub' | 'main' | 'main_h264' =
+      body?.streamType === 'main'      ? 'main'      :
+      body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     await stopStream(server, user.sub, id, streamType)
     return reply.send({ ok: true })
   })
