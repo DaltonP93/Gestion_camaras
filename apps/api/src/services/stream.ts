@@ -18,6 +18,16 @@ const registeredPaths = new Map<string, string>()
 // Evita solicitudes concurrentes duplicadas para el mismo path
 const inFlightPaths   = new Set<string>()
 
+// Transcoding config — read once at module load, no runtime overhead
+const ENABLE_HEVC_TRANSCODING  = process.env.ENABLE_HEVC_TRANSCODING  === 'true'
+const HEVC_TRANSCODE_PRESET    = process.env.HEVC_TRANSCODE_PRESET    || 'ultrafast'
+const HEVC_TRANSCODE_WIDTH     = process.env.HEVC_TRANSCODE_WIDTH     || '1280'
+const HEVC_TRANSCODE_FPS       = process.env.HEVC_TRANSCODE_FPS       || '15'
+const HEVC_TRANSCODE_BITRATE   = process.env.HEVC_TRANSCODE_BITRATE   || '1500k'
+const MEDIAMTX_RTSP_PORT       = process.env.MEDIAMTX_RTSP_PORT       || '8554'
+
+export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
+
 function configFingerprint(source: string, streamType: 'sub' | 'main'): string {
   return `${source}|tcp|10m|${streamType}`
 }
@@ -39,9 +49,14 @@ export async function listRegisteredConfigPaths(): Promise<Set<string> | null> {
 }
 
 // Nombre del path en MediaMTX para una cámara.
-// streamType='sub' → Channels/102,1202 (H264); 'main' → Channels/101,1201 (puede ser HEVC)
+// streamType='sub' → Channels/102 (H264); 'main' → Channels/101 (puede ser HEVC)
 export function getStreamPath(nvr: NVR, camera: Camera, streamType: 'sub' | 'main' = 'sub'): string {
   return `nvr_${nvr.id}_ch${String(camera.channel).padStart(2, '0')}_${streamType}`
+}
+
+// Path para stream transcodificado HEVC → H.264 via FFmpeg + MediaMTX runOnDemand
+export function getTranscodedStreamPath(nvr: NVR, camera: Camera): string {
+  return `nvr_${nvr.id}_ch${String(camera.channel).padStart(2, '0')}_main_h264`
 }
 
 // URL HLS relativa para el frontend (pasa por Nginx /hls/ → mediamtx:8888)
@@ -141,6 +156,76 @@ export async function publishStream(nvr: NVR, camera: Camera, streamType: 'sub' 
       }
 
       console.error(`[stream] failed to register path ${streamPath}:`, status, err.message)
+      return false
+    }
+  } finally {
+    inFlightPaths.delete(streamPath)
+  }
+}
+
+// ─── Publicar stream transcodificado HEVC→H.264 via MediaMTX runOnDemand ─
+// Usa FFmpeg on-demand para transcodificar el stream principal (H.265) a H.264.
+// Solo disponible cuando ENABLE_HEVC_TRANSCODING=true.
+export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise<boolean> {
+  if (!ENABLE_HEVC_TRANSCODING) return false
+
+  const streamPath = getTranscodedStreamPath(nvr, camera)
+  const pass: string = (nvr as any).password ?? ''
+  if (!pass) {
+    console.error(`[stream] PASSWORD_EMPTY — skipping transcoded path ${streamPath}`)
+    return false
+  }
+
+  const rtspUrl = buildRtspUrl(nvr, camera.channel, false)  // false = main stream
+  if (/:@/.test(rtspUrl)) {
+    console.error(`[stream] RTSP_EMPTY_CREDENTIALS — skipping transcoded path ${streamPath}`)
+    return false
+  }
+
+  const fp = `transcode|${rtspUrl}|${HEVC_TRANSCODE_WIDTH}|${HEVC_TRANSCODE_FPS}|${HEVC_TRANSCODE_BITRATE}`
+  if (registeredPaths.get(streamPath) === fp) return true
+  if (inFlightPaths.has(streamPath)) return true
+
+  // FFmpeg: read from NVR RTSP directly → transcode → publish back to MediaMTX via RTSP
+  const ffmpegCmd = [
+    'ffmpeg', '-rtsp_transport', 'tcp',
+    '-i', rtspUrl,
+    '-vf', `scale=${HEVC_TRANSCODE_WIDTH}:-2`,
+    '-r', HEVC_TRANSCODE_FPS,
+    '-c:v', 'libx264',
+    '-preset', HEVC_TRANSCODE_PRESET,
+    '-b:v', HEVC_TRANSCODE_BITRATE,
+    '-an',
+    '-f', 'rtsp', '-rtsp_transport', 'tcp',
+    `rtsp://127.0.0.1:${MEDIAMTX_RTSP_PORT}/${streamPath}`,
+  ].join(' ')
+
+  const pathConfig = {
+    runOnDemand: ffmpegCmd,
+    runOnDemandCloseAfter: '10m',
+  }
+
+  const sourceMasked = rtspUrl.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+  console.info(`[stream] publish-transcoded path=${streamPath} source=${sourceMasked} preset=${HEVC_TRANSCODE_PRESET} width=${HEVC_TRANSCODE_WIDTH}`)
+
+  inFlightPaths.add(streamPath)
+  try {
+    try {
+      await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
+      registeredPaths.set(streamPath, fp)
+      console.info(`[stream] transcoded path created: ${streamPath}`)
+      return true
+    } catch (err: any) {
+      if (err.response?.status === 400) {
+        try {
+          await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
+          registeredPaths.set(streamPath, fp)
+          return true
+        } catch {
+          return false
+        }
+      }
+      console.error(`[stream] transcoded path error: ${err.message}`)
       return false
     }
   } finally {

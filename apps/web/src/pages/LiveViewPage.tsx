@@ -104,7 +104,7 @@ export function LiveViewPage() {
   const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
   // Track the intended stream type separately — focusStreamInfo alone can't tell us 'main'
   // when HEVC blocks the stream before the API call (focusStreamInfo stays null).
-  const [focusStreamType, setFocusStreamType]   = useState<'sub' | 'main'>('sub')
+  const [focusStreamType, setFocusStreamType]   = useState<'sub' | 'main' | 'main_h264'>('sub')
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
 
   // playerKeys forces VideoPlayer remount (new HLS instance) when incremented for a camera
@@ -608,21 +608,28 @@ export function LiveViewPage() {
     }
   }, [bumpPlayerKeys])
 
-  // ─── Quality switch from VideoPlayer (Baja/Alta buttons) ────
-  const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main') => {
+  // ─── Quality switch from VideoPlayer (Baja/Alta/Trans buttons) ─
+  const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main' | 'main_h264') => {
     if (!focusCamera) return
     if (quality === 'sub') {
+      // Stop both main and main_h264 streams if any were started
       apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main_h264' }).catch(() => {})
       setFocusStreamInfo(null)
       setFocusStreamError(null)
       setFocusStreamType('sub')
       bumpPlayerKeys([focusCamera])
     } else {
+      // Stop whichever focus stream was running before switching
+      const prevType = focusStreamType
+      if (prevType !== 'sub') {
+        apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: prevType }).catch(() => {})
+      }
       setFocusStreamInfo(null)
       setFocusStreamError(null)
-      setFocusStreamType('main')
+      setFocusStreamType(quality)
       try {
-        const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: 'main' })
+        const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality })
         setFocusStreamInfo(info)
         bumpPlayerKeys([focusCamera])
       } catch (err: any) {
@@ -635,12 +642,12 @@ export function LiveViewPage() {
         }
         setFocusStreamError({
           code: errCodeMap[body.error] || 'UNKNOWN',
-          message: body.message || 'Error al iniciar stream principal',
+          message: body.message || `Error al iniciar stream ${quality === 'main_h264' ? 'transcodificado' : 'principal'}`,
           technicalDetail: body.details,
         })
       }
     }
-  }, [focusCamera, bumpPlayerKeys])
+  }, [focusCamera, focusStreamType, bumpPlayerKeys])
 
   // ─── Exit fullscreen/focus view ──────────────────────────────
   // On return from fullscreen, stop the focus camera and restart the grid cameras.
@@ -652,9 +659,10 @@ export function LiveViewPage() {
     setFocusStreamError(null)
     setFocusStreamType('sub')
 
-    // Stop main stream only — sub stream stays alive for the grid
+    // Stop main/main_h264 streams — sub stream stays alive for the grid
     if (prevFocusId) {
       apiPost(`/cameras/${prevFocusId}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      apiPost(`/cameras/${prevFocusId}/stop-stream`, { streamType: 'main_h264' }).catch(() => {})
     }
 
     // Reconcile the grid cameras after returning from fullscreen.
@@ -754,10 +762,15 @@ export function LiveViewPage() {
               // the stream was blocked before the API call (focusStreamInfo=null).
               const focusType  = focusStreamType
               const focusHls   = isMain ? focusStreamInfo!.hls : (stream?.hls || '')
-              const focusCodec = focusStreamType === 'main' ? cam.mainCodec : cam.subCodec
-              const focusRes   = focusStreamType === 'main' ? cam.mainResolution : cam.subResolution
+              const focusCodec = focusStreamType === 'main' || focusStreamType === 'main_h264'
+                ? cam.mainCodec
+                : cam.subCodec
+              const focusRes   = focusStreamType === 'main' || focusStreamType === 'main_h264'
+                ? cam.mainResolution
+                : cam.subResolution
+              const canTryMainStream = focusStreamType === 'sub' && !focusStreamError
               return (
-                <div className="h-full flex gap-2">
+                <div className="h-full flex flex-col gap-0 relative">
                   <VideoPlayer
                     key={`focus-${focusCamera}-${focusType}-${playerKeys[focusCamera] ?? 0}`}
                     hlsUrl={focusHls}
@@ -768,14 +781,28 @@ export function LiveViewPage() {
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
                     onQualitySwitch={handleQualitySwitch}
-                    className="flex-1 h-full"
+                    className="flex-1 min-h-0"
                     playbackError={focusStreamError || streamErrors[focusCamera]}
                     streamType={focusType}
                     streamCodec={focusCodec}
                     streamResolution={focusRes}
                   />
+                  {/* Intentar alta calidad — visible button when watching sub in focus */}
+                  {canTryMainStream && (
+                    <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20">
+                      <button
+                        onClick={() => handleQualitySwitch('main')}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-black/70 text-surface-200 text-xs hover:bg-black/90 transition-colors border border-surface-600/50"
+                        title="Intentar stream principal HD (puede ser H.265 en algunas cámaras)"
+                      >
+                        ↑ Intentar alta calidad
+                      </button>
+                    </div>
+                  )}
                   {(user?.role === 'ADMIN' || user?.role === 'SUPERVISOR') && cam.ptzEnabled && (
-                    <PTZControls cameraId={cam.id} />
+                    <div className="flex-shrink-0">
+                      <PTZControls cameraId={cam.id} />
+                    </div>
                   )}
                 </div>
               )

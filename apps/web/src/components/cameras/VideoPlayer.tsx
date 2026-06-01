@@ -5,7 +5,7 @@ import type { ErrorData } from 'hls.js'
 import {
   Maximize2, Volume2, VolumeX, RefreshCw,
   Circle, AlertTriangle, Loader2, Stethoscope,
-  WifiOff, Lock, Clock, Film, Server,
+  WifiOff, Lock, Clock, Film, Server, Cpu,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 
@@ -92,11 +92,11 @@ interface Props {
   onFullscreen?: () => void
   onDiagnostic?: (cameraId: string) => void
   onStreamError?: (cameraId: string, err: CameraPlaybackError) => void
-  onQualitySwitch?: (quality: 'sub' | 'main') => void
+  onQualitySwitch?: (quality: 'sub' | 'main' | 'main_h264') => void
   className?: string
   error?: boolean
   playbackError?: CameraPlaybackError
-  streamType?: 'sub' | 'main'
+  streamType?: 'sub' | 'main' | 'main_h264'
   streamCodec?: string        // e.g. "hevc", "h264"
   streamResolution?: string   // e.g. "1920×1080", "640×360"
 }
@@ -119,6 +119,8 @@ export function VideoPlayer({
   streamCodec,
   streamResolution,
 }: Props) {
+  // Whether the current stream is the transcoded (HEVC→H.264) variant
+  const isTranscoded = streamType === 'main_h264'
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const firstFrameTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -334,7 +336,7 @@ export function VideoPlayer({
                 <p className="text-[10px] text-surface-400 text-center leading-snug max-w-[200px]">
                   El flujo principal está en H.265/HEVC. Para alta calidad web se requiere H.264 o transcodificación.
                 </p>
-                <div className="flex gap-1.5 mt-1">
+                <div className="flex flex-wrap gap-1.5 mt-1 justify-center">
                   {onQualitySwitch && (
                     <button
                       onClick={() => onQualitySwitch('sub')}
@@ -343,11 +345,20 @@ export function VideoPlayer({
                       Usar baja calidad
                     </button>
                   )}
+                  {onQualitySwitch && (
+                    <button
+                      onClick={() => onQualitySwitch('main_h264')}
+                      className="btn-ghost text-[10px] px-2 py-1 text-purple-400 hover:text-purple-300"
+                      title="Transcodificar H.265→H.264 via FFmpeg (requiere ENABLE_HEVC_TRANSCODING=true)"
+                    >
+                      <Cpu size={10} /> Transcodificar H.264
+                    </button>
+                  )}
                   <button
                     onClick={() => onQualitySwitch ? onQualitySwitch('main') : handleRetry()}
                     className="btn-ghost text-[10px] px-2 py-1"
                   >
-                    <RefreshCw size={10} /> Reintentar alta calidad
+                    <RefreshCw size={10} /> Reintentar
                   </button>
                 </div>
               </>
@@ -391,10 +402,10 @@ export function VideoPlayer({
             </>
           )}
           {streamType && status === 'playing' && (
-            <span className="text-[9px] text-surface-300 font-medium leading-none">
-              {streamType === 'main' ? 'Main' : 'Sub'}
+            <span className={clsx('text-[9px] font-medium leading-none', isTranscoded ? 'text-purple-300' : 'text-surface-300')}>
+              {isTranscoded ? 'Trans' : streamType === 'main' ? 'Main' : 'Sub'}
               {streamResolution && ` ${formatResolution(streamResolution)}`}
-              {streamCodec && ` ${formatBadgeCodec(streamCodec)}`}
+              {isTranscoded ? ' H.264' : streamCodec ? ` ${formatBadgeCodec(streamCodec)}` : ''}
             </span>
           )}
         </div>
@@ -451,6 +462,14 @@ export function VideoPlayer({
               title="Alta calidad (stream principal)"
             >
               Alta
+            </button>
+            <button
+              onClick={() => onQualitySwitch('main_h264')}
+              className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
+                isTranscoded ? 'bg-purple-700 text-white' : 'text-purple-300 hover:text-white')}
+              title="Transcodificado H.264 (requiere ENABLE_HEVC_TRANSCODING=true)"
+            >
+              Trans
             </button>
           </div>
         )}

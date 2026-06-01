@@ -238,8 +238,6 @@ export function NVRDetailPage() {
         nameCandidates?: number; skippedNameBecauseEmpty?: number; statusUpdated?: number
         sourceUsed?: string; warning?: string; nameSource?: 'real' | 'none'; nameReason?: string
       }>(`/nvrs/${id}/sync-cameras`)
-      setLastSyncResult(res)
-      setLastSyncStats({ sourceUsed: res.sourceUsed, nameUpdated: res.nameUpdated, ipUpdated: res.ipUpdated, portUpdated: res.portUpdated, statusUpdated: res.statusUpdated, total: res.total, synced: res.synced })
       if (res.warning) {
         toast.error(res.warning)
       } else {
@@ -255,6 +253,9 @@ export function NVRDetailPage() {
       }
       await loadNvr()
       await loadCameras()
+      // Set AFTER cameras reload so hasRealCameraNames evaluates against fresh data
+      setLastSyncResult(res)
+      setLastSyncStats({ sourceUsed: res.sourceUsed, nameUpdated: res.nameUpdated, ipUpdated: res.ipUpdated, portUpdated: res.portUpdated, statusUpdated: res.statusUpdated, total: res.total, synced: res.synced })
     } catch (e: any) {
       const msg = e?.response?.data?.message || 'Error al sincronizar cámaras IP'
       toast.error(msg)
@@ -271,7 +272,7 @@ export function NVRDetailPage() {
       const res = await apiPost<{
         synced: number; total: number; sourceUsed?: string; warning?: string
         nameUpdated?: number; nameCandidates?: number; skippedNameBecauseEmpty?: number; skippedNameBecauseNotPlaceholder?: number
-        ipUpdated?: number; portUpdated?: number
+        ipUpdated?: number; portUpdated?: number; nameSource?: 'real' | 'none'; nameReason?: string
       }>(`/nvrs/${id}/sync-cameras?forceNames=true`)
       if (res.warning) {
         toast.error(res.warning)
@@ -289,11 +290,13 @@ export function NVRDetailPage() {
           (res.ipUpdated ? ` · ${res.ipUpdated} IPs` : '')
         )
       }
+      await loadNvr()
+      await loadCameras()
+      // Set AFTER cameras reload so hasRealCameraNames evaluates against fresh data
+      setLastSyncResult(res)
       if (!res.warning && (res.nameUpdated ?? 0) > 0) {
         setLastSyncStats({ sourceUsed: res.sourceUsed, nameUpdated: res.nameUpdated, ipUpdated: res.ipUpdated, portUpdated: res.portUpdated, total: res.total, synced: res.synced })
       }
-      await loadNvr()
-      await loadCameras()
     } catch (e: any) {
       const msg = e?.response?.data?.message || 'Error al forzar nombres desde NVR'
       toast.error(msg)
@@ -1030,12 +1033,10 @@ function CamerasTab({
         )}
       </div>
 
-      {/* nameSource notice — shown after a sync that found no real names AND cameras don't already have real names */}
+      {/* nameSource notice — only when sync genuinely found no real names AND list has none */}
       {lastSyncResult?.nameSource === 'none' &&
        (lastSyncResult?.nameCandidates ?? 0) === 0 &&
-       !hasRealCameraNames(list) &&
-       lastSyncResult?.sourceUsed !== 'inputproxy_channels_secure' &&
-       lastSyncResult?.sourceUsed !== 'inputproxy_channels' && (
+       !hasRealCameraNames(list) && (
         <div className="flex items-start gap-2 px-3 py-2 text-xs text-amber-500/80 bg-amber-900/10 border border-amber-900/20 rounded-lg">
           <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
           <span>

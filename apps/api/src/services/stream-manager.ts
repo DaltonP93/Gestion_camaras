@@ -2,7 +2,7 @@
 // Los streams en MediaMTX ya tienen sourceOnDemand: true (se conectan solos cuando hay requests HLS)
 // Este manager trackea quién está mirando para informar al frontend y aplicar límites.
 import type { FastifyInstance } from 'fastify'
-import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus } from './stream'
+import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import CryptoJS from 'crypto-js'
 
@@ -26,7 +26,7 @@ interface StreamSession {
   cameraId: string
   userId: string
   viewId: string                  // identificador de pestaña/view del navegador
-  streamType: 'sub' | 'main'      // sub = grid (H264 640p), main = focus/fullscreen (HD, puede ser HEVC)
+  streamType: 'sub' | 'main' | 'main_h264'  // sub=grid H264, main=HD (puede HEVC), main_h264=transcodificado
   streamPath: string
   startedAt: Date
   lastHeartbeat: Date             // actualizado por touchSession o touchView
@@ -40,7 +40,7 @@ const sessions = new Map<string, StreamSession>()
 const viewCameras   = new Map<string, Set<string>>() // key: `${userId}:${viewId}`
 const viewHeartbeat = new Map<string, Date>()         // key: `${userId}:${viewId}` → last heartbeat
 
-function sessionKey(userId: string, cameraId: string, streamType: 'sub' | 'main' = 'sub') {
+function sessionKey(userId: string, cameraId: string, streamType: 'sub' | 'main' | 'main_h264' = 'sub') {
   return `${userId}:${cameraId}:${streamType}`
 }
 
@@ -57,7 +57,7 @@ export function getSessionsForUser(userId: string): StreamSession[] {
 }
 
 // Tocar una sola sesión (backward compat para touch-stream endpoint individual)
-export function touchSession(userId: string, cameraId: string, streamType: 'sub' | 'main' = 'sub') {
+export function touchSession(userId: string, cameraId: string, streamType: 'sub' | 'main' | 'main_h264' = 'sub') {
   const key = sessionKey(userId, cameraId, streamType)
   const s = sessions.get(key)
   if (s) s.lastHeartbeat = new Date()
@@ -96,7 +96,7 @@ export async function startStream(
   userId: string,
   cameraId: string,
   viewId?: string,
-  streamType: 'sub' | 'main' = 'sub',
+  streamType: 'sub' | 'main' | 'main_h264' = 'sub',
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; error?: StreamError; warning?: StreamError }> {
   // Buscar cámara en DB con NVR
   const camera = await server.prisma.camera.findUnique({
@@ -110,6 +110,39 @@ export async function startStream(
 
   if (!camera.active) {
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_DISABLED', message: 'Cámara desactivada' } }
+  }
+
+  // Handle transcoded (HEVC → H.264) stream via MediaMTX runOnDemand + FFmpeg
+  if (streamType === 'main_h264') {
+    if (!isTranscodingEnabled()) {
+      return {
+        hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'TRANSCODING_DISABLED', message: 'La transcodificación HEVC no está habilitada. Configura ENABLE_HEVC_TRANSCODING=true en el servidor para activarla.' },
+      }
+    }
+    const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
+    const streamPath = getTranscodedStreamPath(nvr as any, camera as any)
+    const key = sessionKey(userId, cameraId, 'main_h264')
+
+    const totalSessions = sessions.size
+    if (totalSessions >= MAX_STREAMS_GLOBAL && !sessions.has(key)) {
+      return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado' } }
+    }
+
+    const published = await publishTranscodedStream(nvr as any, camera as any)
+    if (!published) {
+      return {
+        hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar stream transcodificado en el servidor de medios' },
+      }
+    }
+
+    const effectiveViewId = viewId || 'default'
+    sessions.set(key, {
+      cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
+      streamPath, startedAt: sessions.get(key)?.startedAt || new Date(), lastHeartbeat: new Date(),
+    })
+    return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath }
   }
 
   // Block HEVC main stream when codec is known — browsers can't decode H.265.
@@ -202,7 +235,7 @@ export async function stopStream(
   server: FastifyInstance,
   userId: string,
   cameraId: string,
-  streamType: 'sub' | 'main' = 'sub',
+  streamType: 'sub' | 'main' | 'main_h264' = 'sub',
 ): Promise<void> {
   const key = sessionKey(userId, cameraId, streamType)
   const session = sessions.get(key)
