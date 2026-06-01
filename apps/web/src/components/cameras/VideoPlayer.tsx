@@ -125,6 +125,9 @@ export function VideoPlayer({
 }: Props) {
   // Whether the current stream is the transcoded (HEVC→H.264) variant
   const isTranscoded = streamType === 'main_h264'
+  // Ref so the HLS error closure can read current streamType without stale closure issues
+  const streamTypeRef = useRef(streamType)
+  streamTypeRef.current = streamType
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const firstFrameTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -208,19 +211,23 @@ export function VideoPlayer({
           }
 
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            // 500 → MediaMTX source error (HEVC/RTSP fail / muxer destroyed) → 0 retries (fail immediately)
-            // 404 → stream still starting up → max 1 retry
-            // other network errors → max 5 retries with backoff
+            // 500 on main_h264: FFmpeg may still be starting even after backend wait — retry briefly
+            // 500 otherwise: MediaMTX source/muxer error → fail immediately
+            // 404: stream still registering → 1 retry
+            // other network errors: up to 5 retries with backoff
             const statusCode = data.response?.code
             const is500 = statusCode === 500
             const is404 = statusCode === 404
-            if (is500) console.warn('[VideoPlayer] HLS 500 — MediaMTX muxer/source error', { cameraId, details: data.details })
-            const maxRetries = is500 ? 0 : is404 ? 1 : 5
+            const isTranscodedStream = streamTypeRef.current === 'main_h264'
+            if (is500) console.warn('[VideoPlayer] HLS 500', { cameraId, isTranscoded: isTranscodedStream, details: data.details })
+            // Transcoded 500: retry 8 times × 800ms = 6.4s safety net in case backend wait wasn't enough
+            const maxRetries = is500 ? (isTranscodedStream ? 8 : 0) : is404 ? 1 : 5
             setRetryCount((r) => {
               if (r >= maxRetries) {
                 const err: CameraPlaybackError = {
                   code: errorCode,
-                  message: is500 ? 'Stream no disponible'
+                  message: is500 && isTranscodedStream ? 'Transcodificación en progreso — intenta de nuevo en unos segundos'
+                          : is500 ? 'Stream no disponible'
                           : is404 ? 'Stream no disponible en el servidor'
                           :         'Sin respuesta del servidor de streaming',
                   technicalDetail: `HTTP ${statusCode ?? 'err'} ${data.details}. URL: ${hlsUrl}`,
@@ -230,7 +237,7 @@ export function VideoPlayer({
                 if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              const delay = is404 ? 4000 : 3000 * (r + 1)
+              const delay = is500 && isTranscodedStream ? 800 : is404 ? 4000 : 3000 * (r + 1)
               setTimeout(() => hls.startLoad(), delay)
               return r + 1
             })

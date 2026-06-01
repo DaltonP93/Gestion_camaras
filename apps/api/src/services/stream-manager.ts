@@ -2,7 +2,7 @@
 // Los streams en MediaMTX ya tienen sourceOnDemand: true (se conectan solos cuando hay requests HLS)
 // Este manager trackea quién está mirando para informar al frontend y aplicar límites.
 import type { FastifyInstance } from 'fastify'
-import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities } from './stream'
+import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import CryptoJS from 'crypto-js'
 
@@ -206,6 +206,13 @@ export async function startStream(
     if (!published) {
       return { hlsUrl: '', webrtcUrl: '', streamPath: '',
         error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar stream transcodificado en el servidor de medios' } }
+    }
+    // Poll internal HLS endpoint — this also triggers runOnDemand (starts FFmpeg).
+    // Only register the session and return the URL once HLS is confirmed ready.
+    const hlsReady = await waitForHlsReady(streamPath)
+    if (!hlsReady) {
+      return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'TRANSCODE_NOT_READY', message: 'El stream transcodificado no pudo iniciar a tiempo. Intenta de nuevo.' } }
     }
     const effectiveViewId = viewId || 'default'
     sessions.set(transcodeKey, {

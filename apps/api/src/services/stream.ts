@@ -10,6 +10,10 @@ const mediamtxApi = axios.create({
   timeout: 10000,
 })
 
+// Internal HLS endpoint (port 8888, not proxied through Nginx)
+// Used to health-check the manifest right after registering a path.
+const MEDIAMTX_HLS_INTERNAL = process.env.MEDIAMTX_HLS_URL || 'http://mediamtx:8888'
+
 // ─── Cache local de paths registrados ───────────────────────────
 // Evita POST/PATCH repetitivos que generan spam en logs de MediaMTX.
 // Clave: streamPath. Valor: fingerprint de la config (source|transport|closeAfter).
@@ -29,6 +33,39 @@ const HEVC_TRANSCODE_BITRATE   = process.env.HEVC_TRANSCODE_BITRATE   || '1500k'
 const MEDIAMTX_RTSP_PORT       = process.env.MEDIAMTX_RTSP_PORT       || '8554'
 
 export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
+
+// ─── Wait for HLS manifest to become available ──────────────
+// Polls the internal MediaMTX HLS endpoint after registering a path.
+// The first poll also triggers runOnDemand (starts FFmpeg).
+// Returns true when the manifest responds 200, false if timeout.
+export async function waitForHlsReady(
+  streamPath: string,
+  maxWaitMs = 10_000,
+  intervalMs = 300,
+): Promise<boolean> {
+  const url = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`
+  const attempts = Math.ceil(maxWaitMs / intervalMs)
+  console.info(`[transcode] waiting_hls path=${streamPath}`)
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await axios.get(url, { timeout: 2500, validateStatus: () => true })
+      if (res.status === 200) {
+        console.info(`[transcode] hls_ready path=${streamPath} attempt=${i + 1}`)
+        return true
+      }
+      if (i === attempts - 1) {
+        console.warn(`[transcode] hls_not_ready path=${streamPath} status=${res.status} timeout=true`)
+      }
+    } catch (err: any) {
+      const status = err.response?.status ?? 'timeout'
+      if (i === attempts - 1) {
+        console.warn(`[transcode] hls_not_ready path=${streamPath} status=${status} timeout=true`)
+      }
+    }
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs))
+  }
+  return false
+}
 
 // ─── FFmpeg capability detection ────────────────────────────
 // Run once on first call; cached for the process lifetime.
