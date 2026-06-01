@@ -1,7 +1,8 @@
 // apps/api/src/services/stream.ts
 // Gestión de streams via MediaMTX (RTSP → HLS/WebRTC)
 import axios from 'axios'
-import { execSync } from 'child_process'
+import { execSync, spawn } from 'child_process'
+import type { ChildProcess } from 'child_process'
 import type { NVR, Camera } from '@prisma/client'
 import { buildRtspUrl } from './hikvision'
 
@@ -9,6 +10,10 @@ const mediamtxApi = axios.create({
   baseURL: process.env.MEDIAMTX_URL || 'http://mediamtx:9997',
   timeout: 10000,
 })
+
+// Internal HLS endpoint (port 8888, not proxied through Nginx)
+// Used to health-check the manifest right after registering a path.
+const MEDIAMTX_HLS_INTERNAL = process.env.MEDIAMTX_HLS_URL || 'http://mediamtx:8888'
 
 // ─── Cache local de paths registrados ───────────────────────────
 // Evita POST/PATCH repetitivos que generan spam en logs de MediaMTX.
@@ -27,8 +32,175 @@ const HEVC_TRANSCODE_WIDTH     = process.env.HEVC_TRANSCODE_WIDTH     || '1280'
 const HEVC_TRANSCODE_FPS       = process.env.HEVC_TRANSCODE_FPS       || '15'
 const HEVC_TRANSCODE_BITRATE   = process.env.HEVC_TRANSCODE_BITRATE   || '1500k'
 const MEDIAMTX_RTSP_PORT       = process.env.MEDIAMTX_RTSP_PORT       || '8554'
+const TRANSCODE_ENCODER        = process.env.TRANSCODE_ENCODER        || 'libx264'
+
+// Derive MediaMTX hostname from MEDIAMTX_URL so FFmpeg publishes to the right host
+const MEDIAMTX_HOST = (() => {
+  try { return new URL(process.env.MEDIAMTX_URL || 'http://mediamtx:9997').hostname }
+  catch { return 'mediamtx' }
+})()
+
+// ─── API-owned FFmpeg processes for transcoded streams ───────
+// runOnDemand in MediaMTX executes inside the MediaMTX container, which
+// doesn't have FFmpeg. We spawn FFmpeg from the API container instead.
+const transcodeProcesses = new Map<string, ChildProcess>()
+const transcodeStderr    = new Map<string, string>()
+
+export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string): ChildProcess | null {
+  const pass: string = (nvr as any).password ?? ''
+  if (!pass) return null
+
+  const rtspInput = buildRtspUrl(nvr, camera.channel, false)  // main (HEVC) stream
+  if (/:@/.test(rtspInput)) return null  // empty password guard
+
+  const rtspOutput = `rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${streamPath}`
+
+  // Compute bufsize = 2× bitrate (handles "1500k" → "3000k")
+  const bitrateNum  = parseInt(HEVC_TRANSCODE_BITRATE) || 1500
+  const bitrateUnit = HEVC_TRANSCODE_BITRATE.replace(/^\d+/, '') || 'k'
+  const bufsize     = `${bitrateNum * 2}${bitrateUnit}`
+
+  const args: string[] = [
+    '-rtsp_transport', 'tcp',
+    '-i', rtspInput,
+    '-an',
+    '-vf', `scale=${HEVC_TRANSCODE_WIDTH}:-2`,
+    '-r', HEVC_TRANSCODE_FPS,
+    '-c:v', TRANSCODE_ENCODER,
+    '-preset', HEVC_TRANSCODE_PRESET,
+  ]
+  // -tune zerolatency only valid for libx264/libx265
+  if (TRANSCODE_ENCODER === 'libx264' || TRANSCODE_ENCODER === 'libx265') {
+    args.push('-tune', 'zerolatency')
+  }
+  args.push(
+    '-b:v', HEVC_TRANSCODE_BITRATE,
+    '-maxrate', HEVC_TRANSCODE_BITRATE,
+    '-bufsize', bufsize,
+    '-f', 'rtsp',
+    '-rtsp_transport', 'tcp',
+    rtspOutput,
+  )
+
+  // Kill any stale process for this path before spawning a new one
+  stopTranscodeProcess(streamPath)
+
+  const inputMasked = rtspInput.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+  console.info(`[transcode] spawn_ffmpeg path=${streamPath} encoder=${TRANSCODE_ENCODER} input=${inputMasked}`)
+
+  const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+  transcodeProcesses.set(streamPath, proc)
+  transcodeStderr.set(streamPath, '')  // reset stderr buffer on each spawn
+
+  proc.on('spawn', () => {
+    console.info(`[transcode] ffmpeg_started path=${streamPath} pid=${proc.pid}`)
+  })
+
+  proc.stderr?.on('data', (data: Buffer) => {
+    let s = (transcodeStderr.get(streamPath) || '') + data.toString()
+    if (s.length > 3000) s = s.slice(-3000)
+    transcodeStderr.set(streamPath, s)
+  })
+
+  proc.on('exit', (code, signal) => {
+    const summary = (transcodeStderr.get(streamPath) || '').slice(-400).replace(/\n/g, ' ')
+    console.warn(`[transcode] ffmpeg_exit path=${streamPath} code=${code ?? signal} stderr=${summary}`)
+    transcodeProcesses.delete(streamPath)
+  })
+
+  proc.on('error', (err) => {
+    console.error(`[transcode] ffmpeg_error path=${streamPath} err=${err.message}`)
+    transcodeProcesses.delete(streamPath)
+  })
+
+  return proc
+}
+
+export function stopTranscodeProcess(streamPath: string): void {
+  const proc = transcodeProcesses.get(streamPath)
+  if (!proc) return
+  try { proc.kill('SIGTERM') } catch {}
+  transcodeProcesses.delete(streamPath)
+  console.info(`[transcode] ffmpeg_killed path=${streamPath}`)
+}
+
+export function isTranscodeProcessAlive(streamPath: string): boolean {
+  const proc = transcodeProcesses.get(streamPath)
+  return !!(proc && proc.exitCode === null && !proc.killed)
+}
+
+export function getTranscodeStderr(streamPath: string): string {
+  return (transcodeStderr.get(streamPath) || '').slice(-500)
+}
 
 export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
+
+// ─── Wait for HLS manifest with real segment data ───────────
+// Polls internal MediaMTX HLS port waiting for FFmpeg (spawned by API) to start
+// publishing. Validates body — requires #EXTM3U + a segment reference (#EXTINF,
+// .ts, .m4s) to avoid accepting a stub manifest MediaMTX emits before FFmpeg data.
+// isAlive: optional callback checked each interval — if it returns false the
+// wait aborts immediately (FFmpeg exited early) instead of waiting full timeout.
+export async function waitForHlsReady(
+  streamPath: string,
+  maxWaitMs = 12_000,
+  intervalMs = 300,
+  isAlive?: () => boolean,
+): Promise<{ ready: boolean; lastStatus: number; elapsedMs: number; processExited: boolean }> {
+  const url      = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`
+  const startMs  = Date.now()
+  const attempts = Math.ceil(maxWaitMs / intervalMs)
+  let lastStatus   = 0
+  let lastLoggedAt = 0
+
+  console.info(`[transcode] waiting_hls path=${streamPath}`)
+
+  for (let i = 0; i < attempts; i++) {
+    const now = Date.now()
+
+    // Early exit if FFmpeg process has died — no point waiting the full timeout
+    if (isAlive && !isAlive()) {
+      const elapsed = now - startMs
+      console.warn(`[transcode] waiting_hls aborted path=${streamPath} reason=process_exited elapsedMs=${elapsed}`)
+      return { ready: false, lastStatus, elapsedMs: elapsed, processExited: true }
+    }
+
+    try {
+      const res = await axios.get(url, {
+        timeout: 2000,
+        validateStatus: () => true,
+        responseType: 'text',
+      })
+      lastStatus = res.status
+      const body = typeof res.data === 'string' ? res.data : ''
+
+      // A valid, playable manifest must have the M3U8 header AND at least one
+      // segment reference. MediaMTX emits #EXTM3U-only stubs before FFmpeg
+      // data arrives; those cause immediate 500 on the first segment fetch.
+      const hasHeader  = body.includes('#EXTM3U')
+      const hasSegment = body.includes('#EXTINF') || body.includes('.ts') || body.includes('.m4s')
+
+      if (res.status === 200 && hasHeader && hasSegment) {
+        const elapsed = now - startMs
+        console.info(`[transcode] hls_ready path=${streamPath} attempt=${i + 1} elapsedMs=${elapsed}`)
+        return { ready: true, lastStatus, elapsedMs: elapsed, processExited: false }
+      }
+
+      // Throttle per-attempt logs to once per second
+      if (now - lastLoggedAt >= 1000) {
+        console.info(`[transcode] waiting_hls path=${streamPath} attempt=${i + 1} status=${res.status} header=${hasHeader} segment=${hasSegment}`)
+        lastLoggedAt = now
+      }
+    } catch {
+      // network/timeout — keep polling
+    }
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs))
+  }
+
+  const elapsed = Date.now() - startMs
+  console.warn(`[transcode] hls_timeout path=${streamPath} lastStatus=${lastStatus} elapsedMs=${elapsed}`)
+  return { ready: false, lastStatus, elapsedMs: elapsed, processExited: false }
+}
 
 // ─── FFmpeg capability detection ────────────────────────────
 // Run once on first call; cached for the process lifetime.
@@ -190,9 +362,10 @@ export async function publishStream(nvr: NVR, camera: Camera, streamType: 'sub' 
   }
 }
 
-// ─── Publicar stream transcodificado HEVC→H.264 via MediaMTX runOnDemand ─
-// Usa FFmpeg on-demand para transcodificar el stream principal (H.265) a H.264.
-// Solo disponible cuando ENABLE_HEVC_TRANSCODING=true.
+// ─── Publicar path receptor pasivo para stream transcodificado ──
+// Registra el path en MediaMTX como receptor RTSP pasivo (sin runOnDemand).
+// FFmpeg es iniciado por el API (spawnTranscodeProcess) y publica a este path.
+// MediaMTX solo espera al publisher; no ejecuta FFmpeg por sí mismo.
 export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise<boolean> {
   if (!ENABLE_HEVC_TRANSCODING) return false
 
@@ -203,37 +376,23 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
     return false
   }
 
-  const rtspUrl = buildRtspUrl(nvr, camera.channel, false)  // false = main stream
-  if (/:@/.test(rtspUrl)) {
-    console.error(`[stream] RTSP_EMPTY_CREDENTIALS — skipping transcoded path ${streamPath}`)
-    return false
-  }
-
-  const fp = `transcode|${rtspUrl}|${HEVC_TRANSCODE_WIDTH}|${HEVC_TRANSCODE_FPS}|${HEVC_TRANSCODE_BITRATE}`
-  if (registeredPaths.get(streamPath) === fp) return true
   if (inFlightPaths.has(streamPath)) return true
 
-  // FFmpeg: read from NVR RTSP directly → transcode → publish back to MediaMTX via RTSP
-  const ffmpegCmd = [
-    'ffmpeg', '-rtsp_transport', 'tcp',
-    '-i', rtspUrl,
-    '-vf', `scale=${HEVC_TRANSCODE_WIDTH}:-2`,
-    '-r', HEVC_TRANSCODE_FPS,
-    '-c:v', 'libx264',
-    '-preset', HEVC_TRANSCODE_PRESET,
-    '-b:v', HEVC_TRANSCODE_BITRATE,
-    '-an',
-    '-f', 'rtsp', '-rtsp_transport', 'tcp',
-    `rtsp://127.0.0.1:${MEDIAMTX_RTSP_PORT}/${streamPath}`,
-  ].join(' ')
-
+  // Passive RTSP receiver — no source, no runOnDemand.
+  // Explicitly clear runOnDemand/source so paths previously registered with
+  // runOnDemand (old config) get properly updated to passive receiver mode.
   const pathConfig = {
-    runOnDemand: ffmpegCmd,
-    runOnDemandCloseAfter: '10m',
+    source:               '',
+    runOnDemand:          '',
+    runOnDemandCloseAfter:'',
+    record:               false,
+    overridePublisher:    true,
   }
 
-  const sourceMasked = rtspUrl.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
-  console.info(`[stream] publish-transcoded path=${streamPath} source=${sourceMasked} preset=${HEVC_TRANSCODE_PRESET} width=${HEVC_TRANSCODE_WIDTH}`)
+  const fp = `passive_receiver_v2|${streamPath}`
+  if (registeredPaths.get(streamPath) === fp) return true
+
+  console.info(`[stream] publish-transcoded path=${streamPath} type=passive_receiver encoder=${TRANSCODE_ENCODER}`)
 
   inFlightPaths.add(streamPath)
   try {
@@ -244,9 +403,11 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
       return true
     } catch (err: any) {
       if (err.response?.status === 400) {
+        // Path exists — PATCH to ensure it's a passive receiver (clears old runOnDemand)
         try {
           await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
           registeredPaths.set(streamPath, fp)
+          console.info(`[stream] transcoded path updated to passive_receiver: ${streamPath}`)
           return true
         } catch {
           return false

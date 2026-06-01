@@ -2,7 +2,7 @@
 // Los streams en MediaMTX ya tienen sourceOnDemand: true (se conectan solos cuando hay requests HLS)
 // Este manager trackea quién está mirando para informar al frontend y aplicar límites.
 import type { FastifyInstance } from 'fastify'
-import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities } from './stream'
+import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import CryptoJS from 'crypto-js'
 
@@ -23,8 +23,21 @@ const BLOCKED_HEALTH_STATUSES = new Set([
   'OFFLINE',
 ])
 
-function getActiveTranscodeSessions(): number {
-  return Array.from(sessions.values()).filter(s => s.streamType === 'main_h264').length
+// Per-path in-flight transcode state — prevents duplicate FFmpeg startups
+// during the waitForHlsReady window (heartbeat can fire multiple times during 10s wait).
+// Key: streamPath (e.g. nvr_xxx_ch09_main_h264)
+interface TranscodeInFlight {
+  state: 'starting' | 'ready' | 'failed'
+  promise: Promise<boolean>        // resolves true=ready, false=failed
+  resolve: (v: boolean) => void    // called by the starter when done
+}
+const transcodeInFlight = new Map<string, TranscodeInFlight>()
+
+function getActiveTranscodeCount(): number {
+  // Count registered sessions + paths currently starting (not yet registered)
+  const registered = Array.from(sessions.values()).filter(s => s.streamType === 'main_h264').length
+  const starting   = Array.from(transcodeInFlight.values()).filter(f => f.state === 'starting').length
+  return registered + starting
 }
 
 interface StreamSession {
@@ -183,37 +196,115 @@ export async function startStream(
       return { hlsUrl: '', webrtcUrl: '', streamPath: '',
         error: { code: 'MEDIA_SERVER_ERROR', message: 'FFmpeg no disponible en el servidor.' } }
     }
-    const activeTrans = getActiveTranscodeSessions()
+
+    const transcodeKey = sessionKey(userId, cameraId, 'main_h264')
+    const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
+    const streamPath = getTranscodedStreamPath(nvr as any, camera as any)
+
+    // ── 1. Reuse already-registered session ──────────────────
+    const existingSession = sessions.get(transcodeKey)
+    if (existingSession) {
+      existingSession.lastHeartbeat = new Date()
+      if (viewId) existingSession.viewId = viewId
+      console.info(`[userLimit] reuse existing cameraId=${cameraId} streamType=main_h264`)
+      return { hlsUrl: getHlsUrl(existingSession.streamPath), webrtcUrl: getWebRtcUrl(existingSession.streamPath), streamPath: existingSession.streamPath, transcoded: true }
+    }
+
+    // ── 2. If this path is already starting, await it ────────
+    // Prevents duplicate FFmpeg processes when heartbeat fires during
+    // the 10-12s waitForHlsReady window.
+    const inFlight = transcodeInFlight.get(streamPath)
+    if (inFlight?.state === 'starting') {
+      console.info(`[transcode] awaiting in-progress cameraId=${cameraId} path=${streamPath}`)
+      const ready = await inFlight.promise
+      if (ready) {
+        const s = sessions.get(transcodeKey)
+        if (s) {
+          s.lastHeartbeat = new Date()
+          return { hlsUrl: getHlsUrl(s.streamPath), webrtcUrl: getWebRtcUrl(s.streamPath), streamPath: s.streamPath, transcoded: true }
+        }
+      }
+      return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'TRANSCODE_NOT_READY', message: 'El stream transcodificado no pudo iniciar. Intenta de nuevo.' } }
+    }
+
+    // Clear failed state so the caller can retry
+    if (inFlight?.state === 'failed') transcodeInFlight.delete(streamPath)
+
+    // ── 3. Check limits (count starting + registered) ────────
+    const activeTrans = getActiveTranscodeCount()
     if (activeTrans >= MAX_TRANSCODE_SESSIONS) {
       console.warn(`[transcode] reject cameraId=${cameraId} reason=MAX_TRANSCODE_SESSIONS active=${activeTrans}/${MAX_TRANSCODE_SESSIONS}`)
       return { hlsUrl: '', webrtcUrl: '', streamPath: '',
         error: { code: 'TRANSCODE_LIMIT_REACHED', message: `Límite de transcodificaciones alcanzado (máx ${MAX_TRANSCODE_SESSIONS})` } }
     }
-    const transcodeKey = sessionKey(userId, cameraId, 'main_h264')
-    const existingTranscode = sessions.get(transcodeKey)
-    if (existingTranscode) {
-      existingTranscode.lastHeartbeat = new Date()
-      if (viewId) existingTranscode.viewId = viewId
-      console.info(`[userLimit] reuse existing cameraId=${cameraId} streamType=main_h264`)
-      return { hlsUrl: getHlsUrl(existingTranscode.streamPath), webrtcUrl: getWebRtcUrl(existingTranscode.streamPath), streamPath: existingTranscode.streamPath, transcoded: true }
-    }
     if (sessions.size >= MAX_STREAMS_GLOBAL) {
       return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado' } }
     }
-    const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
-    const streamPath = getTranscodedStreamPath(nvr as any, camera as any)
-    const published = await publishTranscodedStream(nvr as any, camera as any)
-    if (!published) {
-      return { hlsUrl: '', webrtcUrl: '', streamPath: '',
-        error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar stream transcodificado en el servidor de medios' } }
+
+    // ── 4. Start new transcode with in-flight guard ──────────
+    let resolveInFlight!: (v: boolean) => void
+    const readyPromise = new Promise<boolean>(r => { resolveInFlight = r })
+    transcodeInFlight.set(streamPath, { state: 'starting', promise: readyPromise, resolve: resolveInFlight })
+
+    try {
+      // Register passive RTSP receiver path in MediaMTX (no runOnDemand)
+      const published = await publishTranscodedStream(nvr as any, camera as any)
+      if (!published) {
+        transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
+        resolveInFlight(false)
+        return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+          error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar path transcodificado en MediaMTX' } }
+      }
+
+      // Spawn FFmpeg in the API container — MediaMTX container doesn't have FFmpeg
+      const proc = spawnTranscodeProcess(nvr as any, camera as any, streamPath)
+      if (!proc) {
+        transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
+        resolveInFlight(false)
+        return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+          error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al iniciar proceso FFmpeg para transcodificación' } }
+      }
+
+      // Poll HLS manifest — abort early if FFmpeg exits before producing segments
+      const { ready, lastStatus, elapsedMs, processExited } = await waitForHlsReady(
+        streamPath, 12_000, 300,
+        () => isTranscodeProcessAlive(streamPath),
+      )
+
+      if (!ready) {
+        const stderrSnippet = getTranscodeStderr(streamPath)
+        stopTranscodeProcess(streamPath)
+        transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
+        resolveInFlight(false)
+        if (processExited) {
+          console.error(`[transcode] process_exited_early path=${streamPath} stderr=${stderrSnippet}`)
+          return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+            error: { code: 'TRANSCODE_PROCESS_EXITED',
+              message: 'FFmpeg finalizó antes de que HLS estuviese listo. Verifica la conexión RTSP al NVR.',
+              details: stderrSnippet.slice(-200) } }
+        }
+        return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+          error: { code: 'TRANSCODE_NOT_READY',
+            message: 'El stream transcodificado no pudo iniciar a tiempo. Intenta de nuevo.',
+            details: `lastStatus=${lastStatus} elapsed=${elapsedMs}ms` } }
+      }
+
+      const effectiveViewId = viewId || 'default'
+      sessions.set(transcodeKey, {
+        cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
+        streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+      })
+      transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
+      resolveInFlight(true)
+      console.info(`[transcode] ready cameraId=${cameraId} ch=${ch} path=${streamPath}`)
+      return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
+    } catch (err) {
+      stopTranscodeProcess(streamPath)
+      transcodeInFlight.delete(streamPath)
+      resolveInFlight(false)
+      throw err
     }
-    const effectiveViewId = viewId || 'default'
-    sessions.set(transcodeKey, {
-      cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
-      streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
-    })
-    console.info(`[transcode] ready cameraId=${cameraId} ch=${ch} path=${streamPath}`)
-    return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
   }
 
   // ── Sub early exit if confirmed down ──────────────────────────────────
@@ -290,6 +381,11 @@ export async function stopStream(
       viewCameras.get(vk)?.delete(cameraId)
     }
     sessions.delete(key)
+    if (streamType === 'main_h264') {
+      // Kill FFmpeg and clear in-flight state so path can be restarted on next request
+      stopTranscodeProcess(session.streamPath)
+      transcodeInFlight.delete(session.streamPath)
+    }
   }
 
   // Si nadie más está mirando, MediaMTX cerrará automáticamente vía sourceOnDemandCloseAfter
@@ -392,9 +488,14 @@ export async function cleanupUserSessions(
   let removed = 0
 
   for (const session of userSessions) {
-    const key = sessionKey(userId, session.cameraId)
+    const key = sessionKey(userId, session.cameraId, session.streamType)
     sessions.delete(key)
     removed++
+
+    if (session.streamType === 'main_h264') {
+      stopTranscodeProcess(session.streamPath)
+      transcodeInFlight.delete(session.streamPath)
+    }
 
     const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === session.cameraId)
     if (!othersWatching) {
@@ -439,6 +540,10 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
     if (staleViews.has(vk) || session.lastHeartbeat < cutoff) {
       sessions.delete(key)
       removed++
+      if (session.streamType === 'main_h264') {
+        stopTranscodeProcess(session.streamPath)
+        transcodeInFlight.delete(session.streamPath)
+      }
       server.log.info(`[stream-manager] Sesión idle eliminada: ${key} (view: ${session.viewId})`)
     }
   }

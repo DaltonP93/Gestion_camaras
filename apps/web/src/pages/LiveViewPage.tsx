@@ -227,6 +227,8 @@ export function LiveViewPage() {
         CAMERA_DISABLED:        'UNKNOWN',
         TRANSCODING_DISABLED:   'CODEC_UNSUPPORTED',
         TRANSCODE_LIMIT_REACHED:'UNKNOWN',
+        TRANSCODE_NOT_READY:    'MEDIAMTX_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'MEDIAMTX_NOT_READY',
       }
       const isHevc = err.code === 'CODEC_UNSUPPORTED_HEVC'
       setStreamErrors(prev => ({
@@ -431,6 +433,8 @@ export function LiveViewPage() {
         CAMERA_DISABLED:        'UNKNOWN',
         TRANSCODING_DISABLED:   'CODEC_UNSUPPORTED',
         TRANSCODE_LIMIT_REACHED:'UNKNOWN',
+        TRANSCODE_NOT_READY:    'MEDIAMTX_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'MEDIAMTX_NOT_READY',
       }
 
       setStreamErrors(prev => ({
