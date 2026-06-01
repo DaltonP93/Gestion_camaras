@@ -10,7 +10,7 @@ import { VideoPlayer, type CameraPlaybackError } from '@/components/cameras/Vide
 import { PTZControls } from '@/components/cameras/PTZControls'
 import { CameraDiagnosticModal } from '@/components/cameras/CameraDiagnosticModal'
 import { useAuthStore } from '@/stores/authStore'
-import { apiPost } from '@/lib/api'
+import { apiGet, apiPost } from '@/lib/api'
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
 
@@ -25,7 +25,7 @@ const STAGGER_MS: Record<GridLayout, number> = { 1: 0, 4: 250, 9: 400, 16: 500, 
 
 // ─── Health status config ────────────────────────────────────
 const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; blockStream: boolean }> = {
-  USING_MAIN_STREAM:       { icon: <Film size={12} />,          label: 'Main stream',           blockStream: false },
+  USING_MAIN_STREAM:       { icon: <Film size={12} />,          label: 'Sub no disponible',     blockStream: true },
   RTSP_SUB_NOT_FOUND:      { icon: <AlertTriangle size={12} />, label: 'Substream 404',         blockStream: true },
   RTSP_MAIN_NOT_FOUND:     { icon: <AlertTriangle size={12} />, label: 'RTSP no encontrado',    blockStream: true },
   CODEC_UNSUPPORTED_HEVC:  { icon: <Film size={12} />,          label: 'HEVC no compatible',    blockStream: true },
@@ -41,11 +41,6 @@ function isBlockedByHealth(camera: Camera): boolean {
 
   const status = camera.streamHealthStatus
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
-  if (status === 'USING_MAIN_STREAM') {
-    const mc = ((camera as any).mainCodec || '').toLowerCase()
-    if (mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')) return true
-    return false
-  }
   return HEALTH_CONFIG[status]?.blockStream ?? false
 }
 
@@ -54,6 +49,7 @@ function getHealthError(status: StreamHealthStatus, channel: number): CameraPlay
   const codeMap: Record<string, CameraPlaybackError['code']> = {
     RTSP_SUB_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
     RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
+    USING_MAIN_STREAM:      'RTSP_CHANNEL_NOT_FOUND',
     CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
     AUTH_FAILED:            'AUTH_FAILED',
     OFFLINE:                'CAMERA_OFFLINE',
@@ -67,9 +63,11 @@ function getHealthError(status: StreamHealthStatus, channel: number): CameraPlay
       : cfg?.label ?? status,
     technicalDetail: status === 'RTSP_SUB_NOT_FOUND'
       ? `Substream /Streaming/Channels/${channel}02 devolvió 404`
-      : status === 'CODEC_UNSUPPORTED_HEVC'
-        ? 'Recomendación: cambiar el codec del substream a H.264 en la interfaz del NVR (Configuración → Video → Substream → Codec: H.264)'
-        : undefined,
+      : status === 'USING_MAIN_STREAM'
+        ? 'Substream no disponible — doble clic para ver en pantalla completa'
+        : status === 'CODEC_UNSUPPORTED_HEVC'
+          ? 'Recomendación: cambiar el codec del substream a H.264 en la interfaz del NVR (Configuración → Video → Substream → Codec: H.264)'
+          : undefined,
   }
 }
 
@@ -106,6 +104,7 @@ export function LiveViewPage() {
   // when HEVC blocks the stream before the API call (focusStreamInfo stays null).
   const [focusStreamType, setFocusStreamType]   = useState<'sub' | 'main' | 'main_h264'>('sub')
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
+  const [streamCapabilities, setStreamCapabilities] = useState<{ ffmpegAvailable: boolean; transcodingEnabled: boolean } | null>(null)
 
   // playerKeys forces VideoPlayer remount (new HLS instance) when incremented for a camera
   const [playerKeys, setPlayerKeys] = useState<Record<string, number>>({})
@@ -135,6 +134,12 @@ export function LiveViewPage() {
 
   useEffect(() => { loadNVRs(); loadCameras() }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
+
+  useEffect(() => {
+    apiGet<{ ffmpegAvailable: boolean; transcodingEnabled: boolean }>('/live-view/capabilities')
+      .then(caps => setStreamCapabilities(caps))
+      .catch(() => setStreamCapabilities({ ffmpegAvailable: false, transcodingEnabled: false }))
+  }, [])
 
   // Derived visible cameras
   const allFiltered = cameras.filter((c) =>
@@ -206,9 +211,12 @@ export function LiveViewPage() {
         CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
         AUTH_FAILED:            'AUTH_FAILED',
         OFFLINE:                'CAMERA_OFFLINE',
+        CAMERA_OFFLINE:         'CAMERA_OFFLINE',
         MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
         CAMERA_NOT_FOUND:       'UNKNOWN',
         CAMERA_DISABLED:        'UNKNOWN',
+        TRANSCODING_DISABLED:   'CODEC_UNSUPPORTED',
+        TRANSCODE_LIMIT_REACHED:'UNKNOWN',
       }
       const isHevc = err.code === 'CODEC_UNSUPPORTED_HEVC'
       setStreamErrors(prev => ({
@@ -399,9 +407,12 @@ export function LiveViewPage() {
         CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
         AUTH_FAILED:            'AUTH_FAILED',
         OFFLINE:                'CAMERA_OFFLINE',
+        CAMERA_OFFLINE:         'CAMERA_OFFLINE',
         MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
         CAMERA_NOT_FOUND:       'UNKNOWN',
         CAMERA_DISABLED:        'UNKNOWN',
+        TRANSCODING_DISABLED:   'CODEC_UNSUPPORTED',
+        TRANSCODE_LIMIT_REACHED:'UNKNOWN',
       }
 
       setStreamErrors(prev => ({
@@ -443,11 +454,20 @@ export function LiveViewPage() {
   }, [filteredCameras, gridLayout, stopSessions, loadStream])
 
   // ─── Start visible streams with stagger ─────────────────────
+  // Blocked cameras (offline / known bad health) are loaded immediately without stagger
+  // so their error overlay appears right away without a spinner delay.
   const startVisibleStreams = useCallback((cams: Camera[]) => {
     const delay = STAGGER_MS[gridLayout] ?? 500
-    cams.forEach((cam, idx) => {
-      const timer = setTimeout(() => loadStream(cam), idx * delay)
-      staggerTimers.current.push(timer)
+    let staggerIdx = 0
+    cams.forEach((cam) => {
+      if (isBlockedByHealth(cam)) {
+        // Immediate — no timer needed, loadStream returns synchronously for blocked cameras
+        loadStream(cam)
+      } else {
+        const timer = setTimeout(() => loadStream(cam), staggerIdx * delay)
+        staggerTimers.current.push(timer)
+        staggerIdx++
+      }
     })
   }, [gridLayout, loadStream])
 
@@ -577,8 +597,10 @@ export function LiveViewPage() {
     setFocusStreamError(null)
     setFocusStreamType('main')  // always targeting main in focus view
 
-    // Proactively block known HEVC main stream before wasting a backend call
-    if (isHevcCodec(camera.mainCodec)) {
+    // Proactively block known HEVC main stream only when transcoding is unavailable.
+    // When transcoding is available, let the backend handle the auto-redirect to main_h264.
+    const transcodingAvailable = streamCapabilities?.ffmpegAvailable && streamCapabilities?.transcodingEnabled
+    if (isHevcCodec(camera.mainCodec) && !transcodingAvailable) {
       setFocusStreamError({
         code: 'CODEC_UNSUPPORTED',
         message: 'El flujo principal está en H.265/HEVC. Los navegadores no pueden reproducir H.265.',
@@ -606,7 +628,7 @@ export function LiveViewPage() {
         technicalDetail: body.details,
       })
     }
-  }, [bumpPlayerKeys])
+  }, [bumpPlayerKeys, streamCapabilities])
 
   // ─── Quality switch from VideoPlayer (Baja/Alta/Trans buttons) ─
   const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main' | 'main_h264') => {
@@ -769,6 +791,7 @@ export function LiveViewPage() {
                 ? cam.mainResolution
                 : cam.subResolution
               const canTryMainStream = focusStreamType === 'sub' && !focusStreamError
+              const transcodingAvailable = !!(streamCapabilities?.ffmpegAvailable && streamCapabilities?.transcodingEnabled)
               return (
                 <div className="h-full flex flex-col gap-0 relative">
                   <VideoPlayer
@@ -786,6 +809,7 @@ export function LiveViewPage() {
                     streamType={focusType}
                     streamCodec={focusCodec}
                     streamResolution={focusRes}
+                    transcodingAvailable={transcodingAvailable}
                   />
                   {/* Intentar alta calidad — visible button when watching sub in focus */}
                   {canTryMainStream && (
@@ -821,17 +845,11 @@ export function LiveViewPage() {
                   {/* Health badge */}
                   {(() => {
                     if (!health || health === 'HEALTHY' || health === 'UNKNOWN' || !HEALTH_CONFIG[health]) return null
-                    const mc = ((camera as any).mainCodec || '').toLowerCase()
-                    const mainIsHevc = mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')
-                    const isHevcMain = health === 'USING_MAIN_STREAM' && mainIsHevc
-                    const badgeLabel = isHevcMain ? 'Main HEVC' : HEALTH_CONFIG[health].label
-                    const bgClass = isHevcMain ? 'bg-amber-900/70' : health === 'USING_MAIN_STREAM' ? 'bg-blue-900/70' : 'bg-black/70'
-                    const iconClass = isHevcMain ? 'text-amber-400' : health === 'USING_MAIN_STREAM' ? 'text-blue-400' : 'text-amber-400'
-                    const textClass = isHevcMain ? 'text-amber-300' : health === 'USING_MAIN_STREAM' ? 'text-blue-300' : 'text-amber-300'
+                    const badgeLabel = HEALTH_CONFIG[health].label
                     return (
-                      <div className={clsx('absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5', bgClass)}>
-                        <span className={iconClass}>{HEALTH_CONFIG[health].icon}</span>
-                        <span className={clsx('text-[9px] font-medium', textClass)}>{badgeLabel}</span>
+                      <div className="absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5 bg-black/70">
+                        <span className="text-amber-400">{HEALTH_CONFIG[health].icon}</span>
+                        <span className="text-[9px] font-medium text-amber-300">{badgeLabel}</span>
                       </div>
                     )
                   })()}

@@ -2,7 +2,8 @@
 // Endpoint de viewport heartbeat: reconcilia cámaras visibles sin N llamadas individuales
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { reconcileView } from '../services/stream-manager'
+import { reconcileView, MAX_TRANSCODE_SESSIONS } from '../services/stream-manager'
+import { getFfmpegCapabilities, isTranscodingEnabled } from '../services/stream'
 
 const heartbeatSchema = z.object({
   viewId:           z.string().min(1).max(128),
@@ -54,5 +55,17 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
     server.log.info(logParts.join(' '))
 
     return reply.send(result)
+  })
+
+  // GET /api/live-view/capabilities
+  // Devuelve capacidades del servidor para que el frontend adapte la UI.
+  server.get('/capabilities', { preHandler: [server.authenticate] }, async (_request, reply) => {
+    const caps = getFfmpegCapabilities()
+    return reply.send({
+      ffmpegAvailable:     caps.available,
+      transcodingEnabled:  isTranscodingEnabled(),
+      encoders:            caps.encoders,
+      maxTranscodeSessions: MAX_TRANSCODE_SESSIONS,
+    })
   })
 }

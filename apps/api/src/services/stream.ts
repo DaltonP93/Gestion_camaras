@@ -1,6 +1,7 @@
 // apps/api/src/services/stream.ts
 // Gestión de streams via MediaMTX (RTSP → HLS/WebRTC)
 import axios from 'axios'
+import { execSync } from 'child_process'
 import type { NVR, Camera } from '@prisma/client'
 import { buildRtspUrl } from './hikvision'
 
@@ -27,6 +28,31 @@ const HEVC_TRANSCODE_BITRATE   = process.env.HEVC_TRANSCODE_BITRATE   || '1500k'
 const MEDIAMTX_RTSP_PORT       = process.env.MEDIAMTX_RTSP_PORT       || '8554'
 
 export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
+
+// ─── FFmpeg capability detection ────────────────────────────
+// Run once on first call; cached for the process lifetime.
+interface FfmpegCaps { available: boolean; encoders: string[] }
+let _ffmpegCaps: FfmpegCaps | null = null
+
+export function getFfmpegCapabilities(): FfmpegCaps {
+  if (_ffmpegCaps) return _ffmpegCaps
+  try {
+    execSync('which ffmpeg', { timeout: 3000, stdio: 'pipe' })
+  } catch {
+    _ffmpegCaps = { available: false, encoders: [] }
+    console.warn('[stream] ffmpeg not found — HEVC transcoding unavailable')
+    return _ffmpegCaps
+  }
+  const wantedEncoders = ['libx264', 'h264_nvenc', 'h264_vaapi', 'h264_qsv']
+  const found: string[] = []
+  try {
+    const out = execSync('ffmpeg -encoders 2>&1', { timeout: 8000, stdio: 'pipe' }).toString()
+    for (const enc of wantedEncoders) { if (out.includes(enc)) found.push(enc) }
+  } catch {}
+  _ffmpegCaps = { available: true, encoders: found }
+  console.info(`[stream] ffmpeg available encoders=[${found.join(', ') || 'none-detected'}]`)
+  return _ffmpegCaps
+}
 
 function configFingerprint(source: string, streamType: 'sub' | 'main'): string {
   return `${source}|tcp|10m|${streamType}`
