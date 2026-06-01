@@ -372,50 +372,88 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
   const streamPath = getTranscodedStreamPath(nvr, camera)
   const pass: string = (nvr as any).password ?? ''
   if (!pass) {
-    console.error(`[stream] PASSWORD_EMPTY — skipping transcoded path ${streamPath}`)
+    console.error(`[transcode] register_path_error path=${streamPath} reason=PASSWORD_EMPTY`)
     return false
   }
 
-  if (inFlightPaths.has(streamPath)) return true
-
-  // Passive RTSP receiver — no source, no runOnDemand.
-  // Explicitly clear runOnDemand/source so paths previously registered with
-  // runOnDemand (old config) get properly updated to passive receiver mode.
-  const pathConfig = {
-    source:               '',
-    runOnDemand:          '',
-    runOnDemandCloseAfter:'',
-    record:               false,
-    overridePublisher:    true,
+  if (inFlightPaths.has(streamPath)) {
+    console.info(`[transcode] register_path_skip path=${streamPath} reason=in_flight`)
+    return true
   }
 
-  const fp = `passive_receiver_v2|${streamPath}`
-  if (registeredPaths.get(streamPath) === fp) return true
+  // Minimal passive receiver config — NO empty-string fields (MediaMTX validates
+  // field types; an empty string for source/runOnDemand causes a 400 rejection).
+  const pathConfig = {
+    record:            false,
+    overridePublisher: true,
+  }
 
-  console.info(`[stream] publish-transcoded path=${streamPath} type=passive_receiver encoder=${TRANSCODE_ENCODER}`)
+  const fp = `passive_receiver_v3|${streamPath}`
+  if (registeredPaths.get(streamPath) === fp) {
+    console.info(`[transcode] register_path_skip path=${streamPath} reason=already_registered`)
+    return true
+  }
+
+  const encodedPath = encodeURIComponent(streamPath)
+  const addUrl      = `/v3/config/paths/add/${encodedPath}`
+  const delUrl      = `/v3/config/paths/delete/${encodedPath}`
+
+  console.info(`[transcode] register_path_start path=${streamPath} encoder=${TRANSCODE_ENCODER}`)
 
   inFlightPaths.add(streamPath)
   try {
+    // ── Step 1: POST (optimistic create) ────────────────────
+    console.info(`[transcode] register_path request method=POST url=${addUrl} body=${JSON.stringify(pathConfig)}`)
     try {
-      await mediamtxApi.post('/v3/config/paths/add/' + streamPath, pathConfig)
+      const res = await mediamtxApi.post(addUrl, pathConfig)
+      console.info(`[transcode] register_path response status=${res.status} body=${JSON.stringify(res.data)}`)
       registeredPaths.set(streamPath, fp)
-      console.info(`[stream] transcoded path created: ${streamPath}`)
+      console.info(`[transcode] register_path_ok path=${streamPath} method=POST`)
       return true
-    } catch (err: any) {
-      if (err.response?.status === 400) {
-        // Path exists — PATCH to ensure it's a passive receiver (clears old runOnDemand)
-        try {
-          await mediamtxApi.patch('/v3/config/paths/patch/' + streamPath, pathConfig)
-          registeredPaths.set(streamPath, fp)
-          console.info(`[stream] transcoded path updated to passive_receiver: ${streamPath}`)
-          return true
-        } catch {
+    } catch (postErr: any) {
+      const postStatus = postErr.response?.status
+      const postBody   = JSON.stringify(postErr.response?.data ?? postErr.message)
+      console.warn(`[transcode] register_path response status=${postStatus} body=${postBody} path=${streamPath}`)
+
+      if (postStatus !== 400 && postStatus !== 409) {
+        console.error(`[transcode] register_path_error path=${streamPath} method=POST status=${postStatus}`)
+        return false
+      }
+
+      // ── Step 2: DELETE existing path, then POST again ──────
+      console.info(`[transcode] register_path request method=DELETE url=${delUrl} path=${streamPath}`)
+      try {
+        const delRes = await mediamtxApi.delete(delUrl)
+        console.info(`[transcode] register_path response status=${delRes.status} method=DELETE path=${streamPath}`)
+      } catch (delErr: any) {
+        const delStatus = delErr.response?.status
+        const delBody   = JSON.stringify(delErr.response?.data ?? delErr.message)
+        console.warn(`[transcode] register_path response status=${delStatus} body=${delBody} method=DELETE path=${streamPath}`)
+        // 404 on DELETE is fine — path may not exist yet; continue to re-POST
+        if (delStatus !== 404) {
+          console.error(`[transcode] register_path_error path=${streamPath} method=DELETE status=${delStatus}`)
           return false
         }
       }
-      console.error(`[stream] transcoded path error: ${err.message}`)
-      return false
+
+      // ── Step 3: POST after DELETE ─────────────────────────
+      console.info(`[transcode] register_path request method=POST url=${addUrl} body=${JSON.stringify(pathConfig)} (after delete)`)
+      try {
+        const res2 = await mediamtxApi.post(addUrl, pathConfig)
+        console.info(`[transcode] register_path response status=${res2.status} body=${JSON.stringify(res2.data)}`)
+        registeredPaths.set(streamPath, fp)
+        console.info(`[transcode] register_path_ok path=${streamPath} method=POST_after_DELETE`)
+        return true
+      } catch (post2Err: any) {
+        const p2Status = post2Err.response?.status
+        const p2Body   = JSON.stringify(post2Err.response?.data ?? post2Err.message)
+        console.error(`[transcode] register_path_error path=${streamPath} method=POST_after_DELETE status=${p2Status} body=${p2Body}`)
+        return false
+      }
     }
+  } catch (unexpectedErr: any) {
+    console.error(`[transcode] register_path_error path=${streamPath} unexpected=${unexpectedErr.message}`)
+    return false
   } finally {
     inFlightPaths.delete(streamPath)
   }
