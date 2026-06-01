@@ -119,10 +119,16 @@ export async function startStream(
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_DISABLED', message: 'Cámara desactivada' } }
   }
 
+  if ((camera as any).online === false) {
+    console.info(`[startStream] skip offline cameraId=${cameraId} reason=camera_online_false`)
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_OFFLINE', message: 'Cámara offline' } }
+  }
+
   // Explicit offline: both RTSP paths confirmed down → no MediaMTX path created
   const rtspSubOk  = (camera as any).rtspSubOk  as boolean | null
   const rtspMainOk = (camera as any).rtspMainOk as boolean | null
   if (rtspSubOk === false && rtspMainOk === false) {
+    console.info(`[startStream] skip offline cameraId=${cameraId} reason=rtsp_both_down`)
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_OFFLINE', message: 'Cámara offline — sin RTSP disponible' } }
   }
 
@@ -195,6 +201,7 @@ export async function startStream(
 
   // Sub stream: block early if known to be down (prevents creating a MediaMTX path that will 500)
   if (effectiveType === 'sub' && rtspSubOk === false) {
+    console.info(`[startStream] skip cameraId=${cameraId} reason=rtsp_sub_down`)
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'RTSP_SUB_NOT_FOUND', message: 'Substream RTSP no disponible' } }
   }
 
@@ -211,10 +218,13 @@ export async function startStream(
     }
   }
 
-  // Stream limits
+  // Stream limits — only sub streams count toward the per-user limit
+  // main/main_h264 are focus-view streams and are tracked separately
   const userSessions = getSessionsForUser(userId)
+  const userSubSessions = userSessions.filter(s => s.streamType === 'sub')
   const hasSameCamera = userSessions.some(s => s.cameraId === cameraId)
-  if (userSessions.length >= MAX_STREAMS_PER_USER && !hasSameCamera) {
+  if (effectiveType === 'sub' && userSubSessions.length >= MAX_STREAMS_PER_USER && !hasSameCamera) {
+    console.info(`[startStream] userLimit cameraId=${cameraId} current=${userSubSessions.length} max=${MAX_STREAMS_PER_USER}`)
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_REACHED', message: 'Límite de streams por usuario alcanzado' } }
   }
   const key = sessionKey(userId, cameraId, effectiveType as 'sub' | 'main')

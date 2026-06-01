@@ -93,6 +93,7 @@ interface Props {
   onDiagnostic?: (cameraId: string) => void
   onStreamError?: (cameraId: string, err: CameraPlaybackError) => void
   onQualitySwitch?: (quality: 'sub' | 'main' | 'main_h264') => void
+  onRetry?: (cameraId: string) => void
   className?: string
   error?: boolean
   playbackError?: CameraPlaybackError
@@ -113,6 +114,7 @@ export function VideoPlayer({
   onDiagnostic,
   onStreamError,
   onQualitySwitch,
+  onRetry,
   className,
   error,
   playbackError: externalError,
@@ -302,6 +304,16 @@ export function VideoPlayer({
     initPlayer()
   }
 
+  const handleRetrySmart = () => {
+    if (onRetry && cameraId) {
+      onRetry(cameraId)
+    } else {
+      setRetryCount(0)
+      setInternalError(null)
+      initPlayer()
+    }
+  }
+
   const activeError = displayError
   const errCfg = activeError ? ERROR_CONFIG[activeError.code] : null
 
@@ -357,7 +369,7 @@ export function VideoPlayer({
                     </button>
                   )}
                   <button
-                    onClick={() => onQualitySwitch ? onQualitySwitch('main') : handleRetry()}
+                    onClick={() => onQualitySwitch ? onQualitySwitch('main') : handleRetrySmart()}
                     className="btn-ghost text-[10px] px-2 py-1"
                   >
                     <RefreshCw size={10} /> Reintentar
@@ -376,7 +388,7 @@ export function VideoPlayer({
                   </p>
                 )}
                 <div className="flex gap-1.5 mt-1">
-                  <button onClick={handleRetry} className="btn-ghost text-[10px] px-2 py-1">
+                  <button onClick={handleRetrySmart} className="btn-ghost text-[10px] px-2 py-1">
                     <RefreshCw size={10} /> Reintentar
                   </button>
                   {onDiagnostic && cameraId && (

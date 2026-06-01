@@ -193,6 +193,9 @@ export function startHealthWorker(server: FastifyInstance) {
         }
         const nvrDecrypted = { ...nvr, password: plainPass }
         for (const camera of nvr.cameras) {
+          // Skip cameras where RTSP is confirmed down — don't register paths that will 500
+          const camRtspSubOk = (camera as any).rtspSubOk as boolean | null
+          if (camera.online === false || camRtspSubOk === false) continue
           const path = getStreamPath(nvrDecrypted as any, camera)
           if (!mediamtxPaths.has(path)) {
             // Path ausente en MediaMTX (p.ej. reinicio de MediaMTX) — re-registrar

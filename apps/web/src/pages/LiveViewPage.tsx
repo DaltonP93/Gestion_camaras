@@ -36,9 +36,10 @@ const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; bloc
 }
 
 function isBlockedByHealth(camera: Camera): boolean {
-  // If both RTSP streams confirmed failed (explicit false), block regardless of health status
-  if (camera.rtspSubOk === false && camera.rtspMainOk === false) return true
-
+  // RTSP validator confirmed camera unreachable
+  if (camera.online === false) return true
+  // Sub RTSP specifically confirmed down — grid always requests sub
+  if (camera.rtspSubOk === false) return true
   const status = camera.streamHealthStatus
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
   return HEALTH_CONFIG[status]?.blockStream ?? false
@@ -97,6 +98,8 @@ export function LiveViewPage() {
   const [streams, setStreams]         = useState<Record<string, StreamInfo>>({})
   const [loadingStreams, setLoadingStreams] = useState<Record<string, boolean>>({})
   const [streamErrors, setStreamErrors]    = useState<Record<string, CameraPlaybackError>>({})
+  const streamErrorsRef = useRef<Record<string, CameraPlaybackError>>({})
+  streamErrorsRef.current = streamErrors  // keep ref current without triggering re-renders
   const [focusCamera, setFocusCamera]      = useState<string | null>(null)
   const [focusStreamInfo, setFocusStreamInfo]   = useState<StreamInfo | null>(null)
   const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
@@ -242,9 +245,19 @@ export function LiveViewPage() {
     if (visibleCameraIds.length === 0) return
     if (!useAuthStore.getState().isAuthenticated) return
     try {
+      // Don't re-queue cameras with permanent blocking errors — prevents MediaMTX RTSP retry spam
+      const PERMANENT_ERROR_CODES: CameraPlaybackError['code'][] = [
+        'RTSP_CHANNEL_NOT_FOUND', 'CAMERA_OFFLINE', 'AUTH_FAILED',
+        'CODEC_UNSUPPORTED', 'SUBSTREAM_DISABLED', 'NVR_OFFLINE',
+      ]
+      const filteredIds = visibleCameraIds.filter(id => {
+        const err = streamErrorsRef.current[id]
+        return !err || !PERMANENT_ERROR_CODES.includes(err.code)
+      })
+      if (filteredIds.length === 0) return
       const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', {
         viewId,
-        visibleCameraIds,
+        visibleCameraIds: filteredIds,
       })
       applyHeartbeat(result)
     } catch (err: any) {
@@ -563,6 +576,18 @@ export function LiveViewPage() {
     if (cam) setTimeout(() => loadStream(cam), 3000)
   }, [cameras, loadStream, bumpPlayerKeys])
 
+  // ─── Retry a single grid camera (full stream restart) ───────
+  const handleGridCameraRetry = useCallback((cameraId: string) => {
+    apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
+    activeSessions.current.delete(cameraId)
+    setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+    setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+    pendingStarts.current.delete(cameraId)
+    bumpPlayerKeys([cameraId])
+    const cam = cameras.find(c => c.id === cameraId)
+    if (cam) setTimeout(() => loadStream(cam), 300)
+  }, [cameras, loadStream, bumpPlayerKeys])
+
   // ─── HLS fatal error from VideoPlayer ───────────────────────
   // HLS_SESSION_EXPIRED is coalesced: batches simultaneous 401s into one
   // heartbeat (2s window) so N cameras expiring together get 1 backend call.
@@ -862,6 +887,7 @@ export function LiveViewPage() {
                     onFullscreen={() => handleEnterFocus(camera)}
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
+                    onRetry={handleGridCameraRetry}
                     className="w-full h-full"
                     playbackError={streamErrors[camera.id]}
                     streamType="sub"
