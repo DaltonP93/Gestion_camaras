@@ -93,12 +93,14 @@ interface Props {
   onDiagnostic?: (cameraId: string) => void
   onStreamError?: (cameraId: string, err: CameraPlaybackError) => void
   onQualitySwitch?: (quality: 'sub' | 'main' | 'main_h264') => void
+  onRetry?: (cameraId: string) => void
   className?: string
   error?: boolean
   playbackError?: CameraPlaybackError
   streamType?: 'sub' | 'main' | 'main_h264'
   streamCodec?: string        // e.g. "hevc", "h264"
   streamResolution?: string   // e.g. "1920×1080", "640×360"
+  transcodingAvailable?: boolean
 }
 
 type Status = 'loading' | 'playing' | 'error' | 'offline'
@@ -112,12 +114,14 @@ export function VideoPlayer({
   onDiagnostic,
   onStreamError,
   onQualitySwitch,
+  onRetry,
   className,
   error,
   playbackError: externalError,
   streamType,
   streamCodec,
   streamResolution,
+  transcodingAvailable,
 }: Props) {
   // Whether the current stream is the transcoded (HEVC→H.264) variant
   const isTranscoded = streamType === 'main_h264'
@@ -204,19 +208,19 @@ export function VideoPlayer({
           }
 
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            // 500 → MediaMTX source error (HEVC/RTSP fail / muxer destroyed) → max 1 retry
-            // 404 → stream still starting up → max 2 retries
+            // 500 → MediaMTX source error (HEVC/RTSP fail / muxer destroyed) → 0 retries (fail immediately)
+            // 404 → stream still starting up → max 1 retry
             // other network errors → max 5 retries with backoff
             const statusCode = data.response?.code
             const is500 = statusCode === 500
             const is404 = statusCode === 404
             if (is500) console.warn('[VideoPlayer] HLS 500 — MediaMTX muxer/source error', { cameraId, details: data.details })
-            const maxRetries = is500 ? 1 : is404 ? 2 : 5
+            const maxRetries = is500 ? 0 : is404 ? 1 : 5
             setRetryCount((r) => {
               if (r >= maxRetries) {
                 const err: CameraPlaybackError = {
                   code: errorCode,
-                  message: is500 ? 'Error en servidor de streaming (MediaMTX 500)'
+                  message: is500 ? 'Stream no disponible'
                           : is404 ? 'Stream no disponible en el servidor'
                           :         'Sin respuesta del servidor de streaming',
                   technicalDetail: `HTTP ${statusCode ?? 'err'} ${data.details}. URL: ${hlsUrl}`,
@@ -226,7 +230,7 @@ export function VideoPlayer({
                 if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              const delay = is500 ? 5000 : is404 ? 4000 : 3000 * (r + 1)
+              const delay = is404 ? 4000 : 3000 * (r + 1)
               setTimeout(() => hls.startLoad(), delay)
               return r + 1
             })
@@ -300,6 +304,16 @@ export function VideoPlayer({
     initPlayer()
   }
 
+  const handleRetrySmart = () => {
+    if (onRetry && cameraId) {
+      onRetry(cameraId)
+    } else {
+      setRetryCount(0)
+      setInternalError(null)
+      initPlayer()
+    }
+  }
+
   const activeError = displayError
   const errCfg = activeError ? ERROR_CONFIG[activeError.code] : null
 
@@ -345,17 +359,17 @@ export function VideoPlayer({
                       Usar baja calidad
                     </button>
                   )}
-                  {onQualitySwitch && (
+                  {onQualitySwitch && transcodingAvailable && (
                     <button
                       onClick={() => onQualitySwitch('main_h264')}
                       className="btn-ghost text-[10px] px-2 py-1 text-purple-400 hover:text-purple-300"
-                      title="Transcodificar H.265→H.264 via FFmpeg (requiere ENABLE_HEVC_TRANSCODING=true)"
+                      title="Transcodificar H.265→H.264 via FFmpeg"
                     >
                       <Cpu size={10} /> Transcodificar H.264
                     </button>
                   )}
                   <button
-                    onClick={() => onQualitySwitch ? onQualitySwitch('main') : handleRetry()}
+                    onClick={() => onQualitySwitch ? onQualitySwitch('main') : handleRetrySmart()}
                     className="btn-ghost text-[10px] px-2 py-1"
                   >
                     <RefreshCw size={10} /> Reintentar
@@ -374,7 +388,7 @@ export function VideoPlayer({
                   </p>
                 )}
                 <div className="flex gap-1.5 mt-1">
-                  <button onClick={handleRetry} className="btn-ghost text-[10px] px-2 py-1">
+                  <button onClick={handleRetrySmart} className="btn-ghost text-[10px] px-2 py-1">
                     <RefreshCw size={10} /> Reintentar
                   </button>
                   {onDiagnostic && cameraId && (
@@ -463,14 +477,16 @@ export function VideoPlayer({
             >
               Alta
             </button>
-            <button
-              onClick={() => onQualitySwitch('main_h264')}
-              className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
-                isTranscoded ? 'bg-purple-700 text-white' : 'text-purple-300 hover:text-white')}
-              title="Transcodificado H.264 (requiere ENABLE_HEVC_TRANSCODING=true)"
-            >
-              Trans
-            </button>
+            {transcodingAvailable && (
+              <button
+                onClick={() => onQualitySwitch('main_h264')}
+                className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
+                  isTranscoded ? 'bg-purple-700 text-white' : 'text-purple-300 hover:text-white')}
+                title="Transcodificado H.264"
+              >
+                Trans
+              </button>
+            )}
           </div>
         )}
       </div>

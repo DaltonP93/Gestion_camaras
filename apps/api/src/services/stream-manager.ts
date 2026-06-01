@@ -2,7 +2,7 @@
 // Los streams en MediaMTX ya tienen sourceOnDemand: true (se conectan solos cuando hay requests HLS)
 // Este manager trackea quién está mirando para informar al frontend y aplicar límites.
 import type { FastifyInstance } from 'fastify'
-import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled } from './stream'
+import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import CryptoJS from 'crypto-js'
 
@@ -10,17 +10,23 @@ const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET 
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
 // Límites configurables
-const MAX_STREAMS_PER_USER = Number(process.env.MAX_STREAMS_PER_USER || 16)
-const MAX_STREAMS_GLOBAL   = Number(process.env.MAX_STREAMS_GLOBAL   || 50)
-const STREAM_IDLE_TIMEOUT  = Number(process.env.STREAM_IDLE_TIMEOUT  || 90)  // segundos
+const MAX_STREAMS_PER_USER   = Number(process.env.MAX_STREAMS_PER_USER   || 16)
+const MAX_STREAMS_GLOBAL     = Number(process.env.MAX_STREAMS_GLOBAL     || 50)
+const STREAM_IDLE_TIMEOUT    = Number(process.env.STREAM_IDLE_TIMEOUT    || 90)  // segundos
+export const MAX_TRANSCODE_SESSIONS = Number(process.env.MAX_TRANSCODE_SESSIONS || 2)
 
-// Estados de salud que impiden el inicio del stream
+// USING_MAIN_STREAM: sub is down — block sub requests, exempt main/main_h264
 const BLOCKED_HEALTH_STATUSES = new Set([
   'RTSP_SUB_NOT_FOUND',
   'CODEC_UNSUPPORTED_HEVC',
   'AUTH_FAILED',
   'OFFLINE',
+  'USING_MAIN_STREAM',
 ])
+
+function getActiveTranscodeSessions(): number {
+  return Array.from(sessions.values()).filter(s => s.streamType === 'main_h264').length
+}
 
 interface StreamSession {
   cameraId: string
@@ -84,11 +90,12 @@ interface StreamError {
 }
 
 const HEALTH_STATUS_ERRORS: Record<string, StreamError> = {
-  RTSP_SUB_NOT_FOUND:    { code: 'RTSP_SUB_NOT_FOUND',    message: 'Substream RTSP no disponible',                          details: 'Substream /Streaming/Channels/502 devolvió 404' },
+  RTSP_SUB_NOT_FOUND:    { code: 'RTSP_SUB_NOT_FOUND',    message: 'Substream RTSP no disponible' },
   CODEC_UNSUPPORTED_HEVC:{ code: 'CODEC_UNSUPPORTED_HEVC', message: 'Codec HEVC/H.265 no compatible para reproducción web' },
   AUTH_FAILED:           { code: 'AUTH_FAILED',            message: 'Credenciales inválidas en cámara' },
   OFFLINE:               { code: 'OFFLINE',                message: 'Cámara offline' },
   RTSP_MAIN_NOT_FOUND:   { code: 'RTSP_MAIN_NOT_FOUND',   message: 'Stream RTSP principal no disponible' },
+  USING_MAIN_STREAM:     { code: 'RTSP_SUB_NOT_FOUND',    message: 'Substream no disponible — doble clic para ver en pantalla completa' },
 }
 
 export async function startStream(
@@ -97,7 +104,7 @@ export async function startStream(
   cameraId: string,
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
-): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; error?: StreamError; warning?: StreamError }> {
+): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
   // Buscar cámara en DB con NVR
   const camera = await server.prisma.camera.findUnique({
     where: { id: cameraId },
@@ -112,23 +119,71 @@ export async function startStream(
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_DISABLED', message: 'Cámara desactivada' } }
   }
 
-  // Handle transcoded (HEVC → H.264) stream via MediaMTX runOnDemand + FFmpeg
-  if (streamType === 'main_h264') {
+  if ((camera as any).online === false) {
+    console.info(`[startStream] skip offline cameraId=${cameraId} reason=camera_online_false`)
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_OFFLINE', message: 'Cámara offline' } }
+  }
+
+  // Explicit offline: both RTSP paths confirmed down → no MediaMTX path created
+  const rtspSubOk  = (camera as any).rtspSubOk  as boolean | null
+  const rtspMainOk = (camera as any).rtspMainOk as boolean | null
+  if (rtspSubOk === false && rtspMainOk === false) {
+    console.info(`[startStream] skip offline cameraId=${cameraId} reason=rtsp_both_down`)
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_OFFLINE', message: 'Cámara offline — sin RTSP disponible' } }
+  }
+
+  // Determine effective stream type.
+  // main + HEVC codec → auto-redirect to main_h264 (if transcoding enabled), else block.
+  let effectiveType: 'sub' | 'main' | 'main_h264' = streamType
+  if (streamType === 'main') {
+    const mainCodecStr = ((camera as any).mainCodec || '').toLowerCase()
+    const isHevc = mainCodecStr && (
+      mainCodecStr.includes('hevc') || mainCodecStr.includes('h265') ||
+      mainCodecStr.includes('h.265') || mainCodecStr.includes('hvc1')
+    )
+    if (isHevc) {
+      if (!isTranscodingEnabled()) {
+        return {
+          hlsUrl: '', webrtcUrl: '', streamPath: '',
+          error: { code: 'CODEC_UNSUPPORTED_HEVC', message: 'El flujo principal está en H.265/HEVC. Los navegadores no soportan H.265. Configura ENABLE_HEVC_TRANSCODING=true para habilitar transcodificación.' },
+        }
+      }
+      // Transcoding enabled → silently serve main_h264 instead of raw HEVC
+      console.info(`[transcode] start camera=${cameraId} channel=${(camera as any).channel} codec=${mainCodecStr}`)
+      effectiveType = 'main_h264'
+    }
+  }
+
+  // Transcoded stream (main_h264) — also reached via direct request or auto-redirect above
+  if (effectiveType === 'main_h264') {
     if (!isTranscodingEnabled()) {
+      console.warn(`[transcode] reject camera=${cameraId} reason=HEVC_DISABLED`)
       return {
         hlsUrl: '', webrtcUrl: '', streamPath: '',
-        error: { code: 'TRANSCODING_DISABLED', message: 'La transcodificación HEVC no está habilitada. Configura ENABLE_HEVC_TRANSCODING=true en el servidor para activarla.' },
+        error: { code: 'TRANSCODING_DISABLED', message: 'La transcodificación HEVC no está habilitada. Configura ENABLE_HEVC_TRANSCODING=true.' },
+      }
+    }
+    if (!getFfmpegCapabilities().available) {
+      console.warn(`[transcode] reject camera=${cameraId} reason=FFMPEG_NOT_AVAILABLE`)
+      return {
+        hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'MEDIA_SERVER_ERROR', message: 'FFmpeg no disponible en el servidor — transcodificación no operativa.' },
+      }
+    }
+    const activeTrans = getActiveTranscodeSessions()
+    if (activeTrans >= MAX_TRANSCODE_SESSIONS) {
+      console.warn(`[transcode] reject camera=${cameraId} reason=MAX_TRANSCODE_SESSIONS active=${activeTrans}`)
+      return {
+        hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'TRANSCODE_LIMIT_REACHED', message: `Límite de transcodificaciones simultáneas alcanzado (máx ${MAX_TRANSCODE_SESSIONS})` },
       }
     }
     const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
     const streamPath = getTranscodedStreamPath(nvr as any, camera as any)
     const key = sessionKey(userId, cameraId, 'main_h264')
-
-    const totalSessions = sessions.size
-    if (totalSessions >= MAX_STREAMS_GLOBAL && !sessions.has(key)) {
+    if (sessions.size >= MAX_STREAMS_GLOBAL && !sessions.has(key)) {
       return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado' } }
     }
-
     const published = await publishTranscodedStream(nvr as any, camera as any)
     if (!published) {
       return {
@@ -136,98 +191,71 @@ export async function startStream(
         error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar stream transcodificado en el servidor de medios' },
       }
     }
-
     const effectiveViewId = viewId || 'default'
     sessions.set(key, {
       cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
       streamPath, startedAt: sessions.get(key)?.startedAt || new Date(), lastHeartbeat: new Date(),
     })
-    return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath }
+    return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
   }
 
-  // Block HEVC main stream when codec is known — browsers can't decode H.265.
-  // This is a belt-and-suspenders check: the frontend proactively blocks too, but
-  // only when camera.mainCodec is populated. When it's null, the backend is the last guard.
-  if (streamType === 'main') {
-    const mainCodecStr = ((camera as any).mainCodec || '').toLowerCase()
-    if (mainCodecStr && (mainCodecStr.includes('hevc') || mainCodecStr.includes('h265') || mainCodecStr.includes('h.265'))) {
-      return {
-        hlsUrl: '', webrtcUrl: '', streamPath: '',
-        error: { code: 'CODEC_UNSUPPORTED_HEVC', message: 'El flujo principal está en H.265/HEVC. Los navegadores no pueden reproducir H.265 sin transcodificación.' },
-      }
-    }
+  // Sub stream: block early if known to be down (prevents creating a MediaMTX path that will 500)
+  if (effectiveType === 'sub' && rtspSubOk === false) {
+    console.info(`[startStream] skip cameraId=${cameraId} reason=rtsp_sub_down`)
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'RTSP_SUB_NOT_FOUND', message: 'Substream RTSP no disponible' } }
   }
 
-  // Rechazar cámaras con estado de salud bloqueante (sub stream).
+  // Health status blocking.
+  // USING_MAIN_STREAM is blocked for sub (sub is down) but allowed for main/main_h264.
   const healthStatus = (camera as any).streamHealthStatus as string | undefined
   const effectiveBlocked = healthStatus && BLOCKED_HEALTH_STATUSES.has(healthStatus)
-    && !(streamType === 'main' && healthStatus === 'CODEC_UNSUPPORTED_HEVC')
+    && !(effectiveType !== 'sub' && healthStatus === 'USING_MAIN_STREAM')
   if (effectiveBlocked) {
     const knownError = HEALTH_STATUS_ERRORS[healthStatus!]
     return {
-      hlsUrl: '',
-      webrtcUrl: '',
-      streamPath: '',
+      hlsUrl: '', webrtcUrl: '', streamPath: '',
       error: knownError ?? { code: healthStatus!, message: `Stream no disponible: ${healthStatus}` },
     }
   }
 
-  // USING_MAIN_STREAM: sub no disponible — si piden main, es correcto; si piden sub, aviso
-  const usingMainStream = streamType === 'sub' && (camera as any).streamHealthStatus === 'USING_MAIN_STREAM'
-
-  // Verificar límites (main streams no cuentan contra el límite por cámara si ya tiene una sub sesión)
+  // Stream limits — only sub streams count toward the per-user limit
+  // main/main_h264 are focus-view streams and are tracked separately
   const userSessions = getSessionsForUser(userId)
+  const userSubSessions = userSessions.filter(s => s.streamType === 'sub')
   const hasSameCamera = userSessions.some(s => s.cameraId === cameraId)
-  if (userSessions.length >= MAX_STREAMS_PER_USER && !hasSameCamera) {
+  if (effectiveType === 'sub' && userSubSessions.length >= MAX_STREAMS_PER_USER && !hasSameCamera) {
+    console.info(`[startStream] userLimit cameraId=${cameraId} current=${userSubSessions.length} max=${MAX_STREAMS_PER_USER}`)
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_REACHED', message: 'Límite de streams por usuario alcanzado' } }
   }
-
-  const key = sessionKey(userId, cameraId, streamType)
-  const totalSessions = sessions.size
-  if (totalSessions >= MAX_STREAMS_GLOBAL && !sessions.has(key)) {
+  const key = sessionKey(userId, cameraId, effectiveType as 'sub' | 'main')
+  if (sessions.size >= MAX_STREAMS_GLOBAL && !sessions.has(key)) {
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado' } }
   }
 
+  // Publish to MediaMTX
   const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
-  const streamPath = getStreamPath(nvr as NVR, camera as Camera, streamType)
-
-  // Registrar en MediaMTX — si falla, NO registrar sesión
-  const published = await publishStream(nvr as NVR, camera as Camera, streamType)
+  const streamPath = getStreamPath(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
+  const published = await publishStream(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
   if (!published) {
     return {
-      hlsUrl: '',
-      webrtcUrl: '',
-      streamPath: '',
+      hlsUrl: '', webrtcUrl: '', streamPath: '',
       error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar stream en el servidor de medios' },
     }
   }
 
-  // Registrar sesión solo si publishStream tuvo éxito
+  // Register session
   const effectiveViewId = viewId || 'default'
   sessions.set(key, {
-    cameraId,
-    userId,
-    viewId: effectiveViewId,
-    streamType,
-    streamPath,
-    startedAt: sessions.get(key)?.startedAt || new Date(),
-    lastHeartbeat: new Date(),
+    cameraId, userId, viewId: effectiveViewId, streamType: effectiveType as 'sub' | 'main',
+    streamPath, startedAt: sessions.get(key)?.startedAt || new Date(), lastHeartbeat: new Date(),
   })
-
-  // Asociar cámara a su view solo para sub streams — main streams son explícitos (no gestionados por heartbeat)
-  if (streamType === 'sub') {
+  if (effectiveType === 'sub') {
     const vk = vKey(userId, effectiveViewId)
     if (!viewCameras.has(vk)) viewCameras.set(vk, new Set())
     viewCameras.get(vk)!.add(cameraId)
     viewHeartbeat.set(vk, new Date())
   }
-
-  return {
-    hlsUrl: getHlsUrl(streamPath),
-    webrtcUrl: getWebRtcUrl(streamPath),
-    streamPath,
-    warning: usingMainStream ? { code: 'USING_MAIN_STREAM', message: 'Substream no disponible — usando stream principal (calidad HD)' } : undefined,
-  }
+  return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath }
 }
 
 // Detener stream para un usuario
