@@ -314,6 +314,9 @@ export interface AppearanceSettings {
   theme: 'dark' | 'darker' | 'midnight'
   sidebarWidth: 'compact' | 'normal'
   showNVRsInSidebar: boolean
-  customCss?: string
+  customCss: string
+  logoUrl: string
+  sidebarLogoUrl: string
+  faviconUrl: string
   updatedAt: string
 }

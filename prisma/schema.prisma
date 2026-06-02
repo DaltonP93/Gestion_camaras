@@ -278,6 +278,9 @@ model AppearanceSettings {
   sidebarWidth      String  @default("normal")
   showNVRsInSidebar Boolean @default(true)
   customCss         String? @db.Text
+  logoUrl           String? @db.Text
+  sidebarLogoUrl    String? @db.Text
+  faviconUrl        String? @db.Text
   updatedAt         DateTime @updatedAt
 
   @@map("appearance_settings")
