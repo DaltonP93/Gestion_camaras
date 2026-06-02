@@ -61,6 +61,15 @@ const SUPERVISOR_MAX_RESTARTS = 3
 const SUPERVISOR_WINDOW_MS    = 2 * 60_000          // 2 minutes
 const SUPERVISOR_BACKOFFS     = [2_000, 5_000, 10_000] as const
 
+// Reasons that explicitly allow FFmpeg to be killed when stopping a main_h264 session.
+// Any other reason (e.g. 'retry', 'hls_error') keeps FFmpeg alive so the next startStream
+// call can detect the live process via isTranscodeProcessAlive and reuse it.
+const TRANSCODE_KILL_REASONS = new Set([
+  'exit_focus', 'switch_to_sub', 'cleanup_unmount', 'idle_timeout',
+  'force_stop', 'logout', 'session_cleanup', 'viewport_change',
+  'layout_change', 'nvr_change', 'page_change', 'stop_all',
+])
+
 function getActiveTranscodeCount(): number {
   // Count registered sessions + paths currently starting (not yet registered)
   const registered = Array.from(sessions.values()).filter(s => s.streamType === 'main_h264').length
@@ -155,8 +164,10 @@ async function runTranscodeSupervisor(
 ): Promise<void> {
   const transcodeKey = sessionKey(sourceRef.userId, sourceRef.cameraId, 'main_h264')
 
-  if (!sessions.get(transcodeKey)) {
-    console.info(`[supervisor] skip path=${streamPath} reason=no_active_session`)
+  const hasSession    = !!sessions.get(transcodeKey)
+  const inFlightState = transcodeInFlight.get(streamPath)?.state
+  if (!hasSession && inFlightState !== 'starting') {
+    console.info(`[supervisor] skip path=${streamPath} reason=no_active_session inFlight=${inFlightState ?? 'none'}`)
     transcodeRestarts.delete(streamPath)
     return
   }
@@ -194,8 +205,10 @@ async function runTranscodeSupervisor(
 
   await new Promise(r => setTimeout(r, backoffMs))
 
-  if (!sessions.get(transcodeKey)) {
-    console.info(`[supervisor] restart_cancelled path=${streamPath} reason=session_gone_after_backoff`)
+  const hasSessionAfter    = !!sessions.get(transcodeKey)
+  const inFlightStateAfter = transcodeInFlight.get(streamPath)?.state
+  if (!hasSessionAfter && inFlightStateAfter !== 'starting') {
+    console.info(`[supervisor] restart_cancelled path=${streamPath} reason=session_gone_after_backoff inFlight=${inFlightStateAfter ?? 'none'}`)
     return
   }
 
@@ -360,6 +373,22 @@ export async function startStream(
 
     // Clear failed state so the caller can retry
     if (inFlight?.state === 'failed') transcodeInFlight.delete(streamPath)
+
+    // ── 2b. Reuse live FFmpeg even if session was cleared ────────
+    // Happens when stopStream was called with a non-kill reason (e.g. 'retry', 'hls_error')
+    // which removed the session but kept FFmpeg running. Re-register the session and return
+    // the existing URL immediately without spawning a new process.
+    if (isTranscodeProcessAlive(streamPath)) {
+      console.info(`[transcode] reuse_live_process path=${streamPath} cameraId=${cameraId} — session cleared but FFmpeg alive`)
+      const effectiveViewId0 = viewId || 'default'
+      sessions.set(transcodeKey, {
+        cameraId, userId, viewId: effectiveViewId0, streamType: 'main_h264',
+        streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+      })
+      // Supervisor is still attached from the original spawn — no need to re-attach.
+      transcodeInFlight.set(streamPath, { state: 'ready', promise: Promise.resolve(true), resolve: () => {} })
+      return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
+    }
 
     // ── 3. Check limits (count starting + registered) ────────
     const activeTrans = getActiveTranscodeCount()
@@ -567,11 +596,20 @@ export async function stopStream(
     }
     sessions.delete(key)
     if (streamType === 'main_h264') {
-      stopTranscodeProcess(session.streamPath)
+      // Only kill FFmpeg when the reason explicitly permits it.
+      // Non-kill reasons (retry, hls_error, etc.) keep FFmpeg alive so the next
+      // startStream call can detect the live process and reuse it without re-spawning.
+      const shouldKill = !reason || TRANSCODE_KILL_REASONS.has(reason)
+      if (shouldKill) {
+        stopTranscodeProcess(session.streamPath)
+        transcodeRestarts.delete(session.streamPath)
+        transcodeSourceInfo.delete(session.streamPath)
+        killedFfmpeg = true
+      } else {
+        console.info(`[stopStream] skip_kill_active_main_h264 path=${session.streamPath} reason=${reason}`)
+      }
+      // Always clear inFlight — next startStream will re-register via isTranscodeProcessAlive check
       transcodeInFlight.delete(session.streamPath)
-      transcodeRestarts.delete(session.streamPath)
-      transcodeSourceInfo.delete(session.streamPath)
-      killedFfmpeg = true
       clearedInFlight = true
     }
   }

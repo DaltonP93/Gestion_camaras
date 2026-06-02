@@ -354,7 +354,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const streamType: 'sub' | 'main' | 'main_h264' =
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
-    await stopStream(server, user.sub, id, streamType)
+    const reason = typeof body?.reason === 'string' ? body.reason : undefined
+    await stopStream(server, user.sub, id, streamType, reason)
     return reply.send({ ok: true })
   })
 

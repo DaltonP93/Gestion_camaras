@@ -69,6 +69,40 @@ const transcodeStderr     = new Map<string, string>()
 const transcodeStderrStart = new Map<string, string>()
 // Masked RTSP source URL per path — for diagnostic endpoint (no credentials)
 const transcodeRtspMasked  = new Map<string, string>()
+// Wall-clock timestamp when the process was spawned — used to detect very early exits
+const transcodeSpawnTime   = new Map<string, number>()
+
+// Mask RTSP credentials in any string before writing to logs or API responses
+function sanitizeRtsp(s: string): string {
+  return s.replace(/rtsp:\/\/([^:@\s]+):([^@\s]+)@/gi, 'rtsp://$1:***@')
+}
+
+// ─── RTSP timeout option detection ──────────────────────────
+// Different FFmpeg builds expose different timeout options for the RTSP demuxer.
+// Alpine FFmpeg 8.0.1 (this container): supports -timeout but NOT -rw_timeout.
+// Detect once at first spawn and cache for the process lifetime.
+type RtspTimeoutOpt = '-rw_timeout' | '-timeout' | null
+let _rtspTimeoutOpt: RtspTimeoutOpt | undefined = undefined  // undefined = not yet detected
+
+function getRtspTimeoutOption(): RtspTimeoutOpt {
+  if (_rtspTimeoutOpt !== undefined) return _rtspTimeoutOpt
+  try {
+    const out = execSync('ffmpeg -hide_banner -h demuxer=rtsp 2>&1', { timeout: 5000, stdio: 'pipe' }).toString()
+    if (/^\s*-rw_timeout\b/m.test(out)) {
+      _rtspTimeoutOpt = '-rw_timeout'
+    } else if (/^\s*-timeout\b/m.test(out)) {
+      _rtspTimeoutOpt = '-timeout'
+    } else {
+      _rtspTimeoutOpt = null
+      console.warn('[transcode] rtsp_timeout_detect — neither rw_timeout nor timeout found in ffmpeg -h demuxer=rtsp; RTSP I/O timeout disabled')
+    }
+  } catch (err: any) {
+    _rtspTimeoutOpt = null
+    console.warn(`[transcode] rtsp_timeout_detect failed: ${err.message} — RTSP I/O timeout disabled`)
+  }
+  console.info(`[transcode] rtsp_timeout_detect opt=${_rtspTimeoutOpt ?? 'none'}`)
+  return _rtspTimeoutOpt
+}
 
 export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string): ChildProcess | null {
   const pass: string = (nvr as any).password ?? ''
@@ -95,12 +129,15 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   const bitrateUnit = HEVC_TRANSCODE_BITRATE.replace(/^\d+/, '') || 'k'
   const bufsize     = TRANSCODE_BUFSIZE_ENV || `${bitrateNum * 2}${bitrateUnit}`
 
+  // Detect which RTSP I/O timeout option this FFmpeg build supports.
+  // Alpine FFmpeg 8.0.1: -timeout (not -rw_timeout). Detection is cached after first call.
+  const rtspTimeoutOpt = getRtspTimeoutOption()
+
   const args: string[] = [
     '-rtsp_transport', 'tcp',
     '-fflags', '+genpts+discardcorrupt',
     '-use_wallclock_as_timestamps', '1',
-    '-rw_timeout', '15000000',
-    '-timeout', '15000000',
+    ...(rtspTimeoutOpt ? [rtspTimeoutOpt, '15000000'] : []),  // 15s RTSP I/O timeout (microseconds)
     '-reorder_queue_size', '0',
     '-i', rtspInput,
     '-an',
@@ -164,6 +201,7 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   transcodeStderr.set(streamPath, '')
   transcodeStderrStart.set(streamPath, '')
   transcodeRtspMasked.set(streamPath, inputMasked)
+  transcodeSpawnTime.set(streamPath, Date.now())
 
   proc.on('spawn', () => {
     console.info(`[transcode] ffmpeg_started path=${streamPath} pid=${proc.pid}`)
@@ -192,25 +230,41 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   })
 
   proc.on('exit', (code, signal) => {
-    const fullStderr  = transcodeStderr.get(streamPath) || ''
-    const startBuf    = transcodeStderrStart.get(streamPath) || ''
-    // Log full stderr (up to 20KB) so crash reasons are never truncated
-    // Split into chunks of 1000 chars to avoid log line length limits
+    // Sanitize before any logging — FFmpeg echoes the input URL (with credentials) in stderr
+    const fullStderr  = sanitizeRtsp(transcodeStderr.get(streamPath) || '')
+    const startBuf    = sanitizeRtsp(transcodeStderrStart.get(streamPath) || '')
+    const spawnedAt   = transcodeSpawnTime.get(streamPath) ?? Date.now()
+    const uptime      = Date.now() - spawnedAt
+    const isEarlyExit = uptime < 3_000
     const exitLabel   = code !== null ? `code=${code}` : `signal=${signal}`
     const isEof       = fullStderr.includes('End of file') || fullStderr.includes('Failed reading RTSP data')
-    const exitReason  = isEof ? 'RTSP_INPUT_EOF' : code !== null ? `exit_${code}` : `sig_${signal}`
-    console.warn(`[transcode] ffmpeg_exit path=${streamPath} ${exitLabel} reason=${exitReason} stderrBytes=${fullStderr.length}`)
-    if (fullStderr.length > 0) {
-      // Log start (first 1KB) separately — contains codec/format errors
+    const exitReason  = isEof              ? 'RTSP_INPUT_EOF'
+      : (code === 8 && isEarlyExit)       ? 'FFMPEG_INVALID_OPTION'
+      : code !== null                      ? `exit_${code}`
+      : `sig_${signal}`
+    console.warn(`[transcode] ffmpeg_exit path=${streamPath} ${exitLabel} reason=${exitReason} uptime=${uptime}ms stderrBytes=${fullStderr.length}`)
+
+    if (isEarlyExit) {
+      // Very early exit — likely an invalid argument. Extract option-error lines explicitly.
+      const combined    = startBuf + '\n' + fullStderr
+      const optErrors   = combined.split('\n')
+        .filter(l => /unrecognized option|option .* not found|invalid argument|error splitting the argument|unknown encoder|no such (file|codec)/i.test(l))
+        .slice(0, 5).join(' | ')
+      if (optErrors) {
+        console.error(`[transcode] ffmpeg_option_error path=${streamPath} uptime=${uptime}ms | ${optErrors}`)
+      }
+      const startLog = startBuf.slice(0, 1200).replace(/\n/g, ' | ')
+      console.error(`[transcode] ffmpeg_early_exit path=${streamPath} uptime=${uptime}ms code=${code} | ${startLog || '(empty stderr — FFmpeg may not have started)'}`)
+    } else if (fullStderr.length > 0) {
       const startLog = startBuf.slice(0, 800).replace(/\n/g, ' | ')
       console.warn(`[transcode] ffmpeg_stderr_start path=${streamPath} | ${startLog}`)
-      // Log end (last 1.5KB) — contains last encoding stats and final error
       const endLog = fullStderr.slice(-1500).replace(/\n/g, ' | ')
       console.warn(`[transcode] ffmpeg_stderr_end   path=${streamPath} | ${endLog}`)
     } else {
       console.warn(`[transcode] ffmpeg_exit_no_stderr path=${streamPath} — FFmpeg may not have started (binary missing or EPERM)`)
     }
     transcodeProcesses.delete(streamPath)
+    transcodeSpawnTime.delete(streamPath)
     transcodeStderrStart.delete(streamPath)
   })
 
@@ -242,8 +296,8 @@ export function isTranscodeProcessAlive(streamPath: string): boolean {
 }
 
 export function getTranscodeStderr(streamPath: string): string {
-  const start = (transcodeStderrStart.get(streamPath) || '').slice(0, 600)
-  const end   = (transcodeStderr.get(streamPath) || '').slice(-1200)
+  const start = sanitizeRtsp((transcodeStderrStart.get(streamPath) || '').slice(0, 600))
+  const end   = sanitizeRtsp((transcodeStderr.get(streamPath) || '').slice(-1200))
   if (start && !end.startsWith(start.slice(0, 40))) {
     return `[inicio]\n${start}\n[final]\n${end}`
   }
@@ -267,9 +321,10 @@ export function getActiveTranscodesList(): Array<{
   }))
 }
 
-// Full 20 KB rolling stderr buffer — used by supervisor to classify exit reason
+// Full 20 KB rolling stderr buffer — used by supervisor to classify exit reason and
+// by the diagnostic endpoint. Credentials are masked before returning.
 export function getTranscodeRawStderr(streamPath: string): string {
-  return transcodeStderr.get(streamPath) || ''
+  return sanitizeRtsp(transcodeStderr.get(streamPath) || '')
 }
 
 // Masked RTSP source URL — credentials replaced with *** for diagnostic endpoint
@@ -420,8 +475,22 @@ export async function waitForHlsReady(
 
     if (isAlive && !isAlive()) {
       const elapsed = now - startMs
-      console.warn(`[transcode] waiting_hls aborted path=${streamPath} reason=process_exited elapsedMs=${elapsed}`)
-      return { ready: false, lastStatus, elapsedMs: elapsed, processExited: true, manifestVisible }
+      const rem = deadline - now
+      if (rem > 2600) {
+        // Give the supervisor (2s backoff) time to restart FFmpeg before aborting.
+        console.warn(`[transcode] waiting_hls process_exited path=${streamPath} elapsedMs=${elapsed} — waiting 2.5s for supervisor restart`)
+        await new Promise(r => setTimeout(r, 2500))
+        if (!isAlive()) {
+          const elapsed2 = Date.now() - startMs
+          console.warn(`[transcode] waiting_hls aborted path=${streamPath} reason=process_exited elapsedMs=${elapsed2}`)
+          return { ready: false, lastStatus, elapsedMs: elapsed2, processExited: true, manifestVisible }
+        }
+        console.info(`[transcode] waiting_hls process_restarted path=${streamPath} — supervisor restarted FFmpeg, continuing poll`)
+        continue
+      } else {
+        console.warn(`[transcode] waiting_hls aborted path=${streamPath} reason=process_exited elapsedMs=${elapsed}`)
+        return { ready: false, lastStatus, elapsedMs: elapsed, processExited: true, manifestVisible }
+      }
     }
 
     // Every 5 iterations (~1.5s), check if RTSP publisher is active in MediaMTX.
