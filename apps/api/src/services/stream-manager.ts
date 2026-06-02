@@ -2,7 +2,7 @@
 // Los streams en MediaMTX ya tienen sourceOnDemand: true (se conectan solos cuando hay requests HLS)
 // Este manager trackea quién está mirando para informar al frontend y aplicar límites.
 import type { FastifyInstance } from 'fastify'
-import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr } from './stream'
+import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr, getStreamDetails } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import CryptoJS from 'crypto-js'
 
@@ -14,8 +14,8 @@ const MAX_STREAMS_PER_USER   = Number(process.env.MAX_STREAMS_PER_USER   || 32)
 const MAX_STREAMS_GLOBAL     = Number(process.env.MAX_STREAMS_GLOBAL     || 50)
 const STREAM_IDLE_TIMEOUT    = Number(process.env.STREAM_IDLE_TIMEOUT    || 90)  // segundos
 export const MAX_TRANSCODE_SESSIONS = Number(process.env.MAX_TRANSCODE_SESSIONS || 2)
-// How long to wait for HLS manifest after FFmpeg starts (default 45s to allow first segment)
-const TRANSCODE_HLS_READY_TIMEOUT_MS = Number(process.env.TRANSCODE_HLS_READY_TIMEOUT_MS || 45_000)
+// How long to wait for HLS manifest after FFmpeg starts (default 60s to allow first segment)
+const TRANSCODE_HLS_READY_TIMEOUT_MS = Number(process.env.TRANSCODE_HLS_READY_TIMEOUT_MS || 60_000)
 
 // Health statuses that unconditionally block all stream requests
 // (USING_MAIN_STREAM and CODEC_UNSUPPORTED_HEVC are handled by codec redirect logic instead)
@@ -263,13 +263,19 @@ export async function startStream(
       }
 
       // Spawn FFmpeg in the API container — MediaMTX container doesn't have FFmpeg
+      // spawnTranscodeProcess returns null if password is empty or RTSP URL is invalid.
+      // The spawn_abort log in stream.ts explains the reason; show it in the error detail too.
       const proc = spawnTranscodeProcess(nvr as any, camera as any, streamPath)
       if (!proc) {
         transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
         resolveInFlight(false)
+        console.error(`[transcode] spawn_null cameraId=${cameraId} ch=${ch} path=${streamPath} — spawnTranscodeProcess returned null (see spawn_abort log above)`)
         return { hlsUrl: '', webrtcUrl: '', streamPath: '',
-          error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al iniciar proceso FFmpeg para transcodificación' } }
+          error: { code: 'TRANSCODE_PROCESS_EXITED',
+            message: 'FFmpeg no pudo iniciarse. Verifica credenciales NVR y que FFmpeg esté instalado en el contenedor API.',
+            details: `path=${streamPath} — ver logs [transcode] spawn_abort para causa exacta` } }
       }
+      console.info(`[transcode] spawn_ok cameraId=${cameraId} ch=${ch} path=${streamPath} pid=${proc.pid ?? 'pending'}`)
 
       // Poll HLS manifest — abort early if FFmpeg exits before producing segments.
       // manifestVisible=true means status=200+#EXTM3U was seen; FFmpeg is alive
@@ -305,9 +311,31 @@ export async function startStream(
           resolveInFlight(true)
           return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
         }
+        // Final safety net: even without HLS manifest evidence, check if MediaMTX
+        // actually has the RTSP publisher live (FFmpeg connected and pushing frames).
+        // waitForHlsReady already does this check, but we do it once more here as a
+        // last resort before killing FFmpeg.
+        const liveDetails = await getStreamDetails(streamPath).catch(() => null)
+        const rtspActive  = liveDetails?.sourceType === 'rtspSession' || liveDetails?.active === true
+        if (rtspActive) {
+          console.warn(
+            `[transcode] hls_partial_ready path=${streamPath} elapsedMs=${elapsedMs}` +
+            ` sourceType=${liveDetails?.sourceType} active=${liveDetails?.active}` +
+            ` — publisher active, HLS muxer slow; returning URL for VideoPlayer retry`
+          )
+          const effectiveViewId3 = viewId || 'default'
+          sessions.set(transcodeKey, {
+            cameraId, userId, viewId: effectiveViewId3, streamType: 'main_h264',
+            streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+          })
+          transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
+          resolveInFlight(true)
+          return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
+        }
         stopTranscodeProcess(streamPath)
         transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
         resolveInFlight(false)
+        console.error(`[transcode] hls_not_ready_killing path=${streamPath} elapsedMs=${elapsedMs} lastStatus=${lastStatus} rtspActive=${rtspActive}`)
         return { hlsUrl: '', webrtcUrl: '', streamPath: '',
           error: { code: 'TRANSCODE_NOT_READY',
             message: 'El stream transcodificado no pudo iniciar a tiempo. Intenta de nuevo.',
@@ -482,7 +510,10 @@ export async function reconcileView(
       // Touch co-located main/main_h264 sessions so idle cleanup doesn't kill active focus streams
       for (const st of ['main', 'main_h264'] as const) {
         const sOther = sessions.get(sessionKey(userId, cameraId, st))
-        if (sOther) sOther.lastHeartbeat = now2
+        if (sOther) {
+          sOther.lastHeartbeat = now2
+          console.info(`[reconcileView] touch ${st} cameraId=${cameraId} path=${sOther.streamPath}`)
+        }
       }
       streams[cameraId] = {
         hls: getHlsUrl(existing.streamPath),
