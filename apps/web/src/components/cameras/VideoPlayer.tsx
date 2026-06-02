@@ -249,8 +249,10 @@ export function VideoPlayer({
                 : 5
             setRetryCount((r) => {
               if (r === 0 && is500 && isTranscodedStream) {
-                // First 500 on a transcoded stream — show startup message, keep loading
                 setTranscodeStartMsg('Preparando transcodificación...')
+              } else if (r >= 5 && is500 && isTranscodedStream) {
+                // After ~4s of retries, supervisor may have restarted FFmpeg — show reconnecting msg
+                setTranscodeStartMsg('Reconectando transcodificación...')
               }
               if (r >= maxRetries) {
                 setTranscodeStartMsg(null)

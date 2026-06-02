@@ -67,6 +67,8 @@ const transcodeStderr     = new Map<string, string>()
 // First ~1 KB of stderr captured separately — shows codec errors, file-not-found, etc.
 // The rolling buffer captures the end; the start buffer captures startup messages.
 const transcodeStderrStart = new Map<string, string>()
+// Masked RTSP source URL per path — for diagnostic endpoint (no credentials)
+const transcodeRtspMasked  = new Map<string, string>()
 
 export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string): ChildProcess | null {
   const pass: string = (nvr as any).password ?? ''
@@ -95,6 +97,11 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
 
   const args: string[] = [
     '-rtsp_transport', 'tcp',
+    '-fflags', '+genpts+discardcorrupt',
+    '-use_wallclock_as_timestamps', '1',
+    '-rw_timeout', '15000000',
+    '-timeout', '15000000',
+    '-reorder_queue_size', '0',
     '-i', rtspInput,
     '-an',
   ]
@@ -156,6 +163,7 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   transcodeProcesses.set(streamPath, proc)
   transcodeStderr.set(streamPath, '')
   transcodeStderrStart.set(streamPath, '')
+  transcodeRtspMasked.set(streamPath, inputMasked)
 
   proc.on('spawn', () => {
     console.info(`[transcode] ffmpeg_started path=${streamPath} pid=${proc.pid}`)
@@ -189,7 +197,9 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
     // Log full stderr (up to 20KB) so crash reasons are never truncated
     // Split into chunks of 1000 chars to avoid log line length limits
     const exitLabel   = code !== null ? `code=${code}` : `signal=${signal}`
-    console.warn(`[transcode] ffmpeg_exit path=${streamPath} ${exitLabel} stderrBytes=${fullStderr.length}`)
+    const isEof       = fullStderr.includes('End of file') || fullStderr.includes('Failed reading RTSP data')
+    const exitReason  = isEof ? 'RTSP_INPUT_EOF' : code !== null ? `exit_${code}` : `sig_${signal}`
+    console.warn(`[transcode] ffmpeg_exit path=${streamPath} ${exitLabel} reason=${exitReason} stderrBytes=${fullStderr.length}`)
     if (fullStderr.length > 0) {
       // Log start (first 1KB) separately — contains codec/format errors
       const startLog = startBuf.slice(0, 800).replace(/\n/g, ' | ')
@@ -222,6 +232,7 @@ export function stopTranscodeProcess(streamPath: string): void {
   if (!proc) return
   try { proc.kill('SIGTERM') } catch {}
   transcodeProcesses.delete(streamPath)
+  transcodeRtspMasked.delete(streamPath)
   console.info(`[transcode] ffmpeg_killed path=${streamPath}`)
 }
 
@@ -254,6 +265,16 @@ export function getActiveTranscodesList(): Array<{
     alive:       proc.exitCode === null && !proc.killed,
     stderrBytes: (transcodeStderr.get(path) || '').length,
   }))
+}
+
+// Full 20 KB rolling stderr buffer — used by supervisor to classify exit reason
+export function getTranscodeRawStderr(streamPath: string): string {
+  return transcodeStderr.get(streamPath) || ''
+}
+
+// Masked RTSP source URL — credentials replaced with *** for diagnostic endpoint
+export function getTranscodeRtspMasked(streamPath: string): string | undefined {
+  return transcodeRtspMasked.get(streamPath)
 }
 
 // Check if MediaMTX has an active RTSP publisher on this path (i.e. FFmpeg is connected
