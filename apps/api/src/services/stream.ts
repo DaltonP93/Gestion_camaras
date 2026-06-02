@@ -28,11 +28,17 @@ const inFlightPaths   = new Set<string>()
 // Accept both ENABLE_HEVC_TRANSCODING and the legacy alias ENABLE_HEVC_TRANSCODE
 const ENABLE_HEVC_TRANSCODING  = process.env.ENABLE_HEVC_TRANSCODING === 'true' || process.env.ENABLE_HEVC_TRANSCODE === 'true'
 const HEVC_TRANSCODE_PRESET    = process.env.HEVC_TRANSCODE_PRESET    || 'ultrafast'
-const HEVC_TRANSCODE_WIDTH     = process.env.HEVC_TRANSCODE_WIDTH     || '1280'
-const HEVC_TRANSCODE_FPS       = process.env.HEVC_TRANSCODE_FPS       || '15'
-const HEVC_TRANSCODE_BITRATE   = process.env.HEVC_TRANSCODE_BITRATE   || '1500k'
-const MEDIAMTX_RTSP_PORT       = process.env.MEDIAMTX_RTSP_PORT       || '8554'
-const TRANSCODE_ENCODER        = process.env.TRANSCODE_ENCODER        || 'libx264'
+// TRANSCODE_WIDTH takes priority; 'source' means no scaling
+const HEVC_TRANSCODE_WIDTH     = process.env.TRANSCODE_WIDTH || process.env.HEVC_TRANSCODE_WIDTH || '1280'
+// TRANSCODE_FPS / TRANSCODE_BITRATE are the canonical names; HEVC_ names kept for compat
+const HEVC_TRANSCODE_FPS       = process.env.TRANSCODE_FPS     || process.env.HEVC_TRANSCODE_FPS     || '15'
+const HEVC_TRANSCODE_BITRATE   = process.env.TRANSCODE_BITRATE || process.env.HEVC_TRANSCODE_BITRATE || '1500k'
+// Optional overrides — default to computed values when unset
+const TRANSCODE_MAXRATE        = process.env.TRANSCODE_MAXRATE  || HEVC_TRANSCODE_BITRATE
+const TRANSCODE_BUFSIZE_ENV    = process.env.TRANSCODE_BUFSIZE  || ''  // empty → auto (2×bitrate)
+const TRANSCODE_GOP_SECONDS    = Number(process.env.TRANSCODE_GOP_SECONDS || '2')
+const MEDIAMTX_RTSP_PORT       = process.env.MEDIAMTX_RTSP_PORT || '8554'
+const TRANSCODE_ENCODER        = process.env.TRANSCODE_ENCODER  || 'libx264'
 
 // Derive MediaMTX hostname from MEDIAMTX_URL so FFmpeg publishes to the right host
 const MEDIAMTX_HOST = (() => {
@@ -55,27 +61,51 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
 
   const rtspOutput = `rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${streamPath}`
 
-  // Compute bufsize = 2× bitrate (handles "1500k" → "3000k")
+  // GOP: force keyframe every TRANSCODE_GOP_SECONDS (default 2s) so HLS segments stay short
+  const fps       = Number(HEVC_TRANSCODE_FPS) || 15
+  const gopFrames = Math.max(1, Math.round(fps * TRANSCODE_GOP_SECONDS))
+
+  // Bitrate / maxrate / bufsize
   const bitrateNum  = parseInt(HEVC_TRANSCODE_BITRATE) || 1500
   const bitrateUnit = HEVC_TRANSCODE_BITRATE.replace(/^\d+/, '') || 'k'
-  const bufsize     = `${bitrateNum * 2}${bitrateUnit}`
+  const bufsize     = TRANSCODE_BUFSIZE_ENV || `${bitrateNum * 2}${bitrateUnit}`
 
   const args: string[] = [
     '-rtsp_transport', 'tcp',
     '-i', rtspInput,
     '-an',
-    '-vf', `scale=${HEVC_TRANSCODE_WIDTH}:-2`,
+  ]
+
+  // Scale — skip if TRANSCODE_WIDTH=source
+  if (HEVC_TRANSCODE_WIDTH !== 'source') {
+    args.push('-vf', `scale=${HEVC_TRANSCODE_WIDTH}:-2`)
+  }
+
+  args.push(
     '-r', HEVC_TRANSCODE_FPS,
     '-c:v', TRANSCODE_ENCODER,
     '-preset', HEVC_TRANSCODE_PRESET,
-  ]
+  )
+
   // -tune zerolatency only valid for libx264/libx265
   if (TRANSCODE_ENCODER === 'libx264' || TRANSCODE_ENCODER === 'libx265') {
     args.push('-tune', 'zerolatency')
   }
+
+  // Browser-compatibility + short GOP for live view
+  args.push(
+    '-pix_fmt', 'yuv420p',
+    '-profile:v', 'main',
+    '-level', '4.1',
+    '-bf', '0',               // no B-frames (already implied by zerolatency but explicit)
+    '-sc_threshold', '0',     // disable scene-change detection to keep GOP regular
+    '-g', String(gopFrames),
+    '-keyint_min', String(gopFrames),
+  )
+
   args.push(
     '-b:v', HEVC_TRANSCODE_BITRATE,
-    '-maxrate', HEVC_TRANSCODE_BITRATE,
+    '-maxrate', TRANSCODE_MAXRATE,
     '-bufsize', bufsize,
     '-f', 'rtsp',
     '-rtsp_transport', 'tcp',
@@ -86,7 +116,15 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   stopTranscodeProcess(streamPath)
 
   const inputMasked = rtspInput.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
-  console.info(`[transcode] spawn_ffmpeg path=${streamPath} encoder=${TRANSCODE_ENCODER} input=${inputMasked}`)
+  console.info(
+    `[transcode] spawn_ffmpeg path=${streamPath} encoder=${TRANSCODE_ENCODER}` +
+    ` fps=${HEVC_TRANSCODE_FPS} width=${HEVC_TRANSCODE_WIDTH} gopFrames=${gopFrames}` +
+    ` bitrate=${HEVC_TRANSCODE_BITRATE} maxrate=${TRANSCODE_MAXRATE} bufsize=${bufsize}` +
+    ` input=${inputMasked}`
+  )
+  // Log full command for diagnosis (mask password)
+  const maskedArgs = args.map(a => a === rtspInput ? inputMasked : a)
+  console.info(`[transcode] spawn_ffmpeg_cmd path=${streamPath} cmd=ffmpeg ${maskedArgs.join(' ')}`)
 
   const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
   transcodeProcesses.set(streamPath, proc)
@@ -190,6 +228,7 @@ function extractFirstVariantUri(masterBody: string): string | null {
 async function fetchWithCookieJar(
   url: string,
   jar: Map<string, string>,
+  timeoutMs = 3000,
 ): Promise<{ status: number; body: string }> {
   let currentUrl = url
 
@@ -199,7 +238,7 @@ async function fetchWithCookieJar(
       : undefined
 
     const res = await axios.get(currentUrl, {
-      timeout: 3000,
+      timeout: timeoutMs,
       validateStatus: () => true,
       responseType: 'text',
       maxRedirects: 0,   // manual redirect — we need to capture Set-Cookie on 302 too
@@ -255,23 +294,26 @@ async function fetchWithCookieJar(
 // kill FFmpeg on timeout (the stream IS live, it's a cookie/timing issue).
 export async function waitForHlsReady(
   streamPath: string,
-  maxWaitMs = 12_000,
+  maxWaitMs = 45_000,
   intervalMs = 300,
   isAlive?: () => boolean,
 ): Promise<{ ready: boolean; lastStatus: number; elapsedMs: number; processExited: boolean; manifestVisible: boolean }> {
-  const masterUrl  = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`
-  const startMs    = Date.now()
-  const attempts   = Math.ceil(maxWaitMs / intervalMs)
-  let lastStatus       = 0
-  let lastLoggedAt     = 0
-  let manifestVisible  = false
-  let bodyLoggedOnce   = false
-  const cookieJar      = new Map<string, string>()  // persists across polling iterations
+  const masterUrl       = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`
+  const startMs         = Date.now()
+  const deadline        = startMs + maxWaitMs
+  let lastStatus        = 0
+  let lastLoggedAt      = 0
+  let manifestVisible   = false
+  let bodyLoggedOnce    = false
+  let consecutiveAuth   = 0   // consecutive auth errors on variant — clear jar after threshold
+  const cookieJar       = new Map<string, string>()  // persists across all iterations
 
   console.info(`[transcode] waiting_hls path=${streamPath} maxWaitMs=${maxWaitMs}`)
 
-  for (let i = 0; i < attempts; i++) {
-    const now = Date.now()
+  for (let i = 0; ; i++) {
+    const now       = Date.now()
+    const remaining = deadline - now
+    if (remaining <= 0) break
 
     if (isAlive && !isAlive()) {
       const elapsed = now - startMs
@@ -279,18 +321,20 @@ export async function waitForHlsReady(
       return { ready: false, lastStatus, elapsedMs: elapsed, processExited: true, manifestVisible }
     }
 
+    // Per-request timeout: min(3s, remaining) so we don't overshoot the deadline
+    const perReqMs = Math.min(3000, Math.max(500, remaining))
+
     try {
-      // Fetch index.m3u8 with cookie jar — follows 302→200 and captures all Set-Cookie
-      const { status, body } = await fetchWithCookieJar(masterUrl, cookieJar)
+      const { status, body } = await fetchWithCookieJar(masterUrl, cookieJar, perReqMs)
       lastStatus = status
       const hasHeader = body.includes('#EXTM3U')
       const isMaster  = body.includes('#EXT-X-STREAM-INF')
 
       if (hasHeader) manifestVisible = true
 
-      // ── Case A: direct media playlist (no STREAM-INF) ─────────────────────
+      // ── Case A: direct media playlist ─────────────────────────────────────
       if (status === 200 && hasHeader && !isMaster && isMediaPlaylistReady(body)) {
-        const elapsed = now - startMs
+        const elapsed = Date.now() - startMs
         console.info(`[transcode] hls_ready path=${streamPath} type=media_playlist attempt=${i + 1} elapsedMs=${elapsed}`)
         return { ready: true, lastStatus, elapsedMs: elapsed, processExited: false, manifestVisible: true }
       }
@@ -305,82 +349,95 @@ export async function waitForHlsReady(
             ? Array.from(cookieJar.entries()).map(([k, v]) => `${k}=${v}`).join('; ')
             : '(none)'
 
-          try {
-            const { status: varStatus, body: varBody } = await fetchWithCookieJar(variantUrl, cookieJar)
+          const rem2      = deadline - Date.now()
+          if (rem2 <= 0) break
+          const varReqMs  = Math.min(3000, Math.max(500, rem2))
 
-            if (varStatus === 200 && varBody.includes('#EXTM3U') && isMediaPlaylistReady(varBody)) {
-              const elapsed = now - startMs
-              console.info(
-                `[transcode] hls_ready path=${streamPath} type=master+variant` +
-                ` attempt=${i + 1} elapsedMs=${elapsed} variant=${variantUri.split('?')[0]}`
-              )
-              return { ready: true, lastStatus, elapsedMs: elapsed, processExited: false, manifestVisible: true }
-            }
+          const { status: varStatus, body: varBody } = await fetchWithCookieJar(variantUrl, cookieJar, varReqMs)
 
-            // Auth error on variant — NOT an FFmpeg issue; log for diagnosis
-            const isAuthError = varStatus === 401 || varBody.includes('"authentication error"')
-            if (isAuthError) {
+          if (varStatus === 200 && varBody.includes('#EXTM3U') && isMediaPlaylistReady(varBody)) {
+            const elapsed   = Date.now() - startMs
+            const mediaSeq  = varBody.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/)?.[1] ?? '-'
+            const targetDur = varBody.match(/#EXT-X-TARGETDURATION:(\d+)/)?.[1] ?? '-'
+            console.info(
+              `[transcode] hls_ready path=${streamPath} type=master+variant` +
+              ` attempt=${i + 1} elapsedMs=${elapsed} variant=${variantUri.split('?')[0]}` +
+              ` targetDuration=${targetDur} mediaSequence=${mediaSeq}`
+            )
+            return { ready: true, lastStatus, elapsedMs: elapsed, processExited: false, manifestVisible: true }
+          }
+
+          const isAuthError = varStatus === 401 || varBody.includes('"authentication error"')
+          if (isAuthError) {
+            consecutiveAuth++
+            // Only clear the jar after 5 consecutive auth failures — avoids creating new
+            // MediaMTX HLS sessions on every attempt (each new hlsSession = new muxer reader).
+            const shouldClear = consecutiveAuth >= 5
+            if (Date.now() - lastLoggedAt >= 500 || shouldClear) {
               console.warn(
                 `[transcode] waiting_hls child_auth_error path=${streamPath}` +
-                ` variantUrl=${variantUrl.split('?')[0]} variantStatus=${varStatus}` +
-                ` cookieHdr=${cookieHdr}` +
-                ` varBodyFirst200=${varBody.slice(0, 200).replace(/\n/g, '\\n')}`
+                ` attempt=${i + 1} variantStatus=${varStatus} consecutiveAuth=${consecutiveAuth}` +
+                ` clearing=${shouldClear} cookieHdr=${cookieHdr}` +
+                ` varBodyFirst100=${varBody.slice(0, 100).replace(/\n/g, '\\n')}`
               )
-              // Auth error means cookie was lost — retry will re-do the 302 handshake
-              cookieJar.clear()
-            } else if (now - lastLoggedAt >= 1000) {
-              const hasHdr = varBody.includes('#EXTM3U')
-              const hasSegs = isMediaPlaylistReady(varBody)
-              console.info(
-                `[transcode] waiting_hls path=${streamPath} master_ok variant_not_ready` +
-                ` variantStatus=${varStatus} varBodyLen=${varBody.length}` +
-                ` varHdr=${hasHdr} varSegs=${hasSegs}`
-              )
-              lastLoggedAt = now
+              lastLoggedAt = Date.now()
             }
-          } catch (varErr: any) {
-            if (now - lastLoggedAt >= 1000) {
-              console.info(`[transcode] waiting_hls path=${streamPath} variant_fetch_error err=${varErr.message}`)
-              lastLoggedAt = now
+            if (shouldClear) {
+              cookieJar.clear()
+              consecutiveAuth = 0
+            }
+          } else {
+            consecutiveAuth = 0
+            if (Date.now() - lastLoggedAt >= 1000) {
+              const targetDur = varBody.match(/#EXT-X-TARGETDURATION:(\d+)/)?.[1] ?? '-'
+              const mediaSeq  = varBody.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/)?.[1] ?? '-'
+              console.info(
+                `[transcode] waiting_hls path=${streamPath} attempt=${i + 1}` +
+                ` master_ok variant_not_ready variantStatus=${varStatus}` +
+                ` varBodyLen=${varBody.length} varHdr=${varBody.includes('#EXTM3U')}` +
+                ` varSegs=${isMediaPlaylistReady(varBody)} targetDuration=${targetDur}` +
+                ` mediaSequence=${mediaSeq} extinf=${varBody.includes('#EXTINF')}` +
+                ` map=${varBody.includes('#EXT-X-MAP')} cookies=${cookieJar.size}` +
+                ` elapsedMs=${Date.now() - startMs} remainingMs=${deadline - Date.now()}`
+              )
+              lastLoggedAt = Date.now()
             }
           }
-        } else if (now - lastLoggedAt >= 1000) {
-          console.info(`[transcode] waiting_hls path=${streamPath} master_no_variant_uri bodyLen=${body.length}`)
-          lastLoggedAt = now
+        } else if (Date.now() - lastLoggedAt >= 1000) {
+          console.info(`[transcode] waiting_hls path=${streamPath} attempt=${i + 1} master_no_variant_uri bodyLen=${body.length}`)
+          lastLoggedAt = Date.now()
         }
-        // Master is visible — mark manifestVisible so FFmpeg is NOT killed on timeout
-        if (!manifestVisible) manifestVisible = true
-        if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs))
-        continue
-      }
-
-      // ── Not yet available — log diagnostics ───────────────────────────────
-      if (status === 200 && hasHeader && !isMediaPlaylistReady(body) && !bodyLoggedOnce) {
+        // Master is visible — FFmpeg is alive; don't kill on timeout
+        manifestVisible = true
+      } else if (status === 200 && hasHeader && !isMediaPlaylistReady(body) && !bodyLoggedOnce) {
         bodyLoggedOnce = true
         console.warn(
           `[transcode] waiting_hls manifest_no_segment path=${streamPath}` +
           ` isMaster=${isMaster} bodyLen=${body.length}` +
           ` first500=${body.slice(0, 500).replace(/\n/g, '\\n')}`
         )
-      }
-
-      if (now - lastLoggedAt >= 1000) {
+      } else if (Date.now() - lastLoggedAt >= 1000) {
         console.info(
           `[transcode] waiting_hls path=${streamPath} attempt=${i + 1} status=${status}` +
           ` header=${hasHeader} isMaster=${isMaster} bodyLen=${body.length}` +
-          ` cookies=${cookieJar.size}` +
-          ` targetDuration=${body.includes('#EXT-X-TARGETDURATION')}` +
-          ` extinf=${body.includes('#EXTINF')} map=${body.includes('#EXT-X-MAP')}`
+          ` cookies=${cookieJar.size} elapsedMs=${Date.now() - startMs}` +
+          ` remainingMs=${deadline - Date.now()}`
         )
-        lastLoggedAt = now
+        lastLoggedAt = Date.now()
       }
     } catch (err: any) {
-      if (now - lastLoggedAt >= 2000) {
-        console.info(`[transcode] waiting_hls path=${streamPath} attempt=${i + 1} fetch_error=${err.message}`)
-        lastLoggedAt = now
+      if (Date.now() - lastLoggedAt >= 2000) {
+        console.info(
+          `[transcode] waiting_hls path=${streamPath} attempt=${i + 1}` +
+          ` fetch_error=${err.message} elapsedMs=${Date.now() - startMs}`
+        )
+        lastLoggedAt = Date.now()
       }
     }
-    if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs))
+
+    const rem3 = deadline - Date.now()
+    if (rem3 <= 0) break
+    await new Promise(r => setTimeout(r, Math.min(intervalMs, rem3)))
   }
 
   const elapsed = Date.now() - startMs

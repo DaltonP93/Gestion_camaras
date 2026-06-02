@@ -14,6 +14,8 @@ const MAX_STREAMS_PER_USER   = Number(process.env.MAX_STREAMS_PER_USER   || 32)
 const MAX_STREAMS_GLOBAL     = Number(process.env.MAX_STREAMS_GLOBAL     || 50)
 const STREAM_IDLE_TIMEOUT    = Number(process.env.STREAM_IDLE_TIMEOUT    || 90)  // segundos
 export const MAX_TRANSCODE_SESSIONS = Number(process.env.MAX_TRANSCODE_SESSIONS || 2)
+// How long to wait for HLS manifest after FFmpeg starts (default 45s to allow first segment)
+const TRANSCODE_HLS_READY_TIMEOUT_MS = Number(process.env.TRANSCODE_HLS_READY_TIMEOUT_MS || 45_000)
 
 // Health statuses that unconditionally block all stream requests
 // (USING_MAIN_STREAM and CODEC_UNSUPPORTED_HEVC are handled by codec redirect logic instead)
@@ -273,7 +275,7 @@ export async function startStream(
       // manifestVisible=true means status=200+#EXTM3U was seen; FFmpeg is alive
       // and MediaMTX is muxing — don't kill FFmpeg on timeout in that case.
       const { ready, lastStatus, elapsedMs, processExited, manifestVisible } = await waitForHlsReady(
-        streamPath, 12_000, 300,
+        streamPath, TRANSCODE_HLS_READY_TIMEOUT_MS, 300,
         () => isTranscodeProcessAlive(streamPath),
       )
 

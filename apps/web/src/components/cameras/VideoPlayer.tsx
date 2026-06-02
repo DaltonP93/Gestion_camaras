@@ -22,6 +22,8 @@ export type CameraPlaybackErrorCode =
   | 'MEDIAMTX_NOT_READY'
   | 'HLS_MANIFEST_NOT_FOUND'
   | 'HLS_SESSION_EXPIRED'
+  | 'TRANSCODE_NOT_READY'
+  | 'TRANSCODE_PROCESS_EXITED'
   | 'PLAYER_TIMEOUT'
   | 'UNKNOWN'
 
@@ -43,9 +45,11 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   MEDIAMTX_ROUTE_MISSING:  { icon: <Server size={16} />,       label: 'Ruta MediaMTX no existe',    color: 'text-orange-400' },
   MEDIAMTX_NOT_READY:      { icon: <Server size={16} />,       label: 'Stream MediaMTX no listo',   color: 'text-orange-400' },
   HLS_MANIFEST_NOT_FOUND:  { icon: <Film size={16} />,         label: 'HLS manifest no encontrado', color: 'text-orange-400' },
-  HLS_SESSION_EXPIRED:     { icon: <Clock size={16} />,        label: 'Sesión HLS expirada',         color: 'text-amber-400' },
-  PLAYER_TIMEOUT:          { icon: <Clock size={16} />,        label: 'Sin frames (timeout)',        color: 'text-surface-400' },
-  UNKNOWN:                 { icon: <AlertTriangle size={16} />, label: 'Error desconocido',          color: 'text-surface-400' },
+  HLS_SESSION_EXPIRED:        { icon: <Clock size={16} />,        label: 'Sesión HLS expirada',          color: 'text-amber-400' },
+  TRANSCODE_NOT_READY:        { icon: <Cpu size={16} />,          label: 'Transcodificación no lista',   color: 'text-purple-400' },
+  TRANSCODE_PROCESS_EXITED:   { icon: <Cpu size={16} />,          label: 'FFmpeg finalizó inesperadamente', color: 'text-purple-400' },
+  PLAYER_TIMEOUT:             { icon: <Clock size={16} />,        label: 'Sin frames (timeout)',         color: 'text-surface-400' },
+  UNKNOWN:                    { icon: <AlertTriangle size={16} />, label: 'Error desconocido',           color: 'text-surface-400' },
 }
 
 function isHevcCodec(codec?: string): boolean {
@@ -174,15 +178,18 @@ export function VideoPlayer({
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoRef.current?.play().catch(() => {})
-        // Timeout si no llegan frames tras 15s — use ref, not state, to avoid stale closure
+        // Transcoded streams (main_h264) need more time: GOP=2s → segments ~2s,
+        // but startup (FFmpeg connect + first keyframe) can take up to 30-45s.
+        const frameTimeoutMs = streamTypeRef.current === 'main_h264' ? 60_000 : 15_000
         firstFrameTimer.current = setTimeout(() => {
           if (!isPlayingRef.current) {
-            const err: CameraPlaybackError = { code: 'PLAYER_TIMEOUT', message: 'Sin frames tras 15 segundos', technicalDetail: hlsUrl }
+            const secs = frameTimeoutMs / 1000
+            const err: CameraPlaybackError = { code: 'PLAYER_TIMEOUT', message: `Sin frames tras ${secs} segundos`, technicalDetail: hlsUrl }
             setStatus('error')
             setInternalError(err)
             if (cameraId) onStreamError?.(cameraId, err)
           }
-        }, 15000)
+        }, frameTimeoutMs)
       })
 
       hls.on(Hls.Events.FRAG_LOADED, () => {
@@ -195,7 +202,13 @@ export function VideoPlayer({
 
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
-          const errorCode = classifyHlsError(data)
+          const rawCode   = classifyHlsError(data)
+          // For transcoded streams, unclassified errors are almost always transient
+          // encoding/buffering issues — show a more informative label than "Error desconocido".
+          const errorCode: CameraPlaybackErrorCode =
+            rawCode === 'UNKNOWN' && streamTypeRef.current === 'main_h264'
+              ? 'TRANSCODE_NOT_READY'
+              : rawCode
 
           // 401 — MediaMTX HLS session expired (cookie expired or muxer destroyed)
           if (data.response?.code === 401) {

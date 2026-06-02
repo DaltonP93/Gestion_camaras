@@ -225,16 +225,16 @@ export function LiveViewPage() {
         MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
         CAMERA_NOT_FOUND:       'UNKNOWN',
         CAMERA_DISABLED:        'UNKNOWN',
-        TRANSCODING_DISABLED:   'CODEC_UNSUPPORTED',
-        TRANSCODE_LIMIT_REACHED:'UNKNOWN',
-        TRANSCODE_NOT_READY:    'MEDIAMTX_NOT_READY',
-        TRANSCODE_PROCESS_EXITED:'MEDIAMTX_NOT_READY',
+        TRANSCODING_DISABLED:    'CODEC_UNSUPPORTED',
+        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
       }
       const isHevc = err.code === 'CODEC_UNSUPPORTED_HEVC'
       setStreamErrors(prev => ({
         ...prev,
         [cameraId]: {
-          code: errCodeMap[err.code] || 'UNKNOWN',
+          code: (errCodeMap[err.code] || 'UNKNOWN') as any,
           message: isHevc
             ? 'HEVC/H.265 no es compatible con navegadores. Configura H.264 en la cámara o habilita transcodificación en el NVR.'
             : err.message,
@@ -423,25 +423,25 @@ export function LiveViewPage() {
       }
 
       const errCodeMap: Record<string, CameraPlaybackError['code']> = {
-        RTSP_SUB_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
-        RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
-        CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
-        AUTH_FAILED:            'AUTH_FAILED',
-        OFFLINE:                'CAMERA_OFFLINE',
-        CAMERA_OFFLINE:         'CAMERA_OFFLINE',
-        MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
-        CAMERA_NOT_FOUND:       'UNKNOWN',
-        CAMERA_DISABLED:        'UNKNOWN',
-        TRANSCODING_DISABLED:   'CODEC_UNSUPPORTED',
-        TRANSCODE_LIMIT_REACHED:'UNKNOWN',
-        TRANSCODE_NOT_READY:    'MEDIAMTX_NOT_READY',
-        TRANSCODE_PROCESS_EXITED:'MEDIAMTX_NOT_READY',
+        RTSP_SUB_NOT_FOUND:      'RTSP_CHANNEL_NOT_FOUND',
+        RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
+        CODEC_UNSUPPORTED_HEVC:  'CODEC_UNSUPPORTED',
+        AUTH_FAILED:             'AUTH_FAILED',
+        OFFLINE:                 'CAMERA_OFFLINE',
+        CAMERA_OFFLINE:          'CAMERA_OFFLINE',
+        MEDIA_SERVER_ERROR:      'MEDIAMTX_NOT_READY',
+        CAMERA_NOT_FOUND:        'UNKNOWN',
+        CAMERA_DISABLED:         'UNKNOWN',
+        TRANSCODING_DISABLED:    'CODEC_UNSUPPORTED',
+        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
       }
 
       setStreamErrors(prev => ({
         ...prev,
         [camera.id]: {
-          code: errCodeMap[code] || 'UNKNOWN',
+          code: (errCodeMap[code] || 'UNKNOWN') as any,
           message: rawMsg || 'No se pudo obtener el stream',
           technicalDetail: body.details,
         },
@@ -677,14 +677,17 @@ export function LiveViewPage() {
     } catch (err: any) {
       const body = err?.response?.data || {}
       const errCodeMap: Record<string, CameraPlaybackError['code']> = {
-        CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
-        AUTH_FAILED:            'AUTH_FAILED',
-        OFFLINE:                'CAMERA_OFFLINE',
-        MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
-        RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
+        CODEC_UNSUPPORTED_HEVC:  'CODEC_UNSUPPORTED',
+        AUTH_FAILED:             'AUTH_FAILED',
+        OFFLINE:                 'CAMERA_OFFLINE',
+        MEDIA_SERVER_ERROR:      'MEDIAMTX_NOT_READY',
+        RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
+        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
+        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
       }
       setFocusStreamError({
-        code: errCodeMap[body.error] || 'UNKNOWN',
+        code: (errCodeMap[body.error] || 'UNKNOWN') as any,
         message: body.message || 'Error al iniciar stream principal',
         technicalDetail: body.details,
       })
@@ -732,16 +735,17 @@ export function LiveViewPage() {
       } catch (err: any) {
         const body = err?.response?.data || {}
         const errCodeMap: Record<string, CameraPlaybackError['code']> = {
-          CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
-          AUTH_FAILED:            'AUTH_FAILED',
-          OFFLINE:                'CAMERA_OFFLINE',
-          MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
-          TRANSCODE_NOT_READY:    'MEDIAMTX_NOT_READY',
-          TRANSCODE_PROCESS_EXITED: 'MEDIAMTX_NOT_READY',
+          CODEC_UNSUPPORTED_HEVC:  'CODEC_UNSUPPORTED',
+          AUTH_FAILED:             'AUTH_FAILED',
+          OFFLINE:                 'CAMERA_OFFLINE',
+          MEDIA_SERVER_ERROR:      'MEDIAMTX_NOT_READY',
+          RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
+          TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
+          TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
           TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
         }
         setFocusStreamError({
-          code: errCodeMap[body.error] || 'UNKNOWN',
+          code: (errCodeMap[body.error] || 'UNKNOWN') as any,
           message: body.message || `Error al iniciar stream ${quality === 'main_h264' ? 'transcodificado' : 'principal'}`,
           technicalDetail: body.details,
         })
@@ -867,9 +871,13 @@ export function LiveViewPage() {
               const focusCodec = focusStreamType === 'main' || focusStreamType === 'main_h264'
                 ? cam.mainCodec
                 : cam.subCodec
-              const focusRes   = focusStreamType === 'main' || focusStreamType === 'main_h264'
-                ? cam.mainResolution
-                : cam.subResolution
+              // For transcoded streams the output resolution depends on TRANSCODE_WIDTH env var,
+              // not the camera's native mainResolution — don't show misleading metadata.
+              const focusRes   = focusStreamType === 'main_h264'
+                ? undefined
+                : focusStreamType === 'main'
+                  ? cam.mainResolution
+                  : cam.subResolution
               const canTryMainStream = focusStreamType === 'sub' && !focusStreamError
               const transcodingAvailable = !!(streamCapabilities?.ffmpegAvailable && streamCapabilities?.transcodingEnabled)
               return (
