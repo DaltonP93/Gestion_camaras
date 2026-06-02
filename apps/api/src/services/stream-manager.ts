@@ -2,7 +2,8 @@
 // Los streams en MediaMTX ya tienen sourceOnDemand: true (se conectan solos cuando hay requests HLS)
 // Este manager trackea quién está mirando para informar al frontend y aplicar límites.
 import type { FastifyInstance } from 'fastify'
-import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr, getStreamDetails } from './stream'
+import type { ChildProcess } from 'child_process'
+import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr, getStreamDetails, getActiveTranscodesList, getTranscodeRawStderr, getTranscodeRtspMasked } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import CryptoJS from 'crypto-js'
 
@@ -34,6 +35,31 @@ interface TranscodeInFlight {
   resolve: (v: boolean) => void    // called by the starter when done
 }
 const transcodeInFlight = new Map<string, TranscodeInFlight>()
+
+// ─── Auto-restart supervisor state ──────────────────────────────────────────
+// Tracks restart history per stream path and source info needed to re-spawn FFmpeg.
+
+interface TranscodeRestartInfo {
+  count:          number       // restarts performed within current window
+  windowStart:    number       // ms — window resets if >2 min has passed since last restart
+  lastExitCode:   number | null
+  lastExitReason: string       // e.g. 'RTSP_INPUT_EOF', 'exit_224', 'sig_SIGKILL'
+  lastExitAt:     number       // ms timestamp
+}
+
+interface TranscodeSourceRef {
+  nvr:      any               // NVR with decrypted password — needed for FFmpeg restart
+  camera:   any
+  userId:   string
+  cameraId: string
+}
+
+const transcodeRestarts   = new Map<string, TranscodeRestartInfo>()
+const transcodeSourceInfo = new Map<string, TranscodeSourceRef>()
+
+const SUPERVISOR_MAX_RESTARTS = 3
+const SUPERVISOR_WINDOW_MS    = 2 * 60_000          // 2 minutes
+const SUPERVISOR_BACKOFFS     = [2_000, 5_000, 10_000] as const
 
 function getActiveTranscodeCount(): number {
   // Count registered sessions + paths currently starting (not yet registered)
@@ -97,6 +123,105 @@ export function touchView(userId: string, viewId: string) {
       if (s) s.lastHeartbeat = now
     }
   }
+}
+
+// ─── Transcode supervisor ────────────────────────────────────────────────────
+// When FFmpeg exits unexpectedly and a session is still active, this supervisor
+// automatically restarts it with exponential backoff (2s/5s/10s).
+// After SUPERVISOR_MAX_RESTARTS in a 2-minute window it gives up and marks the
+// session failed so the frontend shows a permanent error instead of looping.
+
+function attachTranscodeSupervisor(
+  streamPath: string,
+  proc: ChildProcess,
+  sourceRef: TranscodeSourceRef,
+): void {
+  proc.once('exit', (code, signal) => {
+    const stderr     = getTranscodeRawStderr(streamPath)
+    const isEof      = stderr.includes('End of file') || stderr.includes('Failed reading RTSP data')
+    const exitReason = isEof ? 'RTSP_INPUT_EOF'
+      : code !== null ? `exit_${code}`
+      : `sig_${signal}`
+    void runTranscodeSupervisor(streamPath, sourceRef, code, signal, exitReason)
+  })
+}
+
+async function runTranscodeSupervisor(
+  streamPath: string,
+  sourceRef: TranscodeSourceRef,
+  exitCode: number | null,
+  _exitSignal: NodeJS.Signals | null,
+  exitReason: string,
+): Promise<void> {
+  const transcodeKey = sessionKey(sourceRef.userId, sourceRef.cameraId, 'main_h264')
+
+  if (!sessions.get(transcodeKey)) {
+    console.info(`[supervisor] skip path=${streamPath} reason=no_active_session`)
+    transcodeRestarts.delete(streamPath)
+    return
+  }
+
+  const now  = Date.now()
+  let info   = transcodeRestarts.get(streamPath)
+
+  if (!info || (now - info.windowStart) > SUPERVISOR_WINDOW_MS) {
+    info = { count: 0, windowStart: now, lastExitCode: exitCode, lastExitReason: exitReason, lastExitAt: now }
+  } else {
+    info.lastExitCode   = exitCode
+    info.lastExitReason = exitReason
+    info.lastExitAt     = now
+  }
+  transcodeRestarts.set(streamPath, info)
+
+  if (info.count >= SUPERVISOR_MAX_RESTARTS) {
+    console.warn(
+      `[supervisor] exhausted path=${streamPath} count=${info.count}/${SUPERVISOR_MAX_RESTARTS}` +
+      ` reason=${exitReason} — dropping session`
+    )
+    sessions.delete(transcodeKey)
+    transcodeInFlight.set(streamPath, { state: 'failed', promise: Promise.resolve(false), resolve: () => {} })
+    return
+  }
+
+  const backoffMs = SUPERVISOR_BACKOFFS[info.count] ?? 10_000
+  info.count++
+  transcodeRestarts.set(streamPath, info)
+
+  console.info(
+    `[supervisor] restart_pending path=${streamPath} reason=${exitReason}` +
+    ` attempt=${info.count}/${SUPERVISOR_MAX_RESTARTS} backoffMs=${backoffMs}`
+  )
+
+  await new Promise(r => setTimeout(r, backoffMs))
+
+  if (!sessions.get(transcodeKey)) {
+    console.info(`[supervisor] restart_cancelled path=${streamPath} reason=session_gone_after_backoff`)
+    return
+  }
+
+  if (isTranscodeProcessAlive(streamPath)) {
+    console.info(`[supervisor] restart_skipped path=${streamPath} reason=process_already_alive`)
+    return
+  }
+
+  const proc = spawnTranscodeProcess(sourceRef.nvr, sourceRef.camera, streamPath)
+  if (!proc) {
+    console.error(`[supervisor] restart_spawn_failed path=${streamPath} attempt=${info.count}`)
+    sessions.delete(transcodeKey)
+    transcodeInFlight.set(streamPath, { state: 'failed', promise: Promise.resolve(false), resolve: () => {} })
+    return
+  }
+
+  console.info(`[supervisor] restarted path=${streamPath} pid=${proc.pid ?? 'pending'} attempt=${info.count}`)
+
+  const existing = transcodeInFlight.get(streamPath)
+  if (existing && existing.state !== 'ready') {
+    existing.state = 'ready'
+  } else if (!existing) {
+    transcodeInFlight.set(streamPath, { state: 'ready', promise: Promise.resolve(true), resolve: () => {} })
+  }
+
+  attachTranscodeSupervisor(streamPath, proc, sourceRef)
 }
 
 // Iniciar stream para un usuario
@@ -277,6 +402,11 @@ export async function startStream(
       }
       console.info(`[transcode] spawn_ok cameraId=${cameraId} ch=${ch} path=${streamPath} pid=${proc.pid ?? 'pending'}`)
 
+      // Store source info for supervisor restarts and attach the supervisor
+      const sourceRef: TranscodeSourceRef = { nvr: nvr as any, camera: camera as any, userId, cameraId }
+      transcodeSourceInfo.set(streamPath, sourceRef)
+      attachTranscodeSupervisor(streamPath, proc, sourceRef)
+
       // Poll HLS manifest — abort early if FFmpeg exits before producing segments.
       // manifestVisible=true means status=200+#EXTM3U was seen; FFmpeg is alive
       // and MediaMTX is muxing — don't kill FFmpeg on timeout in that case.
@@ -439,6 +569,8 @@ export async function stopStream(
     if (streamType === 'main_h264') {
       stopTranscodeProcess(session.streamPath)
       transcodeInFlight.delete(session.streamPath)
+      transcodeRestarts.delete(session.streamPath)
+      transcodeSourceInfo.delete(session.streamPath)
       killedFfmpeg = true
       clearedInFlight = true
     }
@@ -566,6 +698,8 @@ export async function cleanupUserSessions(
     if (session.streamType === 'main_h264') {
       stopTranscodeProcess(session.streamPath)
       transcodeInFlight.delete(session.streamPath)
+      transcodeRestarts.delete(session.streamPath)
+      transcodeSourceInfo.delete(session.streamPath)
     }
 
     const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === session.cameraId)
@@ -614,6 +748,8 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
       if (session.streamType === 'main_h264') {
         stopTranscodeProcess(session.streamPath)
         transcodeInFlight.delete(session.streamPath)
+        transcodeRestarts.delete(session.streamPath)
+        transcodeSourceInfo.delete(session.streamPath)
       }
       server.log.info(`[stream-manager] Sesión idle eliminada: ${key} (view: ${session.viewId})`)
     }
@@ -644,6 +780,36 @@ export function getAdminSessionsSummary(): Array<{
     streamPath:    s.streamPath,
     startedAt:     s.startedAt,
     lastHeartbeat: s.lastHeartbeat,
+  }))
+}
+
+// Enhanced diagnostic for /api/live-view/transcodes — one entry per active FFmpeg process
+export async function getTranscodesDiagnostic(): Promise<Array<{
+  streamPath:              string
+  pid:                     number | undefined
+  alive:                   boolean
+  restartCount:            number
+  lastExitCode:            number | null
+  lastExitReason:          string
+  stderrLast20k:           string
+  sourceRtspMasked:        string | undefined
+  mediaMtxPublisherActive: boolean
+}>> {
+  const procs = getActiveTranscodesList()
+  return Promise.all(procs.map(async (p) => {
+    const restartInfo = transcodeRestarts.get(p.streamPath)
+    const details     = await getStreamDetails(p.streamPath).catch(() => null)
+    return {
+      streamPath:              p.streamPath,
+      pid:                     p.pid,
+      alive:                   p.alive,
+      restartCount:            restartInfo?.count ?? 0,
+      lastExitCode:            restartInfo?.lastExitCode ?? null,
+      lastExitReason:          restartInfo?.lastExitReason ?? '',
+      stderrLast20k:           getTranscodeRawStderr(p.streamPath),
+      sourceRtspMasked:        getTranscodeRtspMasked(p.streamPath),
+      mediaMtxPublisherActive: details?.active === true,
+    }
   }))
 }
 
