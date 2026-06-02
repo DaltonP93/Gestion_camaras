@@ -2,8 +2,8 @@
 // Endpoint de viewport heartbeat: reconcilia cámaras visibles sin N llamadas individuales
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { reconcileView, MAX_TRANSCODE_SESSIONS } from '../services/stream-manager'
-import { getFfmpegCapabilities, isTranscodingEnabled } from '../services/stream'
+import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary } from '../services/stream-manager'
+import { getFfmpegCapabilities, isTranscodingEnabled, getActiveTranscodesList } from '../services/stream'
 
 const heartbeatSchema = z.object({
   viewId:           z.string().min(1).max(128),
@@ -66,6 +66,24 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
       transcodingEnabled:  isTranscodingEnabled(),
       encoders:            caps.encoders,
       maxTranscodeSessions: MAX_TRANSCODE_SESSIONS,
+    })
+  })
+
+  // GET /api/live-view/transcodes
+  // Lista procesos FFmpeg activos y sesiones main_h264 — para diagnóstico desde el API container.
+  // Úsalo para confirmar que FFmpeg sigue vivo después de hacer click en "Transcodificar".
+  // Equivalente a: docker compose exec api ps -ef | grep ffmpeg
+  server.get('/transcodes', { preHandler: [server.authenticate] }, async (_request, reply) => {
+    const procs    = getActiveTranscodesList()
+    const sessions = getAdminSessionsSummary().filter(s => s.streamPath.endsWith('_main_h264'))
+    return reply.send({
+      activeFFmpegProcesses: procs,
+      activeTranscodeSessions: sessions,
+      summary: {
+        ffmpegCount:  procs.length,
+        aliveCount:   procs.filter(p => p.alive).length,
+        sessionCount: sessions.length,
+      },
     })
   })
 }

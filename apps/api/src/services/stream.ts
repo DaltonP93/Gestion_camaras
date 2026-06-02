@@ -46,6 +46,22 @@ const MEDIAMTX_HOST = (() => {
   catch { return 'mediamtx' }
 })()
 
+// Log all transcoding config at module load — confirms env vars are being read
+console.info(
+  `[transcode] config_loaded` +
+  ` ENABLE_HEVC_TRANSCODING=${ENABLE_HEVC_TRANSCODING}` +
+  ` ENCODER=${TRANSCODE_ENCODER}` +
+  ` PRESET=${HEVC_TRANSCODE_PRESET}` +
+  ` WIDTH=${HEVC_TRANSCODE_WIDTH}` +
+  ` FPS=${HEVC_TRANSCODE_FPS}` +
+  ` BITRATE=${HEVC_TRANSCODE_BITRATE}` +
+  ` MAXRATE=${TRANSCODE_MAXRATE}` +
+  ` BUFSIZE=${TRANSCODE_BUFSIZE_ENV || '(auto)'}` +
+  ` GOP_SECONDS=${TRANSCODE_GOP_SECONDS}` +
+  ` MEDIAMTX_HOST=${MEDIAMTX_HOST}` +
+  ` RTSP_PORT=${MEDIAMTX_RTSP_PORT}`
+)
+
 const transcodeProcesses  = new Map<string, ChildProcess>()
 const transcodeStderr     = new Map<string, string>()
 // First ~1 KB of stderr captured separately — shows codec errors, file-not-found, etc.
@@ -54,10 +70,17 @@ const transcodeStderrStart = new Map<string, string>()
 
 export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string): ChildProcess | null {
   const pass: string = (nvr as any).password ?? ''
-  if (!pass) return null
+  if (!pass) {
+    console.error(`[transcode] spawn_abort path=${streamPath} reason=PASSWORD_EMPTY (decryptPass returned empty — check NVR_CREDENTIAL_KEY)`)
+    return null
+  }
 
   const rtspInput = buildRtspUrl(nvr, camera.channel, false)  // main (HEVC) stream
-  if (/:@/.test(rtspInput)) return null  // empty password guard
+  if (/:@/.test(rtspInput)) {
+    const masked = rtspInput.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+    console.error(`[transcode] spawn_abort path=${streamPath} reason=RTSP_EMPTY_CREDENTIALS url=${masked}`)
+    return null  // empty password guard
+  }
 
   const rtspOutput = `rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${streamPath}`
 
@@ -118,6 +141,7 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   stopTranscodeProcess(streamPath)
 
   const inputMasked = rtspInput.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+  console.info(`[transcode] spawn_start path=${streamPath} source=${inputMasked}`)
   console.info(
     `[transcode] spawn_ffmpeg path=${streamPath} encoder=${TRANSCODE_ENCODER}` +
     ` fps=${HEVC_TRANSCODE_FPS} width=${HEVC_TRANSCODE_WIDTH} gopFrames=${gopFrames}` +
@@ -135,6 +159,15 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
 
   proc.on('spawn', () => {
     console.info(`[transcode] ffmpeg_started path=${streamPath} pid=${proc.pid}`)
+    // Verify FFmpeg is still alive 2s after spawn — catches immediate crashes
+    // (e.g. invalid arguments, codec not found) before waitForHlsReady starts polling.
+    setTimeout(() => {
+      const alive = !!(proc.exitCode === null && !proc.killed)
+      console.info(
+        `[transcode] ffmpeg_alive_check path=${streamPath} pid=${proc.pid}` +
+        ` alive=${alive} exitCode=${proc.exitCode ?? 'null'} killed=${proc.killed}`
+      )
+    }, 2000)
   })
 
   proc.stderr?.on('data', (data: Buffer) => {
@@ -151,17 +184,32 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   })
 
   proc.on('exit', (code, signal) => {
-    const startSnip = (transcodeStderrStart.get(streamPath) || '').slice(0, 400).replace(/\n/g, ' ')
-    const endSnip   = (transcodeStderr.get(streamPath) || '').slice(-600).replace(/\n/g, ' ')
-    console.warn(`[transcode] ffmpeg_exit path=${streamPath} code=${code ?? signal}`)
-    console.warn(`[transcode] ffmpeg_exit_start path=${streamPath} stderr_start=${startSnip}`)
-    console.warn(`[transcode] ffmpeg_exit_end   path=${streamPath} stderr_end=${endSnip}`)
+    const fullStderr  = transcodeStderr.get(streamPath) || ''
+    const startBuf    = transcodeStderrStart.get(streamPath) || ''
+    // Log full stderr (up to 20KB) so crash reasons are never truncated
+    // Split into chunks of 1000 chars to avoid log line length limits
+    const exitLabel   = code !== null ? `code=${code}` : `signal=${signal}`
+    console.warn(`[transcode] ffmpeg_exit path=${streamPath} ${exitLabel} stderrBytes=${fullStderr.length}`)
+    if (fullStderr.length > 0) {
+      // Log start (first 1KB) separately — contains codec/format errors
+      const startLog = startBuf.slice(0, 800).replace(/\n/g, ' | ')
+      console.warn(`[transcode] ffmpeg_stderr_start path=${streamPath} | ${startLog}`)
+      // Log end (last 1.5KB) — contains last encoding stats and final error
+      const endLog = fullStderr.slice(-1500).replace(/\n/g, ' | ')
+      console.warn(`[transcode] ffmpeg_stderr_end   path=${streamPath} | ${endLog}`)
+    } else {
+      console.warn(`[transcode] ffmpeg_exit_no_stderr path=${streamPath} — FFmpeg may not have started (binary missing or EPERM)`)
+    }
     transcodeProcesses.delete(streamPath)
     transcodeStderrStart.delete(streamPath)
   })
 
-  proc.on('error', (err) => {
-    console.error(`[transcode] ffmpeg_error path=${streamPath} err=${err.message}`)
+  proc.on('error', (err: NodeJS.ErrnoException) => {
+    // 'error' event fires when spawn itself fails (ENOENT=binary not found, EACCES=no exec permission)
+    console.error(`[transcode] ffmpeg_spawn_error path=${streamPath} err=${err.message} code=${err.code ?? 'n/a'}`)
+    if (err.code === 'ENOENT') {
+      console.error(`[transcode] ffmpeg_not_found — 'ffmpeg' binary not in PATH inside API container. Check Dockerfile.`)
+    }
     transcodeProcesses.delete(streamPath)
     transcodeStderrStart.delete(streamPath)
   })
@@ -192,6 +240,21 @@ export function getTranscodeStderr(streamPath: string): string {
 }
 
 export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
+
+// List all active FFmpeg transcoding processes — for diagnostic endpoint and health checks
+export function getActiveTranscodesList(): Array<{
+  streamPath: string
+  pid:        number | undefined
+  alive:      boolean
+  stderrBytes: number
+}> {
+  return Array.from(transcodeProcesses.entries()).map(([path, proc]) => ({
+    streamPath:  path,
+    pid:         proc.pid,
+    alive:       proc.exitCode === null && !proc.killed,
+    stderrBytes: (transcodeStderr.get(path) || '').length,
+  }))
+}
 
 // Check if MediaMTX has an active RTSP publisher on this path (i.e. FFmpeg is connected
 // and pushing frames). This is reliable BEFORE the HLS muxer creates its first segment —

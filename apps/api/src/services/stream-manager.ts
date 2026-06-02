@@ -263,13 +263,19 @@ export async function startStream(
       }
 
       // Spawn FFmpeg in the API container — MediaMTX container doesn't have FFmpeg
+      // spawnTranscodeProcess returns null if password is empty or RTSP URL is invalid.
+      // The spawn_abort log in stream.ts explains the reason; show it in the error detail too.
       const proc = spawnTranscodeProcess(nvr as any, camera as any, streamPath)
       if (!proc) {
         transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
         resolveInFlight(false)
+        console.error(`[transcode] spawn_null cameraId=${cameraId} ch=${ch} path=${streamPath} — spawnTranscodeProcess returned null (see spawn_abort log above)`)
         return { hlsUrl: '', webrtcUrl: '', streamPath: '',
-          error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al iniciar proceso FFmpeg para transcodificación' } }
+          error: { code: 'TRANSCODE_PROCESS_EXITED',
+            message: 'FFmpeg no pudo iniciarse. Verifica credenciales NVR y que FFmpeg esté instalado en el contenedor API.',
+            details: `path=${streamPath} — ver logs [transcode] spawn_abort para causa exacta` } }
       }
+      console.info(`[transcode] spawn_ok cameraId=${cameraId} ch=${ch} path=${streamPath} pid=${proc.pid ?? 'pending'}`)
 
       // Poll HLS manifest — abort early if FFmpeg exits before producing segments.
       // manifestVisible=true means status=200+#EXTM3U was seen; FFmpeg is alive
