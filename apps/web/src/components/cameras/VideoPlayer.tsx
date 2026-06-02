@@ -237,11 +237,16 @@ export function VideoPlayer({
             const is404 = statusCode === 404
             const isTranscodedStream = streamTypeRef.current === 'main_h264'
             if (is500) console.warn('[VideoPlayer] HLS 500', { cameraId, isTranscoded: isTranscodedStream, details: data.details })
-            // Transcoded 500: retry 15×800ms = 12s while FFmpeg starts up.
+            // Transcoded 500: retry 40×800ms ≈ 32s grace period while FFmpeg starts.
             // Show "Preparando transcodificación..." in loading overlay during wait.
             // Normal 500: fail immediately (source/muxer error, not a startup delay).
-            // 404: stream still registering → 1 retry.
-            const maxRetries = is500 ? (isTranscodedStream ? 15 : 0) : is404 ? 1 : 5
+            // Transcoded 404: retry 20×1000ms = 20s (publisher may still be connecting).
+            // Normal 404: 1 retry.
+            const maxRetries = is500
+              ? (isTranscodedStream ? 40 : 0)
+              : is404
+                ? (isTranscodedStream ? 20 : 1)
+                : 5
             setRetryCount((r) => {
               if (r === 0 && is500 && isTranscodedStream) {
                 // First 500 on a transcoded stream — show startup message, keep loading
@@ -263,7 +268,10 @@ export function VideoPlayer({
                 if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              const delay = is500 && isTranscodedStream ? 800 : is404 ? 4000 : 3000 * (r + 1)
+              const delay = is500 && isTranscodedStream ? 800
+                : is404 && isTranscodedStream ? 1000
+                : is404 ? 4000
+                : 3000 * (r + 1)
               setTimeout(() => hls.startLoad(), delay)
               return r + 1
             })

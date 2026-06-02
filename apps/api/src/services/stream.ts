@@ -101,6 +101,8 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
     '-sc_threshold', '0',     // disable scene-change detection to keep GOP regular
     '-g', String(gopFrames),
     '-keyint_min', String(gopFrames),
+    // force_key_frames guarantees keyframes every TRANSCODE_GOP_SECONDS regardless of encoder
+    '-force_key_frames', `expr:gte(t,n_forced*${TRANSCODE_GOP_SECONDS})`,
   )
 
   args.push(
@@ -190,6 +192,23 @@ export function getTranscodeStderr(streamPath: string): string {
 }
 
 export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
+
+// Check if MediaMTX has an active RTSP publisher on this path (i.e. FFmpeg is connected
+// and pushing frames). This is reliable BEFORE the HLS muxer creates its first segment —
+// the muxer may not exist yet while the RTSP path is already live.
+// Uses the live /v3/paths/get/{name} endpoint (not config).
+async function isRtspPublisherActive(streamPath: string): Promise<boolean> {
+  try {
+    const res = await mediamtxApi.get('/v3/paths/get/' + streamPath, {
+      timeout: 2000,
+      validateStatus: () => true,
+    })
+    // ready=true means the path has an active source (RTSP publisher connected)
+    return res.status === 200 && res.data?.ready === true
+  } catch {
+    return false
+  }
+}
 
 // Returns true if a media playlist body has any indicator that it is a valid,
 // playable HLS media playlist (not just a bare #EXTM3U stub).
@@ -294,7 +313,7 @@ async function fetchWithCookieJar(
 // kill FFmpeg on timeout (the stream IS live, it's a cookie/timing issue).
 export async function waitForHlsReady(
   streamPath: string,
-  maxWaitMs = 45_000,
+  maxWaitMs = 60_000,
   intervalMs = 300,
   isAlive?: () => boolean,
 ): Promise<{ ready: boolean; lastStatus: number; elapsedMs: number; processExited: boolean; manifestVisible: boolean }> {
@@ -319,6 +338,20 @@ export async function waitForHlsReady(
       const elapsed = now - startMs
       console.warn(`[transcode] waiting_hls aborted path=${streamPath} reason=process_exited elapsedMs=${elapsed}`)
       return { ready: false, lastStatus, elapsedMs: elapsed, processExited: true, manifestVisible }
+    }
+
+    // Every 5 iterations (~1.5s), check if RTSP publisher is active in MediaMTX.
+    // The HLS muxer may not exist yet while FFmpeg is already connected and sending frames.
+    // If publisher is active, set manifestVisible=true so FFmpeg won't be killed on timeout.
+    if (i > 0 && i % 5 === 0 && !manifestVisible) {
+      const pubActive = await isRtspPublisherActive(streamPath)
+      if (pubActive) {
+        manifestVisible = true
+        console.info(
+          `[transcode] waiting_hls path=${streamPath} attempt=${i + 1}` +
+          ` rtsp_publisher_active=true hls_not_ready_yet elapsedMs=${Date.now() - startMs}`
+        )
+      }
     }
 
     // Per-request timeout: min(3s, remaining) so we don't overshoot the deadline
@@ -441,6 +474,20 @@ export async function waitForHlsReady(
   }
 
   const elapsed = Date.now() - startMs
+
+  // Final publisher check: if we never saw the HLS manifest but RTSP publisher is active,
+  // FFmpeg IS alive and connected — don't kill it on timeout.
+  if (!manifestVisible) {
+    const pubActive = await isRtspPublisherActive(streamPath)
+    if (pubActive) {
+      manifestVisible = true
+      console.warn(
+        `[transcode] hls_timeout path=${streamPath} elapsedMs=${elapsed}` +
+        ` rtsp_publisher_active=true → setting manifestVisible=true (HLS muxer slow to start)`
+      )
+    }
+  }
+
   console.warn(
     `[transcode] hls_timeout path=${streamPath} lastStatus=${lastStatus}` +
     ` elapsedMs=${elapsed} manifestVisible=${manifestVisible} cookies=${cookieJar.size}`
