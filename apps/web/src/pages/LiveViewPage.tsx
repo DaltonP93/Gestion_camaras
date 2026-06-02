@@ -618,9 +618,19 @@ export function LiveViewPage() {
       return
     }
 
+    // For main_h264 focus errors: keep the session and FFmpeg alive so the user can
+    // retry by clicking "Trans" or the refresh icon without restarting the whole pipeline.
+    // The error overlay is shown but stop-stream is NOT called — the user explicitly
+    // switches to sub (handleQualitySwitch) or exits focus (handleExitFocus) to stop FFmpeg.
+    const isFocusTranscode = cameraId === focusCamera && focusStreamType === 'main_h264'
+    if (isFocusTranscode) {
+      console.info(`[LiveView] stream_error main_h264 cameraId=${cameraId} code=${err.code} — keeping FFmpeg alive, showing error overlay`)
+      setFocusStreamError(err)
+      return
+    }
+
     // For all other fatal errors, stop the backend stream using the correct type.
-    // Focus camera: use focusStreamType (may be main_h264, not sub).
-    // Grid camera: always sub.
+    // Focus camera non-transcode: use focusStreamType. Grid camera: always sub.
     if (activeSessions.current.has(cameraId)) {
       const st = cameraId === focusCamera ? focusStreamType : 'sub'
       console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${st} reason=stream_error code=${err.code}`)
@@ -874,6 +884,11 @@ export function LiveViewPage() {
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
                     onQualitySwitch={handleQualitySwitch}
+                    onRetry={focusType === 'main_h264' ? () => {
+                      // Clear error overlay first, then restart FFmpeg pipeline
+                      setFocusStreamError(null)
+                      handleQualitySwitch('main_h264')
+                    } : undefined}
                     className="flex-1 min-h-0"
                     playbackError={focusStreamError || streamErrors[focusCamera]}
                     streamType={focusType}

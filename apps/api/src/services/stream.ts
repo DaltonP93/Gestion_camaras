@@ -40,11 +40,11 @@ const MEDIAMTX_HOST = (() => {
   catch { return 'mediamtx' }
 })()
 
-// ─── API-owned FFmpeg processes for transcoded streams ───────
-// runOnDemand in MediaMTX executes inside the MediaMTX container, which
-// doesn't have FFmpeg. We spawn FFmpeg from the API container instead.
-const transcodeProcesses = new Map<string, ChildProcess>()
-const transcodeStderr    = new Map<string, string>()
+const transcodeProcesses  = new Map<string, ChildProcess>()
+const transcodeStderr     = new Map<string, string>()
+// First ~1 KB of stderr captured separately — shows codec errors, file-not-found, etc.
+// The rolling buffer captures the end; the start buffer captures startup messages.
+const transcodeStderrStart = new Map<string, string>()
 
 export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string): ChildProcess | null {
   const pass: string = (nvr as any).password ?? ''
@@ -90,27 +90,40 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
 
   const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
   transcodeProcesses.set(streamPath, proc)
-  transcodeStderr.set(streamPath, '')  // reset stderr buffer on each spawn
+  transcodeStderr.set(streamPath, '')
+  transcodeStderrStart.set(streamPath, '')
 
   proc.on('spawn', () => {
     console.info(`[transcode] ffmpeg_started path=${streamPath} pid=${proc.pid}`)
   })
 
   proc.stderr?.on('data', (data: Buffer) => {
-    let s = (transcodeStderr.get(streamPath) || '') + data.toString()
-    if (s.length > 3000) s = s.slice(-3000)
+    const chunk = data.toString()
+    // Save first ~1KB for startup/error diagnosis (codec errors, file-not-found, etc.)
+    const startBuf = transcodeStderrStart.get(streamPath) || ''
+    if (startBuf.length < 1200) {
+      transcodeStderrStart.set(streamPath, (startBuf + chunk).slice(0, 1200))
+    }
+    // 20 KB rolling buffer for the tail (encoding stats, last error lines)
+    let s = (transcodeStderr.get(streamPath) || '') + chunk
+    if (s.length > 20_000) s = s.slice(-20_000)
     transcodeStderr.set(streamPath, s)
   })
 
   proc.on('exit', (code, signal) => {
-    const summary = (transcodeStderr.get(streamPath) || '').slice(-400).replace(/\n/g, ' ')
-    console.warn(`[transcode] ffmpeg_exit path=${streamPath} code=${code ?? signal} stderr=${summary}`)
+    const startSnip = (transcodeStderrStart.get(streamPath) || '').slice(0, 400).replace(/\n/g, ' ')
+    const endSnip   = (transcodeStderr.get(streamPath) || '').slice(-600).replace(/\n/g, ' ')
+    console.warn(`[transcode] ffmpeg_exit path=${streamPath} code=${code ?? signal}`)
+    console.warn(`[transcode] ffmpeg_exit_start path=${streamPath} stderr_start=${startSnip}`)
+    console.warn(`[transcode] ffmpeg_exit_end   path=${streamPath} stderr_end=${endSnip}`)
     transcodeProcesses.delete(streamPath)
+    transcodeStderrStart.delete(streamPath)
   })
 
   proc.on('error', (err) => {
     console.error(`[transcode] ffmpeg_error path=${streamPath} err=${err.message}`)
     transcodeProcesses.delete(streamPath)
+    transcodeStderrStart.delete(streamPath)
   })
 
   return proc
@@ -130,37 +143,136 @@ export function isTranscodeProcessAlive(streamPath: string): boolean {
 }
 
 export function getTranscodeStderr(streamPath: string): string {
-  return (transcodeStderr.get(streamPath) || '').slice(-500)
+  const start = (transcodeStderrStart.get(streamPath) || '').slice(0, 600)
+  const end   = (transcodeStderr.get(streamPath) || '').slice(-1200)
+  if (start && !end.startsWith(start.slice(0, 40))) {
+    return `[inicio]\n${start}\n[final]\n${end}`
+  }
+  return end
 }
 
 export function isTranscodingEnabled(): boolean { return ENABLE_HEVC_TRANSCODING }
 
+// Returns true if a media playlist body has any indicator that it is a valid,
+// playable HLS media playlist (not just a bare #EXTM3U stub).
+function isMediaPlaylistReady(body: string): boolean {
+  return (
+    body.includes('#EXTINF')                ||
+    body.includes('#EXT-X-PART')            ||
+    body.includes('#EXT-X-MAP')             ||
+    body.includes('#EXT-X-TARGETDURATION')  ||
+    body.includes('#EXT-X-MEDIA-SEQUENCE')  ||
+    body.includes('.ts')                    ||
+    body.includes('.m4s')                   ||
+    body.includes('.mp4')
+  )
+}
+
+// Extract the first variant stream URI from a master playlist body.
+function extractFirstVariantUri(masterBody: string): string | null {
+  const lines = masterBody.split('\n')
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (lines[i].trim().startsWith('#EXT-X-STREAM-INF')) {
+      const uri = lines[i + 1]?.trim()
+      if (uri && !uri.startsWith('#') && uri.length > 0) return uri
+    }
+  }
+  return null
+}
+
+// ─── Cookie-aware HTTP fetch with manual redirect following ──
+// Axios in Node does not maintain a cookie jar. MediaMTX HLS requires:
+//   1. GET index.m3u8  → 302 + Set-Cookie: cookieCheck=1
+//   2. Follow redirect → 200 + Set-Cookie: hlsSession=<uuid>
+//   3. GET variant     → send both cookies → 200 + segments
+// This helper follows redirects manually and accumulates Set-Cookie headers
+// into the provided jar (Map<name,value>) so subsequent requests reuse them.
+async function fetchWithCookieJar(
+  url: string,
+  jar: Map<string, string>,
+): Promise<{ status: number; body: string }> {
+  let currentUrl = url
+
+  for (let hop = 0; hop < 6; hop++) {
+    const cookieHeader = jar.size > 0
+      ? Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join('; ')
+      : undefined
+
+    const res = await axios.get(currentUrl, {
+      timeout: 3000,
+      validateStatus: () => true,
+      responseType: 'text',
+      maxRedirects: 0,   // manual redirect — we need to capture Set-Cookie on 302 too
+      headers: cookieHeader ? { Cookie: cookieHeader } : {},
+    })
+
+    // Accumulate all Set-Cookie headers into the jar
+    const setCookies = res.headers['set-cookie']
+    if (setCookies) {
+      const list = Array.isArray(setCookies) ? setCookies : [setCookies]
+      for (const c of list) {
+        const eqIdx = c.indexOf('=')
+        const semi  = c.indexOf(';')
+        if (eqIdx > 0) {
+          const name  = c.slice(0, eqIdx).trim()
+          const value = c.slice(eqIdx + 1, semi > eqIdx ? semi : undefined).trim()
+          jar.set(name, value)
+        }
+      }
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const location = (res.headers['location'] as string | undefined) || ''
+      if (location) {
+        try {
+          currentUrl = new URL(location, currentUrl).href
+        } catch {
+          currentUrl = location.startsWith('/') ? `${MEDIAMTX_HLS_INTERNAL}${location}` : location
+        }
+        continue
+      }
+    }
+
+    return { status: res.status, body: typeof res.data === 'string' ? res.data : '' }
+  }
+
+  return { status: 0, body: '' }
+}
+
 // ─── Wait for HLS manifest with real segment data ───────────
 // Polls internal MediaMTX HLS port waiting for FFmpeg to start publishing.
+//
+// MediaMTX HLS flow:
+//   GET index.m3u8 → 302 (Set-Cookie: cookieCheck=1) → 200 (Set-Cookie: hlsSession=uuid)
+//   index.m3u8 body is a MASTER PLAYLIST with #EXT-X-STREAM-INF → video1_stream.m3u8
+//   GET video1_stream.m3u8 with Cookie: cookieCheck=1; hlsSession=uuid → 200 + #EXTINF
+//
+// We use a cookie jar that persists across all polling iterations so the
+// 302→200 handshake happens once and subsequent polls reuse the same session.
+//
 // Returns { ready, lastStatus, elapsedMs, processExited, manifestVisible }.
-// manifestVisible=true means status=200 + #EXTM3U was seen; used by the caller
-// to decide whether to kill FFmpeg on timeout (if manifest is visible, FFmpeg is
-// alive — don't kill it; let VideoPlayer retry on 500/stub).
+// manifestVisible=true → master or media playlist was seen at 200; caller must NOT
+// kill FFmpeg on timeout (the stream IS live, it's a cookie/timing issue).
 export async function waitForHlsReady(
   streamPath: string,
   maxWaitMs = 12_000,
   intervalMs = 300,
   isAlive?: () => boolean,
 ): Promise<{ ready: boolean; lastStatus: number; elapsedMs: number; processExited: boolean; manifestVisible: boolean }> {
-  const url      = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`
-  const startMs  = Date.now()
-  const attempts = Math.ceil(maxWaitMs / intervalMs)
-  let lastStatus      = 0
-  let lastLoggedAt    = 0
-  let manifestVisible = false
-  let bodyLoggedOnce  = false  // log manifest body once when header=true segment=false
+  const masterUrl  = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`
+  const startMs    = Date.now()
+  const attempts   = Math.ceil(maxWaitMs / intervalMs)
+  let lastStatus       = 0
+  let lastLoggedAt     = 0
+  let manifestVisible  = false
+  let bodyLoggedOnce   = false
+  const cookieJar      = new Map<string, string>()  // persists across polling iterations
 
   console.info(`[transcode] waiting_hls path=${streamPath} maxWaitMs=${maxWaitMs}`)
 
   for (let i = 0; i < attempts; i++) {
     const now = Date.now()
 
-    // Early exit if FFmpeg process has died — no point waiting the full timeout
     if (isAlive && !isAlive()) {
       const elapsed = now - startMs
       console.warn(`[transcode] waiting_hls aborted path=${streamPath} reason=process_exited elapsedMs=${elapsed}`)
@@ -168,70 +280,114 @@ export async function waitForHlsReady(
     }
 
     try {
-      const res = await axios.get(url, {
-        timeout: 2000,
-        validateStatus: () => true,
-        responseType: 'text',
-      })
-      lastStatus = res.status
-      const body = typeof res.data === 'string' ? res.data : ''
-
+      // Fetch index.m3u8 with cookie jar — follows 302→200 and captures all Set-Cookie
+      const { status, body } = await fetchWithCookieJar(masterUrl, cookieJar)
+      lastStatus = status
       const hasHeader = body.includes('#EXTM3U')
-
-      // Expanded segment detection: covers TS, fMP4 (.m4s, .mp4), LL-HLS (#EXT-X-PART),
-      // and proper media-playlist headers (#EXT-X-TARGETDURATION, #EXT-X-MEDIA-SEQUENCE,
-      // #EXT-X-MAP). MediaMTX may use any of these depending on HLS variant config.
-      const hasSegment =
-        body.includes('#EXTINF')                 ||  // MPEG-TS & fMP4 segments
-        body.includes('#EXT-X-PART')             ||  // LL-HLS parts
-        body.includes('#EXT-X-MAP')              ||  // fMP4 initialization segment ref
-        body.includes('#EXT-X-TARGETDURATION')   ||  // any proper media playlist
-        body.includes('#EXT-X-MEDIA-SEQUENCE')   ||  // any proper media playlist
-        body.includes('.ts')                     ||  // .ts segment URIs
-        body.includes('.m4s')                    ||  // fMP4 segment URIs
-        body.includes('.mp4')                       // fMP4 segment/init URIs
+      const isMaster  = body.includes('#EXT-X-STREAM-INF')
 
       if (hasHeader) manifestVisible = true
 
-      if (res.status === 200 && hasHeader && hasSegment) {
+      // ── Case A: direct media playlist (no STREAM-INF) ─────────────────────
+      if (status === 200 && hasHeader && !isMaster && isMediaPlaylistReady(body)) {
         const elapsed = now - startMs
-        console.info(`[transcode] hls_ready path=${streamPath} attempt=${i + 1} elapsedMs=${elapsed}`)
+        console.info(`[transcode] hls_ready path=${streamPath} type=media_playlist attempt=${i + 1} elapsedMs=${elapsed}`)
         return { ready: true, lastStatus, elapsedMs: elapsed, processExited: false, manifestVisible: true }
       }
 
-      // Log manifest body ONCE when header=true but no segment detected — helps diagnose format
-      if (res.status === 200 && hasHeader && !hasSegment && !bodyLoggedOnce) {
-        bodyLoggedOnce = true
-        const snippet = body.slice(0, 500).replace(/\n/g, '\\n')
-        console.warn(`[transcode] waiting_hls manifest_no_segment path=${streamPath} bodyLen=${body.length} first500=${snippet}`)
+      // ── Case B: master playlist — follow variant with same cookie jar ──────
+      if (status === 200 && hasHeader && isMaster) {
+        const variantUri = extractFirstVariantUri(body)
+        if (variantUri) {
+          const base       = `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/`
+          const variantUrl = variantUri.startsWith('http') ? variantUri : `${base}${variantUri}`
+          const cookieHdr  = cookieJar.size > 0
+            ? Array.from(cookieJar.entries()).map(([k, v]) => `${k}=${v}`).join('; ')
+            : '(none)'
+
+          try {
+            const { status: varStatus, body: varBody } = await fetchWithCookieJar(variantUrl, cookieJar)
+
+            if (varStatus === 200 && varBody.includes('#EXTM3U') && isMediaPlaylistReady(varBody)) {
+              const elapsed = now - startMs
+              console.info(
+                `[transcode] hls_ready path=${streamPath} type=master+variant` +
+                ` attempt=${i + 1} elapsedMs=${elapsed} variant=${variantUri.split('?')[0]}`
+              )
+              return { ready: true, lastStatus, elapsedMs: elapsed, processExited: false, manifestVisible: true }
+            }
+
+            // Auth error on variant — NOT an FFmpeg issue; log for diagnosis
+            const isAuthError = varStatus === 401 || varBody.includes('"authentication error"')
+            if (isAuthError) {
+              console.warn(
+                `[transcode] waiting_hls child_auth_error path=${streamPath}` +
+                ` variantUrl=${variantUrl.split('?')[0]} variantStatus=${varStatus}` +
+                ` cookieHdr=${cookieHdr}` +
+                ` varBodyFirst200=${varBody.slice(0, 200).replace(/\n/g, '\\n')}`
+              )
+              // Auth error means cookie was lost — retry will re-do the 302 handshake
+              cookieJar.clear()
+            } else if (now - lastLoggedAt >= 1000) {
+              const hasHdr = varBody.includes('#EXTM3U')
+              const hasSegs = isMediaPlaylistReady(varBody)
+              console.info(
+                `[transcode] waiting_hls path=${streamPath} master_ok variant_not_ready` +
+                ` variantStatus=${varStatus} varBodyLen=${varBody.length}` +
+                ` varHdr=${hasHdr} varSegs=${hasSegs}`
+              )
+              lastLoggedAt = now
+            }
+          } catch (varErr: any) {
+            if (now - lastLoggedAt >= 1000) {
+              console.info(`[transcode] waiting_hls path=${streamPath} variant_fetch_error err=${varErr.message}`)
+              lastLoggedAt = now
+            }
+          }
+        } else if (now - lastLoggedAt >= 1000) {
+          console.info(`[transcode] waiting_hls path=${streamPath} master_no_variant_uri bodyLen=${body.length}`)
+          lastLoggedAt = now
+        }
+        // Master is visible — mark manifestVisible so FFmpeg is NOT killed on timeout
+        if (!manifestVisible) manifestVisible = true
+        if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs))
+        continue
       }
 
-      // Throttle per-attempt logs to once per second
+      // ── Not yet available — log diagnostics ───────────────────────────────
+      if (status === 200 && hasHeader && !isMediaPlaylistReady(body) && !bodyLoggedOnce) {
+        bodyLoggedOnce = true
+        console.warn(
+          `[transcode] waiting_hls manifest_no_segment path=${streamPath}` +
+          ` isMaster=${isMaster} bodyLen=${body.length}` +
+          ` first500=${body.slice(0, 500).replace(/\n/g, '\\n')}`
+        )
+      }
+
       if (now - lastLoggedAt >= 1000) {
-        const hasTargetDuration = body.includes('#EXT-X-TARGETDURATION')
-        const hasMediaSeq       = body.includes('#EXT-X-MEDIA-SEQUENCE')
-        const hasMap            = body.includes('#EXT-X-MAP')
-        const hasExtinf         = body.includes('#EXTINF')
-        const hasPart           = body.includes('#EXT-X-PART')
-        const hasTs             = body.includes('.ts')
-        const hasM4s            = body.includes('.m4s')
-        const hasMp4            = body.includes('.mp4')
         console.info(
-          `[transcode] waiting_hls path=${streamPath} attempt=${i + 1} status=${res.status}` +
-          ` header=${hasHeader} segment=${hasSegment} bodyLen=${body.length}` +
-          ` targetDuration=${hasTargetDuration} mediaSeq=${hasMediaSeq} map=${hasMap}` +
-          ` extinf=${hasExtinf} part=${hasPart} ts=${hasTs} m4s=${hasM4s} mp4=${hasMp4}`
+          `[transcode] waiting_hls path=${streamPath} attempt=${i + 1} status=${status}` +
+          ` header=${hasHeader} isMaster=${isMaster} bodyLen=${body.length}` +
+          ` cookies=${cookieJar.size}` +
+          ` targetDuration=${body.includes('#EXT-X-TARGETDURATION')}` +
+          ` extinf=${body.includes('#EXTINF')} map=${body.includes('#EXT-X-MAP')}`
         )
         lastLoggedAt = now
       }
-    } catch {
-      // network/timeout — keep polling
+    } catch (err: any) {
+      if (now - lastLoggedAt >= 2000) {
+        console.info(`[transcode] waiting_hls path=${streamPath} attempt=${i + 1} fetch_error=${err.message}`)
+        lastLoggedAt = now
+      }
     }
     if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs))
   }
 
   const elapsed = Date.now() - startMs
-  console.warn(`[transcode] hls_timeout path=${streamPath} lastStatus=${lastStatus} elapsedMs=${elapsed} manifestVisible=${manifestVisible}`)
+  console.warn(
+    `[transcode] hls_timeout path=${streamPath} lastStatus=${lastStatus}` +
+    ` elapsedMs=${elapsed} manifestVisible=${manifestVisible} cookies=${cookieJar.size}`
+  )
   return { ready: false, lastStatus, elapsedMs: elapsed, processExited: false, manifestVisible }
 }
 
