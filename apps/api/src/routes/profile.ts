@@ -2,6 +2,7 @@
 import type { FastifyPluginAsync } from 'fastify'
 import bcrypt from 'bcryptjs'
 import { z } from 'zod'
+import { checkPasswordPolicy, checkPasswordHistory, addToPasswordHistory } from '../services/totp'
 
 const updateProfileSchema = z.object({
   fullName: z.string().min(2).max(100).optional(),
@@ -61,7 +62,10 @@ const profileRoutes: FastifyPluginAsync = async (server) => {
   server.put('/password', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { currentPassword, newPassword } = changePasswordSchema.parse(request.body)
 
-    const user = await server.prisma.user.findUnique({ where: { id: request.user.sub } })
+    const user = await server.prisma.user.findUnique({
+      where: { id: request.user.sub },
+      select: { id: true, passwordHash: true, passwordHistory: true },
+    })
     if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
 
     const valid = await bcrypt.compare(currentPassword, user.passwordHash)
@@ -69,17 +73,30 @@ const profileRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(400).send({ message: 'Contraseña actual incorrecta' })
     }
 
-    const passwordHash = await bcrypt.hash(newPassword, 12)
+    const policy = checkPasswordPolicy(newPassword)
+    if (!policy.valid) {
+      return reply.status(400).send({ message: 'Contraseña no cumple la política', errors: policy.errors })
+    }
+
+    const reused = await checkPasswordHistory(newPassword, user.passwordHistory ?? null)
+    if (reused) {
+      return reply.status(400).send({ message: 'No puedes reutilizar una de tus últimas 5 contraseñas' })
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 12)
+    const newHistory = await addToPasswordHistory(newHash, user.passwordHistory ?? null)
+
     await server.prisma.user.update({
       where: { id: request.user.sub },
-      data: { passwordHash },
+      data: {
+        passwordHash: newHash,
+        passwordHistory: newHistory,
+        passwordChangedAt: new Date(),
+        forcePasswordChange: false,
+      },
     })
 
-    // Invalidate all other sessions
-    await server.prisma.session.deleteMany({
-      where: { userId: request.user.sub },
-    })
-
+    await server.prisma.session.deleteMany({ where: { userId: request.user.sub } })
     return reply.send({ message: 'Contraseña actualizada. Inicia sesión nuevamente.' })
   })
 

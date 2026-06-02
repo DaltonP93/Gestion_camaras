@@ -14,6 +14,31 @@ export type StreamHealthStatus =
   | 'OFFLINE'
   | 'UNKNOWN'
 
+export interface UserFeaturePermissions {
+  canViewDashboard:    boolean
+  canViewLive:         boolean
+  canViewRecordings:   boolean
+  canViewAlerts:       boolean
+  canViewDiagnostics:  boolean
+  canManageNVRs:       boolean
+  canManageCameras:    boolean
+  canManageUsers:      boolean
+  canManageAppearance: boolean
+  canResolveAlerts:    boolean
+  canRestartStreams:   boolean
+  canTranscode:        boolean
+}
+
+export interface UserSession {
+  id:          string
+  userAgent?:  string | null
+  ipAddress?:  string | null
+  deviceName?: string | null
+  createdAt:   string
+  expiresAt:   string
+  lastUsedAt?: string | null
+}
+
 export interface User {
   id: string
   username: string
@@ -24,7 +49,15 @@ export interface User {
   avatarUrl?: string | null
   phone?: string | null
   createdAt: string
-  permissions?: UserPermission[]
+  twoFactorEnabled?:   boolean
+  forcePasswordChange?: boolean
+  lockedUntil?:        string | null
+  failedLoginAttempts?: number
+  passwordChangedAt?:  string | null
+  permissions?:         UserPermission[]
+  featurePermissions?:  UserFeaturePermissions
+  sessions?:            UserSession[]
+  _count?: { permissions: number; sessions: number }
 }
 
 export interface AlertSettings {
@@ -44,14 +77,15 @@ export interface AlertSettings {
 }
 
 export interface UserPermission {
-  id: string
-  userId: string
-  nvrId?: string
-  cameraId?: string
-  canView: boolean
-  canPlayback: boolean
-  canPtz: boolean
-  nvr?: { id: string; name: string }
+  id:             string
+  userId:         string
+  nvrId?:         string
+  cameraId?:      string
+  canView:        boolean
+  canPlayback:    boolean
+  canPtz:         boolean
+  canHighQuality: boolean
+  nvr?:    { id: string; name: string }
   camera?: { id: string; name: string; channel: number }
 }
 

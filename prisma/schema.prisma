@@ -33,10 +33,23 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  sessions     Session[]
-  permissions  UserPermission[]
-  auditLogs    AuditLog[]
-  viewAccess   CameraViewAccess[]
+  // 2FA TOTP
+  twoFactorEnabled     Boolean  @default(false)
+  twoFactorSecret      String?  @db.Text
+  twoFactorBackupCodes String?  @db.Text  // JSON: hashed recovery codes
+
+  // Seguridad de contraseña
+  passwordChangedAt    DateTime?
+  passwordHistory      String?   @db.Text  // JSON: last 5 bcrypt hashes
+  forcePasswordChange  Boolean   @default(false)
+  failedLoginAttempts  Int       @default(0)
+  lockedUntil          DateTime?
+
+  sessions           Session[]
+  permissions        UserPermission[]
+  auditLogs          AuditLog[]
+  viewAccess         CameraViewAccess[]
+  featurePermissions UserFeaturePermissions?
 
   @@map("users")
 }
@@ -49,6 +62,8 @@ model Session {
   refreshToken String   @unique
   userAgent    String?
   ipAddress    String?
+  deviceName   String?  // Parsed from User-Agent
+  lastUsedAt   DateTime?
   expiresAt    DateTime
   createdAt    DateTime @default(now())
 
@@ -173,19 +188,47 @@ model Camera {
 
 // ─── Permisos por usuario ────────────────────────────────────
 model UserPermission {
-  id          String  @id @default(cuid())
-  userId      String
-  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  nvrId       String?
-  nvr         NVR?    @relation(fields: [nvrId], references: [id], onDelete: Cascade)
-  cameraId    String?
-  camera      Camera? @relation(fields: [cameraId], references: [id], onDelete: Cascade)
-  canView     Boolean @default(true)
-  canPlayback Boolean @default(false)
-  canPtz      Boolean @default(false)
+  id             String  @id @default(cuid())
+  userId         String
+  user           User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nvrId          String?
+  nvr            NVR?    @relation(fields: [nvrId], references: [id], onDelete: Cascade)
+  cameraId       String?
+  camera         Camera? @relation(fields: [cameraId], references: [id], onDelete: Cascade)
+  canView        Boolean @default(true)
+  canPlayback    Boolean @default(false)
+  canPtz         Boolean @default(false)
+  canHighQuality Boolean @default(false)  // Alta calidad / H.265
 
   @@unique([userId, nvrId, cameraId])
   @@map("user_permissions")
+}
+
+// ─── Permisos de funcionalidades ─────────────────────────────
+model UserFeaturePermissions {
+  id                  String  @id @default(cuid())
+  userId              String  @unique
+  user                User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Módulos de interfaz
+  canViewDashboard    Boolean @default(true)
+  canViewLive         Boolean @default(true)
+  canViewRecordings   Boolean @default(false)
+  canViewAlerts       Boolean @default(true)
+  canViewDiagnostics  Boolean @default(false)
+
+  // Administración
+  canManageNVRs       Boolean @default(false)
+  canManageCameras    Boolean @default(false)
+  canManageUsers      Boolean @default(false)
+  canManageAppearance Boolean @default(false)
+
+  // Acciones
+  canResolveAlerts    Boolean @default(false)
+  canRestartStreams    Boolean @default(false)
+  canTranscode        Boolean @default(false)
+
+  @@map("user_feature_permissions")
 }
 
 // ─── Log de auditoría ────────────────────────────────────────
