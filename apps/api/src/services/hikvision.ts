@@ -215,12 +215,33 @@ export async function getNVRStatus(nvr: NVR): Promise<HikNVRStatus> {
     const diskData = diskRes.status === 'fulfilled' ? diskRes.value.data : null
 
     let diskUsage = 0
-    if (diskData?.StorageList?.storage) {
+    if (typeof diskData === 'string') {
+      // XML response — sum all hdd blocks
+      const blocks = xmlGetAll(diskData, 'hdd')
+      if (blocks.length > 0) {
+        let totalKb = 0, freeKb = 0
+        blocks.forEach((b) => {
+          const cap  = parseInt(xmlGet(b, 'capacity')  || '0')
+          const free = parseInt(xmlGet(b, 'freeSpace') || '0')
+          if (cap > 0) { totalKb += cap; freeKb += free }
+        })
+        diskUsage = totalKb > 0 ? Math.round(((totalKb - freeKb) / totalKb) * 100) : 0
+      }
+    } else if (diskData?.StorageList?.storage) {
       const storages = Array.isArray(diskData.StorageList.storage)
         ? diskData.StorageList.storage : [diskData.StorageList.storage]
       const total = storages.reduce((a: number, s: any) => a + (s.capacity || 0), 0)
       const used  = storages.reduce((a: number, s: any) => a + (s.freeSpace ? s.capacity - s.freeSpace : 0), 0)
       diskUsage = total > 0 ? Math.round((used / total) * 100) : 0
+    } else if (diskData) {
+      // Try alternate XML/JSON structures (hddList, HDDList, diskList)
+      const raw = diskData?.hddList?.hdd || diskData?.HDDList?.HDD || diskData?.diskList?.disk
+      if (raw) {
+        const list = Array.isArray(raw) ? raw : [raw]
+        const total = list.reduce((a: number, d: any) => a + (parseInt(d.capacity || '0')), 0)
+        const free  = list.reduce((a: number, d: any) => a + (parseInt(d.freeSpace || d.remainCapacity || '0')), 0)
+        diskUsage = total > 0 ? Math.round(((total - free) / total) * 100) : 0
+      }
     }
 
     return {
@@ -1591,40 +1612,98 @@ export async function rebootDevice(nvr: NVR): Promise<boolean> {
 export async function searchRecordings(
   nvr: NVR, channel: number, startTime: Date, endTime: Date
 ): Promise<HikRecording[]> {
+  const client = createHikClient(nvr)
+  const trackID = channel * 100 + 1
+  const fmt = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, '+00:00')
+  const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
+<CMSearchDescription>
+  <searchID>search_${Date.now()}</searchID>
+  <trackList>
+    <TrackDescriptor>
+      <trackID>${trackID}</trackID>
+    </TrackDescriptor>
+  </trackList>
+  <timeSpanList>
+    <TimeSpan>
+      <startTime>${fmt(startTime)}</startTime>
+      <endTime>${fmt(endTime)}</endTime>
+    </TimeSpan>
+  </timeSpanList>
+  <maxResults>200</maxResults>
+  <searchResultPostion>0</searchResultPostion>
+  <metadataList>
+    <metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>
+  </metadataList>
+</CMSearchDescription>`
+
+  let responseData: any
   try {
-    const client = createHikClient(nvr)
-    const body = {
-      CMSearchDescription: {
-        searchID: `search_${Date.now()}`,
-        trackList: { TrackDescriptor: { trackID: `${String(channel).padStart(2, '0')}00` } },
-        timeSpanList: {
-          TimeSpan: {
-            startTime: startTime.toISOString().replace('Z', '+00:00'),
-            endTime:   endTime.toISOString().replace('Z', '+00:00'),
-          },
-        },
-        maxResults: 100,
-        searchResultPostion: 0,
-        metadataList: { metadataDescriptor: '//recordType.meta.std-cgi.com' },
-      },
+    const resp = await client.post('/ISAPI/ContentMgmt/search', xmlBody, {
+      headers: { 'Content-Type': 'application/xml', 'Accept': 'application/xml' },
+    })
+    responseData = resp.data
+  } catch (err: any) {
+    const status = err?.response?.status
+    if (status === 401 || status === 403) {
+      const e: any = new Error('ISAPI auth error')
+      e.authError = true
+      throw e
+    }
+    if (status === 404 || status === 400) {
+      const e: any = new Error('ISAPI search not supported')
+      e.unsupported = true
+      throw e
+    }
+    throw err
+  }
+
+  // Parse XML or JSON response
+  if (typeof responseData === 'string') {
+    // Check for error status
+    const statusCode = xmlGet(responseData, 'statusCode')
+    if (statusCode && statusCode !== '1' && statusCode !== '200') {
+      const statusStr = xmlGet(responseData, 'statusString')
+      if (statusStr?.toLowerCase().includes('not support') || statusCode === '3') {
+        const e: any = new Error('ISAPI search not supported by this device')
+        e.unsupported = true
+        throw e
+      }
     }
 
-    const response = await client.post('/ISAPI/ContentMgmt/search', body)
-    const items = response.data?.CMSearchResult?.matchList?.SearchMatchItem
-    if (!items) return []
-    const list = Array.isArray(items) ? items : [items]
-
-    return list.map((item: any, index: number) => ({
-      id:        `${nvr.id}_${channel}_${index}`,
-      channel,
-      startTime: item.timeSpan?.startTime || '',
-      endTime:   item.timeSpan?.endTime || '',
-      size:      item.mediaSegmentDescriptor?.contentLength || 0,
-      type:      item.mediaSegmentDescriptor?.contentType || 'video/mp4',
-    }))
-  } catch {
-    return []
+    const items = xmlGetAll(responseData, 'searchMatchItem')
+    if (items.length === 0) {
+      // Some firmware uses PascalCase
+      const itemsPascal = xmlGetAll(responseData, 'SearchMatchItem')
+      if (itemsPascal.length > 0) {
+        return itemsPascal.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+      }
+      return []
+    }
+    return items.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
   }
+
+  // JSON fallback (unlikely for ISAPI search but handle gracefully)
+  const result = responseData?.CMSearchResult
+  if (!result) return []
+  const items = result?.matchList?.searchMatchItem ?? result?.matchList?.SearchMatchItem
+  if (!items) return []
+  const list = Array.isArray(items) ? items : [items]
+  return list.map((item: any, index: number) => ({
+    id:        `${nvr.id}_${channel}_${index}`,
+    channel,
+    startTime: item.timeSpan?.startTime || '',
+    endTime:   item.timeSpan?.endTime || '',
+    size:      Number(item.mediaSegmentDescriptor?.contentLength || 0),
+    type:      item.mediaSegmentDescriptor?.contentType || 'video/mp4',
+  }))
+}
+
+function parseSearchMatchItem(block: string, nvrId: string, channel: number, index: number): HikRecording {
+  const startTime = xmlGet(block, 'startTime')
+  const endTime   = xmlGet(block, 'endTime')
+  const size      = parseInt(xmlGet(block, 'contentLength') || xmlGet(block, 'fileSize') || '0')
+  const type      = xmlGet(block, 'contentType') || xmlGet(block, 'recordType') || 'video/mp4'
+  return { id: `${nvrId}_${channel}_${index}_${startTime}`, channel, startTime, endTime, size, type }
 }
 
 // ─── URL de playback de grabación ─────────────────────────────

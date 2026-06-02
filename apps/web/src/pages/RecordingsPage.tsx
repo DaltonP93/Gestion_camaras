@@ -1,9 +1,9 @@
 // src/pages/RecordingsPage.tsx
 import { useEffect, useState, useMemo } from 'react'
-import { Search, Play, Download, Calendar, Clock, ChevronDown, CheckSquare, Square } from 'lucide-react'
+import { Search, Play, Download, Calendar, Clock, ChevronDown, CheckSquare, Square, AlertTriangle, Server } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet } from '@/lib/api'
-import { format, subDays } from 'date-fns'
+import { format, subDays, subHours } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
 import toast from 'react-hot-toast'
@@ -12,6 +12,13 @@ interface RecordingWithCamera extends Recording {
   cameraId: string
   cameraName: string
   nvrName: string
+}
+
+interface IsapiError {
+  cameraId: string
+  cameraName: string
+  nvrModel?: string
+  code: string
 }
 
 export function RecordingsPage() {
@@ -25,6 +32,8 @@ export function RecordingsPage() {
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
   const [showCameraList, setShowCameraList] = useState(false)
+  const [isapiErrors, setIsapiErrors] = useState<IsapiError[]>([])
+  const [searchSource, setSearchSource] = useState<string | null>(null)
 
   useEffect(() => {
     loadNVRs()
@@ -80,37 +89,52 @@ export function RecordingsPage() {
     setIsSearching(true)
     setPlaybackUrl(null)
     setRecordings([])
+    setIsapiErrors([])
+    setSearchSource(null)
 
     const cameraIds = [...selectedCameras]
-    try {
-      const results = await Promise.allSettled(
-        cameraIds.map((cameraId) =>
-          apiGet<{ recordings: Recording[] }>('/recordings/search', {
+    const errors: IsapiError[] = []
+    let foundSource: string | null = null
+
+    const results = await Promise.allSettled(
+      cameraIds.map(async (cameraId) => {
+        const cam = cameras.find(c => c.id === cameraId)
+        try {
+          const res = await apiGet<{ recordings: Recording[]; source?: string; nvrModel?: string }>('/recordings/search', {
             cameraId,
             startTime: new Date(startDate).toISOString(),
             endTime: new Date(endDate).toISOString(),
-          }).then((res) => {
-            const cam = cameras.find(c => c.id === cameraId)
-            return (res?.recordings ?? []).map((r): RecordingWithCamera => ({
-              ...r,
-              cameraId,
-              cameraName: cam?.name || 'Desconocida',
-              nvrName: cam?.nvr?.name || '',
-            }))
           })
-        )
-      )
+          if (res?.source) foundSource = res.source
+          return (res?.recordings ?? []).map((r): RecordingWithCamera => ({
+            ...r,
+            cameraId,
+            cameraName: cam?.name || 'Desconocida',
+            nvrName: cam?.nvr?.name || '',
+          }))
+        } catch (err: any) {
+          const code = err?.response?.data?.code || err?.code || 'NVR_ERROR'
+          errors.push({
+            cameraId,
+            cameraName: cam?.name || 'Desconocida',
+            nvrModel: err?.response?.data?.nvrModel,
+            code,
+          })
+          return []
+        }
+      })
+    )
 
-      const all: RecordingWithCamera[] = results
-        .filter((r): r is PromiseFulfilledResult<RecordingWithCamera[]> => r.status === 'fulfilled')
-        .flatMap(r => r.value)
-        .sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
+    const all: RecordingWithCamera[] = results
+      .filter((r): r is PromiseFulfilledResult<RecordingWithCamera[]> => r.status === 'fulfilled')
+      .flatMap(r => r.value)
+      .sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
 
-      setRecordings(all)
-      if (all.length === 0) toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
-    } finally {
-      setIsSearching(false)
-    }
+    setRecordings(all)
+    setIsapiErrors(errors)
+    if (foundSource) setSearchSource(foundSource)
+    if (all.length === 0 && errors.length === 0) toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
+    setIsSearching(false)
   }
 
   const handlePlay = async (rec: RecordingWithCamera) => {
@@ -274,17 +298,14 @@ export function RecordingsPage() {
           {/* Shortcuts de fechas */}
           <div className="flex gap-2 flex-wrap flex-1">
             {[
-              { label: 'Última hora', hours: 1 },
-              { label: 'Hoy', hours: 24 },
-              { label: 'Ayer', hours: 48 },
-              { label: 'Últimos 7 días', hours: 168 },
-            ].map(({ label, hours }) => (
+              { label: 'Última hora', fn: () => { setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm")); setStartDate(format(subHours(new Date(), 1), "yyyy-MM-dd'T'HH:mm")) } },
+              { label: 'Hoy', fn: () => { setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm")); setStartDate(format(subHours(new Date(), 24), "yyyy-MM-dd'T'HH:mm")) } },
+              { label: 'Ayer', fn: () => { setEndDate(format(subDays(new Date(), 1), "yyyy-MM-dd'T'HH:mm")); setStartDate(format(subDays(new Date(), 2), "yyyy-MM-dd'T'HH:mm")) } },
+              { label: 'Últimos 7 días', fn: () => { setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm")); setStartDate(format(subDays(new Date(), 7), "yyyy-MM-dd'T'HH:mm")) } },
+            ].map(({ label, fn }) => (
               <button
                 key={label}
-                onClick={() => {
-                  setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm"))
-                  setStartDate(format(subDays(new Date(), hours / 24), "yyyy-MM-dd'T'HH:mm"))
-                }}
+                onClick={fn}
                 className="text-xs px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors"
               >
                 {label}
@@ -306,6 +327,35 @@ export function RecordingsPage() {
       {/* Cerrar dropdown al hacer click fuera */}
       {showCameraList && (
         <div className="fixed inset-0 z-40" onClick={() => setShowCameraList(false)} />
+      )}
+
+      {/* Source banner */}
+      {searchSource === 'nvr_isapi' && recordings.length > 0 && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-brand-900/30 border border-brand-800/50 text-xs text-brand-300">
+          <Server size={12} className="flex-shrink-0" />
+          Resultados obtenidos directamente del NVR vía ISAPI
+        </div>
+      )}
+
+      {/* ISAPI errors */}
+      {isapiErrors.length > 0 && (
+        <div className="space-y-1.5">
+          {isapiErrors.map((err) => (
+            <div key={err.cameraId} className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-900/20 border border-amber-800/40 text-xs">
+              <AlertTriangle size={12} className="text-amber-400 flex-shrink-0 mt-0.5" />
+              <div>
+                <span className="text-amber-300 font-medium">{err.cameraName}</span>
+                {err.code === 'ISAPI_UNSUPPORTED' ? (
+                  <span className="text-amber-500"> — NVR no soporta búsqueda ISAPI{err.nvrModel ? ` (${err.nvrModel})` : ''}</span>
+                ) : err.code === 'NVR_AUTH_ERROR' ? (
+                  <span className="text-amber-500"> — Error de autenticación con el NVR</span>
+                ) : (
+                  <span className="text-amber-500"> — No se pudo contactar el NVR</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -341,17 +391,24 @@ export function RecordingsPage() {
                     <Play size={12} className="text-brand-400 fill-brand-400" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="text-xs text-surface-300 font-medium truncate">
-                      {rec.nvrName} · {rec.cameraName}
+                    <div className="flex items-center gap-1.5 mb-0.5">
+                      <span className="text-xs text-surface-300 font-medium truncate">
+                        {rec.nvrName} · {rec.cameraName}
+                      </span>
+                      {rec.type && rec.type !== 'video/mp4' && (
+                        <span className="text-[9px] px-1 py-0.5 rounded bg-surface-700 text-surface-400 uppercase tracking-wide flex-shrink-0">
+                          {rec.type.replace('video/', '').replace('//recordType.meta.std-cgi.com/', '')}
+                        </span>
+                      )}
                     </div>
-                    <div className="text-xs text-surface-100 mt-0.5">
+                    <div className="text-xs text-surface-100">
                       {format(new Date(rec.startTime), 'dd/MM/yyyy HH:mm:ss')}
                     </div>
                     <div className="text-xs text-surface-400 flex items-center gap-2 mt-0.5">
                       <span className="flex items-center gap-1">
                         <Clock size={10} /> {formatDuration(rec.startTime, rec.endTime)}
                       </span>
-                      <span>{formatSize(rec.size)}</span>
+                      {rec.size > 0 && <span>{formatSize(rec.size)}</span>}
                     </div>
                   </div>
                   <button

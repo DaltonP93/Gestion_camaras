@@ -1,9 +1,9 @@
 // src/pages/DashboardPage.tsx
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import {
   Video, Server, HardDrive, Bell, Activity,
-  ChevronRight, AlertTriangle, CheckCircle2
+  ChevronRight, AlertTriangle, CheckCircle2, Database
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { useAlertStore } from '@/stores/alertStore'
@@ -157,30 +157,63 @@ export function DashboardPage() {
           <div className="divide-y divide-surface-700">
             {nvrs.map((nvr) => {
               const status = nvrStatuses[nvr.id]
+              const hdds = nvr.hdds ?? []
+              // Prefer live status disk usage, fall back to saved hdds
+              const diskPct = status?.diskUsage != null
+                ? status.diskUsage
+                : hdds.length > 0
+                  ? Math.round(hdds.reduce((a, h) => a + (h.usedPercent ?? 0), 0) / hdds.length)
+                  : null
+              const hddsSynced = hdds.length > 0
               return (
-                <div key={nvr.id} className="px-4 py-3 flex items-center gap-3">
+                <div key={nvr.id} className="px-4 py-3 flex items-start gap-3">
                   <span className={clsx(
-                    'w-2 h-2 rounded-full flex-shrink-0',
+                    'w-2 h-2 rounded-full flex-shrink-0 mt-1.5',
                     status?.online ? 'bg-green-400' : nvr.active ? 'bg-amber-400' : 'bg-surface-500'
                   )} />
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-surface-100 truncate">{nvr.name}</div>
                     <div className="text-xs text-surface-400">{nvr.model} · {nvr.channels} canales</div>
+                    {hddsSynced && (
+                      <div className="flex flex-wrap gap-1.5 mt-1.5">
+                        {hdds.map((hdd) => (
+                          <div key={hdd.id} className="flex items-center gap-1 text-[10px] text-surface-500">
+                            <Database size={8} className="flex-shrink-0" />
+                            <span>HDD{hdd.diskNumber}</span>
+                            {hdd.usedPercent != null && (
+                              <span className={clsx(
+                                'font-medium',
+                                hdd.usedPercent > 85 ? 'text-red-400' : hdd.usedPercent > 70 ? 'text-amber-400' : 'text-surface-400'
+                              )}>{hdd.usedPercent}%</span>
+                            )}
+                            {hdd.capacityGb != null && (
+                              <span className="text-surface-600">{hdd.capacityGb >= 1000 ? `${(hdd.capacityGb / 1000).toFixed(1)}TB` : `${hdd.capacityGb}GB`}</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {!hddsSynced && !status && (
+                      <Link to="/nvrs" className="text-[10px] text-surface-600 mt-1 block hover:text-brand-400">
+                        Sin datos de almacenamiento · Ver NVR →
+                      </Link>
+                    )}
                   </div>
-                  {status && (
-                    <div className="text-right flex-shrink-0">
+                  <div className="text-right flex-shrink-0">
+                    {diskPct != null ? (
                       <div className={clsx(
                         'text-xs font-medium',
-                        status.diskUsage > 85 ? 'text-red-400' : status.diskUsage > 70 ? 'text-amber-400' : 'text-surface-400'
+                        diskPct > 85 ? 'text-red-400' : diskPct > 70 ? 'text-amber-400' : 'text-surface-400'
                       )}>
-                        HDD {status.diskUsage}%
+                        {diskPct}%
                       </div>
-                      <div className="text-xs text-surface-500">{status.firmware}</div>
-                    </div>
-                  )}
-                  {!status && (
-                    <div className="text-xs text-surface-500">Cargando...</div>
-                  )}
+                    ) : (
+                      <div className="text-xs text-surface-600">—</div>
+                    )}
+                    {status?.firmware && (
+                      <div className="text-xs text-surface-500 mt-0.5">{status.firmware}</div>
+                    )}
+                  </div>
                 </div>
               )
             })}
