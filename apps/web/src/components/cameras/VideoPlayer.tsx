@@ -136,7 +136,9 @@ export function VideoPlayer({
   const hlsRef = useRef<Hls | null>(null)
   const firstFrameTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Ref mirrors playing state so firstFrameTimer closure reads current value, not stale snapshot
-  const isPlayingRef = useRef(false)
+  const isPlayingRef   = useRef(false)
+  // True once the first fragment was loaded in this mount — drives "Reconectando" vs "Preparando"
+  const hasPlayedOnce  = useRef(false)
   const [status, setStatus] = useState<Status>('loading')
   const [internalError, setInternalError] = useState<CameraPlaybackError | null>(null)
   // Message shown in the loading overlay during transcoding startup (HLS 500 retry window)
@@ -152,7 +154,8 @@ export function VideoPlayer({
 
     hlsRef.current?.destroy()
     if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
-    isPlayingRef.current = false
+    isPlayingRef.current  = false
+    hasPlayedOnce.current = false
     setStatus('loading')
     setInternalError(null)
     setTranscodeStartMsg(null)
@@ -194,7 +197,8 @@ export function VideoPlayer({
 
       hls.on(Hls.Events.FRAG_LOADED, () => {
         if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
-        isPlayingRef.current = true
+        isPlayingRef.current  = true
+        hasPlayedOnce.current = true
         setStatus('playing')
         setInternalError(null)
         setTranscodeStartMsg(null)
@@ -249,9 +253,12 @@ export function VideoPlayer({
                 : 5
             setRetryCount((r) => {
               if (r === 0 && is500 && isTranscodedStream) {
-                setTranscodeStartMsg('Preparando transcodificación...')
+                setTranscodeStartMsg(
+                  hasPlayedOnce.current
+                    ? 'Reconectando transcodificación...'
+                    : 'Preparando transcodificación...'
+                )
               } else if (r >= 5 && is500 && isTranscodedStream) {
-                // After ~4s of retries, supervisor may have restarted FFmpeg — show reconnecting msg
                 setTranscodeStartMsg('Reconectando transcodificación...')
               }
               if (r >= maxRetries) {
