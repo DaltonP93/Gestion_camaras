@@ -81,7 +81,8 @@ export function touchSession(userId: string, cameraId: string, streamType: 'sub'
   if (s) s.lastHeartbeat = new Date()
 }
 
-// Tocar todas las sesiones de un view de una vez (solo sub streams del heartbeat)
+// Tocar todas las sesiones de un view de una vez — toca sub, main y main_h264
+// para evitar que el idle cleanup mate streams HD/transcodificados durante heartbeat
 export function touchView(userId: string, viewId: string) {
   const vk = vKey(userId, viewId)
   viewHeartbeat.set(vk, new Date())
@@ -89,8 +90,10 @@ export function touchView(userId: string, viewId: string) {
   if (!vCams) return
   const now = new Date()
   for (const cameraId of vCams) {
-    const s = sessions.get(sessionKey(userId, cameraId, 'sub'))
-    if (s) s.lastHeartbeat = now
+    for (const st of ['sub', 'main', 'main_h264'] as const) {
+      const s = sessions.get(sessionKey(userId, cameraId, st))
+      if (s) s.lastHeartbeat = now
+    }
   }
 }
 
@@ -266,24 +269,43 @@ export async function startStream(
           error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al iniciar proceso FFmpeg para transcodificación' } }
       }
 
-      // Poll HLS manifest — abort early if FFmpeg exits before producing segments
-      const { ready, lastStatus, elapsedMs, processExited } = await waitForHlsReady(
+      // Poll HLS manifest — abort early if FFmpeg exits before producing segments.
+      // manifestVisible=true means status=200+#EXTM3U was seen; FFmpeg is alive
+      // and MediaMTX is muxing — don't kill FFmpeg on timeout in that case.
+      const { ready, lastStatus, elapsedMs, processExited, manifestVisible } = await waitForHlsReady(
         streamPath, 12_000, 300,
         () => isTranscodeProcessAlive(streamPath),
       )
 
       if (!ready) {
         const stderrSnippet = getTranscodeStderr(streamPath)
-        stopTranscodeProcess(streamPath)
-        transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
-        resolveInFlight(false)
         if (processExited) {
+          stopTranscodeProcess(streamPath)
+          transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
+          resolveInFlight(false)
           console.error(`[transcode] process_exited_early path=${streamPath} stderr=${stderrSnippet}`)
           return { hlsUrl: '', webrtcUrl: '', streamPath: '',
             error: { code: 'TRANSCODE_PROCESS_EXITED',
               message: 'FFmpeg finalizó antes de que HLS estuviese listo. Verifica la conexión RTSP al NVR.',
               details: stderrSnippet.slice(-200) } }
         }
+        if (manifestVisible) {
+          // MediaMTX is serving a manifest (status=200 + #EXTM3U) but segment
+          // indicators were not detected — likely fMP4/LL-HLS format or master playlist.
+          // FFmpeg IS alive and MediaMTX IS muxing; return the URL and let VideoPlayer retry.
+          console.warn(`[transcode] hls_partial_ready path=${streamPath} manifestVisible=true elapsedMs=${elapsedMs} — returning url for VideoPlayer retry`)
+          const effectiveViewId2 = viewId || 'default'
+          sessions.set(transcodeKey, {
+            cameraId, userId, viewId: effectiveViewId2, streamType: 'main_h264',
+            streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+          })
+          transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
+          resolveInFlight(true)
+          return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
+        }
+        stopTranscodeProcess(streamPath)
+        transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
+        resolveInFlight(false)
         return { hlsUrl: '', webrtcUrl: '', streamPath: '',
           error: { code: 'TRANSCODE_NOT_READY',
             message: 'El stream transcodificado no pudo iniciar a tiempo. Intenta de nuevo.',
@@ -371,24 +393,34 @@ export async function stopStream(
   userId: string,
   cameraId: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
+  reason?: string,
 ): Promise<void> {
   const key = sessionKey(userId, cameraId, streamType)
   const session = sessions.get(key)
+  let killedFfmpeg = false
+  let clearedInFlight = false
+
   if (session) {
-    // Quitar de viewCameras (solo relevante para sub streams)
     if (streamType === 'sub') {
       const vk = vKey(userId, session.viewId)
       viewCameras.get(vk)?.delete(cameraId)
     }
     sessions.delete(key)
     if (streamType === 'main_h264') {
-      // Kill FFmpeg and clear in-flight state so path can be restarted on next request
       stopTranscodeProcess(session.streamPath)
       transcodeInFlight.delete(session.streamPath)
+      killedFfmpeg = true
+      clearedInFlight = true
     }
   }
 
-  // Si nadie más está mirando, MediaMTX cerrará automáticamente vía sourceOnDemandCloseAfter
+  console.info(
+    `[stopStream] cameraId=${cameraId} streamType=${streamType} key=${key}` +
+    ` sessionFound=${!!session} path=${session?.streamPath || 'n/a'}` +
+    ` killedFfmpeg=${killedFfmpeg} clearedInFlight=${clearedInFlight}` +
+    (reason ? ` reason=${reason}` : '')
+  )
+
   const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === cameraId)
   if (!othersWatching) {
     server.log.info(`[stream-manager] Todos los viewers salieron de cámara ${cameraId}`)
@@ -428,10 +460,10 @@ export async function reconcileView(
   // Determinar qué cámaras tenía este view antes
   const previousCams = viewCameras.get(vk) || new Set<string>()
 
-  // Detener cámaras que ya no son visibles en este view
+  // Detener cámaras que ya no son visibles en este view (solo sub — main/main_h264 tienen lifecycle explícito)
   const toStop = Array.from(previousCams).filter(id => !visibleSet.has(id))
   for (const cameraId of toStop) {
-    await stopStream(server, userId, cameraId)
+    await stopStream(server, userId, cameraId, 'sub', 'viewport_reconcile')
     stoppedIds.push(cameraId)
   }
 
@@ -442,8 +474,14 @@ export async function reconcileView(
 
     if (existing) {
       // Ya está corriendo — tocar y devolver URL
-      existing.lastHeartbeat = new Date()
-      existing.viewId = viewId  // actualizar viewId por si cambió
+      const now2 = new Date()
+      existing.lastHeartbeat = now2
+      existing.viewId = viewId
+      // Touch co-located main/main_h264 sessions so idle cleanup doesn't kill active focus streams
+      for (const st of ['main', 'main_h264'] as const) {
+        const sOther = sessions.get(sessionKey(userId, cameraId, st))
+        if (sOther) sOther.lastHeartbeat = now2
+      }
       streams[cameraId] = {
         hls: getHlsUrl(existing.streamPath),
         webrtc: getWebRtcUrl(existing.streamPath),
