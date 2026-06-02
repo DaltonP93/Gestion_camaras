@@ -9,8 +9,10 @@ interface AlertState {
   isLoading: boolean
 
   setAlerts: (alerts: Alert[]) => void
+  setUnreadCount: (count: number) => void
   addAlert: (alert: Alert) => void
   markResolved: (id: string) => void
+  markRead: (id: string) => void
   markAllRead: () => void
 }
 
@@ -27,17 +29,18 @@ export const useAlertStore = create<AlertState>((set, get) => ({
   isLoading: false,
 
   setAlerts: (alerts) => {
-    const unreadCount = alerts.filter((a) => !a.resolved).length
+    const unreadCount = alerts.filter((a) => !a.resolved && !a.readAt).length
     set({ alerts, unreadCount })
   },
+
+  setUnreadCount: (count) => set({ unreadCount: count }),
 
   addAlert: (alert) => {
     set((state) => ({
       alerts: [alert, ...state.alerts].slice(0, 200),
+      // New WebSocket alerts are always unread
       unreadCount: state.unreadCount + 1,
     }))
-
-    // Mostrar notificación toast
     const icon = SEVERITY_ICONS[alert.severity] || '⚡'
     const toastFn = ['CRITICAL', 'HIGH'].includes(alert.severity) ? toast.error : toast
     toastFn(`${icon} ${alert.message}`, {
@@ -46,15 +49,40 @@ export const useAlertStore = create<AlertState>((set, get) => ({
   },
 
   markResolved: (id) => {
-    set((state) => ({
-      alerts: state.alerts.map((a) =>
-        a.id === id ? { ...a, resolved: true, resolvedAt: new Date().toISOString() } : a
-      ),
-      unreadCount: Math.max(0, state.unreadCount - 1),
-    }))
+    set((state) => {
+      const alert = state.alerts.find((a) => a.id === id)
+      const wasUnread = alert && !alert.readAt && !alert.resolved
+      return {
+        alerts: state.alerts.map((a) =>
+          a.id === id
+            ? { ...a, resolved: true, resolvedAt: new Date().toISOString(), readAt: a.readAt ?? new Date().toISOString() }
+            : a
+        ),
+        unreadCount: wasUnread ? Math.max(0, state.unreadCount - 1) : state.unreadCount,
+      }
+    })
+  },
+
+  markRead: (id) => {
+    set((state) => {
+      const alert = state.alerts.find((a) => a.id === id)
+      const wasUnread = alert && !alert.readAt && !alert.resolved
+      return {
+        alerts: state.alerts.map((a) =>
+          a.id === id && !a.readAt ? { ...a, readAt: new Date().toISOString() } : a
+        ),
+        unreadCount: wasUnread ? Math.max(0, state.unreadCount - 1) : state.unreadCount,
+      }
+    })
   },
 
   markAllRead: () => {
-    set({ unreadCount: 0 })
+    const now = new Date().toISOString()
+    set((state) => ({
+      alerts: state.alerts.map((a) =>
+        a.readAt || a.resolved ? a : { ...a, readAt: now }
+      ),
+      unreadCount: 0,
+    }))
   },
 }))

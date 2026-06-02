@@ -52,7 +52,7 @@ export function DashboardPage() {
   useEffect(() => {
     loadNVRs()
     loadCameras()
-    apiGet<Alert[]>('/alerts?resolved=false').then(setAlerts).catch(() => {})
+    apiGet<Alert[]>('/alerts?status=active&limit=200').then(setAlerts).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -61,7 +61,8 @@ export function DashboardPage() {
 
   const totalCameras = nvrs.reduce((acc, n) => acc + n.channels, 0)
   const onlineCameras = cameras.filter((c) => c.online).length
-  const criticalAlerts = alerts.filter((a) => !a.resolved && ['HIGH', 'CRITICAL'].includes(a.severity))
+  const activeAlerts = alerts.filter((a) => !a.resolved)
+  const criticalAlerts = activeAlerts.filter((a) => ['HIGH', 'CRITICAL'].includes(a.severity))
   const avgDiskUsage = nvrs.length > 0
     ? Math.round(Object.values(nvrStatuses).reduce((acc, s) => acc + s.diskUsage, 0) / Math.max(Object.keys(nvrStatuses).length, 1))
     : 0
@@ -106,9 +107,13 @@ export function DashboardPage() {
         <StatCard
           icon={<Bell size={16} />}
           label="Alertas activas"
-          value={criticalAlerts.length}
-          sub={criticalAlerts.length > 0 ? 'Requieren atención' : 'Todo OK'}
-          subColor={criticalAlerts.length > 0 ? 'text-red-400' : 'text-green-400'}
+          value={activeAlerts.length}
+          sub={
+            criticalAlerts.length > 0
+              ? `${criticalAlerts.length} críticas/altas`
+              : activeAlerts.length > 0 ? 'Revisar alertas' : 'Todo OK'
+          }
+          subColor={criticalAlerts.length > 0 ? 'text-red-400' : activeAlerts.length > 0 ? 'text-amber-400' : 'text-green-400'}
           to="/alerts"
         />
       </div>

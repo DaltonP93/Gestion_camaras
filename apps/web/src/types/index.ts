@@ -240,7 +240,8 @@ export interface Alert {
   message: string
   detail?: Record<string, unknown>
   resolved: boolean
-  resolvedAt?: string
+  resolvedAt?: string | null
+  readAt?: string | null
   createdAt: string
   nvrName?: string
 }

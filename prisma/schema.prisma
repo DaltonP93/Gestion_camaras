@@ -214,6 +214,7 @@ model Alert {
   detail     Json?
   resolved   Boolean       @default(false)
   resolvedAt DateTime?
+  readAt     DateTime?
   createdAt  DateTime      @default(now())
 
   @@map("alerts")
