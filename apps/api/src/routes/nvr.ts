@@ -253,9 +253,14 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const user = request.user
     let nvrs
 
+    const nvrInclude = {
+      cameras: { select: { id: true, channel: true, name: true, online: true, active: true, channelCode: true } },
+      hdds: { orderBy: { diskNumber: 'asc' as const } },
+    }
+
     if (['ADMIN', 'SUPERVISOR'].includes(user.role)) {
       nvrs = await server.prisma.nVR.findMany({
-        include: { cameras: { select: { id: true, channel: true, name: true, online: true, active: true, channelCode: true } } },
+        include: nvrInclude,
         orderBy: { name: 'asc' },
       })
     } else {
@@ -266,7 +271,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       const nvrIds = permissions.map((p: any) => p.nvrId!).filter(Boolean)
       nvrs = await server.prisma.nVR.findMany({
         where: { id: { in: nvrIds } },
-        include: { cameras: { select: { id: true, channel: true, name: true, online: true, active: true, channelCode: true } } },
+        include: nvrInclude,
         orderBy: { name: 'asc' },
       })
     }

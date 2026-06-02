@@ -15,19 +15,22 @@ import type { CameraView, CameraSlot, ViewLayout, NVR, Camera, User } from '@/ty
 
 // ─── Layout config ──────────────────────────────────────────────────────────
 const LAYOUTS: { value: ViewLayout; label: string; slots: number; cols: number; rows: number }[] = [
-  { value: '1x1',      label: '1×1',       slots: 1,  cols: 1, rows: 1 },
-  { value: '2x2',      label: '2×2',       slots: 4,  cols: 2, rows: 2 },
-  { value: '3x3',      label: '3×3',       slots: 9,  cols: 3, rows: 3 },
-  { value: '4x4',      label: '4×4',       slots: 16, cols: 4, rows: 4 },
-  { value: 'featured', label: 'Destacado', slots: 8,  cols: 3, rows: 3 },
+  { value: '1x1',      label: '1×1',          slots: 1,  cols: 1, rows: 1 },
+  { value: '2x2',      label: '2×2',          slots: 4,  cols: 2, rows: 2 },
+  { value: '3x3',      label: '3×3',          slots: 9,  cols: 3, rows: 3 },
+  { value: '4x4',      label: '4×4',          slots: 16, cols: 4, rows: 4 },
+  { value: 'featured', label: 'Destacado',    slots: 8,  cols: 3, rows: 3 },
+  { value: 'custom',   label: 'Personalizado', slots: 12, cols: 3, rows: 4 },
 ]
 
-function makeSlots(layout: ViewLayout, existing?: CameraSlot[]): CameraSlot[] {
-  const conf = LAYOUTS.find((l) => l.value === layout) || LAYOUTS[2]
-  return Array.from({ length: conf.slots }, (_, i) => ({
+function makeSlots(layout: ViewLayout, existing?: CameraSlot[], customCount?: number): CameraSlot[] {
+  const count = layout === 'custom'
+    ? (customCount ?? existing?.length ?? 12)
+    : (LAYOUTS.find((l) => l.value === layout)?.slots ?? 9)
+  return Array.from({ length: count }, (_, i) => ({
     slotIndex: i,
     cameraId: existing?.find((s) => s.slotIndex === i)?.cameraId ?? null,
-    size: layout === 'featured' && i === 0 ? 'large' : 'normal',
+    size: layout === 'featured' && i === 0 ? 'large' as const : 'normal' as const,
   }))
 }
 
@@ -254,6 +257,13 @@ function GridEditor({
 }
 
 // ─── View Builder Modal ──────────────────────────────────────────────────────
+const STEP_ORDER = ['basic', 'cameras', 'access', 'summary'] as const
+type WizardStep = typeof STEP_ORDER[number]
+
+const ROLE_LABELS: Record<string, string> = {
+  ADMIN: 'Admin', SUPERVISOR: 'Supervisor', OPERATOR: 'Operador', AUDITOR: 'Auditor',
+}
+
 function ViewBuilderModal({
   initial,
   nvrs,
@@ -269,22 +279,35 @@ function ViewBuilderModal({
   onSave: (view: CameraView) => void
   onClose: () => void
 }) {
-  const [step, setStep] = useState<'basic' | 'cameras' | 'access'>('basic')
+  const [step, setStep] = useState<WizardStep>('basic')
   const [name, setName] = useState(initial?.name ?? '')
+  const [nameError, setNameError] = useState('')
   const [description, setDescription] = useState(initial?.description ?? '')
   const [layout, setLayout] = useState<ViewLayout>(initial?.layout ?? '3x3')
-  const [slots, setSlots] = useState<CameraSlot[]>(() => makeSlots(initial?.layout ?? '3x3', initial?.cameraSlots))
+  const [customSlotCount, setCustomSlotCount] = useState(() =>
+    initial?.layout === 'custom' ? (initial.cameraSlots.length || 12) : 12
+  )
+  const [slots, setSlots] = useState<CameraSlot[]>(() =>
+    makeSlots(initial?.layout ?? '3x3', initial?.cameraSlots, initial?.layout === 'custom' ? initial.cameraSlots.length : 12)
+  )
   const [slideshowEnabled, setSlideshowEnabled] = useState(initial?.slideshowEnabled ?? false)
   const [slideshowInterval, setSlideshowInterval] = useState(initial?.slideshowInterval ?? 10)
   const [isPublic, setIsPublic] = useState(initial?.isPublic ?? false)
   const [accessUserIds, setAccessUserIds] = useState<string[]>(
     initial?.access?.map((a) => a.userId) ?? []
   )
+  const [roleFilter, setRoleFilter] = useState<string>('all')
   const [isSaving, setIsSaving] = useState(false)
 
   const changeLayout = (l: ViewLayout) => {
     setLayout(l)
-    setSlots(makeSlots(l, slots))
+    setSlots(makeSlots(l, slots, customSlotCount))
+  }
+
+  const handleCustomSlotCount = (n: number) => {
+    const count = Math.max(1, Math.min(25, n))
+    setCustomSlotCount(count)
+    setSlots(makeSlots('custom', slots, count))
   }
 
   const handleSlotChange = (index: number, cameraId: string | null) => {
@@ -295,6 +318,20 @@ function ViewBuilderModal({
     setAccessUserIds((prev) =>
       prev.includes(uid) ? prev.filter((id) => id !== uid) : [...prev, uid]
     )
+  }
+
+  const handleNext = () => {
+    if (step === 'basic') {
+      if (!name.trim()) { setNameError('El nombre es obligatorio'); return }
+      setNameError('')
+    }
+    const idx = STEP_ORDER.indexOf(step)
+    if (idx < STEP_ORDER.length - 1) setStep(STEP_ORDER[idx + 1])
+  }
+
+  const handleBack = () => {
+    const idx = STEP_ORDER.indexOf(step)
+    if (idx > 0) setStep(STEP_ORDER[idx - 1])
   }
 
   const handleSave = async () => {
@@ -318,7 +355,11 @@ function ViewBuilderModal({
     { key: 'basic',   label: 'Diseño' },
     { key: 'cameras', label: 'Cámaras' },
     { key: 'access',  label: 'Acceso' },
+    { key: 'summary', label: 'Resumen' },
   ] as const
+
+  const assignedSlots = slots.filter((s) => s.cameraId)
+  const filteredUsers = users.filter((u) => roleFilter === 'all' || u.role === roleFilter)
 
   return (
     <div className="fixed inset-0 z-50 flex items-stretch bg-black/70 backdrop-blur-sm">
@@ -336,34 +377,52 @@ function ViewBuilderModal({
 
         {/* Steps */}
         <div className="flex items-center gap-0 px-5 py-3 border-b border-surface-700">
-          {steps.map((s, i) => (
-            <button
-              key={s.key}
-              onClick={() => setStep(s.key)}
-              className={clsx(
-                'flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg transition-colors',
-                step === s.key
-                  ? 'bg-brand-600 text-white font-medium'
-                  : 'text-surface-400 hover:text-surface-200'
-              )}
-            >
-              <span className="w-4 h-4 rounded-full border text-[10px] flex items-center justify-center font-medium
-                border-current">{i + 1}</span>
-              {s.label}
-            </button>
-          ))}
+          {steps.map((s, i) => {
+            const currentIdx = STEP_ORDER.indexOf(step)
+            const done = i < currentIdx
+            return (
+              <button
+                key={s.key}
+                onClick={() => {
+                  if (s.key !== 'basic' && !name.trim()) return
+                  setStep(s.key)
+                }}
+                className={clsx(
+                  'flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg transition-colors',
+                  step === s.key
+                    ? 'bg-brand-600 text-white font-medium'
+                    : done
+                      ? 'text-brand-400 hover:text-surface-200'
+                      : 'text-surface-400 hover:text-surface-200'
+                )}
+              >
+                <span className={clsx(
+                  'w-4 h-4 rounded-full border text-[10px] flex items-center justify-center font-medium border-current',
+                  done && step !== s.key && 'bg-brand-600/30'
+                )}>
+                  {done ? <Check size={8} /> : i + 1}
+                </span>
+                {s.label}
+              </button>
+            )
+          })}
         </div>
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-5">
-          {/* ── Step 1: Básico + Layout ── */}
+          {/* ── Step 1: Diseño ── */}
           {step === 'basic' && (
             <div className="space-y-5">
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="label">Nombre *</label>
-                  <input className="input" placeholder="Planta baja - Turno mañana"
-                    value={name} onChange={(e) => setName(e.target.value)} />
+                  <input
+                    className={clsx('input', nameError && 'border-red-500 focus:ring-red-500/30')}
+                    placeholder="Planta baja - Turno mañana"
+                    value={name}
+                    onChange={(e) => { setName(e.target.value); if (e.target.value.trim()) setNameError('') }}
+                  />
+                  {nameError && <p className="text-xs text-red-400 mt-1">{nameError}</p>}
                 </div>
                 <div>
                   <label className="label">Descripción</label>
@@ -374,7 +433,7 @@ function ViewBuilderModal({
 
               <div>
                 <label className="label">Distribución de cámaras</label>
-                <div className="grid grid-cols-5 gap-2 mt-1.5">
+                <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 mt-1.5">
                   {LAYOUTS.map((l) => (
                     <button
                       key={l.value}
@@ -389,10 +448,25 @@ function ViewBuilderModal({
                     >
                       <LayoutPreview layout={l.value} size={36} />
                       <span className="text-xs font-medium">{l.label}</span>
-                      <span className="text-[10px] text-surface-500">{l.slots} cam.</span>
+                      <span className="text-[10px] text-surface-500">
+                        {l.value === 'custom' ? 'variable' : `${l.slots} cam.`}
+                      </span>
                     </button>
                   ))}
                 </div>
+                {layout === 'custom' && (
+                  <div className="flex items-center gap-3 mt-3 p-3 bg-surface-750 rounded-lg">
+                    <label className="text-xs text-surface-300 whitespace-nowrap">Número de celdas</label>
+                    <input
+                      type="number"
+                      min={1} max={25}
+                      className="input w-20 text-center"
+                      value={customSlotCount}
+                      onChange={(e) => handleCustomSlotCount(Number(e.target.value))}
+                    />
+                    <span className="text-xs text-surface-500">máx. 25 cámaras</span>
+                  </div>
+                )}
               </div>
 
               <div className="bg-surface-750 rounded-lg p-4 space-y-3">
@@ -432,20 +506,26 @@ function ViewBuilderModal({
             </div>
           )}
 
-          {/* ── Step 2: Asignación de cámaras ── */}
+          {/* ── Step 2: Cámaras ── */}
           {step === 'cameras' && (
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-xs font-medium text-surface-200">Asigna cámaras a cada celda</p>
                   <p className="text-xs text-surface-500 mt-0.5">
-                    {slots.filter((s) => s.cameraId).length} de {slots.length} celdas asignadas
+                    <span className={clsx(assignedSlots.length > 0 ? 'text-brand-400' : 'text-surface-500')}>
+                      {assignedSlots.length}
+                    </span>
+                    {' '}de {slots.length} celdas asignadas
+                    {nvrs.length > 0 && (
+                      <span className="ml-2 text-surface-600">· {nvrs.length} NVRs · {cameras.length} cámaras disponibles</span>
+                    )}
                   </p>
                 </div>
                 <button
                   type="button"
                   className="btn-secondary text-xs"
-                  onClick={() => setSlots(makeSlots(layout))}
+                  onClick={() => setSlots(makeSlots(layout, undefined, customSlotCount))}
                 >
                   <X size={11} /> Limpiar todo
                 </button>
@@ -494,9 +574,27 @@ function ViewBuilderModal({
 
               {!isPublic && (
                 <div>
-                  <label className="label">Usuarios con acceso</label>
+                  <div className="flex items-center gap-2 mb-2">
+                    <label className="label mb-0 flex-1">Usuarios con acceso</label>
+                    <select
+                      className="input text-xs py-1 w-36"
+                      value={roleFilter}
+                      onChange={(e) => setRoleFilter(e.target.value)}
+                    >
+                      <option value="all">Todos los roles</option>
+                      {(['ADMIN', 'SUPERVISOR', 'OPERATOR', 'AUDITOR'] as const).map((r) => (
+                        <option key={r} value={r}>{ROLE_LABELS[r]}</option>
+                      ))}
+                    </select>
+                    {accessUserIds.length > 0 && (
+                      <span className="text-xs text-brand-400">{accessUserIds.length} seleccionados</span>
+                    )}
+                  </div>
                   <div className="space-y-1 mt-1.5 max-h-64 overflow-y-auto">
-                    {users.map((u) => (
+                    {filteredUsers.length === 0 && (
+                      <div className="py-4 text-center text-xs text-surface-500">Sin usuarios para este filtro</div>
+                    )}
+                    {filteredUsers.map((u) => (
                       <label key={u.id}
                         className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-surface-700 cursor-pointer transition-colors"
                       >
@@ -506,15 +604,24 @@ function ViewBuilderModal({
                           onChange={() => toggleUser(u.id)}
                           className="accent-brand-500"
                         />
-                        <div className="w-6 h-6 rounded-full bg-brand-700 flex items-center justify-center text-white text-xs font-semibold">
+                        <div className="w-6 h-6 rounded-full bg-brand-700 flex items-center justify-center text-white text-xs font-semibold flex-shrink-0">
                           {u.fullName.charAt(0)}
                         </div>
-                        <div className="flex-1">
+                        <div className="flex-1 min-w-0">
                           <div className="text-xs font-medium text-surface-200">{u.fullName}</div>
-                          <div className="text-xs text-surface-500">{u.username} · {u.role}</div>
+                          <div className="text-xs text-surface-500">{u.username}</div>
                         </div>
+                        <span className={clsx(
+                          'text-[10px] px-1.5 py-0.5 rounded font-medium',
+                          u.role === 'ADMIN'       ? 'bg-red-900/40 text-red-300' :
+                          u.role === 'SUPERVISOR'  ? 'bg-amber-900/40 text-amber-300' :
+                          u.role === 'OPERATOR'    ? 'bg-blue-900/40 text-blue-300' :
+                                                     'bg-surface-600 text-surface-400'
+                        )}>
+                          {ROLE_LABELS[u.role] ?? u.role}
+                        </span>
                         {accessUserIds.includes(u.id) && (
-                          <Check size={12} className="text-brand-400" />
+                          <Check size={12} className="text-brand-400 flex-shrink-0" />
                         )}
                       </label>
                     ))}
@@ -523,23 +630,115 @@ function ViewBuilderModal({
               )}
             </div>
           )}
+
+          {/* ── Step 4: Resumen ── */}
+          {step === 'summary' && (
+            <div className="space-y-4">
+              <p className="text-xs text-surface-400">Revisa la configuración antes de {initial ? 'actualizar' : 'crear'} la vista.</p>
+
+              {/* Diseño */}
+              <div className="bg-surface-750 rounded-lg p-4 space-y-2.5">
+                <div className="text-xs font-semibold text-surface-300 mb-1">Diseño</div>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-surface-400">Nombre</span>
+                  <span className="text-xs font-medium text-surface-100">{name}</span>
+                </div>
+                {description && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-surface-400">Descripción</span>
+                    <span className="text-xs text-surface-300">{description}</span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-surface-400">Layout</span>
+                  <span className="text-xs text-surface-200 flex items-center gap-1.5">
+                    <LayoutPreview layout={layout} size={14} />
+                    {LAYOUTS.find((l) => l.value === layout)?.label}
+                    {layout === 'custom' && <span className="text-surface-500">({customSlotCount} celdas)</span>}
+                  </span>
+                </div>
+                {slideshowEnabled && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-surface-400">Presentación</span>
+                    <span className="text-xs text-brand-300">cada {slideshowInterval}s</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Cámaras */}
+              <div className="bg-surface-750 rounded-lg p-4 space-y-2">
+                <div className="text-xs font-semibold text-surface-300 mb-1">
+                  Cámaras asignadas
+                  <span className="ml-2 text-brand-400 font-normal">({assignedSlots.length}/{slots.length})</span>
+                </div>
+                {assignedSlots.length === 0 ? (
+                  <p className="text-xs text-surface-500">Sin cámaras asignadas</p>
+                ) : (
+                  <div className="space-y-1 max-h-40 overflow-y-auto">
+                    {assignedSlots.map((s) => {
+                      const cam = cameras.find((c) => c.id === s.cameraId)
+                      return (
+                        <div key={s.slotIndex} className="flex items-center gap-2 text-xs">
+                          <span className="text-surface-600 w-10 shrink-0">Slot {s.slotIndex + 1}</span>
+                          {cam ? (
+                            <>
+                              <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0', cam.online ? 'bg-green-400' : 'bg-surface-600')} />
+                              <span className="text-surface-200 flex-1 truncate">{cam.name}</span>
+                              <span className="text-surface-500 truncate max-w-24">{cam.nvr?.name}</span>
+                            </>
+                          ) : (
+                            <span className="text-surface-500 italic">Cámara no encontrada</span>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Acceso */}
+              <div className="bg-surface-750 rounded-lg p-4 space-y-2">
+                <div className="text-xs font-semibold text-surface-300 mb-1">Acceso</div>
+                <div className="flex items-center gap-2">
+                  {isPublic
+                    ? <><Globe size={12} className="text-green-400" /><span className="text-xs text-green-300">Pública — todos los usuarios</span></>
+                    : <><Lock size={12} className="text-amber-400" /><span className="text-xs text-amber-300">Privada</span></>}
+                </div>
+                {!isPublic && accessUserIds.length > 0 && (
+                  <div className="space-y-1 mt-1">
+                    {accessUserIds.map((uid) => {
+                      const u = users.find((u) => u.id === uid)
+                      return u ? (
+                        <div key={uid} className="flex items-center gap-2 text-xs text-surface-400">
+                          <span className="text-surface-200">{u.fullName}</span>
+                          <span className="text-surface-600">·</span>
+                          <span className="text-surface-500">{ROLE_LABELS[u.role] ?? u.role}</span>
+                        </div>
+                      ) : null
+                    })}
+                  </div>
+                )}
+                {!isPublic && accessUserIds.length === 0 && (
+                  <p className="text-xs text-amber-400/70">Sin usuarios asignados — solo el creador podrá ver esta vista</p>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Footer */}
         <div className="flex items-center justify-between gap-2 px-5 py-4 border-t border-surface-700">
           <div className="flex gap-2">
             {step !== 'basic' && (
-              <button type="button" className="btn-secondary"
-                onClick={() => setStep(step === 'cameras' ? 'basic' : 'cameras')}>
+              <button type="button" className="btn-secondary" onClick={handleBack}>
                 <ChevronLeft size={13} /> Anterior
               </button>
             )}
           </div>
           <div className="flex gap-2">
             <button type="button" className="btn-secondary" onClick={onClose}>Cancelar</button>
-            {step !== 'access' ? (
-              <button type="button" className="btn-primary"
-                onClick={() => setStep(step === 'basic' ? 'cameras' : 'access')}>
+            {step !== 'summary' ? (
+              <button type="button" className="btn-primary" onClick={handleNext}>
                 Siguiente <ChevronRight size={13} />
               </button>
             ) : (

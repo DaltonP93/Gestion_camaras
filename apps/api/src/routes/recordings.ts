@@ -49,12 +49,28 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
-    const recordings = await searchRecordings(
-      nvr as any,
-      camera.channel,
-      new Date(query.startTime),
-      new Date(query.endTime)
-    )
+
+    let recordings
+    try {
+      recordings = await searchRecordings(
+        nvr as any,
+        camera.channel,
+        new Date(query.startTime),
+        new Date(query.endTime)
+      )
+    } catch (err: any) {
+      if (err?.unsupported) {
+        return reply.status(422).send({
+          code: 'ISAPI_UNSUPPORTED',
+          message: 'Este NVR no soporta búsqueda de grabaciones vía ISAPI',
+          nvrModel: camera.nvr.model,
+        })
+      }
+      if (err?.authError) {
+        return reply.status(502).send({ code: 'NVR_AUTH_ERROR', message: 'Error de autenticación con el NVR' })
+      }
+      return reply.status(502).send({ code: 'NVR_ERROR', message: 'No se pudo contactar el NVR' })
+    }
 
     await AuditAction(server.prisma, user.sub, 'SEARCH_RECORDINGS', query.cameraId, request, {
       startTime: query.startTime,
@@ -62,7 +78,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       resultsCount: recordings.length,
     })
 
-    return reply.send({ recordings, camera: { id: camera.id, name: camera.name, channel: camera.channel } })
+    return reply.send({
+      recordings,
+      source: 'nvr_isapi',
+      camera: { id: camera.id, name: camera.name, channel: camera.channel },
+      nvrModel: camera.nvr.model,
+    })
   })
 
   // POST /api/recordings/playback — Obtener URL de reproducción

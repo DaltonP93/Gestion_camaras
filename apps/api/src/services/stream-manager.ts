@@ -56,6 +56,8 @@ interface TranscodeSourceRef {
 
 const transcodeRestarts   = new Map<string, TranscodeRestartInfo>()
 const transcodeSourceInfo = new Map<string, TranscodeSourceRef>()
+const transcodeLastActivity  = new Map<string, number>()  // ms — last viewer heartbeat for this path
+const SUPERVISOR_GRACE_MS    = 60_000  // restart if viewer was active within this window
 
 const SUPERVISOR_MAX_RESTARTS = 3
 const SUPERVISOR_WINDOW_MS    = 2 * 60_000          // 2 minutes
@@ -115,7 +117,10 @@ export function getSessionsForUser(userId: string): StreamSession[] {
 export function touchSession(userId: string, cameraId: string, streamType: 'sub' | 'main' | 'main_h264' = 'sub') {
   const key = sessionKey(userId, cameraId, streamType)
   const s = sessions.get(key)
-  if (s) s.lastHeartbeat = new Date()
+  if (s) {
+    s.lastHeartbeat = new Date()
+    if (streamType === 'main_h264') transcodeLastActivity.set(s.streamPath, Date.now())
+  }
 }
 
 // Tocar todas las sesiones de un view de una vez — toca sub, main y main_h264
@@ -129,7 +134,10 @@ export function touchView(userId: string, viewId: string) {
   for (const cameraId of vCams) {
     for (const st of ['sub', 'main', 'main_h264'] as const) {
       const s = sessions.get(sessionKey(userId, cameraId, st))
-      if (s) s.lastHeartbeat = now
+      if (s) {
+        s.lastHeartbeat = now
+        if (st === 'main_h264') transcodeLastActivity.set(s.streamPath, Date.now())
+      }
     }
   }
 }
@@ -166,8 +174,13 @@ async function runTranscodeSupervisor(
 
   const hasSession    = !!sessions.get(transcodeKey)
   const inFlightState = transcodeInFlight.get(streamPath)?.state
-  if (!hasSession && inFlightState !== 'starting') {
-    console.info(`[supervisor] skip path=${streamPath} reason=no_active_session inFlight=${inFlightState ?? 'none'}`)
+  const lastActivity  = transcodeLastActivity.get(streamPath) ?? 0
+  const recentViewer  = (Date.now() - lastActivity) < SUPERVISOR_GRACE_MS
+  if (!hasSession && inFlightState !== 'starting' && !recentViewer) {
+    console.info(
+      `[supervisor] skip path=${streamPath} reason=no_active_session` +
+      ` inFlight=${inFlightState ?? 'none'} lastActivityMsAgo=${Date.now() - lastActivity}`
+    )
     transcodeRestarts.delete(streamPath)
     return
   }
@@ -207,8 +220,13 @@ async function runTranscodeSupervisor(
 
   const hasSessionAfter    = !!sessions.get(transcodeKey)
   const inFlightStateAfter = transcodeInFlight.get(streamPath)?.state
-  if (!hasSessionAfter && inFlightStateAfter !== 'starting') {
-    console.info(`[supervisor] restart_cancelled path=${streamPath} reason=session_gone_after_backoff inFlight=${inFlightStateAfter ?? 'none'}`)
+  const lastActivityAfter  = transcodeLastActivity.get(streamPath) ?? 0
+  const recentViewerAfter  = (Date.now() - lastActivityAfter) < SUPERVISOR_GRACE_MS
+  if (!hasSessionAfter && inFlightStateAfter !== 'starting' && !recentViewerAfter) {
+    console.info(
+      `[supervisor] restart_cancelled path=${streamPath} reason=session_gone_after_backoff` +
+      ` inFlight=${inFlightStateAfter ?? 'none'} lastActivityMsAgo=${Date.now() - lastActivityAfter}`
+    )
     return
   }
 
@@ -226,6 +244,7 @@ async function runTranscodeSupervisor(
   }
 
   console.info(`[supervisor] restarted path=${streamPath} pid=${proc.pid ?? 'pending'} attempt=${info.count}`)
+  transcodeLastActivity.set(streamPath, Date.now())
 
   const existing = transcodeInFlight.get(streamPath)
   if (existing && existing.state !== 'ready') {
@@ -349,6 +368,7 @@ export async function startStream(
     if (existingSession) {
       existingSession.lastHeartbeat = new Date()
       if (viewId) existingSession.viewId = viewId
+      transcodeLastActivity.set(existingSession.streamPath, Date.now())
       console.info(`[userLimit] reuse existing cameraId=${cameraId} streamType=main_h264`)
       return { hlsUrl: getHlsUrl(existingSession.streamPath), webrtcUrl: getWebRtcUrl(existingSession.streamPath), streamPath: existingSession.streamPath, transcoded: true }
     }
@@ -385,6 +405,7 @@ export async function startStream(
         cameraId, userId, viewId: effectiveViewId0, streamType: 'main_h264',
         streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
       })
+      transcodeLastActivity.set(streamPath, Date.now())
       // Supervisor is still attached from the original spawn — no need to re-attach.
       transcodeInFlight.set(streamPath, { state: 'ready', promise: Promise.resolve(true), resolve: () => {} })
       return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
@@ -466,6 +487,7 @@ export async function startStream(
             cameraId, userId, viewId: effectiveViewId2, streamType: 'main_h264',
             streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
           })
+          transcodeLastActivity.set(streamPath, Date.now())
           transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
           resolveInFlight(true)
           return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
@@ -487,6 +509,7 @@ export async function startStream(
             cameraId, userId, viewId: effectiveViewId3, streamType: 'main_h264',
             streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
           })
+          transcodeLastActivity.set(streamPath, Date.now())
           transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
           resolveInFlight(true)
           return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
@@ -506,6 +529,7 @@ export async function startStream(
         cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
         streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
       })
+      transcodeLastActivity.set(streamPath, Date.now())
       transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
       resolveInFlight(true)
       console.info(`[transcode] ready cameraId=${cameraId} ch=${ch} path=${streamPath}`)
@@ -604,6 +628,7 @@ export async function stopStream(
         stopTranscodeProcess(session.streamPath)
         transcodeRestarts.delete(session.streamPath)
         transcodeSourceInfo.delete(session.streamPath)
+        transcodeLastActivity.delete(session.streamPath)
         killedFfmpeg = true
       } else {
         console.info(`[stopStream] skip_kill_active_main_h264 path=${session.streamPath} reason=${reason}`)
@@ -682,6 +707,7 @@ export async function reconcileView(
         const sOther = sessions.get(sessionKey(userId, cameraId, st))
         if (sOther) {
           sOther.lastHeartbeat = now2
+          if (st === 'main_h264') transcodeLastActivity.set(sOther.streamPath, Date.now())
           console.info(`[reconcileView] touch ${st} cameraId=${cameraId} path=${sOther.streamPath}`)
         }
       }
@@ -738,6 +764,7 @@ export async function cleanupUserSessions(
       transcodeInFlight.delete(session.streamPath)
       transcodeRestarts.delete(session.streamPath)
       transcodeSourceInfo.delete(session.streamPath)
+      transcodeLastActivity.delete(session.streamPath)
     }
 
     const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === session.cameraId)
@@ -780,17 +807,28 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
   // Eliminar sesiones de views expirados o con lastHeartbeat expirado
   for (const [key, session] of sessions.entries()) {
     const vk = vKey(session.userId, session.viewId)
-    if (staleViews.has(vk) || session.lastHeartbeat < cutoff) {
-      sessions.delete(key)
-      removed++
-      if (session.streamType === 'main_h264') {
-        stopTranscodeProcess(session.streamPath)
-        transcodeInFlight.delete(session.streamPath)
-        transcodeRestarts.delete(session.streamPath)
-        transcodeSourceInfo.delete(session.streamPath)
-      }
-      server.log.info(`[stream-manager] Sesión idle eliminada: ${key} (view: ${session.viewId})`)
+    const isStale = staleViews.has(vk) || session.lastHeartbeat < cutoff
+    if (!isStale) continue
+
+    // Protect active FFmpeg sessions: if the process is still alive, bump heartbeat
+    // instead of deleting. Prevents browser tab throttling (30s → 60s+) from killing
+    // active transcodes before the viewer actually leaves.
+    if (session.streamType === 'main_h264' && isTranscodeProcessAlive(session.streamPath)) {
+      session.lastHeartbeat = new Date()
+      console.info(`[cleanupIdle] skip path=${session.streamPath} reason=ffmpeg_alive — bumped lastHeartbeat`)
+      continue
     }
+
+    sessions.delete(key)
+    removed++
+    if (session.streamType === 'main_h264') {
+      stopTranscodeProcess(session.streamPath)
+      transcodeInFlight.delete(session.streamPath)
+      transcodeRestarts.delete(session.streamPath)
+      transcodeSourceInfo.delete(session.streamPath)
+      transcodeLastActivity.delete(session.streamPath)
+    }
+    server.log.info(`[stream-manager] idle_removed key=${key} streamType=${session.streamType} view=${session.viewId}`)
   }
 
   // Limpiar view maps para views expirados

@@ -5,7 +5,7 @@ import {
   ArrowLeft, LayoutGrid, ChevronLeft, ChevronRight,
   Play, Pause, Clock, Globe, Lock, Monitor, AlertTriangle
 } from 'lucide-react'
-import { apiGet } from '@/lib/api'
+import { apiGet, apiPost } from '@/lib/api'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
 import { clsx } from 'clsx'
 import type { CameraView, CameraSlot, Camera, StreamInfo } from '@/types'
@@ -17,6 +17,15 @@ const LAYOUT_COLS: Record<string, number> = {
   '4x4': 4,
   'featured': 3,
   'custom': 3,
+}
+
+function getSlotsPerPage(layout: string): number {
+  if (layout === '1x1') return 1
+  if (layout === '2x2') return 4
+  if (layout === '3x3') return 9
+  if (layout === '4x4') return 16
+  if (layout === 'featured') return 8
+  return 9
 }
 
 interface SlotWithCamera extends CameraSlot {
@@ -34,15 +43,7 @@ export function ViewPlayerPage() {
   const [error, setError] = useState<string | null>(null)
 
   // Pagination/slideshow
-  const slotsPerPage = view ? (() => {
-    const layout = view.layout
-    if (layout === '1x1') return 1
-    if (layout === '2x2') return 4
-    if (layout === '3x3') return 9
-    if (layout === '4x4') return 16
-    if (layout === 'featured') return 8
-    return 9
-  })() : 9
+  const slotsPerPage = view ? getSlotsPerPage(view.layout) : 9
 
   const filledSlots = slots.filter((s) => s.cameraId)
   const totalPages = Math.max(1, Math.ceil(filledSlots.length / slotsPerPage))
@@ -59,27 +60,25 @@ export function ViewPlayerPage() {
     apiGet<CameraView>(`/views/${id}`)
       .then(async (v) => {
         setView(v)
-        // Load cameras and streams for assigned slots
-        const assignedIds = v.cameraSlots
-          .filter((s) => s.cameraId)
-          .map((s) => s.cameraId!)
+        const assignedSlots = v.cameraSlots.filter((s) => s.cameraId)
+        const assignedIds = assignedSlots.map((s) => s.cameraId!)
 
-        // Fetch all camera details
-        const camerasData = await Promise.allSettled(
-          assignedIds.map((cid) => apiGet<Camera>(`/cameras/${cid}`))
-        )
+        // Batch-fetch all camera metadata in one request
+        const camerasArr = assignedIds.length > 0
+          ? await apiPost<Camera[]>('/cameras/batch', { ids: assignedIds })
+          : []
         const cameraMap = new Map<string, Camera>()
-        camerasData.forEach((r, i) => {
-          if (r.status === 'fulfilled') cameraMap.set(assignedIds[i], r.value)
-        })
+        camerasArr.forEach((c) => cameraMap.set(c.id, c))
 
-        // Fetch stream info
+        // Start streams only for first-page cameras
+        const perPage = getSlotsPerPage(v.layout)
+        const firstPageIds = assignedIds.slice(0, perPage)
         const streamData = await Promise.allSettled(
-          assignedIds.map((cid) => apiGet<StreamInfo>(`/cameras/${cid}/stream`))
+          firstPageIds.map((cid) => apiGet<StreamInfo>(`/cameras/${cid}/stream`))
         )
         const streamMap = new Map<string, StreamInfo>()
         streamData.forEach((r, i) => {
-          if (r.status === 'fulfilled') streamMap.set(assignedIds[i], r.value)
+          if (r.status === 'fulfilled') streamMap.set(firstPageIds[i], r.value)
         })
 
         setSlots(v.cameraSlots.map((s) => ({
@@ -91,6 +90,34 @@ export function ViewPlayerPage() {
       .catch((e) => setError(e?.message ?? 'No se pudo cargar la vista'))
       .finally(() => setIsLoading(false))
   }, [id])
+
+  // Load streams for newly visible cameras when page changes
+  useEffect(() => {
+    if (!view) return
+    const perPage = getSlotsPerPage(view.layout)
+    const pageIds = filledSlots
+      .slice(currentPage * perPage, (currentPage + 1) * perPage)
+      .map((s) => s.cameraId!)
+      .filter((cid) => {
+        const slot = slots.find((s) => s.cameraId === cid)
+        return slot && !slot.stream
+      })
+    if (pageIds.length === 0) return
+
+    Promise.allSettled(
+      pageIds.map((cid) => apiGet<StreamInfo>(`/cameras/${cid}/stream`))
+    ).then((results) => {
+      const loaded = new Map<string, StreamInfo>()
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled') loaded.set(pageIds[i], r.value)
+      })
+      if (loaded.size > 0) {
+        setSlots((prev) =>
+          prev.map((s) => (s.cameraId && loaded.has(s.cameraId) ? { ...s, stream: loaded.get(s.cameraId) } : s))
+        )
+      }
+    })
+  }, [currentPage, view])
 
   // Start slideshow when view loads and slideshowEnabled
   useEffect(() => {

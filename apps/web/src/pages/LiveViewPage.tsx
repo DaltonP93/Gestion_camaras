@@ -102,6 +102,11 @@ export function LiveViewPage() {
   const [streamErrors, setStreamErrors]    = useState<Record<string, CameraPlaybackError>>({})
   const streamErrorsRef = useRef<Record<string, CameraPlaybackError>>({})
   streamErrorsRef.current = streamErrors  // keep ref current without triggering re-renders
+  // Refs for focus state — used by async HLS error callbacks to avoid stale closures
+  const focusCameraRef      = useRef<string | null>(null)
+  focusCameraRef.current    = focusCamera
+  const focusStreamTypeRef  = useRef<'sub' | 'main' | 'main_h264'>('sub')
+  focusStreamTypeRef.current = focusStreamType
   const [focusCamera, setFocusCamera]      = useState<string | null>(null)
   const [focusStreamInfo, setFocusStreamInfo]   = useState<StreamInfo | null>(null)
   const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
@@ -116,6 +121,12 @@ export function LiveViewPage() {
 
   // Stable ID for this browser tab — used by backend to track sessions per view
   const [viewId] = useState<string>(makeViewId)
+
+  // Error codes that belong exclusively to focus/main_h264 streams.
+  // Grid tiles show sub streams — showing these errors on a tile is always stale/misleading.
+  const TRANSCODE_ONLY_CODES = new Set<CameraPlaybackError['code']>([
+    'TRANSCODE_NOT_READY', 'TRANSCODE_PROCESS_EXITED',
+  ])
 
   // Track which cameraIds have active sessions in the backend
   const activeSessions = useRef<Set<string>>(new Set())
@@ -617,13 +628,13 @@ export function LiveViewPage() {
       return
     }
 
-    // For main_h264 focus errors: keep the session and FFmpeg alive so the user can
-    // retry by clicking "Trans" or the refresh icon without restarting the whole pipeline.
-    // The error overlay is shown but stop-stream is NOT called — the user explicitly
-    // switches to sub (handleQualitySwitch) or exits focus (handleExitFocus) to stop FFmpeg.
-    const isFocusTranscode = cameraId === focusCamera && focusStreamType === 'main_h264'
-    if (isFocusTranscode) {
-      console.info(`[LiveView] stream_error main_h264 cameraId=${cameraId} code=${err.code} — keeping FFmpeg alive, showing error overlay`)
+    // For focus-camera main/main_h264 errors: route to focusStreamError, NOT streamErrors.
+    // Use refs (not state) to avoid stale-closure issues in async HLS error callbacks
+    // (e.g. user exits focus, then a pending HLS retry fires — closure would read null).
+    const isFocusStream = cameraId === focusCameraRef.current &&
+      (focusStreamTypeRef.current === 'main_h264' || focusStreamTypeRef.current === 'main')
+    if (isFocusStream) {
+      console.info(`[LiveView] stream_error focus cameraId=${cameraId} type=${focusStreamTypeRef.current} code=${err.code} — routing to focusStreamError`)
       setFocusStreamError(err)
       return
     }
@@ -660,7 +671,7 @@ export function LiveViewPage() {
     }
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main' })
+      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main', viewId })
       // Backend may auto-redirect main→main_h264 (HEVC camera + transcoding enabled).
       // Detect the actual stream type from the response so stop-stream/quality-switch
       // use the correct type key.
@@ -736,7 +747,7 @@ export function LiveViewPage() {
     setFocusStreamType(quality)
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality })
+      const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality, viewId })
       const actualType: 'sub' | 'main' | 'main_h264' =
         (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
           ? 'main_h264' : quality
@@ -970,7 +981,11 @@ export function LiveViewPage() {
                     onStreamError={handleStreamError}
                     onRetry={handleGridCameraRetry}
                     className="w-full h-full"
-                    playbackError={streamErrors[camera.id]}
+                    playbackError={
+                      streamErrors[camera.id] && TRANSCODE_ONLY_CODES.has(streamErrors[camera.id]!.code)
+                        ? undefined
+                        : streamErrors[camera.id]
+                    }
                     streamType="sub"
                     streamCodec={camera.subCodec}
                     streamResolution={camera.subResolution}
