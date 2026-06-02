@@ -71,6 +71,49 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     return reply.send(cameras)
   })
 
+  // POST /api/cameras/batch — cargar múltiples cámaras por IDs (máx. 50)
+  server.post('/batch', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const body = request.body as { ids?: unknown }
+    if (!Array.isArray(body?.ids)) return reply.status(400).send({ message: 'ids debe ser un array' })
+    const ids = (body.ids as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 50)
+    if (ids.length === 0) return reply.send([])
+
+    const user = request.user
+    let cameras
+    if (['ADMIN', 'SUPERVISOR'].includes(user.role)) {
+      cameras = await server.prisma.camera.findMany({
+        where: { id: { in: ids } },
+        include: { nvr: { select: { id: true, name: true, ipAddress: true } } },
+      })
+    } else {
+      const perms = await server.prisma.userPermission.findMany({
+        where: { userId: user.sub, cameraId: { in: ids }, canView: true },
+        select: { cameraId: true },
+      })
+      const allowed = perms.map((p: any) => p.cameraId!).filter(Boolean)
+      cameras = await server.prisma.camera.findMany({
+        where: { id: { in: allowed } },
+        include: { nvr: { select: { id: true, name: true, ipAddress: true } } },
+      })
+    }
+    return reply.send(cameras)
+  })
+
+  // GET /api/cameras/:id — cámara individual con NVR
+  server.get('/:id', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const user = request.user
+    const camera = await server.prisma.camera.findUnique({
+      where: { id },
+      include: { nvr: { select: { id: true, name: true, ipAddress: true } } },
+    })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
+      return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
+    }
+    return reply.send(camera)
+  })
+
   // GET /api/cameras/:id/stream — Obtener URLs de streaming
   server.get('/:id/stream', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
