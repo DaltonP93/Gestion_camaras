@@ -164,8 +164,10 @@ async function runTranscodeSupervisor(
 ): Promise<void> {
   const transcodeKey = sessionKey(sourceRef.userId, sourceRef.cameraId, 'main_h264')
 
-  if (!sessions.get(transcodeKey)) {
-    console.info(`[supervisor] skip path=${streamPath} reason=no_active_session`)
+  const hasSession    = !!sessions.get(transcodeKey)
+  const inFlightState = transcodeInFlight.get(streamPath)?.state
+  if (!hasSession && inFlightState !== 'starting') {
+    console.info(`[supervisor] skip path=${streamPath} reason=no_active_session inFlight=${inFlightState ?? 'none'}`)
     transcodeRestarts.delete(streamPath)
     return
   }
@@ -203,8 +205,10 @@ async function runTranscodeSupervisor(
 
   await new Promise(r => setTimeout(r, backoffMs))
 
-  if (!sessions.get(transcodeKey)) {
-    console.info(`[supervisor] restart_cancelled path=${streamPath} reason=session_gone_after_backoff`)
+  const hasSessionAfter    = !!sessions.get(transcodeKey)
+  const inFlightStateAfter = transcodeInFlight.get(streamPath)?.state
+  if (!hasSessionAfter && inFlightStateAfter !== 'starting') {
+    console.info(`[supervisor] restart_cancelled path=${streamPath} reason=session_gone_after_backoff inFlight=${inFlightStateAfter ?? 'none'}`)
     return
   }
 
