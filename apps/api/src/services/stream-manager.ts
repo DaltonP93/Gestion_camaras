@@ -810,13 +810,32 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
     const isStale = staleViews.has(vk) || session.lastHeartbeat < cutoff
     if (!isStale) continue
 
-    // Protect active FFmpeg sessions: if the process is still alive, bump heartbeat
-    // instead of deleting. Prevents browser tab throttling (30s → 60s+) from killing
-    // active transcodes before the viewer actually leaves.
-    if (session.streamType === 'main_h264' && isTranscodeProcessAlive(session.streamPath)) {
-      session.lastHeartbeat = new Date()
-      console.info(`[cleanupIdle] skip path=${session.streamPath} reason=ffmpeg_alive — bumped lastHeartbeat`)
-      continue
+    if (session.streamType === 'main_h264') {
+      const ffmpegAlive     = isTranscodeProcessAlive(session.streamPath)
+      const lastActivity    = transcodeLastActivity.get(session.streamPath) ?? 0
+      const activityAgeMs   = Date.now() - lastActivity
+      const recentActivity  = activityAgeMs < SUPERVISOR_GRACE_MS
+      const heartbeatAgeMs  = Date.now() - session.lastHeartbeat.getTime()
+
+      console.info(
+        `[cleanupIdle] main_h264 check key=${key} view=${session.viewId}` +
+        ` heartbeatAgeMs=${heartbeatAgeMs} activityAgeMs=${activityAgeMs}` +
+        ` ffmpegAlive=${ffmpegAlive} recentActivity=${recentActivity}`
+      )
+
+      // Keep alive if FFmpeg is running — prevents tab-throttled heartbeats from killing active transcodes.
+      if (ffmpegAlive) {
+        session.lastHeartbeat = new Date()
+        console.info(`[cleanupIdle] skip path=${session.streamPath} reason=ffmpeg_alive — bumped lastHeartbeat`)
+        continue
+      }
+
+      // Keep alive if viewer was recently active (transcodeLastActivity updated by touch-stream / heartbeat).
+      if (recentActivity) {
+        session.lastHeartbeat = new Date()
+        console.info(`[cleanupIdle] skip path=${session.streamPath} reason=recent_activity activityAgeMs=${activityAgeMs}`)
+        continue
+      }
     }
 
     sessions.delete(key)

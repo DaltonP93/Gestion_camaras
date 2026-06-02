@@ -342,8 +342,9 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const streamType: 'sub' | 'main' | 'main_h264' =
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
+    const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
 
-    const result = await startStream(server, user.sub, id, undefined, streamType)
+    const result = await startStream(server, user.sub, id, viewId, streamType)
     if (result.error) {
       // Si el error es del servidor de medios (no de límites ni de estado de salud),
       // marcar la cámara como MEDIA_SERVER_ERROR

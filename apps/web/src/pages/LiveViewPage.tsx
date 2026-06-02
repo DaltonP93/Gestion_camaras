@@ -102,17 +102,17 @@ export function LiveViewPage() {
   const [streamErrors, setStreamErrors]    = useState<Record<string, CameraPlaybackError>>({})
   const streamErrorsRef = useRef<Record<string, CameraPlaybackError>>({})
   streamErrorsRef.current = streamErrors  // keep ref current without triggering re-renders
+  const [focusCamera, setFocusCamera]      = useState<string | null>(null)
+  // Track the intended stream type separately — focusStreamInfo alone can't tell us 'main'
+  // when HEVC blocks the stream before the API call (focusStreamInfo stays null).
+  const [focusStreamType, setFocusStreamType]   = useState<'sub' | 'main' | 'main_h264'>('sub')
   // Refs for focus state — used by async HLS error callbacks to avoid stale closures
   const focusCameraRef      = useRef<string | null>(null)
   focusCameraRef.current    = focusCamera
   const focusStreamTypeRef  = useRef<'sub' | 'main' | 'main_h264'>('sub')
   focusStreamTypeRef.current = focusStreamType
-  const [focusCamera, setFocusCamera]      = useState<string | null>(null)
   const [focusStreamInfo, setFocusStreamInfo]   = useState<StreamInfo | null>(null)
   const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
-  // Track the intended stream type separately — focusStreamInfo alone can't tell us 'main'
-  // when HEVC blocks the stream before the API call (focusStreamInfo stays null).
-  const [focusStreamType, setFocusStreamType]   = useState<'sub' | 'main' | 'main_h264'>('sub')
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
   const [streamCapabilities, setStreamCapabilities] = useState<{ ffmpegAvailable: boolean; transcodingEnabled: boolean } | null>(null)
 
@@ -619,6 +619,15 @@ export function LiveViewPage() {
     console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
 
     if (err.code === 'HLS_SESSION_EXPIRED') {
+      // Focus main/main_h264 session expired → show reconnecting state and re-request stream.
+      // Grid cameras go through the coalesced heartbeat path below.
+      const isFocusH264 = cameraId === focusCameraRef.current &&
+        (focusStreamTypeRef.current === 'main_h264' || focusStreamTypeRef.current === 'main')
+      if (isFocusH264) {
+        console.info(`[LiveView] HLS_SESSION_EXPIRED focus cameraId=${cameraId} — reconnecting transcodificación`)
+        setFocusStreamError({ code: 'TRANSCODE_NOT_READY', message: 'Reconectando transcodificación...' })
+        return
+      }
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
       hlsExpiryQueue.current.add(cameraId)

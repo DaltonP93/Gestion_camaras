@@ -106,7 +106,7 @@ function PermissionsPanel({
       const idx = prev.findIndex((p) =>
         p.nvrId === nvrId && p.cameraId === cameraId
       )
-      const entry: PermMatrix = idx >= 0 ? { ...prev[idx] } : { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false }
+      const entry: PermMatrix = idx >= 0 ? { ...prev[idx] } : { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false, canHighQuality: false }
       entry[field] = value
       if ((field === 'canPlayback' || field === 'canPtz' || field === 'canHighQuality') && value) entry.canView = true
 
