@@ -74,7 +74,6 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
 
     const uploadsDir = process.env.UPLOADS_DIR || '/app/uploads'
     const brandingDir = path.join(uploadsDir, 'branding')
-    const baseUrl = process.env.APP_URL || `http://localhost:4000`
 
     const FIELD_NAMES = new Set(['favicon', 'sidebarLogo', 'loginLogo', 'headerLogo', 'logoUrl', 'sidebarLogoUrl', 'faviconUrl'])
     const fieldToDbKey: Record<string, string> = {
@@ -115,13 +114,14 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
       // Delete previous file for this field if it's a local upload
       const dbKey = fieldToDbKey[part.fieldname]
       const prevUrl: string | null = (current as any)?.[dbKey] ?? null
-      if (prevUrl && prevUrl.startsWith(`${baseUrl}/uploads/branding/`)) {
+      if (prevUrl && (prevUrl.startsWith('/uploads/branding/') || prevUrl.includes('/uploads/branding/'))) {
         const prevFile = path.join(brandingDir, path.basename(prevUrl))
         try { fs.unlinkSync(prevFile) } catch {}
       }
 
       fs.writeFileSync(destPath, buf)
-      updates[dbKey] = `${baseUrl}/uploads/branding/${uniqueName}`
+      // Save as relative path — frontend resolves to full URL using resolveAssetUrl
+      updates[dbKey] = `/uploads/branding/${uniqueName}`
     }
 
     if (Object.keys(updates).length === 0) {

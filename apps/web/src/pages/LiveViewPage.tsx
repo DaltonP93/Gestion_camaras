@@ -89,7 +89,8 @@ function makeViewId(): string {
 
 export function LiveViewPage() {
   const [searchParams] = useSearchParams()
-  const nvrFilter = searchParams.get('nvr')
+  const nvrFilter    = searchParams.get('nvr')
+  const cameraFilter = searchParams.get('camera')
 
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
   const { user } = useAuthStore()
@@ -97,6 +98,8 @@ export function LiveViewPage() {
   const [gridLayout, setGridLayout]   = useState<GridLayout>(9)
   const [selectedNVR, setSelectedNVR] = useState<string>(nvrFilter || 'all')
   const [page, setPage]               = useState(0)
+  const [highlightCamera, setHighlightCamera] = useState<string | null>(null)
+  const appliedCameraQuery = useRef(false)
   const [streams, setStreams]         = useState<Record<string, StreamInfo>>({})
   const [loadingStreams, setLoadingStreams] = useState<Record<string, boolean>>({})
   const [streamErrors, setStreamErrors]    = useState<Record<string, CameraPlaybackError>>({})
@@ -155,6 +158,30 @@ export function LiveViewPage() {
     apiPost('/cameras/cleanup-my-sessions', {}).catch(() => {})
   }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
+
+  // Handle camera query param: once cameras are loaded, navigate to the correct NVR/page
+  // and highlight the target camera for a few seconds.
+  useEffect(() => {
+    if (!cameraFilter || appliedCameraQuery.current || cameras.length === 0) return
+    const cam = cameras.find(c => c.id === cameraFilter)
+    console.info(`[LiveView] focusCameraFromQuery cameraId=${cameraFilter} found=${!!cam}`)
+    if (!cam) return
+    appliedCameraQuery.current = true
+
+    const targetNvrId = cam.nvrId
+    setSelectedNVR(targetNvrId)
+
+    // Calculate the page within that NVR's camera list
+    const nvrCams = cameras.filter(c => c.nvrId === targetNvrId)
+    const camIdx  = nvrCams.findIndex(c => c.id === cameraFilter)
+    const targetPage = camIdx >= 0 ? Math.floor(camIdx / gridLayout) : 0
+    console.info(`[LiveView] globalSearchNavigate cameraId=${cameraFilter} nvrId=${targetNvrId} page=${targetPage}`)
+    setPage(targetPage)
+
+    // Highlight for 4 seconds
+    setHighlightCamera(cameraFilter)
+    setTimeout(() => setHighlightCamera(null), 4000)
+  }, [cameras, cameraFilter, gridLayout])
 
   useEffect(() => {
     apiGet<{ ffmpegAvailable: boolean; transcodingEnabled: boolean }>('/live-view/capabilities')
@@ -963,12 +990,18 @@ export function LiveViewPage() {
         ) : (
           <div className={clsx('grid gap-1.5 h-full', currentGrid.cols)}>
             {filteredCameras.map(camera => {
-              const stream = streams[camera.id]
-              const health = camera.streamHealthStatus
+              const stream    = streams[camera.id]
+              const health    = camera.streamHealthStatus
+              const isHighlit = highlightCamera === camera.id
               return (
                 <div
                   key={camera.id}
-                  className="relative min-h-0 rounded-lg overflow-hidden border border-surface-700"
+                  className={clsx(
+                    'relative min-h-0 rounded-lg overflow-hidden border transition-all duration-300',
+                    isHighlit
+                      ? 'border-brand-400 ring-2 ring-brand-400/60 shadow-lg shadow-brand-400/20'
+                      : 'border-surface-700'
+                  )}
                 >
                   {/* Health badge */}
                   {(() => {

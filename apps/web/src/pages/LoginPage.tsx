@@ -3,12 +3,15 @@ import { useState, useRef, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { Shield, Eye, EyeOff, Loader2, Smartphone, ArrowLeft } from 'lucide-react'
 import { useAuthStore } from '@/stores/authStore'
+import { useAppearanceStore } from '@/stores/appearanceStore'
+import { resolveAssetUrl } from '@/lib/api'
 import toast from 'react-hot-toast'
 
 // ─── Paso 1: Usuario + contraseña ────────────────────────────
 function LoginForm() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [rememberMe, setRememberMe] = useState(true)
   const [showPass, setShowPass] = useState(false)
   const { login, isLoading } = useAuthStore()
   const navigate = useNavigate()
@@ -20,7 +23,7 @@ function LoginForm() {
       return
     }
     try {
-      await login(username, password)
+      await login(username, password, rememberMe)
       // If 2FA required, twoFactorChallenge is set and UI switches
       // If no 2FA, login completes and navigate
       if (!useAuthStore.getState().twoFactorChallenge) {
@@ -67,10 +70,24 @@ function LoginForm() {
         </div>
       </div>
 
+      <div className="flex items-center gap-2">
+        <input
+          id="rememberMe"
+          type="checkbox"
+          checked={rememberMe}
+          onChange={(e) => setRememberMe(e.target.checked)}
+          className="w-4 h-4 rounded accent-brand-500 cursor-pointer"
+          disabled={isLoading}
+        />
+        <label htmlFor="rememberMe" className="text-xs text-surface-400 cursor-pointer select-none">
+          Recordarme en este dispositivo
+        </label>
+      </div>
+
       <button
         type="submit"
         disabled={isLoading}
-        className="btn-primary w-full justify-center py-2.5 mt-2"
+        className="btn-primary w-full justify-center py-2.5"
       >
         {isLoading ? (
           <><Loader2 size={14} className="animate-spin" /> Ingresando...</>
@@ -188,6 +205,13 @@ function TwoFactorForm() {
 // ─── LoginPage ────────────────────────────────────────────────
 export function LoginPage() {
   const { twoFactorChallenge } = useAuthStore()
+  const { settings: appearance, load: loadAppearance } = useAppearanceStore()
+
+  // Load appearance on login page (user not authenticated yet, App.tsx may not have run loadAppearance)
+  useEffect(() => { loadAppearance() }, [])
+
+  const logoUrl = resolveAssetUrl(appearance.logoUrl)
+  const siteName = appearance.siteName || 'VisionCore'
 
   return (
     <div className="min-h-screen bg-surface-900 flex items-center justify-center p-4">
@@ -196,10 +220,14 @@ export function LoginPage() {
       <div className="relative w-full max-w-sm">
         <div className="card p-8 shadow-2xl">
           <div className="flex flex-col items-center mb-8">
-            <div className="w-14 h-14 rounded-2xl bg-brand-600 flex items-center justify-center mb-4 shadow-lg shadow-brand-900/50">
-              <Shield size={28} className="text-white" />
-            </div>
-            <h1 className="text-xl font-semibold text-surface-50">VisionCore</h1>
+            {logoUrl ? (
+              <img src={logoUrl} alt={siteName} className="h-14 object-contain mb-4" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }} />
+            ) : (
+              <div className="w-14 h-14 rounded-2xl bg-brand-600 flex items-center justify-center mb-4 shadow-lg shadow-brand-900/50">
+                <Shield size={28} className="text-white" />
+              </div>
+            )}
+            <h1 className="text-xl font-semibold text-surface-50">{siteName}</h1>
             <p className="text-sm text-surface-400 mt-1">Sistema de gestión NVR</p>
           </div>
 

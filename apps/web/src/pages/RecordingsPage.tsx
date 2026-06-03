@@ -341,44 +341,42 @@ export function RecordingsPage() {
           {/* Fecha inicio */}
           <div>
             <label className="label">Desde</label>
-            <div className="flex items-center gap-1">
+            <div
+              className="flex items-center gap-1 input cursor-pointer p-0 overflow-hidden"
+              onClick={() => triggerDatePicker(startInputRef)}
+            >
               <input
                 ref={startInputRef}
                 type="datetime-local"
                 value={startDate}
                 onChange={(e) => setStartDate(e.target.value)}
-                className="input flex-1 min-w-0"
+                className="flex-1 min-w-0 bg-transparent border-0 outline-none px-3 py-2 text-sm text-surface-100 cursor-pointer"
+                style={{ colorScheme: 'dark' }}
               />
-              <button
-                type="button"
-                onClick={() => triggerDatePicker(startInputRef)}
-                className="p-2 rounded-lg bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors flex-shrink-0"
-                title="Abrir calendario"
-              >
+              <span className="pr-2 text-surface-400 flex-shrink-0 pointer-events-none">
                 <Calendar size={13} />
-              </button>
+              </span>
             </div>
           </div>
 
           {/* Fecha fin */}
           <div>
             <label className="label">Hasta</label>
-            <div className="flex items-center gap-1">
+            <div
+              className="flex items-center gap-1 input cursor-pointer p-0 overflow-hidden"
+              onClick={() => triggerDatePicker(endInputRef)}
+            >
               <input
                 ref={endInputRef}
                 type="datetime-local"
                 value={endDate}
                 onChange={(e) => setEndDate(e.target.value)}
-                className="input flex-1 min-w-0"
+                className="flex-1 min-w-0 bg-transparent border-0 outline-none px-3 py-2 text-sm text-surface-100 cursor-pointer"
+                style={{ colorScheme: 'dark' }}
               />
-              <button
-                type="button"
-                onClick={() => triggerDatePicker(endInputRef)}
-                className="p-2 rounded-lg bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors flex-shrink-0"
-                title="Abrir calendario"
-              >
+              <span className="pr-2 text-surface-400 flex-shrink-0 pointer-events-none">
                 <Calendar size={13} />
-              </button>
+              </span>
             </div>
           </div>
         </div>

@@ -2,8 +2,7 @@
 import { useEffect } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from '@/stores/authStore'
-import { apiGet } from '@/lib/api'
-import type { AppearanceSettings } from '@/types'
+import { useAppearanceStore } from '@/stores/appearanceStore'
 import { Layout } from '@/components/layout/Layout'
 import { LoginPage } from '@/pages/LoginPage'
 import { DashboardPage } from '@/pages/DashboardPage'
@@ -25,29 +24,13 @@ import { ProtectedRoute } from '@/components/layout/ProtectedRoute'
 
 export default function App() {
   const { isAuthenticated, loadUser } = useAuthStore()
+  const { load: loadAppearance } = useAppearanceStore()
 
   useEffect(() => {
-    if (isAuthenticated) loadUser()
-  }, [])
-
-  // Apply saved appearance settings on initial load
-  useEffect(() => {
-    apiGet<AppearanceSettings>('/appearance').then((data) => {
-      if (data.siteName) document.title = data.siteName
-      if (data.faviconUrl) {
-        let link = document.querySelector<HTMLLinkElement>("link[rel~='icon']")
-        if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link) }
-        link.href = data.faviconUrl
-      }
-      const styleId = 'visioncore-custom-css'
-      let style = document.getElementById(styleId) as HTMLStyleElement | null
-      if (!style) { style = document.createElement('style'); style.id = styleId; document.head.appendChild(style) }
-      style.textContent = data.customCss || ''
-      if (data.primaryColor) {
-        document.documentElement.style.setProperty('--brand-500', data.primaryColor)
-        document.documentElement.style.setProperty('--brand-600', data.accentColor || data.primaryColor)
-      }
-    }).catch(() => {})
+    // Validate/rehydrate session on every page load.
+    loadUser()
+    // Load appearance and apply globally (title, favicon, CSS vars).
+    loadAppearance()
   }, [])
 
   // Limpiar sesión sin recargar la página cuando el refresh falla.

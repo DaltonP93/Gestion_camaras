@@ -4,7 +4,8 @@ import {
   Save, RotateCcw, Shield, Moon, Sun,
   SidebarOpen, Eye, Code2, Check, Image, AlertTriangle, Upload,
 } from 'lucide-react'
-import { apiGet, apiPut, apiUpload } from '@/lib/api'
+import { apiGet, apiPut, apiUpload, resolveAssetUrl } from '@/lib/api'
+import { useAppearanceStore } from '@/stores/appearanceStore'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
 import type { AppearanceSettings } from '@/types'
@@ -94,6 +95,7 @@ function ImageUrlInput({
   const [imgError, setImgError] = useState(false)
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const resolvedValue = resolveAssetUrl(value) || value
   const showPreview = !!value && !imgError
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -137,7 +139,7 @@ function ImageUrlInput({
       <div className="flex items-center gap-2">
         {showPreview ? (
           <img
-            src={value}
+            src={resolvedValue}
             alt="preview"
             className={clsx('object-contain flex-shrink-0 rounded', previewClass)}
             onError={() => setImgError(true)}
@@ -212,7 +214,7 @@ function PreviewCard({ settings }: { settings: AppearanceSettings }) {
         <div className="mx-auto flex-shrink-0">
           {settings.sidebarLogoUrl ? (
             <img
-              src={settings.sidebarLogoUrl}
+              src={resolveAssetUrl(settings.sidebarLogoUrl) || settings.sidebarLogoUrl}
               alt="logo"
               className="w-7 h-7 object-contain rounded"
               onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
@@ -243,7 +245,7 @@ function PreviewCard({ settings }: { settings: AppearanceSettings }) {
         <div className="flex items-center gap-1.5">
           {settings.logoUrl && (
             <img
-              src={settings.logoUrl}
+              src={resolveAssetUrl(settings.logoUrl) || settings.logoUrl}
               alt="logo"
               className="h-4 object-contain"
               onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
@@ -277,10 +279,11 @@ function applyAppearance(s: AppearanceSettings) {
   if (s.siteName) document.title = s.siteName
 
   // Favicon
-  if (s.faviconUrl) {
+  const resolvedFavicon = resolveAssetUrl(s.faviconUrl)
+  if (resolvedFavicon) {
     let link = document.querySelector<HTMLLinkElement>("link[rel~='icon']")
     if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link) }
-    link.href = s.faviconUrl
+    link.href = resolvedFavicon
   }
 
   // Custom CSS injection
@@ -301,6 +304,7 @@ function applyAppearance(s: AppearanceSettings) {
 type Tab = 'branding' | 'apariencia' | 'sidebar' | 'advanced'
 
 export function AppearancePage() {
+  const { apply: applyGlobal } = useAppearanceStore()
   const [settings, setSettings]   = useState<AppearanceSettings>(DEFAULTS)
   const [saved, setSaved]         = useState<AppearanceSettings>(DEFAULTS)
   const [isLoading, setIsLoading] = useState(true)
@@ -354,6 +358,7 @@ export function AppearancePage() {
       setSaved(clean)
       setSettings(clean)
       applyAppearance(clean)
+      applyGlobal(clean)  // propagate to all components via store
       toast.success('Apariencia guardada')
     } catch {
       toast.error('Error al guardar apariencia')
