@@ -214,3 +214,123 @@ export async function getAllChannelsVideoConfig(
   )
   return results
 }
+
+// ─── Write API ────────────────────────────────────────────────────────────────
+
+export interface VideoStreamUpdate {
+  videoCodecType?: string      // 'H.264' | 'H.265' | 'H.264+'| 'H.265+'
+  width?: number
+  height?: number
+  fps?: number                 // will be stored as fps*100 for Hikvision
+  bitrateType?: string         // 'CBR' | 'VBR'
+  bitrateMax?: number          // kbps
+  qualityLevel?: string
+  audioEnabled?: boolean
+  audioCodecType?: string
+  audioBitrate?: number
+}
+
+/**
+ * Writes video/audio configuration to NVR for one channel and stream (main=01, sub=02).
+ * Strategy:
+ *   1. GET current XML from ISAPI
+ *   2. Replace only the fields present in `update` using simple XML tag replacement
+ *   3. PUT modified XML back
+ * Returns the updated config by re-reading from NVR after the write.
+ */
+export async function putChannelVideoConfig(
+  nvrId: string,
+  creds: NvrCredentials,
+  channel: number,
+  streamType: 'main' | 'sub',
+  update: VideoStreamUpdate
+): Promise<{ success: boolean; error?: string; config?: ChannelVideoConfig }> {
+  try {
+    function replaceXmlTag(xml: string, tag: string, value: string): string {
+      return xml.replace(
+        new RegExp(`(<${tag}(?:\\s[^>]*)?>)[\\s\\S]*?(</${tag}>)`, 'i'),
+        `$1${value}$2`
+      )
+    }
+
+    const suffix = streamType === 'main' ? '01' : '02'
+    const ch = String(channel).padStart(2, '0')
+    const endpoint = `/ISAPI/Streaming/channels/${ch}${suffix}`
+
+    const client = makeClient(creds)
+
+    // 1. GET current XML
+    const getRes = await client.get<string>(endpoint)
+    let xml: string = typeof getRes.data === 'string'
+      ? getRes.data
+      : JSON.stringify(getRes.data)
+
+    // 2. Apply field replacements
+    if (update.videoCodecType !== undefined) {
+      xml = replaceXmlTag(xml, 'videoCodecType', update.videoCodecType)
+    }
+    if (update.width !== undefined) {
+      xml = replaceXmlTag(xml, 'videoResolutionWidth', String(update.width))
+    }
+    if (update.height !== undefined) {
+      xml = replaceXmlTag(xml, 'videoResolutionHeight', String(update.height))
+    }
+    if (update.fps !== undefined) {
+      const fpsVal = String(update.fps * 100)
+      if (/<maxFrameRate[\s>]/i.test(xml)) {
+        xml = replaceXmlTag(xml, 'maxFrameRate', fpsVal)
+      } else {
+        xml = replaceXmlTag(xml, 'frameRate', fpsVal)
+      }
+    }
+    if (update.bitrateType !== undefined) {
+      if (/<videoQualityControlType[\s>]/i.test(xml)) {
+        xml = replaceXmlTag(xml, 'videoQualityControlType', update.bitrateType)
+      } else {
+        xml = replaceXmlTag(xml, 'bitrateType', update.bitrateType)
+      }
+    }
+    if (update.bitrateMax !== undefined) {
+      if (/<videoBitRate[\s>]/i.test(xml)) {
+        xml = replaceXmlTag(xml, 'videoBitRate', String(update.bitrateMax))
+      } else {
+        xml = replaceXmlTag(xml, 'constantBitRate', String(update.bitrateMax))
+      }
+    }
+    if (update.qualityLevel !== undefined) {
+      if (/<fixedQuality[\s>]/i.test(xml)) {
+        xml = replaceXmlTag(xml, 'fixedQuality', update.qualityLevel)
+      } else {
+        xml = replaceXmlTag(xml, 'videoQuality', update.qualityLevel)
+      }
+    }
+    if (update.audioEnabled !== undefined) {
+      xml = replaceXmlTag(xml, 'enabled', update.audioEnabled ? 'true' : 'false')
+    }
+    if (update.audioCodecType !== undefined) {
+      if (/<audioCompressionType[\s>]/i.test(xml)) {
+        xml = replaceXmlTag(xml, 'audioCompressionType', update.audioCodecType)
+      } else {
+        xml = replaceXmlTag(xml, 'audioCodecType', update.audioCodecType)
+      }
+    }
+    if (update.audioBitrate !== undefined) {
+      xml = replaceXmlTag(xml, 'audioBitRate', String(update.audioBitrate))
+    }
+
+    // 3. PUT modified XML back
+    const putRes = await client.put(endpoint, xml, {
+      headers: { 'Content-Type': 'application/xml' },
+    })
+
+    if (putRes.status < 200 || putRes.status >= 300) {
+      return { success: false, error: putRes.statusText }
+    }
+
+    // 4. Re-read and return the updated config
+    const freshConfig = await getChannelVideoConfig(nvrId, creds, channel)
+    return { success: true, config: freshConfig }
+  } catch (err: any) {
+    return { success: false, error: err.message }
+  }
+}
