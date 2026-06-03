@@ -1,10 +1,10 @@
 // src/pages/AppearancePage.tsx
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Save, RotateCcw, Shield, Moon, Sun,
-  SidebarOpen, Eye, Code2, Check, Image, AlertTriangle,
+  SidebarOpen, Eye, Code2, Check, Image, AlertTriangle, Upload,
 } from 'lucide-react'
-import { apiGet, apiPut } from '@/lib/api'
+import { apiGet, apiPut, apiUpload } from '@/lib/api'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
 import type { AppearanceSettings } from '@/types'
@@ -80,15 +80,55 @@ function ImageUrlInput({
   value,
   onChange,
   previewClass = 'h-8',
+  fieldName,
+  onUpload,
 }: {
   label: string
   hint?: string
   value: string
   onChange: (v: string) => void
   previewClass?: string
+  fieldName?: string
+  onUpload?: (url: string) => void
 }) {
   const [imgError, setImgError] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const showPreview = !!value && !imgError
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file || !fieldName || !onUpload) return
+
+    const ALLOWED = ['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml', 'image/x-icon']
+    if (!ALLOWED.includes(file.type)) {
+      toast.error('Formato no permitido. Use PNG, JPG, WebP, SVG o ICO.')
+      return
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast.error('El archivo no puede superar 2 MB')
+      return
+    }
+
+    setUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append(fieldName, file)
+      const result = await apiUpload<AppearanceSettings>('/appearance/upload', fd)
+      const url = fieldName === 'favicon' ? result.faviconUrl :
+                  fieldName === 'sidebarLogo' ? result.sidebarLogoUrl : result.logoUrl
+      if (url) {
+        onUpload(url)
+        setImgError(false)
+        toast.success('Imagen subida')
+      }
+    } catch {
+      toast.error('Error al subir la imagen')
+    } finally {
+      setUploading(false)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
 
   return (
     <div>
@@ -117,11 +157,31 @@ function ImageUrlInput({
             onChange(e.target.value)
           }}
         />
+        {fieldName && onUpload && (
+          <>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/svg+xml,image/x-icon"
+              className="hidden"
+              onChange={handleFileChange}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              className="flex-shrink-0 px-2 py-1.5 rounded-lg bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors text-xs disabled:opacity-50"
+              title="Subir archivo"
+            >
+              {uploading ? '…' : <Upload size={12} />}
+            </button>
+          </>
+        )}
         {value && (
           <button
             type="button"
             onClick={() => { onChange(''); setImgError(false) }}
-            className="text-surface-400 hover:text-surface-200 text-xs px-1"
+            className="text-surface-400 hover:text-surface-200 text-xs px-1 flex-shrink-0"
             title="Limpiar"
           >
             ✕
@@ -459,6 +519,8 @@ export function AppearancePage() {
                     value={settings.logoUrl}
                     onChange={(v) => set('logoUrl', v)}
                     previewClass="h-10 max-w-[120px]"
+                    fieldName="headerLogo"
+                    onUpload={(url) => { set('logoUrl', url); setSaved(prev => ({ ...prev, logoUrl: url })) }}
                   />
                   <ImageUrlInput
                     label="Logo barra lateral"
@@ -466,6 +528,8 @@ export function AppearancePage() {
                     value={settings.sidebarLogoUrl}
                     onChange={(v) => set('sidebarLogoUrl', v)}
                     previewClass="h-8 w-8"
+                    fieldName="sidebarLogo"
+                    onUpload={(url) => { set('sidebarLogoUrl', url); setSaved(prev => ({ ...prev, sidebarLogoUrl: url })) }}
                   />
                   <ImageUrlInput
                     label="Favicon"
@@ -473,6 +537,8 @@ export function AppearancePage() {
                     value={settings.faviconUrl}
                     onChange={(v) => set('faviconUrl', v)}
                     previewClass="h-6 w-6"
+                    fieldName="favicon"
+                    onUpload={(url) => { set('faviconUrl', url); setSaved(prev => ({ ...prev, faviconUrl: url })) }}
                   />
                 </div>
               </>
