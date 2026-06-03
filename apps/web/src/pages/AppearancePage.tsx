@@ -211,6 +211,32 @@ function PreviewCard({ settings }: { settings: AppearanceSettings }) {
   )
 }
 
+// ─── Apply appearance settings to the live document ──────────
+function applyAppearance(s: AppearanceSettings) {
+  // Page title
+  if (s.siteName) document.title = s.siteName
+
+  // Favicon
+  if (s.faviconUrl) {
+    let link = document.querySelector<HTMLLinkElement>("link[rel~='icon']")
+    if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link) }
+    link.href = s.faviconUrl
+  }
+
+  // Custom CSS injection
+  const styleId = 'visioncore-custom-css'
+  let style = document.getElementById(styleId) as HTMLStyleElement | null
+  if (!style) { style = document.createElement('style'); style.id = styleId; document.head.appendChild(style) }
+  style.textContent = s.customCss || ''
+
+  // CSS variables for primary/accent colors (override Tailwind brand palette)
+  const root = document.documentElement
+  if (s.primaryColor) {
+    root.style.setProperty('--brand-500', s.primaryColor)
+    root.style.setProperty('--brand-600', s.accentColor || s.primaryColor)
+  }
+}
+
 // ─── Main component ───────────────────────────────────────────
 type Tab = 'branding' | 'apariencia' | 'sidebar' | 'advanced'
 
@@ -225,7 +251,6 @@ export function AppearancePage() {
   useEffect(() => {
     apiGet<AppearanceSettings>('/appearance')
       .then((data) => {
-        // Ensure all string fields are never null/undefined
         const clean: AppearanceSettings = {
           ...DEFAULTS,
           ...data,
@@ -236,6 +261,7 @@ export function AppearancePage() {
         }
         setSettings(clean)
         setSaved(clean)
+        applyAppearance(clean)
       })
       .finally(() => setIsLoading(false))
   }, [])
@@ -267,6 +293,7 @@ export function AppearancePage() {
       }
       setSaved(clean)
       setSettings(clean)
+      applyAppearance(clean)
       toast.success('Apariencia guardada')
     } catch {
       toast.error('Error al guardar apariencia')

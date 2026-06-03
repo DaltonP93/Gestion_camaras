@@ -96,6 +96,7 @@ interface Props {
   onFullscreen?: () => void
   onDiagnostic?: (cameraId: string) => void
   onStreamError?: (cameraId: string, err: CameraPlaybackError) => void
+  onPlaying?: (cameraId: string) => void
   onQualitySwitch?: (quality: 'sub' | 'main' | 'main_h264') => void
   onRetry?: (cameraId: string) => void
   className?: string
@@ -117,6 +118,7 @@ export function VideoPlayer({
   onFullscreen,
   onDiagnostic,
   onStreamError,
+  onPlaying,
   onQualitySwitch,
   onRetry,
   className,
@@ -202,6 +204,7 @@ export function VideoPlayer({
         setStatus('playing')
         setInternalError(null)
         setTranscodeStartMsg(null)
+        if (cameraId) onPlaying?.(cameraId)
       })
 
       hls.on(Hls.Events.ERROR, (_, data) => {
