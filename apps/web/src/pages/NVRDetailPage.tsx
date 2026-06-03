@@ -5,7 +5,7 @@ import {
   ArrowLeft, RefreshCw, Power, Wifi, WifiOff,
   HardDrive, Camera, Users, Wrench, Activity,
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
-  Loader2, Play, RotateCcw, Stethoscope, Plus, X,
+  Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
   Copy, Download, ChevronDown, Zap,
 } from 'lucide-react'
@@ -853,6 +853,20 @@ function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolea
   return <span className="text-surface-600 text-[11px]">No leído</span>
 }
 
+// Highlight matching substring in text
+function Highlight({ text, query }: { text: string; query: string }) {
+  if (!query) return <>{text}</>
+  const idx = text.toLowerCase().indexOf(query.toLowerCase())
+  if (idx < 0) return <>{text}</>
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark className="bg-brand-500/30 text-brand-200 rounded-sm px-0.5">{text.slice(idx, idx + query.length)}</mark>
+      {text.slice(idx + query.length)}
+    </>
+  )
+}
+
 function CamerasTab({
   cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus, lastSyncResult, onValidateHealth, validatingHealth,
 }: {
@@ -876,6 +890,8 @@ function CamerasTab({
   const [isapDebugLoading, setIsapDebugLoading] = useState(false)
   const [isapDebugError, setIsapDebugError] = useState<string | null>(null)
   const [showDebug, setShowDebug] = useState(false)
+  const [cameraSearch, setCameraSearch] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'online' | 'offline'>('all')
 
   const handleIsapDebug = async () => {
     setShowDebug(true)
@@ -896,12 +912,61 @@ function CamerasTab({
 
   if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
 
-  const list = cameras?.fromDb || []
+  const allCameras = cameras?.fromDb || []
+  const q = cameraSearch.trim().toLowerCase()
+  const list = allCameras.filter((cam) => {
+    if (statusFilter === 'online' && !cam.online) return false
+    if (statusFilter === 'offline' && cam.online) return false
+    if (!q) return true
+    const codec = (cam.subCodec || cam.mainCodec || '').toLowerCase()
+    const resolution = (cam.subResolution || cam.mainResolution || '').toLowerCase()
+    return (
+      cam.name.toLowerCase().includes(q) ||
+      (cam.channelCode || `D${cam.channel}`).toLowerCase().includes(q) ||
+      (cam.ipAddress || '').toLowerCase().includes(q) ||
+      (cam.location || '').toLowerCase().includes(q) ||
+      codec.includes(q) ||
+      resolution.includes(q)
+    )
+  })
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <span className="text-sm text-surface-400">{list.length} cámaras en base de datos · {cameras?.fromNvr.length || 0} detectadas en NVR</span>
+      {/* Search + filters bar */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-[200px] max-w-xs">
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-surface-400 pointer-events-none" />
+          <input
+            type="text"
+            placeholder="Buscar por nombre, canal, IP, codec..."
+            value={cameraSearch}
+            onChange={(e) => setCameraSearch(e.target.value)}
+            className="w-full pl-8 pr-8 py-1.5 rounded-lg bg-surface-900 border border-surface-600 text-surface-100 text-xs placeholder-surface-500 focus:outline-none focus:border-brand-500 transition-colors"
+          />
+          {cameraSearch && (
+            <button
+              onClick={() => setCameraSearch('')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-500 hover:text-surface-200"
+            >
+              <X size={11} />
+            </button>
+          )}
+        </div>
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as 'all' | 'online' | 'offline')}
+          className="input text-xs py-1.5 w-28"
+        >
+          <option value="all">Todos</option>
+          <option value="online">Online</option>
+          <option value="offline">Offline</option>
+        </select>
+        <span className="text-xs text-surface-500 ml-1">
+          {q || statusFilter !== 'all'
+            ? <><span className="text-brand-400 font-medium">{list.length}</span> de {allCameras.length}</>
+            : <>{allCameras.length} cámaras en BD · {cameras?.fromNvr.length || 0} en NVR</>}
+        </span>
+        <div className="flex-1" />
         <div className="flex gap-2">
           {isAdmin && (
             <button onClick={() => setShowAdopt(true)} className="btn-primary text-xs">
@@ -962,11 +1027,18 @@ function CamerasTab({
               const lastError = (cam as any).lastRtspError || ''
               return (
                 <tr key={cam.id} className="hover:bg-surface-700/30 transition-colors">
-                  <td className="px-3 py-2 text-surface-300 font-mono">{cam.channelCode || `D${cam.channel}`}</td>
-                  <td className="px-3 py-2 text-surface-100 font-medium max-w-[140px] truncate" title={cam.name}>{cam.name}</td>
+                  <td className="px-3 py-2 text-surface-300 font-mono">
+                    <Highlight text={cam.channelCode || `D${cam.channel}`} query={q} />
+                  </td>
+                  <td className="px-3 py-2 text-surface-100 font-medium max-w-[140px] truncate" title={cam.name}>
+                    <Highlight text={cam.name} query={q} />
+                  </td>
                   <td className="px-3 py-2 text-surface-400 whitespace-nowrap">
                     {(cam.ipAddress || fromNvr?.ipAddress) ? (
-                      <span>{cam.ipAddress || fromNvr?.ipAddress}<span className="text-surface-600">:{cam.managementPort || fromNvr?.managementPort || '—'}</span></span>
+                      <span>
+                        <Highlight text={cam.ipAddress || fromNvr?.ipAddress || ''} query={q} />
+                        <span className="text-surface-600">:{cam.managementPort || fromNvr?.managementPort || '—'}</span>
+                      </span>
                     ) : <span className="text-surface-600 text-[11px]">No leído</span>}
                   </td>
                   <td className="px-3 py-2 text-surface-400">{cam.protocol || fromNvr?.protocol || <span className="text-surface-600 text-[11px]">No leído</span>}</td>
@@ -1028,7 +1100,9 @@ function CamerasTab({
         </table>
         {list.length === 0 && (
           <div className="py-10 text-center text-surface-500 text-sm">
-            Sin cámaras — Usa "Sincronizar" para importar desde el NVR
+            {q || statusFilter !== 'all'
+              ? 'Sin cámaras que coincidan con la búsqueda'
+              : 'Sin cámaras — Usa "Sincronizar" para importar desde el NVR'}
           </div>
         )}
       </div>
