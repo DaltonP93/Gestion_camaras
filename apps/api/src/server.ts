@@ -138,11 +138,70 @@ async function main() {
   await server.register(wsHandler, { prefix: '/ws' })
 
   // ─── Health check ─────────────────────────────────────────
-  server.get('/health', async () => ({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    version: '1.0.0',
-  }))
+  const FASTIFY_VERSION: string = (() => {
+    try { return (require('fastify/package.json') as { version: string }).version } catch { return '5.x' }
+  })()
+  const API_VERSION: string = (() => {
+    try { return (require('../package.json') as { version: string }).version } catch { return '1.0.0' }
+  })()
+
+  // Basic liveness — no auth required
+  server.get('/api/health', { logLevel: 'warn' }, async (_req, reply) => {
+    return reply.send({
+      ok:      true,
+      service: 'visioncore-api',
+      version: API_VERSION,
+      fastify: FASTIFY_VERSION,
+      time:    new Date().toISOString(),
+    })
+  })
+
+  // Deep readiness — checks DB, Redis and MediaMTX
+  server.get('/api/health/deep', { logLevel: 'warn' }, async (_req, reply) => {
+    const checks: Record<string, { ok: boolean; latencyMs?: number; error?: string }> = {}
+    let allOk = true
+
+    // PostgreSQL via Prisma
+    try {
+      const t0 = Date.now()
+      await server.prisma.$queryRaw`SELECT 1`
+      checks.postgres = { ok: true, latencyMs: Date.now() - t0 }
+    } catch (e: any) {
+      checks.postgres = { ok: false, error: e?.message ?? 'unknown' }
+      allOk = false
+    }
+
+    // Redis
+    try {
+      const t0 = Date.now()
+      await server.redis.ping()
+      checks.redis = { ok: true, latencyMs: Date.now() - t0 }
+    } catch (e: any) {
+      checks.redis = { ok: false, error: e?.message ?? 'unknown' }
+      allOk = false
+    }
+
+    // MediaMTX (HTTP API on port 9997)
+    try {
+      const mediamtxUrl = process.env.MEDIAMTX_API_URL || 'http://mediamtx:9997'
+      const t0 = Date.now()
+      const res = await fetch(`${mediamtxUrl}/v3/config/global/get`, { signal: AbortSignal.timeout(3000) })
+      checks.mediamtx = { ok: res.ok, latencyMs: Date.now() - t0 }
+      if (!res.ok) allOk = false
+    } catch (e: any) {
+      checks.mediamtx = { ok: false, error: e?.message ?? 'unreachable' }
+      allOk = false
+    }
+
+    return reply.status(allOk ? 200 : 503).send({
+      ok:      allOk,
+      service: 'visioncore-api',
+      version: API_VERSION,
+      fastify: FASTIFY_VERSION,
+      time:    new Date().toISOString(),
+      checks,
+    })
+  })
 
   // ─── Jobs en background ───────────────────────────────────
   startHealthWorker(server)
