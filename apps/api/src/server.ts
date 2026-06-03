@@ -24,6 +24,7 @@ import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
 import { searchRoutes } from './routes/search'
+import { nvrConfigRoutes } from './routes/nvrConfig'
 import { startHealthWorker } from './jobs/healthWorker'
 import { publishStream } from './services/stream'
 import CryptoJS from 'crypto-js'
@@ -133,6 +134,7 @@ async function main() {
   await server.register(alertSettingsRoutes, { prefix: '/api/alerts' })
   await server.register(liveViewRoutes, { prefix: '/api/live-view' })
   await server.register(searchRoutes, { prefix: '/api/search' })
+  await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
   await server.register(wsHandler, { prefix: '/ws' })
 
   // ─── Health check ─────────────────────────────────────────

@@ -7,16 +7,16 @@ import {
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
   Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
-  Copy, Download, ChevronDown, Zap,
+  Copy, Download, ChevronDown, Zap, Video as VideoIcon,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
-import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics } from '@/types'
+import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, VideoStreamConfig } from '@/types'
 import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
 
-type Tab = 'summary' | 'cameras' | 'storage' | 'users' | 'maintenance' | 'diagnostics'
+type Tab = 'summary' | 'cameras' | 'storage' | 'users' | 'maintenance' | 'diagnostics' | 'video'
 
 export function NVRDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -329,12 +329,13 @@ export function NVRDetailPage() {
   }
 
   const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
-    { id: 'summary',     label: 'Resumen',       icon: <Activity size={14} /> },
-    { id: 'cameras',     label: 'Cámaras IP',    icon: <Camera size={14} /> },
+    { id: 'summary',     label: 'Resumen',        icon: <Activity size={14} /> },
+    { id: 'cameras',     label: 'Cámaras IP',     icon: <Camera size={14} /> },
+    { id: 'video',       label: 'Video y audio',  icon: <VideoIcon size={14} /> },
     { id: 'storage',     label: 'Almacenamiento', icon: <HardDrive size={14} /> },
-    { id: 'users',       label: 'Usuarios NVR',  icon: <Users size={14} /> },
-    { id: 'maintenance', label: 'Mantenimiento', icon: <Wrench size={14} /> },
-    { id: 'diagnostics', label: 'Diagnóstico',   icon: <Stethoscope size={14} /> },
+    { id: 'users',       label: 'Usuarios NVR',   icon: <Users size={14} /> },
+    { id: 'maintenance', label: 'Mantenimiento',  icon: <Wrench size={14} /> },
+    { id: 'diagnostics', label: 'Diagnóstico',    icon: <Stethoscope size={14} /> },
   ]
 
   if (loading) {
@@ -446,6 +447,7 @@ export function NVRDetailPage() {
           validatingHealth={validatingHealth}
         />
       )}
+      {tab === 'video' && <VideoAudioTab nvrId={nvr.id} dbCameras={cameras?.fromDb || []} />}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} supported={storageSupported} unsupportedReason={storageUnsupportedReason} onRefresh={loadStorage} />}
       {tab === 'users'   && <UsersTab nvrId={nvr.id} users={nvrUsers} loading={loadingUsers} supported={usersSupported} unsupportedReason={usersUnsupportedReason} onRefresh={loadUsers} isAdmin={isAdmin} />}
       {tab === 'maintenance' && <MaintenanceTab nvr={nvr} onSync={handleSync} onReboot={handleReboot} onValidateHealth={handleValidateHealth} syncing={syncing} rebooting={rebooting} validatingHealth={validatingHealth} isAdmin={isAdmin} isSupervisor={isSupervisor} />}
@@ -1209,6 +1211,238 @@ function CamerasTab({
           onRetest={handleIsapDebug}
           onClose={() => setShowDebug(false)}
         />
+      )}
+    </div>
+  )
+}
+
+// ─── Video / Audio Tab ────────────────────────────────────────
+
+function StreamConfigCard({ config, label }: { config: VideoStreamConfig; label: string }) {
+  const isH265 = config.videoCodecType.toLowerCase().includes('h.265') || config.videoCodecType.toLowerCase().includes('h265') || config.videoCodecType.toLowerCase().includes('hevc')
+
+  const rows: [string, React.ReactNode][] = [
+    ['Codec',     <span className={clsx(isH265 ? 'text-amber-400 font-medium' : 'text-surface-200')}>{config.videoCodecType || '—'}{config.h265Plus && <span className="ml-1 text-[10px] bg-amber-900/40 text-amber-400 px-1 rounded">H.265+</span>}</span>],
+    ['Resolución', `${config.width}×${config.height}` === '0×0' ? '—' : `${config.width}×${config.height}`],
+    ['FPS',       config.fps > 0 ? `${config.fps} fps` : '—'],
+    ['Bitrate',   config.bitrateType ? `${config.bitrateType} · ${config.bitrateMax > 0 ? `${config.bitrateMax} kbps` : '—'}` : '—'],
+    ['Calidad',   config.qualityLevel || '—'],
+    ['Escaneo',   config.videoScanType || '—'],
+    ['Audio',     config.audioEnabled ? `Activo · ${config.audioCodecType || '—'} · ${config.audioBitrate > 0 ? `${config.audioBitrate} kbps` : '—'}` : 'Desactivado'],
+  ]
+
+  return (
+    <div className="bg-surface-750 rounded-lg p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-xs font-semibold text-surface-300">{label}</span>
+        {isH265 && (
+          <span className="flex items-center gap-1 text-[10px] text-amber-400 bg-amber-900/20 border border-amber-900/40 px-1.5 py-0.5 rounded">
+            <AlertTriangle size={9} /> HEVC — puede requerir transcodificación en navegadores
+          </span>
+        )}
+      </div>
+      <dl className="space-y-1.5">
+        {rows.map(([lbl, val]) => (
+          <div key={lbl} className="flex items-center justify-between text-xs">
+            <dt className="text-surface-500 w-24 flex-shrink-0">{lbl}</dt>
+            <dd className="text-surface-200 text-right">{val}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+}
+
+function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraType[] }) {
+  const [configs, setConfigs] = useState<ChannelVideoConfig[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [selectedChannel, setSelectedChannel] = useState<number | null>(null)
+  const [loadingSingle, setLoadingSingle] = useState(false)
+
+  const selectedConfig = configs.find((c) => c.channel === selectedChannel)
+
+  const loadAll = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const data = await apiGet<ChannelVideoConfig[]>(`/nvrs/${nvrId}/channels/video-config`)
+      setConfigs(data)
+      if (data.length > 0 && selectedChannel === null) {
+        setSelectedChannel(data[0].channel)
+      }
+    } catch (e: any) {
+      setError(e?.response?.data?.message || 'Error al obtener configuración de video')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const loadSingle = async (channel: number) => {
+    setLoadingSingle(true)
+    try {
+      const data = await apiGet<ChannelVideoConfig>(`/nvrs/${nvrId}/channels/${channel}/video-config`)
+      setConfigs((prev) => {
+        const idx = prev.findIndex((c) => c.channel === channel)
+        if (idx >= 0) return prev.map((c) => c.channel === channel ? data : c)
+        return [...prev, data].sort((a, b) => a.channel - b.channel)
+      })
+    } catch {
+      // error handled by api lib
+    } finally {
+      setLoadingSingle(false)
+    }
+  }
+
+  useEffect(() => {
+    if (dbCameras.length > 0) loadAll()
+  }, [nvrId])
+
+  const selected = selectedChannel !== null ? dbCameras.find((c) => c.channel === selectedChannel) : null
+
+  if (loading) {
+    return (
+      <div className="space-y-3">
+        <div className="flex justify-end">
+          <span className="text-xs text-surface-500 flex items-center gap-1.5">
+            <Loader2 size={12} className="animate-spin" /> Leyendo configuración del NVR...
+          </span>
+        </div>
+        <div className="card p-8 text-center">
+          <Loader2 size={20} className="animate-spin text-surface-400 mx-auto" />
+          <p className="text-sm text-surface-400 mt-2">Consultando ISAPI para {dbCameras.length} canales...</p>
+          <p className="text-xs text-surface-600 mt-1">Esto puede tomar algunos segundos</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm font-medium text-surface-200">Configuración de video y audio por canal</p>
+          <p className="text-xs text-surface-500 mt-0.5">
+            Lectura directa desde el NVR vía ISAPI — solo visualización, sin escritura.
+          </p>
+        </div>
+        <button onClick={loadAll} disabled={loading} className="btn-secondary text-xs">
+          <RefreshCw size={12} /> Actualizar
+        </button>
+      </div>
+
+      {error && (
+        <div className="flex items-start gap-2 p-3 bg-red-900/20 border border-red-900/40 rounded-lg text-xs text-red-400">
+          <XCircle size={13} className="flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="font-medium">No se pudo leer la configuración</p>
+            <p className="mt-0.5 text-red-400/80">{error}</p>
+          </div>
+        </div>
+      )}
+
+      {configs.length === 0 && !loading && !error && (
+        <div className="card p-8 text-center space-y-2">
+          <VideoIcon size={20} className="mx-auto text-surface-500" />
+          <p className="text-sm text-surface-400">Sin canales disponibles</p>
+          <p className="text-xs text-surface-600">Sincroniza las cámaras IP primero</p>
+        </div>
+      )}
+
+      {configs.length > 0 && (
+        <div className="flex gap-4">
+          {/* Channel sidebar */}
+          <div className="w-44 flex-shrink-0 space-y-1">
+            <p className="text-[10px] text-surface-600 uppercase font-semibold tracking-wide px-2 mb-2">Canales</p>
+            {configs.map((cfg) => {
+              const cam = dbCameras.find((c) => c.channel === cfg.channel)
+              const hasError = !!cfg.error
+              const isSelected = cfg.channel === selectedChannel
+              return (
+                <button
+                  key={cfg.channel}
+                  onClick={() => setSelectedChannel(cfg.channel)}
+                  className={clsx(
+                    'w-full text-left px-3 py-2 rounded-lg text-xs transition-colors',
+                    isSelected
+                      ? 'bg-brand-600/20 border border-brand-600/40 text-brand-300'
+                      : 'text-surface-400 hover:bg-surface-700 hover:text-surface-200'
+                  )}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0',
+                      hasError ? 'bg-surface-600' : cam?.online ? 'bg-green-400' : 'bg-surface-600'
+                    )} />
+                    <span className="font-mono font-medium">{(cam as any)?.channelCode || `D${cfg.channel}`}</span>
+                  </div>
+                  <p className="text-[10px] text-surface-500 truncate mt-0.5">{cam?.name || `Canal ${cfg.channel}`}</p>
+                  {hasError && <p className="text-[10px] text-red-400/70 mt-0.5">Sin datos</p>}
+                </button>
+              )
+            })}
+          </div>
+
+          {/* Config panel */}
+          <div className="flex-1 min-w-0">
+            {selectedConfig ? (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-surface-100">
+                      {(selected as any)?.channelCode || `D${selectedConfig.channel}`} — {selected?.name || `Canal ${selectedConfig.channel}`}
+                    </p>
+                    <p className="text-[10px] text-surface-500 mt-0.5">
+                      Leído a las {new Date(selectedConfig.fetchedAt).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => loadSingle(selectedConfig.channel)}
+                    disabled={loadingSingle}
+                    className="btn-ghost text-xs"
+                    title="Refrescar este canal"
+                  >
+                    {loadingSingle ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+                    Refrescar
+                  </button>
+                </div>
+
+                {selectedConfig.error ? (
+                  <div className="p-4 bg-surface-750 rounded-lg text-xs text-surface-500 text-center">
+                    <XCircle size={16} className="mx-auto mb-2 text-surface-600" />
+                    {selectedConfig.error}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {selectedConfig.main && (
+                      <StreamConfigCard config={selectedConfig.main} label="Flujo principal (Main)" />
+                    )}
+                    {selectedConfig.sub && (
+                      <StreamConfigCard config={selectedConfig.sub} label="Flujo secundario (Sub)" />
+                    )}
+                    {!selectedConfig.main && !selectedConfig.sub && (
+                      <div className="col-span-2 p-6 bg-surface-750 rounded-lg text-center text-xs text-surface-500">
+                        Sin datos de configuración para este canal
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex items-start gap-2 p-3 bg-surface-750 rounded-lg text-xs text-surface-500 border border-surface-700">
+                  <AlertTriangle size={12} className="flex-shrink-0 mt-0.5 text-amber-500" />
+                  <p>
+                    Esta vista es <span className="font-medium text-surface-400">solo lectura</span>.
+                    La edición de parámetros de video (codec, resolución, FPS, bitrate) estará disponible
+                    en la próxima versión junto con backup automático y confirmación explícita antes de escribir al NVR.
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div className="card p-8 text-center text-xs text-surface-500">
+                Selecciona un canal para ver su configuración
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )
