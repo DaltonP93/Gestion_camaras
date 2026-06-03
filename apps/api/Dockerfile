@@ -37,6 +37,11 @@ EXPOSE 4000
 
 ENV NODE_ENV=production
 
+# Bake the git commit SHA into the image at build time.
+# Pass via: docker build --build-arg COMMIT_SHA=$(git rev-parse --short HEAD) ...
+ARG COMMIT_SHA=development
+ENV COMMIT_SHA=$COMMIT_SHA
+
 ENTRYPOINT ["dumb-init", "--"]
 # Use the local Prisma CLI (production dep) — never the global npx one
 CMD ["sh", "-c", "./node_modules/.bin/prisma migrate deploy --schema=./prisma/schema.prisma && node dist/server.js"]

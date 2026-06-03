@@ -139,13 +139,52 @@ async function main() {
 
   const COMMIT_SHA = process.env.COMMIT_SHA || 'development'
 
-  // ─── Health check ─────────────────────────────────────────
-  server.get('/health', async () => ({
+  // ─── Health checks (public, no auth) ──────────────────────
+  // /health        — acceso directo en puerto 4000
+  // /api/health    — accesible vía nginx (mismo contenido)
+  // /api/health/deep — comprueba DB y Redis
+
+  const healthResponse = () => ({
     status: 'ok',
     timestamp: new Date().toISOString(),
     version: '1.0.0',
     commit: COMMIT_SHA,
-  }))
+  })
+
+  server.get('/health',     async () => healthResponse())
+  server.get('/api/health', async () => healthResponse())
+
+  server.get('/api/health/deep', async (_request, reply) => {
+    let dbOk = false
+    let dbLatencyMs = -1
+    try {
+      const t0 = Date.now()
+      await server.prisma.$queryRaw`SELECT 1`
+      dbLatencyMs = Date.now() - t0
+      dbOk = true
+    } catch {}
+
+    let redisOk = false
+    let redisLatencyMs = -1
+    try {
+      const t0 = Date.now()
+      await server.redis.ping()
+      redisLatencyMs = Date.now() - t0
+      redisOk = true
+    } catch {}
+
+    const healthy = dbOk && redisOk
+    return reply.status(healthy ? 200 : 503).send({
+      status: healthy ? 'ok' : 'degraded',
+      timestamp: new Date().toISOString(),
+      version: '1.0.0',
+      commit: COMMIT_SHA,
+      checks: {
+        db:    { ok: dbOk,    latencyMs: dbLatencyMs },
+        redis: { ok: redisOk, latencyMs: redisLatencyMs },
+      },
+    })
+  })
 
   // ─── Jobs en background ───────────────────────────────────
   startHealthWorker(server)

@@ -1,16 +1,17 @@
 -- Migration 0013: normalize localhost URLs in appearance_settings
--- Replaces http://localhost:PORT/uploads/branding/... with /uploads/branding/...
--- Safe to re-run: REGEXP_REPLACE is idempotent; only rows with localhost URLs are updated.
+-- Strips http://localhost:PORT prefix, leaving /uploads/branding/... relative paths.
+-- Idempotent: ILIKE WHERE guard ensures only rows with localhost URLs are touched,
+-- and regexp_replace on an already-clean value is a no-op.
 
 UPDATE "appearance_settings"
 SET
-  "logoUrl"        = REGEXP_REPLACE("logoUrl",        '^https?://localhost(:[0-9]+)?/uploads/', '/uploads/'),
-  "sidebarLogoUrl" = REGEXP_REPLACE("sidebarLogoUrl", '^https?://localhost(:[0-9]+)?/uploads/', '/uploads/'),
-  "faviconUrl"     = REGEXP_REPLACE("faviconUrl",     '^https?://localhost(:[0-9]+)?/uploads/', '/uploads/')
+  "logoUrl"        = regexp_replace("logoUrl",        '^https?://localhost:[0-9]+', ''),
+  "sidebarLogoUrl" = regexp_replace("sidebarLogoUrl", '^https?://localhost:[0-9]+', ''),
+  "faviconUrl"     = regexp_replace("faviconUrl",     '^https?://localhost:[0-9]+', '')
 WHERE
-  "logoUrl"        LIKE 'http://localhost%/uploads/%'
-  OR "logoUrl"     LIKE 'https://localhost%/uploads/%'
-  OR "sidebarLogoUrl" LIKE 'http://localhost%/uploads/%'
-  OR "sidebarLogoUrl" LIKE 'https://localhost%/uploads/%'
-  OR "faviconUrl"  LIKE 'http://localhost%/uploads/%'
-  OR "faviconUrl"  LIKE 'https://localhost%/uploads/%';
+  "logoUrl"        ILIKE 'http://localhost:%'
+  OR "logoUrl"     ILIKE 'https://localhost:%'
+  OR "sidebarLogoUrl" ILIKE 'http://localhost:%'
+  OR "sidebarLogoUrl" ILIKE 'https://localhost:%'
+  OR "faviconUrl"  ILIKE 'http://localhost:%'
+  OR "faviconUrl"  ILIKE 'https://localhost:%';
