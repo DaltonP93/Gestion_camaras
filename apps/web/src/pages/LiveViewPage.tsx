@@ -99,7 +99,10 @@ export function LiveViewPage() {
   const [selectedNVR, setSelectedNVR] = useState<string>(nvrFilter || 'all')
   const [page, setPage]               = useState(0)
   const [highlightCamera, setHighlightCamera] = useState<string | null>(null)
-  const appliedCameraQuery = useRef(false)
+  // Tracks the last cameraFilter value already applied — prevents re-running when cameras
+  // array updates but cameraFilter hasn't changed. Stores the camera id, not a boolean,
+  // so a new search result (different camera) correctly triggers re-navigation.
+  const appliedCameraQuery = useRef<string | null>(null)
   const [streams, setStreams]         = useState<Record<string, StreamInfo>>({})
   const [loadingStreams, setLoadingStreams] = useState<Record<string, boolean>>({})
   const [streamErrors, setStreamErrors]    = useState<Record<string, CameraPlaybackError>>({})
@@ -160,28 +163,40 @@ export function LiveViewPage() {
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
 
   // Handle camera query param: once cameras are loaded, navigate to the correct NVR/page
-  // and highlight the target camera for a few seconds.
+  // and highlight the target camera. Tracks by value (not boolean) so navigating to a
+  // second search result correctly re-fires even if we're already on /live.
   useEffect(() => {
-    if (!cameraFilter || appliedCameraQuery.current || cameras.length === 0) return
+    if (!cameraFilter || appliedCameraQuery.current === cameraFilter || cameras.length === 0) return
     const cam = cameras.find(c => c.id === cameraFilter)
-    console.info(`[LiveView] focusCameraFromQuery cameraId=${cameraFilter} found=${!!cam}`)
-    if (!cam) return
-    appliedCameraQuery.current = true
+    if (!cam) {
+      console.info(`[LiveView] queryCameraResolved cameraId=${cameraFilter} found=false`)
+      return
+    }
+    appliedCameraQuery.current = cameraFilter
 
     const targetNvrId = cam.nvrId
-    setSelectedNVR(targetNvrId)
+    const nvrCams     = cameras.filter(c => c.nvrId === targetNvrId)
+    const camIdx      = nvrCams.findIndex(c => c.id === cameraFilter)
+    const targetPage  = camIdx >= 0 ? Math.floor(camIdx / gridLayout) : 0
+    console.info(`[LiveView] queryCameraResolved cameraId=${cameraFilter} nvrId=${targetNvrId} index=${camIdx} page=${targetPage}`)
 
-    // Calculate the page within that NVR's camera list
-    const nvrCams = cameras.filter(c => c.nvrId === targetNvrId)
-    const camIdx  = nvrCams.findIndex(c => c.id === cameraFilter)
-    const targetPage = camIdx >= 0 ? Math.floor(camIdx / gridLayout) : 0
-    console.info(`[LiveView] globalSearchNavigate cameraId=${cameraFilter} nvrId=${targetNvrId} page=${targetPage}`)
-    setPage(targetPage)
-
-    // Highlight for 4 seconds
+    // Start highlight immediately so it's visible once the grid settles
     setHighlightCamera(cameraFilter)
     setTimeout(() => setHighlightCamera(null), 4000)
-  }, [cameras, cameraFilter, gridLayout])
+
+    const needsNvrSwitch  = selectedNVR !== targetNvrId
+    const needsPageSwitch = safePage !== targetPage
+
+    if (needsNvrSwitch || needsPageSwitch) {
+      // Stop all active streams before switching NVR/page — mirrors handleNVRChange/handlePageChange
+      stopAllSessions('camera_query').then(() => {
+        prevVisibleIds.current = []
+        setSelectedNVR(targetNvrId)
+        setPage(targetPage)
+      })
+    }
+    // If camera is already visible (same NVR, same page) only the highlight is needed
+  }, [cameras, cameraFilter, gridLayout]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     apiGet<{ ffmpegAvailable: boolean; transcodingEnabled: boolean }>('/live-view/capabilities')

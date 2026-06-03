@@ -137,11 +137,14 @@ async function main() {
   await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
   await server.register(wsHandler, { prefix: '/ws' })
 
+  const COMMIT_SHA = process.env.COMMIT_SHA || 'development'
+
   // ─── Health check ─────────────────────────────────────────
   server.get('/health', async () => ({
     status: 'ok',
     timestamp: new Date().toISOString(),
     version: '1.0.0',
+    commit: COMMIT_SHA,
   }))
 
   // ─── Jobs en background ───────────────────────────────────
@@ -152,7 +155,7 @@ async function main() {
   const port = parseInt(process.env.API_PORT || '4000')
 
   await server.listen({ host, port })
-  server.log.info(`VisionCore API corriendo en http://${host}:${port}`)
+  server.log.info(`VisionCore API v1.0.0 commit=${COMMIT_SHA} corriendo en http://${host}:${port}`)
 
   // Re-registrar todos los streams en MediaMTX al arrancar
   // MediaMTX pierde los paths dinámicos al reiniciarse; este bloque los restaura

@@ -37,13 +37,33 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
         data: { id: 'singleton' },
       })
     }
-    // Normalize nullable fields before sending to frontend
+
+    // Normalize legacy http://localhost:PORT/uploads/... paths to relative /uploads/...
+    const normalizeUrl = (v: string | null | undefined): string => {
+      if (!v) return ''
+      return v.replace(/^https?:\/\/localhost(:\d+)?\/uploads\//, '/uploads/')
+    }
+
+    const logoUrl        = normalizeUrl(settings.logoUrl)
+    const sidebarLogoUrl = normalizeUrl(settings.sidebarLogoUrl)
+    const faviconUrl     = normalizeUrl(settings.faviconUrl)
+
+    // Persist normalized values back to DB asynchronously (idempotent — only if changed)
+    const urlUpdates: Record<string, string> = {}
+    if (settings.logoUrl        && settings.logoUrl        !== logoUrl)        urlUpdates.logoUrl        = logoUrl
+    if (settings.sidebarLogoUrl && settings.sidebarLogoUrl !== sidebarLogoUrl) urlUpdates.sidebarLogoUrl = sidebarLogoUrl
+    if (settings.faviconUrl     && settings.faviconUrl     !== faviconUrl)     urlUpdates.faviconUrl     = faviconUrl
+    if (Object.keys(urlUpdates).length > 0) {
+      server.prisma.appearanceSettings.update({ where: { id: 'singleton' }, data: urlUpdates })
+        .catch((e: any) => server.log.warn({ err: e }, '[appearance] failed to persist normalized URLs'))
+    }
+
     return reply.send({
       ...settings,
-      customCss:      settings.customCss      ?? '',
-      logoUrl:        settings.logoUrl        ?? '',
-      sidebarLogoUrl: settings.sidebarLogoUrl ?? '',
-      faviconUrl:     settings.faviconUrl     ?? '',
+      customCss:      settings.customCss ?? '',
+      logoUrl,
+      sidebarLogoUrl,
+      faviconUrl,
     })
   })
 
