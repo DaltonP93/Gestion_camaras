@@ -64,6 +64,10 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
+      args:
+        # Bakes current commit into the image so GET /api/health shows which build is running.
+        # Run: COMMIT_SHA=$(git rev-parse --short HEAD) docker compose up --build
+        COMMIT_SHA: ${COMMIT_SHA:-development}
     container_name: visioncore_api
     restart: unless-stopped
     env_file:
