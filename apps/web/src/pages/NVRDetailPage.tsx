@@ -1,22 +1,22 @@
 // src/pages/NVRDetailPage.tsx
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, RefreshCw, Power, Wifi, WifiOff,
   HardDrive, Camera, Users, Wrench, Activity,
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
-  Loader2, Play, RotateCcw, Stethoscope, Plus, X,
+  Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
-  Copy, Download, ChevronDown, Zap,
+  Copy, Download, ChevronDown, Zap, Video as VideoIcon,
 } from 'lucide-react'
-import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
+import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
-import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics } from '@/types'
+import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, VideoStreamConfig } from '@/types'
 import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
 
-type Tab = 'summary' | 'cameras' | 'storage' | 'users' | 'maintenance' | 'diagnostics'
+type Tab = 'summary' | 'cameras' | 'storage' | 'users' | 'maintenance' | 'diagnostics' | 'video'
 
 export function NVRDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -329,12 +329,13 @@ export function NVRDetailPage() {
   }
 
   const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
-    { id: 'summary',     label: 'Resumen',       icon: <Activity size={14} /> },
-    { id: 'cameras',     label: 'Cámaras IP',    icon: <Camera size={14} /> },
+    { id: 'summary',     label: 'Resumen',        icon: <Activity size={14} /> },
+    { id: 'cameras',     label: 'Cámaras IP',     icon: <Camera size={14} /> },
+    { id: 'video',       label: 'Video y audio',  icon: <VideoIcon size={14} /> },
     { id: 'storage',     label: 'Almacenamiento', icon: <HardDrive size={14} /> },
-    { id: 'users',       label: 'Usuarios NVR',  icon: <Users size={14} /> },
-    { id: 'maintenance', label: 'Mantenimiento', icon: <Wrench size={14} /> },
-    { id: 'diagnostics', label: 'Diagnóstico',   icon: <Stethoscope size={14} /> },
+    { id: 'users',       label: 'Usuarios NVR',   icon: <Users size={14} /> },
+    { id: 'maintenance', label: 'Mantenimiento',  icon: <Wrench size={14} /> },
+    { id: 'diagnostics', label: 'Diagnóstico',    icon: <Stethoscope size={14} /> },
   ]
 
   if (loading) {
@@ -446,6 +447,7 @@ export function NVRDetailPage() {
           validatingHealth={validatingHealth}
         />
       )}
+      {tab === 'video' && <VideoAudioTab nvrId={nvr.id} dbCameras={cameras?.fromDb || []} />}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} supported={storageSupported} unsupportedReason={storageUnsupportedReason} onRefresh={loadStorage} />}
       {tab === 'users'   && <UsersTab nvrId={nvr.id} users={nvrUsers} loading={loadingUsers} supported={usersSupported} unsupportedReason={usersUnsupportedReason} onRefresh={loadUsers} isAdmin={isAdmin} />}
       {tab === 'maintenance' && <MaintenanceTab nvr={nvr} onSync={handleSync} onReboot={handleReboot} onValidateHealth={handleValidateHealth} syncing={syncing} rebooting={rebooting} validatingHealth={validatingHealth} isAdmin={isAdmin} isSupervisor={isSupervisor} />}
@@ -853,6 +855,20 @@ function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolea
   return <span className="text-surface-600 text-[11px]">No leído</span>
 }
 
+// Highlight matching substring in text
+function Highlight({ text, query }: { text: string; query: string }) {
+  if (!query) return <>{text}</>
+  const idx = text.toLowerCase().indexOf(query.toLowerCase())
+  if (idx < 0) return <>{text}</>
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark className="bg-brand-500/30 text-brand-200 rounded-sm px-0.5">{text.slice(idx, idx + query.length)}</mark>
+      {text.slice(idx + query.length)}
+    </>
+  )
+}
+
 function CamerasTab({
   cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus, lastSyncResult, onValidateHealth, validatingHealth,
 }: {
@@ -876,6 +892,46 @@ function CamerasTab({
   const [isapDebugLoading, setIsapDebugLoading] = useState(false)
   const [isapDebugError, setIsapDebugError] = useState<string | null>(null)
   const [showDebug, setShowDebug] = useState(false)
+  const [cameraSearch, setCameraSearch] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'online' | 'offline'>('all')
+  // Inline name editing
+  const [editingNameId, setEditingNameId] = useState<string | null>(null)
+  const [editingNameValue, setEditingNameValue] = useState('')
+  const [savingNameId, setSavingNameId] = useState<string | null>(null)
+  const editNameRef = useRef<HTMLInputElement>(null)
+
+  const startEditName = (cam: CameraType) => {
+    setEditingNameId(cam.id)
+    setEditingNameValue(cam.name)
+    setTimeout(() => editNameRef.current?.select(), 30)
+  }
+
+  const cancelEditName = () => {
+    setEditingNameId(null)
+    setEditingNameValue('')
+  }
+
+  const handleSaveName = async (camId: string) => {
+    const trimmed = editingNameValue.trim()
+    if (!trimmed) return cancelEditName()
+    setSavingNameId(camId)
+    try {
+      const updated = await apiPatch<CameraType>(`/cameras/${camId}/name`, { name: trimmed })
+      // Update local list without re-fetching
+      if (cameras) {
+        const newDb = cameras.fromDb.map((c) => c.id === camId ? { ...c, name: updated.name } : c)
+        // cameras is prop-passed so we can't mutate; parent re-fetch on next interaction
+        // For immediate UI update we track renames locally
+      }
+      toast.success('Nombre actualizado')
+      onRefresh()
+    } catch {
+      // error handled by api lib
+    } finally {
+      setSavingNameId(null)
+      setEditingNameId(null)
+    }
+  }
 
   const handleIsapDebug = async () => {
     setShowDebug(true)
@@ -896,12 +952,61 @@ function CamerasTab({
 
   if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
 
-  const list = cameras?.fromDb || []
+  const allCameras = cameras?.fromDb || []
+  const q = cameraSearch.trim().toLowerCase()
+  const list = allCameras.filter((cam) => {
+    if (statusFilter === 'online' && !cam.online) return false
+    if (statusFilter === 'offline' && cam.online) return false
+    if (!q) return true
+    const codec = (cam.subCodec || cam.mainCodec || '').toLowerCase()
+    const resolution = (cam.subResolution || cam.mainResolution || '').toLowerCase()
+    return (
+      cam.name.toLowerCase().includes(q) ||
+      (cam.channelCode || `D${cam.channel}`).toLowerCase().includes(q) ||
+      (cam.ipAddress || '').toLowerCase().includes(q) ||
+      (cam.location || '').toLowerCase().includes(q) ||
+      codec.includes(q) ||
+      resolution.includes(q)
+    )
+  })
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <span className="text-sm text-surface-400">{list.length} cámaras en base de datos · {cameras?.fromNvr.length || 0} detectadas en NVR</span>
+      {/* Search + filters bar */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-[200px] max-w-xs">
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-surface-400 pointer-events-none" />
+          <input
+            type="text"
+            placeholder="Buscar por nombre, canal, IP, codec..."
+            value={cameraSearch}
+            onChange={(e) => setCameraSearch(e.target.value)}
+            className="w-full pl-8 pr-8 py-1.5 rounded-lg bg-surface-900 border border-surface-600 text-surface-100 text-xs placeholder-surface-500 focus:outline-none focus:border-brand-500 transition-colors"
+          />
+          {cameraSearch && (
+            <button
+              onClick={() => setCameraSearch('')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-500 hover:text-surface-200"
+            >
+              <X size={11} />
+            </button>
+          )}
+        </div>
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as 'all' | 'online' | 'offline')}
+          className="input text-xs py-1.5 w-28"
+        >
+          <option value="all">Todos</option>
+          <option value="online">Online</option>
+          <option value="offline">Offline</option>
+        </select>
+        <span className="text-xs text-surface-500 ml-1">
+          {q || statusFilter !== 'all'
+            ? <><span className="text-brand-400 font-medium">{list.length}</span> de {allCameras.length}</>
+            : <>{allCameras.length} cámaras en BD · {cameras?.fromNvr.length || 0} en NVR</>}
+        </span>
+        <div className="flex-1" />
         <div className="flex gap-2">
           {isAdmin && (
             <button onClick={() => setShowAdopt(true)} className="btn-primary text-xs">
@@ -962,11 +1067,60 @@ function CamerasTab({
               const lastError = (cam as any).lastRtspError || ''
               return (
                 <tr key={cam.id} className="hover:bg-surface-700/30 transition-colors">
-                  <td className="px-3 py-2 text-surface-300 font-mono">{cam.channelCode || `D${cam.channel}`}</td>
-                  <td className="px-3 py-2 text-surface-100 font-medium max-w-[140px] truncate" title={cam.name}>{cam.name}</td>
+                  <td className="px-3 py-2 text-surface-300 font-mono">
+                    <Highlight text={cam.channelCode || `D${cam.channel}`} query={q} />
+                  </td>
+                  <td className="px-3 py-2 max-w-[160px]">
+                    {editingNameId === cam.id ? (
+                      <div className="flex items-center gap-1">
+                        <input
+                          ref={editNameRef}
+                          value={editingNameValue}
+                          onChange={(e) => setEditingNameValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter')  handleSaveName(cam.id)
+                            if (e.key === 'Escape') cancelEditName()
+                          }}
+                          className="flex-1 min-w-0 bg-surface-900 border border-brand-500 rounded px-1.5 py-0.5 text-xs text-surface-100 outline-none"
+                          disabled={savingNameId === cam.id}
+                          autoFocus
+                        />
+                        {savingNameId === cam.id
+                          ? <Loader2 size={11} className="animate-spin text-surface-400 flex-shrink-0" />
+                          : (
+                            <>
+                              <button onClick={() => handleSaveName(cam.id)} className="p-0.5 text-green-400 hover:text-green-300" title="Guardar (Enter)">
+                                <Check size={11} />
+                              </button>
+                              <button onClick={cancelEditName} className="p-0.5 text-surface-500 hover:text-surface-300" title="Cancelar (Esc)">
+                                <X size={11} />
+                              </button>
+                            </>
+                          )}
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1 group/name">
+                        <span className="text-surface-100 font-medium truncate" title={cam.name}>
+                          <Highlight text={cam.name} query={q} />
+                        </span>
+                        {isAdmin && (
+                          <button
+                            onClick={() => startEditName(cam)}
+                            className="opacity-0 group-hover/name:opacity-100 p-0.5 rounded text-surface-500 hover:text-surface-200 transition-all flex-shrink-0"
+                            title="Editar nombre"
+                          >
+                            <Pencil size={10} />
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </td>
                   <td className="px-3 py-2 text-surface-400 whitespace-nowrap">
                     {(cam.ipAddress || fromNvr?.ipAddress) ? (
-                      <span>{cam.ipAddress || fromNvr?.ipAddress}<span className="text-surface-600">:{cam.managementPort || fromNvr?.managementPort || '—'}</span></span>
+                      <span>
+                        <Highlight text={cam.ipAddress || fromNvr?.ipAddress || ''} query={q} />
+                        <span className="text-surface-600">:{cam.managementPort || fromNvr?.managementPort || '—'}</span>
+                      </span>
                     ) : <span className="text-surface-600 text-[11px]">No leído</span>}
                   </td>
                   <td className="px-3 py-2 text-surface-400">{cam.protocol || fromNvr?.protocol || <span className="text-surface-600 text-[11px]">No leído</span>}</td>
@@ -1028,7 +1182,9 @@ function CamerasTab({
         </table>
         {list.length === 0 && (
           <div className="py-10 text-center text-surface-500 text-sm">
-            Sin cámaras — Usa "Sincronizar" para importar desde el NVR
+            {q || statusFilter !== 'all'
+              ? 'Sin cámaras que coincidan con la búsqueda'
+              : 'Sin cámaras — Usa "Sincronizar" para importar desde el NVR'}
           </div>
         )}
       </div>
@@ -1055,6 +1211,238 @@ function CamerasTab({
           onRetest={handleIsapDebug}
           onClose={() => setShowDebug(false)}
         />
+      )}
+    </div>
+  )
+}
+
+// ─── Video / Audio Tab ────────────────────────────────────────
+
+function StreamConfigCard({ config, label }: { config: VideoStreamConfig; label: string }) {
+  const isH265 = config.videoCodecType.toLowerCase().includes('h.265') || config.videoCodecType.toLowerCase().includes('h265') || config.videoCodecType.toLowerCase().includes('hevc')
+
+  const rows: [string, React.ReactNode][] = [
+    ['Codec',     <span className={clsx(isH265 ? 'text-amber-400 font-medium' : 'text-surface-200')}>{config.videoCodecType || '—'}{config.h265Plus && <span className="ml-1 text-[10px] bg-amber-900/40 text-amber-400 px-1 rounded">H.265+</span>}</span>],
+    ['Resolución', `${config.width}×${config.height}` === '0×0' ? '—' : `${config.width}×${config.height}`],
+    ['FPS',       config.fps > 0 ? `${config.fps} fps` : '—'],
+    ['Bitrate',   config.bitrateType ? `${config.bitrateType} · ${config.bitrateMax > 0 ? `${config.bitrateMax} kbps` : '—'}` : '—'],
+    ['Calidad',   config.qualityLevel || '—'],
+    ['Escaneo',   config.videoScanType || '—'],
+    ['Audio',     config.audioEnabled ? `Activo · ${config.audioCodecType || '—'} · ${config.audioBitrate > 0 ? `${config.audioBitrate} kbps` : '—'}` : 'Desactivado'],
+  ]
+
+  return (
+    <div className="bg-surface-750 rounded-lg p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-xs font-semibold text-surface-300">{label}</span>
+        {isH265 && (
+          <span className="flex items-center gap-1 text-[10px] text-amber-400 bg-amber-900/20 border border-amber-900/40 px-1.5 py-0.5 rounded">
+            <AlertTriangle size={9} /> HEVC — puede requerir transcodificación en navegadores
+          </span>
+        )}
+      </div>
+      <dl className="space-y-1.5">
+        {rows.map(([lbl, val]) => (
+          <div key={lbl} className="flex items-center justify-between text-xs">
+            <dt className="text-surface-500 w-24 flex-shrink-0">{lbl}</dt>
+            <dd className="text-surface-200 text-right">{val}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+}
+
+function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraType[] }) {
+  const [configs, setConfigs] = useState<ChannelVideoConfig[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [selectedChannel, setSelectedChannel] = useState<number | null>(null)
+  const [loadingSingle, setLoadingSingle] = useState(false)
+
+  const selectedConfig = configs.find((c) => c.channel === selectedChannel)
+
+  const loadAll = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const data = await apiGet<ChannelVideoConfig[]>(`/nvrs/${nvrId}/channels/video-config`)
+      setConfigs(data)
+      if (data.length > 0 && selectedChannel === null) {
+        setSelectedChannel(data[0].channel)
+      }
+    } catch (e: any) {
+      setError(e?.response?.data?.message || 'Error al obtener configuración de video')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const loadSingle = async (channel: number) => {
+    setLoadingSingle(true)
+    try {
+      const data = await apiGet<ChannelVideoConfig>(`/nvrs/${nvrId}/channels/${channel}/video-config`)
+      setConfigs((prev) => {
+        const idx = prev.findIndex((c) => c.channel === channel)
+        if (idx >= 0) return prev.map((c) => c.channel === channel ? data : c)
+        return [...prev, data].sort((a, b) => a.channel - b.channel)
+      })
+    } catch {
+      // error handled by api lib
+    } finally {
+      setLoadingSingle(false)
+    }
+  }
+
+  useEffect(() => {
+    if (dbCameras.length > 0) loadAll()
+  }, [nvrId])
+
+  const selected = selectedChannel !== null ? dbCameras.find((c) => c.channel === selectedChannel) : null
+
+  if (loading) {
+    return (
+      <div className="space-y-3">
+        <div className="flex justify-end">
+          <span className="text-xs text-surface-500 flex items-center gap-1.5">
+            <Loader2 size={12} className="animate-spin" /> Leyendo configuración del NVR...
+          </span>
+        </div>
+        <div className="card p-8 text-center">
+          <Loader2 size={20} className="animate-spin text-surface-400 mx-auto" />
+          <p className="text-sm text-surface-400 mt-2">Consultando ISAPI para {dbCameras.length} canales...</p>
+          <p className="text-xs text-surface-600 mt-1">Esto puede tomar algunos segundos</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm font-medium text-surface-200">Configuración de video y audio por canal</p>
+          <p className="text-xs text-surface-500 mt-0.5">
+            Lectura directa desde el NVR vía ISAPI — solo visualización, sin escritura.
+          </p>
+        </div>
+        <button onClick={loadAll} disabled={loading} className="btn-secondary text-xs">
+          <RefreshCw size={12} /> Actualizar
+        </button>
+      </div>
+
+      {error && (
+        <div className="flex items-start gap-2 p-3 bg-red-900/20 border border-red-900/40 rounded-lg text-xs text-red-400">
+          <XCircle size={13} className="flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="font-medium">No se pudo leer la configuración</p>
+            <p className="mt-0.5 text-red-400/80">{error}</p>
+          </div>
+        </div>
+      )}
+
+      {configs.length === 0 && !loading && !error && (
+        <div className="card p-8 text-center space-y-2">
+          <VideoIcon size={20} className="mx-auto text-surface-500" />
+          <p className="text-sm text-surface-400">Sin canales disponibles</p>
+          <p className="text-xs text-surface-600">Sincroniza las cámaras IP primero</p>
+        </div>
+      )}
+
+      {configs.length > 0 && (
+        <div className="flex gap-4">
+          {/* Channel sidebar */}
+          <div className="w-44 flex-shrink-0 space-y-1">
+            <p className="text-[10px] text-surface-600 uppercase font-semibold tracking-wide px-2 mb-2">Canales</p>
+            {configs.map((cfg) => {
+              const cam = dbCameras.find((c) => c.channel === cfg.channel)
+              const hasError = !!cfg.error
+              const isSelected = cfg.channel === selectedChannel
+              return (
+                <button
+                  key={cfg.channel}
+                  onClick={() => setSelectedChannel(cfg.channel)}
+                  className={clsx(
+                    'w-full text-left px-3 py-2 rounded-lg text-xs transition-colors',
+                    isSelected
+                      ? 'bg-brand-600/20 border border-brand-600/40 text-brand-300'
+                      : 'text-surface-400 hover:bg-surface-700 hover:text-surface-200'
+                  )}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0',
+                      hasError ? 'bg-surface-600' : cam?.online ? 'bg-green-400' : 'bg-surface-600'
+                    )} />
+                    <span className="font-mono font-medium">{(cam as any)?.channelCode || `D${cfg.channel}`}</span>
+                  </div>
+                  <p className="text-[10px] text-surface-500 truncate mt-0.5">{cam?.name || `Canal ${cfg.channel}`}</p>
+                  {hasError && <p className="text-[10px] text-red-400/70 mt-0.5">Sin datos</p>}
+                </button>
+              )
+            })}
+          </div>
+
+          {/* Config panel */}
+          <div className="flex-1 min-w-0">
+            {selectedConfig ? (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-surface-100">
+                      {(selected as any)?.channelCode || `D${selectedConfig.channel}`} — {selected?.name || `Canal ${selectedConfig.channel}`}
+                    </p>
+                    <p className="text-[10px] text-surface-500 mt-0.5">
+                      Leído a las {new Date(selectedConfig.fetchedAt).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => loadSingle(selectedConfig.channel)}
+                    disabled={loadingSingle}
+                    className="btn-ghost text-xs"
+                    title="Refrescar este canal"
+                  >
+                    {loadingSingle ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+                    Refrescar
+                  </button>
+                </div>
+
+                {selectedConfig.error ? (
+                  <div className="p-4 bg-surface-750 rounded-lg text-xs text-surface-500 text-center">
+                    <XCircle size={16} className="mx-auto mb-2 text-surface-600" />
+                    {selectedConfig.error}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {selectedConfig.main && (
+                      <StreamConfigCard config={selectedConfig.main} label="Flujo principal (Main)" />
+                    )}
+                    {selectedConfig.sub && (
+                      <StreamConfigCard config={selectedConfig.sub} label="Flujo secundario (Sub)" />
+                    )}
+                    {!selectedConfig.main && !selectedConfig.sub && (
+                      <div className="col-span-2 p-6 bg-surface-750 rounded-lg text-center text-xs text-surface-500">
+                        Sin datos de configuración para este canal
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex items-start gap-2 p-3 bg-surface-750 rounded-lg text-xs text-surface-500 border border-surface-700">
+                  <AlertTriangle size={12} className="flex-shrink-0 mt-0.5 text-amber-500" />
+                  <p>
+                    Esta vista es <span className="font-medium text-surface-400">solo lectura</span>.
+                    La edición de parámetros de video (codec, resolución, FPS, bitrate) estará disponible
+                    en la próxima versión junto con backup automático y confirmación explícita antes de escribir al NVR.
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div className="card p-8 text-center text-xs text-surface-500">
+                Selecciona un canal para ver su configuración
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )

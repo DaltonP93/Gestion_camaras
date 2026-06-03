@@ -81,6 +81,16 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       # Poner true solo si el sitio tiene HTTPS — false en HTTP o las cookies no se envían
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      APP_URL: ${APP_URL:-http://localhost:4000}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      UPLOADS_DIR: /app/uploads
+    volumes:
+      - uploads_data:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -139,6 +149,7 @@ volumes:
   redis_data:
   certbot_conf:
   certbot_www:
+  uploads_data:
 
 networks:
   visioncore_net:

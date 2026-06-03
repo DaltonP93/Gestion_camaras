@@ -317,6 +317,34 @@ export interface ApiError {
 
 export type GridLayout = 1 | 4 | 9 | 16 | 25
 
+// ─── NVR Video/Audio Config ───────────────────────────────────────────────────
+
+export interface VideoStreamConfig {
+  streamType:      'main' | 'sub'
+  videoCodecType:  string
+  videoScanType:   string
+  width:           number
+  height:          number
+  fps:             number
+  bitrateType:     string  // CBR | VBR
+  bitrateMax:      number  // kbps
+  qualityLevel:    string
+  h265Plus:        boolean
+  audioEnabled:    boolean
+  audioCodecType:  string
+  audioInputType:  string
+  audioBitrate:    number
+}
+
+export interface ChannelVideoConfig {
+  nvrId:     string
+  channel:   number
+  main:      VideoStreamConfig | null
+  sub:       VideoStreamConfig | null
+  fetchedAt: string
+  error?:    string
+}
+
 export type ViewLayout = '1x1' | '2x2' | '3x3' | '4x4' | 'featured' | 'custom'
 
 export interface CameraSlot {

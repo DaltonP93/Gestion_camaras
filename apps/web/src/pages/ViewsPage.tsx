@@ -96,11 +96,13 @@ function CameraPicker({
   value,
   nvrs,
   cameras,
+  usedCameraIds,
   onChange,
 }: {
   value: string | null
   nvrs: NVR[]
   cameras: Camera[]
+  usedCameraIds?: Set<string>   // cameraIds already used in OTHER slots
   onChange: (id: string | null) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -114,6 +116,16 @@ function CameraPicker({
   })
 
   const selected = cameras.find((c) => c.id === value)
+  const isDuplicate = value ? (usedCameraIds?.has(value) ?? false) : false
+
+  const handleSelect = (camId: string | null) => {
+    if (camId && usedCameraIds?.has(camId)) {
+      const cam = cameras.find((c) => c.id === camId)
+      toast(`"${cam?.name ?? 'Esta cámara'}" ya está asignada a otro slot en esta vista.`, { icon: '⚠️' })
+    }
+    onChange(camId)
+    setOpen(false)
+  }
 
   return (
     <div className="relative">
@@ -122,13 +134,18 @@ function CameraPicker({
         onClick={() => setOpen(!open)}
         className={clsx(
           'w-full flex items-center gap-1.5 px-2 py-1.5 rounded text-xs transition-colors text-left',
-          value
-            ? 'bg-brand-700/30 text-brand-300 hover:bg-brand-700/50'
-            : 'bg-surface-700 text-surface-400 hover:bg-surface-600'
+          isDuplicate
+            ? 'bg-amber-900/30 text-amber-300 border border-amber-700/50 hover:bg-amber-900/40'
+            : value
+              ? 'bg-brand-700/30 text-brand-300 hover:bg-brand-700/50'
+              : 'bg-surface-700 text-surface-400 hover:bg-surface-600'
         )}
       >
         <Monitor size={10} className="flex-shrink-0" />
         <span className="flex-1 truncate">{selected ? selected.name : 'Sin asignar'}</span>
+        {isDuplicate && (
+          <span className="text-[9px] bg-amber-700/40 text-amber-300 px-1 rounded shrink-0">Dup.</span>
+        )}
         <ChevronDown size={10} className="flex-shrink-0 opacity-60" />
       </button>
 
@@ -154,30 +171,38 @@ function CameraPicker({
           <div className="max-h-48 overflow-y-auto">
             <button
               type="button"
-              onClick={() => { onChange(null); setOpen(false) }}
+              onClick={() => handleSelect(null)}
               className="w-full flex items-center gap-2 px-3 py-2 text-xs text-surface-400 hover:bg-surface-700 transition-colors"
             >
               <X size={10} /> Sin asignar
             </button>
-            {filtered.map((cam) => (
-              <button
-                key={cam.id}
-                type="button"
-                onClick={() => { onChange(cam.id); setOpen(false) }}
-                className={clsx(
-                  'w-full flex items-center gap-2 px-3 py-2 text-xs transition-colors',
-                  cam.id === value
-                    ? 'bg-brand-600/20 text-brand-300'
-                    : 'text-surface-300 hover:bg-surface-700'
-                )}
-              >
-                <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0',
-                  cam.online ? 'bg-green-400' : 'bg-surface-600')} />
-                <span className="flex-1 truncate">{cam.name}</span>
-                <span className="text-surface-500 text-[10px]">{cam.nvr?.name ?? ''}</span>
-                {cam.id === value && <Check size={10} className="text-brand-400" />}
-              </button>
-            ))}
+            {filtered.map((cam) => {
+              const alreadyUsed = usedCameraIds?.has(cam.id) ?? false
+              return (
+                <button
+                  key={cam.id}
+                  type="button"
+                  onClick={() => handleSelect(cam.id)}
+                  className={clsx(
+                    'w-full flex items-center gap-2 px-3 py-2 text-xs transition-colors',
+                    cam.id === value
+                      ? 'bg-brand-600/20 text-brand-300'
+                      : alreadyUsed
+                        ? 'text-amber-400/80 hover:bg-amber-900/20'
+                        : 'text-surface-300 hover:bg-surface-700'
+                  )}
+                >
+                  <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0',
+                    cam.online ? 'bg-green-400' : 'bg-surface-600')} />
+                  <span className="flex-1 truncate">{cam.name}</span>
+                  {alreadyUsed && (
+                    <span className="text-[9px] text-amber-500 shrink-0">Ya asignada</span>
+                  )}
+                  <span className="text-surface-500 text-[10px]">{cam.nvr?.name ?? ''}</span>
+                  {cam.id === value && <Check size={10} className="text-brand-400" />}
+                </button>
+              )
+            })}
             {filtered.length === 0 && (
               <div className="py-4 text-center text-xs text-surface-500">Sin cámaras</div>
             )}
@@ -205,6 +230,10 @@ function GridEditor({
 }) {
   const conf = LAYOUTS.find((l) => l.value === layout) || LAYOUTS[2]
 
+  // For each slot index, build the set of cameraIds used in ALL OTHER slots
+  const getUsedIds = (slotIndex: number): Set<string> =>
+    new Set(slots.filter((s) => s.slotIndex !== slotIndex && s.cameraId).map((s) => s.cameraId!))
+
   if (layout === 'featured') {
     return (
       <div className="grid gap-1.5" style={{ gridTemplateColumns: `2fr 1fr`, gridTemplateRows: `2fr 1fr 1fr` }}>
@@ -213,6 +242,7 @@ function GridEditor({
           <div className="text-[10px] text-surface-400 font-medium">Slot 1 — Destacado</div>
           <div className="flex-1">
             <CameraPicker value={slots[0]?.cameraId ?? null} nvrs={nvrs} cameras={cameras}
+              usedCameraIds={getUsedIds(0)}
               onChange={(id) => onSlotChange(0, id)} />
           </div>
         </div>
@@ -221,6 +251,7 @@ function GridEditor({
           <div key={i} className="bg-surface-700 rounded-lg p-2 flex flex-col gap-1">
             <div className="text-[10px] text-surface-400 font-medium">Slot {i + 1}</div>
             <CameraPicker value={slots[i]?.cameraId ?? null} nvrs={nvrs} cameras={cameras}
+              usedCameraIds={getUsedIds(i)}
               onChange={(id) => onSlotChange(i, id)} />
           </div>
         ))}
@@ -229,6 +260,7 @@ function GridEditor({
           <div key={i} className="bg-surface-700 rounded-lg p-2 flex flex-col gap-1">
             <div className="text-[10px] text-surface-400 font-medium">Slot {i + 1}</div>
             <CameraPicker value={slots[i]?.cameraId ?? null} nvrs={nvrs} cameras={cameras}
+              usedCameraIds={getUsedIds(i)}
               onChange={(id) => onSlotChange(i, id)} />
           </div>
         ))}
@@ -248,6 +280,7 @@ function GridEditor({
             value={slot.cameraId}
             nvrs={nvrs}
             cameras={cameras}
+            usedCameraIds={getUsedIds(slot.slotIndex)}
             onChange={(id) => onSlotChange(i, id)}
           />
         </div>
@@ -632,9 +665,42 @@ function ViewBuilderModal({
           )}
 
           {/* ── Step 4: Resumen ── */}
-          {step === 'summary' && (
+          {step === 'summary' && (() => {
+            // Detect cameras assigned to more than one slot
+            const cameraSlotMap = new Map<string, number[]>()
+            slots.forEach((s) => {
+              if (!s.cameraId) return
+              const existing = cameraSlotMap.get(s.cameraId) ?? []
+              cameraSlotMap.set(s.cameraId, [...existing, s.slotIndex])
+            })
+            const duplicateCameras = [...cameraSlotMap.entries()].filter(([, idxs]) => idxs.length > 1)
+
+            return (
             <div className="space-y-4">
               <p className="text-xs text-surface-400">Revisa la configuración antes de {initial ? 'actualizar' : 'crear'} la vista.</p>
+
+              {duplicateCameras.length > 0 && (
+                <div className="flex items-start gap-2.5 p-3 rounded-lg bg-amber-900/20 border border-amber-700/40">
+                  <span className="text-amber-400 text-sm leading-none mt-0.5">⚠</span>
+                  <div>
+                    <p className="text-xs font-medium text-amber-300">Cámaras duplicadas</p>
+                    <p className="text-[11px] text-amber-400/80 mt-0.5">
+                      Las siguientes cámaras aparecen en más de un slot. Puedes guardar igualmente, pero cada slot transmitirá el mismo stream.
+                    </p>
+                    <ul className="mt-1.5 space-y-0.5">
+                      {duplicateCameras.map(([camId, idxs]) => {
+                        const cam = cameras.find((c) => c.id === camId)
+                        return (
+                          <li key={camId} className="text-[11px] text-amber-300">
+                            <span className="font-medium">{cam?.name ?? camId}</span>
+                            <span className="text-amber-500 ml-1">— slots {idxs.map((i) => i + 1).join(', ')}</span>
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  </div>
+                </div>
+              )}
 
               {/* Diseño */}
               <div className="bg-surface-750 rounded-lg p-4 space-y-2.5">
@@ -723,7 +789,8 @@ function ViewBuilderModal({
                 )}
               </div>
             </div>
-          )}
+          )
+          })()}
         </div>
 
         {/* Footer */}

@@ -1,6 +1,6 @@
 // src/pages/LoginPage.tsx
 import { useState, useRef, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
 import { Shield, Eye, EyeOff, Loader2, Smartphone, ArrowLeft } from 'lucide-react'
 import { useAuthStore } from '@/stores/authStore'
 import toast from 'react-hot-toast'
@@ -76,6 +76,15 @@ function LoginForm() {
           <><Loader2 size={14} className="animate-spin" /> Ingresando...</>
         ) : 'Iniciar sesión'}
       </button>
+
+      <div className="text-center mt-1">
+        <Link
+          to="/forgot-password"
+          className="text-xs text-surface-400 hover:text-brand-400 transition-colors"
+        >
+          ¿Olvidaste tu contraseña?
+        </Link>
+      </div>
 
       {import.meta.env.DEV && (
         <div className="mt-4 pt-4 border-t border-surface-600">

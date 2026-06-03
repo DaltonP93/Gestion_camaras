@@ -4,6 +4,10 @@ import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
 import websocket from '@fastify/websocket'
+import staticFiles from '@fastify/static'
+import multipart from '@fastify/multipart'
+import path from 'path'
+import fs from 'fs'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -19,6 +23,8 @@ import appearancePlugin from './routes/appearance'
 import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
+import { searchRoutes } from './routes/search'
+import { nvrConfigRoutes } from './routes/nvrConfig'
 import { startHealthWorker } from './jobs/healthWorker'
 import { publishStream } from './services/stream'
 import CryptoJS from 'crypto-js'
@@ -101,6 +107,20 @@ async function main() {
   await server.register(authPlugin)
   await server.register(websocket)
 
+  // ─── Plugins de archivos estáticos y multipart ───────────
+  const uploadsDir = process.env.UPLOADS_DIR || '/app/uploads'
+  fs.mkdirSync(path.join(uploadsDir, 'branding'), { recursive: true })
+
+  await server.register(staticFiles, {
+    root: uploadsDir,
+    prefix: '/uploads/',
+    decorateReply: false,
+  })
+
+  await server.register(multipart, {
+    limits: { fileSize: 2 * 1024 * 1024, files: 4 },
+  })
+
   // ─── Rutas de la API ─────────────────────────────────────
   await server.register(authRoutes, { prefix: '/api/auth' })
   await server.register(nvrRoutes, { prefix: '/api/nvrs' })
@@ -113,6 +133,8 @@ async function main() {
   await server.register(profileRoutes, { prefix: '/api/profile' })
   await server.register(alertSettingsRoutes, { prefix: '/api/alerts' })
   await server.register(liveViewRoutes, { prefix: '/api/live-view' })
+  await server.register(searchRoutes, { prefix: '/api/search' })
+  await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
   await server.register(wsHandler, { prefix: '/ws' })
 
   // ─── Health check ─────────────────────────────────────────

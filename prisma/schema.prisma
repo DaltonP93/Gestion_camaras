@@ -44,6 +44,8 @@ model User {
   forcePasswordChange  Boolean   @default(false)
   failedLoginAttempts  Int       @default(0)
   lockedUntil          DateTime?
+  passwordResetToken   String?   @db.Text
+  passwordResetExpiry  DateTime?
 
   sessions           Session[]
   permissions        UserPermission[]
@@ -227,6 +229,9 @@ model UserFeaturePermissions {
   canResolveAlerts    Boolean @default(false)
   canRestartStreams    Boolean @default(false)
   canTranscode        Boolean @default(false)
+  canDownloadRecordings Boolean @default(false)
+  canManageViews        Boolean @default(false)
+  canManageSettings     Boolean @default(false)
 
   @@map("user_feature_permissions")
 }

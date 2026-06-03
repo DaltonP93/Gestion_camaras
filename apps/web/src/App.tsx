@@ -19,6 +19,8 @@ import { ViewsPage } from '@/pages/ViewsPage'
 import { ViewPlayerPage } from '@/pages/ViewPlayerPage'
 import { AppearancePage } from '@/pages/AppearancePage'
 import { ProfilePage } from '@/pages/ProfilePage'
+import { ForgotPasswordPage } from '@/pages/ForgotPasswordPage'
+import { ResetPasswordPage } from '@/pages/ResetPasswordPage'
 import { ProtectedRoute } from '@/components/layout/ProtectedRoute'
 
 export default function App() {
@@ -64,6 +66,8 @@ export default function App() {
       <Route path="/login" element={
         isAuthenticated ? <Navigate to="/" replace /> : <LoginPage />
       } />
+      <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+      <Route path="/reset-password" element={<ResetPasswordPage />} />
 
       <Route element={<ProtectedRoute />}>
         <Route element={<Layout />}>
