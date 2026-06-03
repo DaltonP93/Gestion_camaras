@@ -104,6 +104,7 @@ export const FEATURE_DEFAULTS: Record<string, Record<string, boolean>> = {
     canManageNVRs: true, canManageCameras: true, canManageUsers: true,
     canManageAppearance: true, canResolveAlerts: true,
     canRestartStreams: true, canTranscode: true,
+    canDownloadRecordings: true, canManageViews: true, canManageSettings: true,
   },
   SUPERVISOR: {
     canViewDashboard: true, canViewLive: true, canViewRecordings: true,
@@ -111,6 +112,7 @@ export const FEATURE_DEFAULTS: Record<string, Record<string, boolean>> = {
     canManageNVRs: false, canManageCameras: false, canManageUsers: false,
     canManageAppearance: false, canResolveAlerts: true,
     canRestartStreams: false, canTranscode: false,
+    canDownloadRecordings: false, canManageViews: false, canManageSettings: false,
   },
   OPERATOR: {
     canViewDashboard: true, canViewLive: true, canViewRecordings: false,
@@ -118,6 +120,7 @@ export const FEATURE_DEFAULTS: Record<string, Record<string, boolean>> = {
     canManageNVRs: false, canManageCameras: false, canManageUsers: false,
     canManageAppearance: false, canResolveAlerts: false,
     canRestartStreams: false, canTranscode: false,
+    canDownloadRecordings: false, canManageViews: false, canManageSettings: false,
   },
   AUDITOR: {
     canViewDashboard: true, canViewLive: false, canViewRecordings: true,
@@ -125,6 +128,7 @@ export const FEATURE_DEFAULTS: Record<string, Record<string, boolean>> = {
     canManageNVRs: false, canManageCameras: false, canManageUsers: false,
     canManageAppearance: false, canResolveAlerts: false,
     canRestartStreams: false, canTranscode: false,
+    canDownloadRecordings: false, canManageViews: false, canManageSettings: false,
   },
 }
 

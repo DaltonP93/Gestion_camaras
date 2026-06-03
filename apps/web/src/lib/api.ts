@@ -55,12 +55,15 @@ api.interceptors.response.use(
     const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh')
     // Estos endpoints manejan sus propios errores — no mostrar toast global
     const isSilentEndpoint = url.includes('/nvrs/test-connection') || url.includes('/nvrs/detect')
+    // /auth/me se llama en cada recarga de página — un 500/error de red no debe mostrar
+    // toast porque el usuario ya tiene sesión activa y es un error interno del servidor.
+    const isToastSuppressed = isSilentEndpoint || url.includes('/auth/me')
 
     if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint && !isSilentEndpoint) {
       originalRequest._retry = true
       try {
         await refreshAccessToken()
-        const token = localStorage.getItem('accessToken')
+        const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
         if (token) originalRequest.headers.Authorization = `Bearer ${token}`
         return api(originalRequest)
       } catch {
@@ -73,7 +76,7 @@ api.interceptors.response.use(
       }
     }
 
-    if (error.response?.status !== 401 && !(error.response?.status === 429 && isAuthEndpoint) && !isSilentEndpoint) {
+    if (error.response?.status !== 401 && !(error.response?.status === 429 && isAuthEndpoint) && !isToastSuppressed) {
       const msg = error.response?.data?.message || 'Error de conexión'
       toast.error(msg)
     }
@@ -84,13 +87,14 @@ api.interceptors.response.use(
 
 // ─── Asset URL resolver ───────────────────────────────────────
 // Converts relative paths (/uploads/...) to full origin URLs.
-// Converts legacy localhost URLs to the current origin (avoids mixed-content on HTTPS).
+// Converts any legacy http://localhost:PORT/... URL to the current origin,
+// regardless of whether the current page is HTTPS or HTTP.
 export function resolveAssetUrl(url: string | null | undefined): string | null {
   if (!url) return null
   // Relative path — prepend current origin
   if (url.startsWith('/')) return `${window.location.origin}${url}`
-  // Absolute localhost URL served over HTTPS → rewrite to current origin
-  if (/^https?:\/\/localhost(:\d+)?/.test(url) && window.location.protocol === 'https:') {
+  // Absolute localhost URL (any protocol, any port) → rewrite to current origin
+  if (/^https?:\/\/localhost(:\d+)?/.test(url)) {
     const path = url.replace(/^https?:\/\/localhost(:\d+)?/, '')
     return `${window.location.origin}${path}`
   }

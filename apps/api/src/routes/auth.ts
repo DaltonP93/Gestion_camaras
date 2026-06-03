@@ -602,17 +602,22 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   server.get('/me', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
-    const user = await server.prisma.user.findUnique({
-      where: { id: request.user.sub },
-      select: userMeSelect,
-    })
-    if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
+    try {
+      const user = await server.prisma.user.findUnique({
+        where: { id: request.user.sub },
+        select: userMeSelect,
+      })
+      if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
 
-    const { featurePermissions, ...rest } = user as any
-    return reply.send({
-      ...rest,
-      featurePermissions: resolveFeaturePermissions(user.role, featurePermissions),
-    })
+      const { featurePermissions, ...rest } = user as any
+      return reply.send({
+        ...rest,
+        featurePermissions: resolveFeaturePermissions(user.role, featurePermissions),
+      })
+    } catch (err) {
+      server.log.error({ err, userId: request.user?.sub }, '[auth/me] error al consultar perfil — verifica que la migración 0012 fue aplicada (ALTER TABLE user_feature_permissions ADD COLUMN IF NOT EXISTS canDownloadRecordings ...)')
+      return reply.status(500).send({ message: 'Error interno al cargar el perfil de usuario' })
+    }
   })
 }
 
