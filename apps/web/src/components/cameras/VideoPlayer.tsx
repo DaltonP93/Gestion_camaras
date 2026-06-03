@@ -106,6 +106,7 @@ interface Props {
   streamCodec?: string        // e.g. "hevc", "h264"
   streamResolution?: string   // e.g. "1920×1080", "640×360"
   transcodingAvailable?: boolean
+  objectFit?: 'cover' | 'contain'  // default: 'contain'
 }
 
 type Status = 'loading' | 'playing' | 'error' | 'offline'
@@ -128,6 +129,7 @@ export function VideoPlayer({
   streamCodec,
   streamResolution,
   transcodingAvailable,
+  objectFit = 'contain',
 }: Props) {
   // Whether the current stream is the transcoded (HEVC→H.264) variant
   const isTranscoded = streamType === 'main_h264'
@@ -375,9 +377,15 @@ export function VideoPlayer({
       className={clsx('relative bg-black overflow-hidden group rounded-lg', className)}
       onMouseEnter={() => setShowControls(true)}
       onMouseLeave={() => setShowControls(false)}
-      onDoubleClick={() => onFullscreen?.()}
+      onDoubleClick={(e) => { e.stopPropagation(); onFullscreen?.() }}
     >
-      <video ref={videoRef} className="w-full h-full object-contain" muted={muted} autoPlay playsInline />
+      <video
+        ref={videoRef}
+        className={clsx('w-full h-full', objectFit === 'cover' ? 'object-cover' : 'object-contain')}
+        muted={muted}
+        autoPlay
+        playsInline
+      />
 
       {/* Loading */}
       {status === 'loading' && !activeError && (
