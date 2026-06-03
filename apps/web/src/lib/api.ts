@@ -75,6 +75,21 @@ api.interceptors.response.use(
   }
 )
 
+// ─── Asset URL resolver ───────────────────────────────────────
+// Converts relative paths (/uploads/...) to full origin URLs.
+// Converts legacy localhost URLs to the current origin (avoids mixed-content on HTTPS).
+export function resolveAssetUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  // Relative path — prepend current origin
+  if (url.startsWith('/')) return `${window.location.origin}${url}`
+  // Absolute localhost URL served over HTTPS → rewrite to current origin
+  if (/^https?:\/\/localhost(:\d+)?/.test(url) && window.location.protocol === 'https:') {
+    const path = url.replace(/^https?:\/\/localhost(:\d+)?/, '')
+    return `${window.location.origin}${path}`
+  }
+  return url
+}
+
 // ─── Helpers tipados ──────────────────────────────────────────
 export const apiGet = <T>(url: string, params?: object) =>
   api.get<T>(url, { params }).then((r) => r.data)

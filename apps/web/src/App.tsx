@@ -2,7 +2,7 @@
 import { useEffect } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from '@/stores/authStore'
-import { apiGet } from '@/lib/api'
+import { apiGet, resolveAssetUrl } from '@/lib/api'
 import type { AppearanceSettings } from '@/types'
 import { Layout } from '@/components/layout/Layout'
 import { LoginPage } from '@/pages/LoginPage'
@@ -26,18 +26,21 @@ import { ProtectedRoute } from '@/components/layout/ProtectedRoute'
 export default function App() {
   const { isAuthenticated, loadUser } = useAuthStore()
 
+  // Always validate/rehydrate session on page load — not just when already authenticated.
+  // This repairs the token header after a hard refresh and validates the token is still valid.
   useEffect(() => {
-    if (isAuthenticated) loadUser()
+    loadUser()
   }, [])
 
   // Apply saved appearance settings on initial load
   useEffect(() => {
     apiGet<AppearanceSettings>('/appearance').then((data) => {
       if (data.siteName) document.title = data.siteName
-      if (data.faviconUrl) {
+      const resolvedFavicon = resolveAssetUrl(data.faviconUrl)
+      if (resolvedFavicon) {
         let link = document.querySelector<HTMLLinkElement>("link[rel~='icon']")
         if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link) }
-        link.href = data.faviconUrl
+        link.href = resolvedFavicon
       }
       const styleId = 'visioncore-custom-css'
       let style = document.getElementById(styleId) as HTMLStyleElement | null

@@ -56,6 +56,8 @@ export function ViewPlayerPage() {
 
   // In-page (CSS overlay) fullscreen — used when native requestFullscreen is unavailable
   const [fullscreenCamId, setFullscreenCamId] = useState<string | null>(null)
+  // Main stream started for the fullscreen camera (upgraded quality)
+  const [fullscreenMainStream, setFullscreenMainStream] = useState<StreamInfo | null>(null)
   // DOM refs per tile — populated by CameraCell's ref callback
   const tileRefs = useRef<Map<string, HTMLDivElement>>(new Map())
 
@@ -65,29 +67,57 @@ export function ViewPlayerPage() {
   // onDoubleClick / onClick — both are direct user gesture events.
   const enterFullscreen = useCallback((cameraId: string) => {
     const el = tileRefs.current.get(cameraId)
+    // Synchronous native FS call — must be first, before any async work
     if (el?.requestFullscreen) {
-      // Synchronous call — still within the user-gesture call stack
       el.requestFullscreen().catch(() => {
-        // Native FS unavailable (e.g. permission denied, iframe) → CSS overlay fallback
+        // Native FS unavailable → CSS overlay fallback
         setFullscreenCamId(cameraId)
       })
-      // Note: we track native FS state via the fullscreenchange listener, not here
     } else {
       setFullscreenCamId(cameraId)
     }
+
+    // Upgrade to main/main_h264 stream for HD quality in fullscreen.
+    // This is async but doesn't block the fullscreen entry above.
+    setFullscreenMainStream(null)
+    apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: 'main' })
+      .then((info) => {
+        console.info(`[ViewPlayer] fullscreen main stream cameraId=${cameraId} path=${info.streamPath}`)
+        setFullscreenMainStream(info)
+      })
+      .catch(() => {
+        // Main stream unavailable — CSS overlay uses sub stream as fallback
+      })
   }, [])
 
   const exitFullscreen = useCallback(() => {
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {})
     }
+    const prevCamId = fullscreenCamId
     setFullscreenCamId(null)
-  }, [])
+    setFullscreenMainStream(null)
+    // Stop the main stream we started for fullscreen
+    if (prevCamId) {
+      apiPost(`/cameras/${prevCamId}/stop-stream`, { streamType: 'main', reason: 'exit_fullscreen' }).catch(() => {})
+      apiPost(`/cameras/${prevCamId}/stop-stream`, { streamType: 'main_h264', reason: 'exit_fullscreen' }).catch(() => {})
+    }
+  }, [fullscreenCamId])
 
   // Sync ESC / browser-native FS exit with React state
   useEffect(() => {
     const handler = () => {
-      if (!document.fullscreenElement) setFullscreenCamId(null)
+      if (!document.fullscreenElement) {
+        setFullscreenCamId((prev) => {
+          if (prev) {
+            // Stop main stream when native fullscreen exits
+            apiPost(`/cameras/${prev}/stop-stream`, { streamType: 'main', reason: 'exit_fullscreen' }).catch(() => {})
+            apiPost(`/cameras/${prev}/stop-stream`, { streamType: 'main_h264', reason: 'exit_fullscreen' }).catch(() => {})
+          }
+          return null
+        })
+        setFullscreenMainStream(null)
+      }
     }
     document.addEventListener('fullscreenchange', handler)
     return () => document.removeEventListener('fullscreenchange', handler)
@@ -348,18 +378,29 @@ export function ViewPlayerPage() {
             </button>
           </div>
           <div className="flex-1 min-h-0">
-            {fullscreenSlot.stream ? (
-              <VideoPlayer
-                key={`fs-${fullscreenSlot.cameraId}`}
-                hlsUrl={fullscreenSlot.stream.hls}
-                cameraName={fullscreenSlot.camera?.name ?? ''}
-                cameraId={fullscreenSlot.cameraId ?? undefined}
-                className="w-full h-full rounded-none"
-                objectFit={objectFit}
-                onFullscreen={exitFullscreen}
-                {...resolveStreamProps(fullscreenSlot)}
-              />
-            ) : (
+            {fullscreenSlot.stream ? (() => {
+              // Use main stream for HD quality if available, else fall back to sub
+              const fsStream = fullscreenMainStream ?? fullscreenSlot.stream
+              const fsPath   = fsStream.streamPath ?? ''
+              const fsType   = getStreamTypeFromPath(fsPath)
+              const fsCam    = fullscreenSlot.camera
+              const fsCodec  = fsType === 'sub' ? fsCam?.subCodec : fsCam?.mainCodec
+              const fsRes    = fsType === 'main_h264' ? undefined : (fsType === 'sub' ? fsCam?.subResolution : fsCam?.mainResolution)
+              return (
+                <VideoPlayer
+                  key={`fs-${fullscreenSlot.cameraId}-${fsType}`}
+                  hlsUrl={fsStream.hls}
+                  cameraName={fsCam?.name ?? ''}
+                  cameraId={fullscreenSlot.cameraId ?? undefined}
+                  className="w-full h-full rounded-none"
+                  objectFit={objectFit}
+                  onFullscreen={exitFullscreen}
+                  streamType={fsType}
+                  streamCodec={fsCodec ?? undefined}
+                  streamResolution={fsRes ?? undefined}
+                />
+              )
+            })() : (
               <OfflinePlaceholder name={fullscreenSlot.camera?.name} />
             )}
           </div>

@@ -104,8 +104,14 @@ export const useAuthStore = create<AuthState>()(
           const user = await apiGet<User>('/auth/me')
           set({ user, isAuthenticated: true })
           connectWebSocket()
-        } catch {
-          set({ user: null, isAuthenticated: false })
+        } catch (err: any) {
+          // Only clear session on explicit 401 — not on network errors or 5xx
+          // to avoid logout on temporary connectivity issues during page load.
+          if (err?.response?.status === 401) {
+            localStorage.removeItem('accessToken')
+            localStorage.removeItem('refreshToken')
+            set({ user: null, isAuthenticated: false })
+          }
         }
       },
 
