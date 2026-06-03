@@ -11,9 +11,9 @@ export const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-// ─── Request interceptor: inyectar token desde localStorage ──
+// ─── Request interceptor: inyectar token desde localStorage/sessionStorage ──
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('accessToken')
+  const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
   if (token) config.headers.Authorization = `Bearer ${token}`
   return config
 })
@@ -24,13 +24,18 @@ let refreshPromise: Promise<void> | null = null
 async function refreshAccessToken(): Promise<void> {
   if (refreshPromise) return refreshPromise
   refreshPromise = (async () => {
-    const refreshToken = localStorage.getItem('refreshToken')
+    const refreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')
     if (!refreshToken) throw new Error('No refresh token')
     const res = await axios.post<{ accessToken: string }>(
       `${BASE_URL}/api/auth/refresh`,
       { refreshToken }
     )
-    localStorage.setItem('accessToken', res.data.accessToken)
+    // Preserve whichever storage the refresh token came from
+    if (localStorage.getItem('refreshToken')) {
+      localStorage.setItem('accessToken', res.data.accessToken)
+    } else {
+      sessionStorage.setItem('accessToken', res.data.accessToken)
+    }
   })().finally(() => { refreshPromise = null })
   return refreshPromise
 }
@@ -61,6 +66,8 @@ api.interceptors.response.use(
       } catch {
         localStorage.removeItem('accessToken')
         localStorage.removeItem('refreshToken')
+        sessionStorage.removeItem('accessToken')
+        sessionStorage.removeItem('refreshToken')
         dispatchAuthExpired()
         return Promise.reject(error)
       }

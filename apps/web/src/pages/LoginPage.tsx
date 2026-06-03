@@ -11,6 +11,7 @@ import toast from 'react-hot-toast'
 function LoginForm() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [rememberMe, setRememberMe] = useState(true)
   const [showPass, setShowPass] = useState(false)
   const { login, isLoading } = useAuthStore()
   const navigate = useNavigate()
@@ -22,7 +23,7 @@ function LoginForm() {
       return
     }
     try {
-      await login(username, password)
+      await login(username, password, rememberMe)
       // If 2FA required, twoFactorChallenge is set and UI switches
       // If no 2FA, login completes and navigate
       if (!useAuthStore.getState().twoFactorChallenge) {
@@ -69,10 +70,24 @@ function LoginForm() {
         </div>
       </div>
 
+      <div className="flex items-center gap-2">
+        <input
+          id="rememberMe"
+          type="checkbox"
+          checked={rememberMe}
+          onChange={(e) => setRememberMe(e.target.checked)}
+          className="w-4 h-4 rounded accent-brand-500 cursor-pointer"
+          disabled={isLoading}
+        />
+        <label htmlFor="rememberMe" className="text-xs text-surface-400 cursor-pointer select-none">
+          Recordarme en este dispositivo
+        </label>
+      </div>
+
       <button
         type="submit"
         disabled={isLoading}
-        className="btn-primary w-full justify-center py-2.5 mt-2"
+        className="btn-primary w-full justify-center py-2.5"
       >
         {isLoading ? (
           <><Loader2 size={14} className="animate-spin" /> Ingresando...</>

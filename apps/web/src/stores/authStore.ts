@@ -16,7 +16,7 @@ interface AuthState {
   isLoading: boolean
   twoFactorChallenge: TwoFactorChallenge | null
 
-  login:         (username: string, password: string) => Promise<void>
+  login:         (username: string, password: string, rememberMe?: boolean) => Promise<void>
   verify2FA:     (code: string) => Promise<void>
   cancelTwoFactor: () => void
   logout:        () => Promise<void>
@@ -36,18 +36,26 @@ export const useAuthStore = create<AuthState>()(
       isLoading: false,
       twoFactorChallenge: null,
 
-      login: async (username, password) => {
+      login: async (username, password, rememberMe = true) => {
         set({ isLoading: true })
         try {
           const data = await apiPost<any>('/auth/login', { username, password })
 
           if (data.requiresTwoFactor) {
+            // Store rememberMe preference for the 2FA step
+            sessionStorage.setItem('pendingRememberMe', rememberMe ? '1' : '0')
             set({ twoFactorChallenge: { tempToken: data.tempToken, username }, isLoading: false })
             return
           }
 
-          localStorage.setItem('accessToken', data.accessToken)
-          localStorage.setItem('refreshToken', data.refreshToken)
+          const storage = rememberMe ? localStorage : sessionStorage
+          storage.setItem('accessToken', data.accessToken)
+          storage.setItem('refreshToken', data.refreshToken)
+          if (!rememberMe) {
+            // Clear localStorage tokens if user explicitly chose not to remember
+            localStorage.removeItem('accessToken')
+            localStorage.removeItem('refreshToken')
+          }
           api.defaults.headers.common.Authorization = `Bearer ${data.accessToken}`
           set({ user: data.user, isAuthenticated: true, isLoading: false, twoFactorChallenge: null })
           connectWebSocket()
@@ -67,8 +75,15 @@ export const useAuthStore = create<AuthState>()(
             tempToken: twoFactorChallenge.tempToken,
             code,
           })
-          localStorage.setItem('accessToken', data.accessToken)
-          localStorage.setItem('refreshToken', data.refreshToken)
+          const rememberMe = sessionStorage.getItem('pendingRememberMe') !== '0'
+          sessionStorage.removeItem('pendingRememberMe')
+          const storage = rememberMe ? localStorage : sessionStorage
+          storage.setItem('accessToken', data.accessToken)
+          storage.setItem('refreshToken', data.refreshToken)
+          if (!rememberMe) {
+            localStorage.removeItem('accessToken')
+            localStorage.removeItem('refreshToken')
+          }
           api.defaults.headers.common.Authorization = `Bearer ${data.accessToken}`
           set({ user: data.user, isAuthenticated: true, isLoading: false, twoFactorChallenge: null })
           connectWebSocket()
@@ -81,12 +96,14 @@ export const useAuthStore = create<AuthState>()(
       cancelTwoFactor: () => set({ twoFactorChallenge: null }),
 
       logout: async () => {
-        const refreshToken = localStorage.getItem('refreshToken')
+        const refreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')
         try {
           if (refreshToken) await apiPost('/auth/logout', { refreshToken })
         } finally {
           localStorage.removeItem('accessToken')
           localStorage.removeItem('refreshToken')
+          sessionStorage.removeItem('accessToken')
+          sessionStorage.removeItem('refreshToken')
           delete api.defaults.headers.common.Authorization
           disconnectWebSocket()
           set({ user: null, isAuthenticated: false, twoFactorChallenge: null })
@@ -94,7 +111,8 @@ export const useAuthStore = create<AuthState>()(
       },
 
       loadUser: async () => {
-        const token = localStorage.getItem('accessToken')
+        // Check localStorage first (rememberMe=true), then sessionStorage (rememberMe=false)
+        const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
         if (!token) {
           set({ user: null, isAuthenticated: false })
           return
@@ -110,6 +128,8 @@ export const useAuthStore = create<AuthState>()(
           if (err?.response?.status === 401) {
             localStorage.removeItem('accessToken')
             localStorage.removeItem('refreshToken')
+            sessionStorage.removeItem('accessToken')
+            sessionStorage.removeItem('refreshToken')
             set({ user: null, isAuthenticated: false })
           }
         }
