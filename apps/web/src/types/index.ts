@@ -345,6 +345,19 @@ export interface ChannelVideoConfig {
   error?:    string
 }
 
+export interface VideoStreamUpdate {
+  videoCodecType?: string
+  width?:          number
+  height?:         number
+  fps?:            number
+  bitrateType?:    string
+  bitrateMax?:     number
+  qualityLevel?:   string
+  audioEnabled?:   boolean
+  audioCodecType?: string
+  audioBitrate?:   number
+}
+
 export type ViewLayout = '1x1' | '2x2' | '3x3' | '4x4' | 'featured' | 'custom'
 
 export interface CameraSlot {

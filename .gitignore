@@ -48,6 +48,8 @@ pgdata/
 *.sql
 backup_*.sql
 backup_*.dump
+# Allow Prisma migration SQL files
+!prisma/migrations/**/*.sql
 
 # Root-level package.json/lock auto-created by "npx prisma generate" from monorepo root
 # Real package management lives in apps/api/package.json and apps/web/package.json

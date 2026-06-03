@@ -1,9 +1,14 @@
 // apps/api/src/routes/nvrConfig.ts
-// Read-only NVR channel video/audio configuration endpoints.
-// All writes will be added separately after backup/diff workflow is ready.
+// NVR channel video/audio configuration endpoints (read + write with backup).
 import type { FastifyPluginAsync } from 'fastify'
 import CryptoJS from 'crypto-js'
-import { getChannelVideoConfig, getAllChannelsVideoConfig } from '../services/nvr-config/hikvision'
+import { z } from 'zod'
+import {
+  getChannelVideoConfig,
+  getAllChannelsVideoConfig,
+  putChannelVideoConfig,
+} from '../services/nvr-config/hikvision'
+import { AuditAction } from '../services/audit'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 
@@ -83,6 +88,180 @@ export const nvrConfigRoutes: FastifyPluginAsync = async (server) => {
       }, channels)
 
       return reply.send(configs)
+    }
+  )
+
+  // PUT /api/nvrs/:nvrId/channels/:channelId/video-config
+  // Writes video/audio config for a channel after saving a backup of the current config.
+  const putVideoConfigSchema = z.object({
+    streamType: z.enum(['main', 'sub']),
+    update: z.object({
+      videoCodecType: z.string().optional(),
+      width:          z.number().int().optional(),
+      height:         z.number().int().optional(),
+      fps:            z.number().optional(),
+      bitrateType:    z.enum(['CBR', 'VBR']).optional(),
+      bitrateMax:     z.number().int().optional(),
+      qualityLevel:   z.string().optional(),
+      audioEnabled:   z.boolean().optional(),
+      audioCodecType: z.string().optional(),
+      audioBitrate:   z.number().int().optional(),
+    }),
+  })
+
+  server.put('/:nvrId/channels/:channelId/video-config',
+    { preHandler: [server.authorize(['ADMIN'])] },
+    async (request, reply) => {
+      const { nvrId, channelId } = request.params as { nvrId: string; channelId: string }
+      const channel = parseInt(channelId)
+      if (isNaN(channel) || channel < 1 || channel > 64) {
+        return reply.status(400).send({ message: 'channelId inválido (1-64)' })
+      }
+
+      const parsed = putVideoConfigSchema.safeParse(request.body)
+      if (!parsed.success) {
+        return reply.status(400).send({ message: 'Cuerpo de solicitud inválido', errors: parsed.error.flatten() })
+      }
+      const { streamType, update } = parsed.data
+
+      const nvr = await server.prisma.nVR.findUnique({ where: { id: nvrId } })
+      if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+      const plainPass = decryptPass(nvr.password)
+      if (!plainPass) {
+        return reply.status(503).send({
+          message: 'No se pueden descifrar las credenciales del NVR. Verifica NVR_CREDENTIAL_KEY.',
+        })
+      }
+
+      const nvrCreds = {
+        ipAddress: nvr.ipAddress,
+        port:      nvr.port,
+        username:  nvr.username,
+        password:  plainPass,
+      }
+
+      // Read current config as backup before writing
+      const current = await getChannelVideoConfig(nvrId, nvrCreds, channel)
+
+      // Save backup
+      await server.prisma.nvrChannelConfigBackup.create({
+        data: {
+          nvrId,
+          channelNo:       channel,
+          streamType,
+          configJson:      JSON.stringify(current),
+          createdByUserId: (request.user as any).sub,
+          reason:          'before_edit',
+        },
+      })
+
+      // Apply update
+      const result = await putChannelVideoConfig(nvrId, nvrCreds, channel, streamType, update)
+      if (!result.success) {
+        return reply.status(502).send({ message: result.error ?? 'Error al escribir configuración en NVR' })
+      }
+
+      await AuditAction(server.prisma, (request.user as any).sub, 'NVR_CHANNEL_CONFIG_UPDATED', nvrId, request)
+
+      return reply.send(result.config)
+    }
+  )
+
+  // POST /api/nvrs/:nvrId/channels/:channelId/video-config/restore
+  // Restores channel config from a backup (latest or specified by backupId).
+  const restoreSchema = z.object({
+    backupId:   z.string().optional(),
+    streamType: z.enum(['main', 'sub']),
+  })
+
+  server.post('/:nvrId/channels/:channelId/video-config/restore',
+    { preHandler: [server.authorize(['ADMIN'])] },
+    async (request, reply) => {
+      const { nvrId, channelId } = request.params as { nvrId: string; channelId: string }
+      const channel = parseInt(channelId)
+      if (isNaN(channel) || channel < 1 || channel > 64) {
+        return reply.status(400).send({ message: 'channelId inválido (1-64)' })
+      }
+
+      const parsed = restoreSchema.safeParse(request.body)
+      if (!parsed.success) {
+        return reply.status(400).send({ message: 'Cuerpo de solicitud inválido', errors: parsed.error.flatten() })
+      }
+      const { backupId, streamType } = parsed.data
+
+      // Find the backup to restore
+      let backup: { configJson: string } | null = null
+      if (backupId) {
+        backup = await server.prisma.nvrChannelConfigBackup.findFirst({
+          where: { id: backupId, nvrId, channelNo: channel },
+          select: { configJson: true },
+        })
+      } else {
+        backup = await server.prisma.nvrChannelConfigBackup.findFirst({
+          where: { nvrId, channelNo: channel, streamType },
+          orderBy: { createdAt: 'desc' },
+          select: { configJson: true },
+        })
+      }
+
+      if (!backup) {
+        return reply.status(404).send({ message: 'No se encontró backup para este canal' })
+      }
+
+      const nvr = await server.prisma.nVR.findUnique({ where: { id: nvrId } })
+      if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+      const plainPass = decryptPass(nvr.password)
+      if (!plainPass) {
+        return reply.status(503).send({
+          message: 'No se pueden descifrar las credenciales del NVR. Verifica NVR_CREDENTIAL_KEY.',
+        })
+      }
+
+      const nvrCreds = {
+        ipAddress: nvr.ipAddress,
+        port:      nvr.port,
+        username:  nvr.username,
+        password:  plainPass,
+      }
+
+      // Parse backup config
+      let savedConfig: import('../services/nvr-config/hikvision').ChannelVideoConfig
+      try {
+        savedConfig = JSON.parse(backup.configJson)
+      } catch {
+        return reply.status(500).send({ message: 'Backup corrupto: JSON inválido' })
+      }
+
+      // Extract the relevant stream config
+      const streamConfig = streamType === 'main' ? savedConfig.main : savedConfig.sub
+      if (!streamConfig) {
+        return reply.status(404).send({ message: `El backup no contiene configuración del stream ${streamType}` })
+      }
+
+      // Map VideoStreamConfig fields to VideoStreamUpdate
+      const updatePayload: import('../services/nvr-config/hikvision').VideoStreamUpdate = {
+        videoCodecType: streamConfig.videoCodecType,
+        width:          streamConfig.width,
+        height:         streamConfig.height,
+        fps:            streamConfig.fps,
+        bitrateType:    streamConfig.bitrateType,
+        bitrateMax:     streamConfig.bitrateMax,
+        qualityLevel:   streamConfig.qualityLevel,
+        audioEnabled:   streamConfig.audioEnabled,
+        audioCodecType: streamConfig.audioCodecType,
+        audioBitrate:   streamConfig.audioBitrate,
+      }
+
+      const result = await putChannelVideoConfig(nvrId, nvrCreds, channel, streamType, updatePayload)
+      if (!result.success) {
+        return reply.status(502).send({ message: result.error ?? 'Error al restaurar configuración en NVR' })
+      }
+
+      await AuditAction(server.prisma, (request.user as any).sub, 'NVR_CHANNEL_CONFIG_RESTORED', nvrId, request)
+
+      return reply.send(result.config)
     }
   )
 }

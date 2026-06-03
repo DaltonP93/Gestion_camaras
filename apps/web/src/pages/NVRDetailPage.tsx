@@ -8,10 +8,11 @@ import {
   Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
   Copy, Download, ChevronDown, Zap, Video as VideoIcon,
+  Save, History,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
-import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, VideoStreamConfig } from '@/types'
+import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, VideoStreamConfig, VideoStreamUpdate } from '@/types'
 import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
@@ -1261,6 +1262,147 @@ function isH265Codec(codec?: string | null): boolean {
   return c.includes('h.265') || c.includes('h265') || c.includes('hevc')
 }
 
+const CODEC_OPTIONS  = ['H.264', 'H.265', 'H.264+', 'H.265+']
+const RES_OPTIONS    = ['3840x2160', '2560x1440', '1920x1080', '1280x720', '704x576', '704x480', '640x480', '352x288', '352x240']
+const AUDIO_CODECS   = ['G.711ulaw', 'G.711alaw', 'G.726', 'AAC', 'G.722.1', 'G.729']
+const QUALITY_OPTS   = ['lowest', 'lower', 'low', 'medium', 'high', 'higher', 'highest']
+
+function streamToUpdate(cfg: VideoStreamConfig): VideoStreamUpdate {
+  return {
+    videoCodecType: cfg.videoCodecType,
+    width:          cfg.width,
+    height:         cfg.height,
+    fps:            cfg.fps,
+    bitrateType:    cfg.bitrateType,
+    bitrateMax:     cfg.bitrateMax,
+    qualityLevel:   cfg.qualityLevel,
+    audioEnabled:   cfg.audioEnabled,
+    audioCodecType: cfg.audioCodecType,
+    audioBitrate:   cfg.audioBitrate,
+  }
+}
+
+function StreamEditForm({
+  initial,
+  onSave,
+  onCancel,
+  saving,
+}: {
+  initial: VideoStreamUpdate
+  onSave:  (v: VideoStreamUpdate) => void
+  onCancel: () => void
+  saving:  boolean
+}) {
+  const [v, setV] = useState<VideoStreamUpdate>(initial)
+  const set = (k: keyof VideoStreamUpdate, val: any) => setV((p) => ({ ...p, [k]: val }))
+
+  const resStr = v.width && v.height ? `${v.width}x${v.height}` : ''
+  const customRes = resStr && !RES_OPTIONS.includes(resStr)
+
+  return (
+    <div className="bg-surface-750 rounded-lg p-4 space-y-3 border border-brand-600/30">
+      <div className="grid grid-cols-2 gap-3">
+        {/* Codec */}
+        <div>
+          <label className="block text-[10px] text-surface-500 mb-1">Codec</label>
+          <select className="input text-xs py-1.5 w-full" value={v.videoCodecType || ''} onChange={e => set('videoCodecType', e.target.value)}>
+            {CODEC_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        {/* Resolution */}
+        <div>
+          <label className="block text-[10px] text-surface-500 mb-1">Resolución</label>
+          <select
+            className="input text-xs py-1.5 w-full"
+            value={customRes ? 'custom' : resStr}
+            onChange={e => {
+              if (e.target.value === 'custom') return
+              const [w, h] = e.target.value.split('x').map(Number)
+              set('width', w); set('height', h)
+            }}
+          >
+            {RES_OPTIONS.map(r => <option key={r} value={r}>{r}</option>)}
+            {customRes && <option value="custom">{resStr} (actual)</option>}
+          </select>
+        </div>
+        {/* FPS */}
+        <div>
+          <label className="block text-[10px] text-surface-500 mb-1">FPS</label>
+          <input type="number" min={1} max={60} className="input text-xs py-1.5 w-full"
+            value={v.fps ?? ''} onChange={e => set('fps', parseInt(e.target.value) || 0)} />
+        </div>
+        {/* Bitrate type */}
+        <div>
+          <label className="block text-[10px] text-surface-500 mb-1">Tipo bitrate</label>
+          <div className="flex gap-1">
+            {['CBR', 'VBR'].map(t => (
+              <button key={t} type="button"
+                onClick={() => set('bitrateType', t)}
+                className={clsx('flex-1 text-xs px-2 py-1.5 rounded border transition-colors',
+                  v.bitrateType === t
+                    ? 'bg-brand-600/20 border-brand-600/40 text-brand-300'
+                    : 'border-surface-600 text-surface-400 hover:text-surface-200'
+                )}
+              >{t}</button>
+            ))}
+          </div>
+        </div>
+        {/* Bitrate max */}
+        <div>
+          <label className="block text-[10px] text-surface-500 mb-1">Bitrate máx (kbps)</label>
+          <input type="number" min={32} max={16384} className="input text-xs py-1.5 w-full"
+            value={v.bitrateMax ?? ''} onChange={e => set('bitrateMax', parseInt(e.target.value) || 0)} />
+        </div>
+        {/* Quality (VBR) */}
+        {v.bitrateType === 'VBR' && (
+          <div>
+            <label className="block text-[10px] text-surface-500 mb-1">Calidad (VBR)</label>
+            <select className="input text-xs py-1.5 w-full" value={v.qualityLevel || ''} onChange={e => set('qualityLevel', e.target.value)}>
+              {QUALITY_OPTS.map(q => <option key={q} value={q}>{q}</option>)}
+            </select>
+          </div>
+        )}
+      </div>
+
+      {/* Audio section */}
+      <div className="border-t border-surface-700 pt-3 space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-2 cursor-pointer select-none text-xs text-surface-300">
+            <input type="checkbox" className="accent-brand-500 w-3.5 h-3.5"
+              checked={!!v.audioEnabled} onChange={e => set('audioEnabled', e.target.checked)} />
+            Audio activo
+          </label>
+        </div>
+        {v.audioEnabled && (
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[10px] text-surface-500 mb-1">Codec audio</label>
+              <select className="input text-xs py-1.5 w-full" value={v.audioCodecType || ''} onChange={e => set('audioCodecType', e.target.value)}>
+                {AUDIO_CODECS.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] text-surface-500 mb-1">Bitrate audio (kbps)</label>
+              <input type="number" min={8} max={320} className="input text-xs py-1.5 w-full"
+                value={v.audioBitrate ?? ''} onChange={e => set('audioBitrate', parseInt(e.target.value) || 0)} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2 pt-1">
+        <button type="button" disabled={saving} onClick={() => onSave(v)} className="btn-primary text-xs flex items-center gap-1.5">
+          {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+          Guardar cambios
+        </button>
+        <button type="button" disabled={saving} onClick={onCancel} className="btn-ghost text-xs">
+          <X size={12} /> Cancelar
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraType[] }) {
   const [configs, setConfigs] = useState<ChannelVideoConfig[]>([])
   const [loading, setLoading] = useState(false)
@@ -1269,6 +1411,13 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
   const [loadingSingle, setLoadingSingle] = useState(false)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<VideoFilter>('all')
+
+  // Edit state
+  const [editStream, setEditStream] = useState<'main' | 'sub' | null>(null)
+  const [editValues, setEditValues] = useState<VideoStreamUpdate>({})
+  const [saving, setSaving] = useState(false)
+  const [restoring, setRestoring] = useState(false)
+  const [confirmSave, setConfirmSave] = useState<{ streamType: 'main' | 'sub'; values: VideoStreamUpdate } | null>(null)
 
   const selectedConfig = configs.find((c) => c.channel === selectedChannel)
 
@@ -1300,9 +1449,68 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
     }
   }
 
+  const handleEdit = (streamType: 'main' | 'sub') => {
+    const cfg = selectedConfig?.[streamType]
+    if (!cfg) return
+    setEditValues(streamToUpdate(cfg))
+    setEditStream(streamType)
+  }
+
+  const handleSaveRequest = (values: VideoStreamUpdate) => {
+    if (!editStream) return
+    setConfirmSave({ streamType: editStream, values })
+  }
+
+  const handleSaveConfirm = async () => {
+    if (!confirmSave || selectedChannel === null) return
+    setSaving(true)
+    setConfirmSave(null)
+    try {
+      const res = await apiPut<{ success: boolean; error?: string; config?: ChannelVideoConfig }>(
+        `/nvrs/${nvrId}/channels/${selectedChannel}/video-config`,
+        { streamType: confirmSave.streamType, update: confirmSave.values }
+      )
+      if (!res.success) throw new Error(res.error || 'Error al guardar')
+      if (res.config) {
+        setConfigs((prev) => prev.map((c) => c.channel === selectedChannel ? res.config! : c))
+      }
+      setEditStream(null)
+      toast.success('Configuración guardada en el NVR')
+    } catch (e: any) {
+      toast.error(e?.response?.data?.message || e?.message || 'Error al escribir en el NVR')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleRestore = async () => {
+    if (selectedChannel === null) return
+    if (!window.confirm('¿Restaurar la última configuración guardada antes del último cambio? Esto sobrescribirá la configuración actual en el NVR.')) return
+    setRestoring(true)
+    try {
+      const res = await apiPost<{ success: boolean; error?: string; config?: ChannelVideoConfig }>(
+        `/nvrs/${nvrId}/channels/${selectedChannel}/video-config/restore`,
+        { streamType: editStream || 'main' }
+      )
+      if (!res.success) throw new Error(res.error || 'Error al restaurar')
+      if (res.config) {
+        setConfigs((prev) => prev.map((c) => c.channel === selectedChannel ? res.config! : c))
+      }
+      setEditStream(null)
+      toast.success('Configuración restaurada desde backup')
+    } catch (e: any) {
+      toast.error(e?.response?.data?.message || e?.message || 'Error al restaurar backup')
+    } finally {
+      setRestoring(false)
+    }
+  }
+
   useEffect(() => {
     if (dbCameras.length > 0) loadAll()
   }, [nvrId])
+
+  // Reset edit when channel changes
+  useEffect(() => { setEditStream(null) }, [selectedChannel])
 
   // ── Stats ──────────────────────────────────────────────────
   const stats = {
@@ -1346,11 +1554,37 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
 
   return (
     <div className="space-y-4">
+      {/* Confirm modal */}
+      {confirmSave && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-surface-800 border border-surface-600 rounded-xl p-6 max-w-sm w-full mx-4 space-y-4 shadow-xl">
+            <div className="flex items-start gap-3">
+              <AlertTriangle size={18} className="text-amber-400 flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-semibold text-surface-100">Confirmar escritura en NVR</p>
+                <p className="text-xs text-surface-400 mt-1">
+                  Se guardará la configuración del flujo <span className="font-medium text-surface-200">{confirmSave.streamType === 'main' ? 'principal (Main)' : 'secundario (Sub)'}</span> directamente en el NVR vía ISAPI. La configuración actual se respaldará automáticamente antes de escribir.
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-2 pt-1">
+              <button onClick={handleSaveConfirm} disabled={saving} className="btn-primary flex-1 text-sm flex items-center justify-center gap-1.5">
+                {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+                Confirmar escritura
+              </button>
+              <button onClick={() => setConfirmSave(null)} disabled={saving} className="btn-ghost text-sm">
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-sm font-medium text-surface-200">Video y audio por canal</p>
-          <p className="text-xs text-surface-500 mt-0.5">Lectura directa del NVR vía ISAPI — solo visualización</p>
+          <p className="text-xs text-surface-500 mt-0.5">Lectura y escritura vía ISAPI — backup automático antes de cada cambio</p>
         </div>
         <button onClick={loadAll} disabled={loading} className="btn-secondary text-xs flex-shrink-0">
           <RefreshCw size={12} /> Actualizar
@@ -1421,7 +1655,7 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
           {/* Split: table + detail */}
           <div className="flex gap-3 min-h-0">
             {/* Compact channel table */}
-            <div className="w-[340px] flex-shrink-0 overflow-auto rounded-lg border border-surface-700 max-h-[420px]">
+            <div className="w-[340px] flex-shrink-0 overflow-auto rounded-lg border border-surface-700 max-h-[500px]">
               <table className="w-full text-xs">
                 <thead className="bg-surface-800 sticky top-0 z-10">
                   <tr>
@@ -1493,7 +1727,7 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
             <div className="flex-1 min-w-0">
               {selectedConfig ? (
                 <div className="space-y-3">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
                     <div>
                       <p className="text-sm font-medium text-surface-100">
                         {(selected as any)?.channelCode || `D${selectedConfig.channel}`} — {selected?.name || `Canal ${selectedConfig.channel}`}
@@ -1502,14 +1736,25 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
                         Leído {new Date(selectedConfig.fetchedAt).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                       </p>
                     </div>
-                    <button
-                      onClick={() => loadSingle(selectedConfig.channel)}
-                      disabled={loadingSingle}
-                      className="btn-ghost text-xs"
-                    >
-                      {loadingSingle ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-                      Refrescar
-                    </button>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <button
+                        onClick={handleRestore}
+                        disabled={restoring || saving}
+                        className="btn-ghost text-xs flex items-center gap-1"
+                        title="Restaurar configuración desde el último backup automático"
+                      >
+                        {restoring ? <Loader2 size={11} className="animate-spin" /> : <History size={11} />}
+                        Restaurar backup
+                      </button>
+                      <button
+                        onClick={() => { setEditStream(null); loadSingle(selectedConfig.channel) }}
+                        disabled={loadingSingle || saving}
+                        className="btn-ghost text-xs"
+                      >
+                        {loadingSingle ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+                        Releer NVR
+                      </button>
+                    </div>
                   </div>
 
                   {selectedConfig.error ? (
@@ -1519,8 +1764,52 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
                     </div>
                   ) : (
                     <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                      {selectedConfig.main && <StreamConfigCard config={selectedConfig.main} label="Flujo principal (Main)" />}
-                      {selectedConfig.sub  && <StreamConfigCard config={selectedConfig.sub}  label="Flujo secundario (Sub)" />}
+                      {/* Main stream */}
+                      {selectedConfig.main && (
+                        <div className="space-y-2">
+                          {editStream === 'main' ? (
+                            <StreamEditForm
+                              initial={editValues}
+                              onSave={handleSaveRequest}
+                              onCancel={() => setEditStream(null)}
+                              saving={saving}
+                            />
+                          ) : (
+                            <div className="relative group">
+                              <StreamConfigCard config={selectedConfig.main} label="Flujo principal (Main)" />
+                              <button
+                                onClick={() => handleEdit('main')}
+                                className="absolute top-3 right-3 btn-ghost text-[10px] py-0.5 px-1.5 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
+                              >
+                                <Pencil size={10} /> Editar
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {/* Sub stream */}
+                      {selectedConfig.sub && (
+                        <div className="space-y-2">
+                          {editStream === 'sub' ? (
+                            <StreamEditForm
+                              initial={editValues}
+                              onSave={handleSaveRequest}
+                              onCancel={() => setEditStream(null)}
+                              saving={saving}
+                            />
+                          ) : (
+                            <div className="relative group">
+                              <StreamConfigCard config={selectedConfig.sub} label="Flujo secundario (Sub)" />
+                              <button
+                                onClick={() => handleEdit('sub')}
+                                className="absolute top-3 right-3 btn-ghost text-[10px] py-0.5 px-1.5 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
+                              >
+                                <Pencil size={10} /> Editar
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
                       {!selectedConfig.main && !selectedConfig.sub && (
                         <div className="col-span-2 p-6 bg-surface-750 rounded-lg text-center text-xs text-surface-500">
                           Sin datos de configuración para este canal
@@ -1528,11 +1817,6 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
                       )}
                     </div>
                   )}
-
-                  <div className="flex items-start gap-2 p-3 bg-surface-750 rounded-lg text-xs text-surface-500 border border-surface-700">
-                    <AlertTriangle size={12} className="flex-shrink-0 mt-0.5 text-amber-500" />
-                    <p>Vista <span className="font-medium text-surface-400">solo lectura</span>. La edición de codec/resolución/FPS/bitrate estará disponible en la próxima versión con backup automático y confirmación antes de escribir al NVR.</p>
-                  </div>
                 </div>
               ) : (
                 <div className="card p-8 text-center text-xs text-surface-500">

@@ -66,6 +66,29 @@ export function ViewPlayerPage() {
   // We receive this call from VideoPlayer's onFullscreen, which itself fires inside
   // onDoubleClick / onClick — both are direct user gesture events.
   const enterFullscreen = useCallback((cameraId: string) => {
+    console.log('[fullscreen] toggle', { hasNativeFS: Boolean(document.fullscreenElement || (document as any).webkitFullscreenElement), hasCssFS: fullscreenCamId !== null, cameraId })
+
+    // Case 1: native fullscreen is active → exit it (fullscreenchange handler cleans up state)
+    if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
+      if (document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {})
+      } else {
+        (document as any).webkitExitFullscreen?.()
+      }
+      return
+    }
+
+    // Case 2: CSS overlay fullscreen is active → exit it
+    if (fullscreenCamId !== null) {
+      const prevCamId = fullscreenCamId
+      setFullscreenCamId(null)
+      setFullscreenMainStream(null)
+      apiPost(`/cameras/${prevCamId}/stop-stream`, { streamType: 'main', reason: 'exit_fullscreen' }).catch(() => {})
+      apiPost(`/cameras/${prevCamId}/stop-stream`, { streamType: 'main_h264', reason: 'exit_fullscreen' }).catch(() => {})
+      return
+    }
+
+    // Case 3: enter fullscreen
     const el = tileRefs.current.get(cameraId)
     // Synchronous native FS call — must be first, before any async work
     if (el?.requestFullscreen) {
@@ -73,6 +96,8 @@ export function ViewPlayerPage() {
         // Native FS unavailable → CSS overlay fallback
         setFullscreenCamId(cameraId)
       })
+    } else if ((el as any)?.webkitRequestFullscreen) {
+      ;(el as any).webkitRequestFullscreen()
     } else {
       setFullscreenCamId(cameraId)
     }
@@ -88,7 +113,7 @@ export function ViewPlayerPage() {
       .catch(() => {
         // Main stream unavailable — CSS overlay uses sub stream as fallback
       })
-  }, [])
+  }, [fullscreenCamId])
 
   const exitFullscreen = useCallback(() => {
     if (document.fullscreenElement) {
@@ -120,7 +145,11 @@ export function ViewPlayerPage() {
       }
     }
     document.addEventListener('fullscreenchange', handler)
-    return () => document.removeEventListener('fullscreenchange', handler)
+    document.addEventListener('webkitfullscreenchange', handler)
+    return () => {
+      document.removeEventListener('fullscreenchange', handler)
+      document.removeEventListener('webkitfullscreenchange', handler)
+    }
   }, [])
 
   // ─── Load view + cameras + first-page streams ────────────────────────────────
