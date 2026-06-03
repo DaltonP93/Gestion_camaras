@@ -445,6 +445,158 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // ──────────────────────────────────────────────────────────
+  // POST /api/auth/forgot-password
+  // ──────────────────────────────────────────────────────────
+  server.post('/forgot-password', {
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
+  }, async (request, reply) => {
+    const { email } = z.object({ email: z.string().email() }).parse(request.body)
+
+    const GENERIC_MSG = { message: 'Si el correo existe, se enviaron instrucciones.' }
+
+    const user = await server.prisma.user.findFirst({ where: { email, active: true } })
+    if (!user) return reply.send(GENERIC_MSG) // Don't reveal existence
+
+    // Rate-limit: only one active token per user
+    if (user.passwordResetExpiry && user.passwordResetExpiry > new Date()) {
+      return reply.send(GENERIC_MSG) // Silently ignore duplicate requests
+    }
+
+    const rawToken = crypto.randomBytes(32).toString('hex')
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex')
+    const expiry = new Date(Date.now() + 30 * 60 * 1000) // 30 minutes
+
+    await server.prisma.user.update({
+      where: { id: user.id },
+      data: { passwordResetToken: tokenHash, passwordResetExpiry: expiry },
+    })
+
+    // Get SMTP config from DB
+    const alertSettings = await server.prisma.alertSettings.findUnique({ where: { id: 'singleton' } })
+
+    if (alertSettings?.emailEnabled && alertSettings.smtpHost) {
+      const appUrl = process.env.APP_URL || 'http://localhost:4000'
+      const resetLink = `${appUrl}/reset-password?token=${rawToken}`
+
+      const nodemailer = await import('nodemailer')
+      const transporter = nodemailer.default.createTransport({
+        host: alertSettings.smtpHost,
+        port: alertSettings.smtpPort,
+        secure: alertSettings.smtpSecure,
+        auth: alertSettings.smtpUser ? { user: alertSettings.smtpUser, pass: alertSettings.smtpPassword } : undefined,
+      })
+
+      const siteName = (await server.prisma.appearanceSettings.findUnique({ where: { id: 'singleton' } }))?.siteName ?? 'VisionCore'
+
+      const html = `
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+        <body style="margin:0;padding:0;background:#1e2130;font-family:Arial,sans-serif">
+          <div style="max-width:520px;margin:40px auto;background:#2a2e42;border-radius:16px;overflow:hidden;border:1px solid #3d4260">
+            <div style="background:#e51d1d;padding:24px;text-align:center">
+              <h1 style="color:#fff;margin:0;font-size:22px;font-weight:700">${siteName}</h1>
+              <p style="color:rgba(255,255,255,0.8);margin:4px 0 0;font-size:13px">Sistema de gestión NVR</p>
+            </div>
+            <div style="padding:32px 40px">
+              <h2 style="color:#e5e7eb;font-size:18px;margin:0 0 12px">Restablecer contraseña</h2>
+              <p style="color:#9ca3af;font-size:14px;line-height:1.6;margin:0 0 24px">
+                Hola <strong style="color:#e5e7eb">${user.fullName || user.username}</strong>,<br><br>
+                Recibimos una solicitud para restablecer la contraseña de tu cuenta. Haz clic en el botón de abajo para continuar.
+              </p>
+              <div style="text-align:center;margin:0 0 24px">
+                <a href="${resetLink}" style="display:inline-block;background:#e51d1d;color:#fff;text-decoration:none;padding:13px 32px;border-radius:8px;font-size:14px;font-weight:600">
+                  Restablecer contraseña
+                </a>
+              </div>
+              <p style="color:#6b7280;font-size:12px;text-align:center;margin:0 0 8px">
+                Este enlace expira en <strong>30 minutos</strong>.
+              </p>
+              <p style="color:#6b7280;font-size:12px;text-align:center;margin:0">
+                Si no solicitaste este cambio, ignora este correo.
+              </p>
+              <hr style="border:none;border-top:1px solid #3d4260;margin:24px 0">
+              <p style="color:#4b5563;font-size:11px;text-align:center;margin:0">
+                ${siteName} · No respondas a este correo
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `
+
+      await transporter.sendMail({
+        from: `"${alertSettings.smtpFromName || siteName}" <${alertSettings.smtpFromEmail}>`,
+        to: user.email,
+        subject: `Restablece tu contraseña - ${siteName}`,
+        html,
+      }).catch((err: any) => server.log.warn(`[forgot-password] email error: ${err.message}`))
+    }
+
+    await AuditAction(server.prisma, user.id, 'PASSWORD_RESET_REQUESTED', user.id, request)
+    return reply.send(GENERIC_MSG)
+  })
+
+  // ──────────────────────────────────────────────────────────
+  // POST /api/auth/reset-password
+  // ──────────────────────────────────────────────────────────
+  server.post('/reset-password', {
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
+  }, async (request, reply) => {
+    const { token, newPassword } = z.object({
+      token:       z.string().min(1),
+      newPassword: z.string().min(10),
+    }).parse(request.body)
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
+
+    const user = await server.prisma.user.findFirst({
+      where: {
+        passwordResetToken: tokenHash,
+        passwordResetExpiry: { gt: new Date() },
+        active: true,
+      },
+    })
+
+    if (!user) {
+      return reply.status(400).send({ message: 'Enlace inválido o expirado' })
+    }
+
+    const policy = checkPasswordPolicy(newPassword)
+    if (!policy.valid) {
+      return reply.status(400).send({ message: 'Contraseña no cumple los requisitos', errors: policy.errors })
+    }
+
+    const reused = await checkPasswordHistory(newPassword, user.passwordHistory ?? null)
+    if (reused) {
+      return reply.status(400).send({ message: 'No puedes reutilizar una contraseña reciente' })
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 12)
+    const newHistory = await addToPasswordHistory(newHash, user.passwordHistory ?? null)
+
+    await server.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordHash: newHash,
+        passwordHistory: newHistory,
+        passwordChangedAt: new Date(),
+        forcePasswordChange: false,
+        passwordResetToken: null,
+        passwordResetExpiry: null,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+    })
+
+    // Invalidate all sessions
+    await server.prisma.session.deleteMany({ where: { userId: user.id } })
+
+    await AuditAction(server.prisma, user.id, 'PASSWORD_RESET_COMPLETED', user.id, request)
+    return reply.send({ message: 'Contraseña restablecida correctamente. Inicia sesión.' })
+  })
+
+  // ──────────────────────────────────────────────────────────
   // GET /api/auth/me
   // ──────────────────────────────────────────────────────────
   server.get('/me', {

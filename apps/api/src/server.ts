@@ -4,6 +4,10 @@ import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
 import websocket from '@fastify/websocket'
+import staticFiles from '@fastify/static'
+import multipart from '@fastify/multipart'
+import path from 'path'
+import fs from 'fs'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -100,6 +104,20 @@ async function main() {
   await server.register(redisPlugin)
   await server.register(authPlugin)
   await server.register(websocket)
+
+  // ─── Plugins de archivos estáticos y multipart ───────────
+  const uploadsDir = process.env.UPLOADS_DIR || '/app/uploads'
+  fs.mkdirSync(path.join(uploadsDir, 'branding'), { recursive: true })
+
+  await server.register(staticFiles, {
+    root: uploadsDir,
+    prefix: '/uploads/',
+    decorateReply: false,
+  })
+
+  await server.register(multipart, {
+    limits: { fileSize: 2 * 1024 * 1024, files: 4 },
+  })
 
   // ─── Rutas de la API ─────────────────────────────────────
   await server.register(authRoutes, { prefix: '/api/auth' })

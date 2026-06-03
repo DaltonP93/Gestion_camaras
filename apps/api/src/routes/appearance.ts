@@ -1,6 +1,8 @@
 // apps/api/src/routes/appearance.ts
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
+import path from 'path'
+import fs from 'fs'
 
 // Accept empty string or valid URL; coerce null/'' to null for storage
 const urlField = z
@@ -53,6 +55,83 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
       where:  { id: 'singleton' },
       create: { id: 'singleton', ...data },
       update: data,
+    })
+
+    return reply.send({
+      ...settings,
+      customCss:      settings.customCss      ?? '',
+      logoUrl:        settings.logoUrl        ?? '',
+      sidebarLogoUrl: settings.sidebarLogoUrl ?? '',
+      faviconUrl:     settings.faviconUrl     ?? '',
+    })
+  })
+  // POST /appearance/upload — multipart file upload for branding assets
+  server.post('/upload', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const ALLOWED_MIMES = new Set([
+      'image/png', 'image/jpeg', 'image/webp', 'image/svg+xml',
+      'image/x-icon', 'image/vnd.microsoft.icon',
+    ])
+
+    const uploadsDir = process.env.UPLOADS_DIR || '/app/uploads'
+    const brandingDir = path.join(uploadsDir, 'branding')
+    const baseUrl = process.env.APP_URL || `http://localhost:4000`
+
+    const FIELD_NAMES = new Set(['favicon', 'sidebarLogo', 'loginLogo', 'headerLogo', 'logoUrl', 'sidebarLogoUrl', 'faviconUrl'])
+    const fieldToDbKey: Record<string, string> = {
+      favicon: 'faviconUrl',
+      faviconUrl: 'faviconUrl',
+      sidebarLogo: 'sidebarLogoUrl',
+      sidebarLogoUrl: 'sidebarLogoUrl',
+      loginLogo: 'logoUrl',
+      headerLogo: 'logoUrl',
+      logoUrl: 'logoUrl',
+    }
+
+    const updates: Record<string, string> = {}
+
+    // Load current settings to know previous file paths
+    const current = await server.prisma.appearanceSettings.findUnique({ where: { id: 'singleton' } })
+
+    const parts = request.parts()
+    for await (const part of parts) {
+      if (part.type !== 'file') continue
+      if (!FIELD_NAMES.has(part.fieldname)) {
+        await part.toBuffer() // drain
+        continue
+      }
+      if (!ALLOWED_MIMES.has(part.mimetype)) {
+        await part.toBuffer()
+        return reply.status(400).send({ message: `Tipo de archivo no permitido: ${part.mimetype}` })
+      }
+
+      const buf = await part.toBuffer()
+      if (buf.length === 0) continue
+
+      // Sanitize filename, generate unique name
+      const ext = path.extname(part.filename || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 5) || '.png'
+      const uniqueName = `${part.fieldname}_${Date.now()}${ext}`
+      const destPath = path.join(brandingDir, uniqueName)
+
+      // Delete previous file for this field if it's a local upload
+      const dbKey = fieldToDbKey[part.fieldname]
+      const prevUrl: string | null = (current as any)?.[dbKey] ?? null
+      if (prevUrl && prevUrl.startsWith(`${baseUrl}/uploads/branding/`)) {
+        const prevFile = path.join(brandingDir, path.basename(prevUrl))
+        try { fs.unlinkSync(prevFile) } catch {}
+      }
+
+      fs.writeFileSync(destPath, buf)
+      updates[dbKey] = `${baseUrl}/uploads/branding/${uniqueName}`
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return reply.status(400).send({ message: 'No se recibieron archivos válidos' })
+    }
+
+    const settings = await server.prisma.appearanceSettings.upsert({
+      where:  { id: 'singleton' },
+      create: { id: 'singleton', ...updates },
+      update: updates,
     })
 
     return reply.send({
