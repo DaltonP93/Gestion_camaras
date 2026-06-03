@@ -5,6 +5,7 @@ import {
   SidebarOpen, Eye, Code2, Check, Image, AlertTriangle, Upload,
 } from 'lucide-react'
 import { apiGet, apiPut, apiUpload, resolveAssetUrl } from '@/lib/api'
+import { useAppearanceStore } from '@/stores/appearanceStore'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
 import type { AppearanceSettings } from '@/types'
@@ -303,6 +304,7 @@ function applyAppearance(s: AppearanceSettings) {
 type Tab = 'branding' | 'apariencia' | 'sidebar' | 'advanced'
 
 export function AppearancePage() {
+  const { apply: applyGlobal } = useAppearanceStore()
   const [settings, setSettings]   = useState<AppearanceSettings>(DEFAULTS)
   const [saved, setSaved]         = useState<AppearanceSettings>(DEFAULTS)
   const [isLoading, setIsLoading] = useState(true)
@@ -356,6 +358,7 @@ export function AppearancePage() {
       setSaved(clean)
       setSettings(clean)
       applyAppearance(clean)
+      applyGlobal(clean)  // propagate to all components via store
       toast.success('Apariencia guardada')
     } catch {
       toast.error('Error al guardar apariencia')
