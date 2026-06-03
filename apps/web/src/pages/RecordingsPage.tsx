@@ -1,9 +1,12 @@
 // src/pages/RecordingsPage.tsx
-import { useEffect, useState, useMemo } from 'react'
-import { Search, Play, Download, Calendar, Clock, ChevronDown, CheckSquare, Square, AlertTriangle, Server } from 'lucide-react'
+import { useEffect, useState, useMemo, useRef } from 'react'
+import {
+  Search, Play, Download, Calendar, Clock,
+  ChevronDown, CheckSquare, Square, AlertTriangle, Server, Info,
+} from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
-import { apiPost, apiGet } from '@/lib/api'
-import { format, subDays, subHours } from 'date-fns'
+import { apiPost } from '@/lib/api'
+import { format, subDays, subHours, startOfDay, endOfDay } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
 import toast from 'react-hot-toast'
@@ -14,39 +17,48 @@ interface RecordingWithCamera extends Recording {
   nvrName: string
 }
 
-interface IsapiError {
-  cameraId: string
-  cameraName: string
+interface NVRErrorGroup {
+  nvrId: string
+  nvrName: string
   nvrModel?: string
   code: string
+  cameraCount: number
+  cameraNames: string[]
+}
+
+function toLocalDatetimeString(d: Date): string {
+  return format(d, "yyyy-MM-dd'T'HH:mm")
 }
 
 export function RecordingsPage() {
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
   const [selectedNVR, setSelectedNVR] = useState<string>('all')
   const [selectedCameras, setSelectedCameras] = useState<Set<string>>(new Set())
-  const [startDate, setStartDate] = useState(format(subDays(new Date(), 1), "yyyy-MM-dd'T'HH:mm"))
-  const [endDate, setEndDate]     = useState(format(new Date(), "yyyy-MM-dd'T'HH:mm"))
+  const [startDate, setStartDate] = useState(toLocalDatetimeString(subHours(new Date(), 1)))
+  const [endDate, setEndDate]     = useState(toLocalDatetimeString(new Date()))
   const [recordings, setRecordings] = useState<RecordingWithCamera[]>([])
   const [isSearching, setIsSearching] = useState(false)
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
   const [showCameraList, setShowCameraList] = useState(false)
-  const [isapiErrors, setIsapiErrors] = useState<IsapiError[]>([])
+  const [nvrErrors, setNvrErrors] = useState<NVRErrorGroup[]>([])
   const [searchSource, setSearchSource] = useState<string | null>(null)
+  // NVRs known to not support ISAPI search — skip in future searches
+  const [unsupportedNVRs] = useState<Set<string>>(new Set())
+
+  const startInputRef = useRef<HTMLInputElement>(null)
+  const endInputRef   = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     loadNVRs()
     loadCameras()
   }, [])
 
-  // Cámaras filtradas por NVR
   const filteredCameras = useMemo(() =>
     cameras.filter(c => selectedNVR === 'all' ? true : c.nvrId === selectedNVR),
     [cameras, selectedNVR]
   )
 
-  // Cámaras agrupadas por NVR
   const camerasByNVR = useMemo(() => {
     const map = new Map<string, { nvrName: string; cameras: Camera[] }>()
     filteredCameras.forEach((cam) => {
@@ -57,7 +69,6 @@ export function RecordingsPage() {
     return map
   }, [filteredCameras])
 
-  // Reset selection when NVR filter changes
   useEffect(() => { setSelectedCameras(new Set()) }, [selectedNVR])
 
   const toggleCamera = (cameraId: string) => {
@@ -84,56 +95,113 @@ export function RecordingsPage() {
   const selectAll = () => setSelectedCameras(new Set(filteredCameras.map(c => c.id)))
   const clearAll  = () => setSelectedCameras(new Set())
 
+  const setQuick = (from: Date, to: Date) => {
+    setStartDate(toLocalDatetimeString(from))
+    setEndDate(toLocalDatetimeString(to))
+  }
+
   const handleSearch = async () => {
     if (selectedCameras.size === 0) { toast.error('Selecciona al menos una cámara'); return }
+    const start = new Date(startDate)
+    const end   = new Date(endDate)
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) { toast.error('Fechas inválidas'); return }
+    if (start >= end) { toast.error('La fecha Desde debe ser anterior a Hasta'); return }
+
     setIsSearching(true)
     setPlaybackUrl(null)
     setRecordings([])
-    setIsapiErrors([])
+    setNvrErrors([])
     setSearchSource(null)
 
-    const cameraIds = [...selectedCameras]
-    const errors: IsapiError[] = []
+    // Group selected cameras by NVR, skipping known-unsupported NVRs
+    const byNvr = new Map<string, string[]>()
+    for (const cid of selectedCameras) {
+      const cam = cameras.find(c => c.id === cid)
+      if (!cam || unsupportedNVRs.has(cam.nvrId)) continue
+      if (!byNvr.has(cam.nvrId)) byNvr.set(cam.nvrId, [])
+      byNvr.get(cam.nvrId)!.push(cid)
+    }
+
+    const errByNvr = new Map<string, NVRErrorGroup>()
+    const allRecordings: RecordingWithCamera[] = []
     let foundSource: string | null = null
 
-    const results = await Promise.allSettled(
-      cameraIds.map(async (cameraId) => {
-        const cam = cameras.find(c => c.id === cameraId)
+    await Promise.all(
+      [...byNvr.entries()].map(async ([nvrId, cameraIds]) => {
+        const fallbackNvrName = cameras.find(c => c.nvrId === nvrId)?.nvr?.name ?? 'NVR desconocido'
         try {
-          const res = await apiGet<{ recordings: Recording[]; source?: string; nvrModel?: string }>('/recordings/search', {
-            cameraId,
-            startTime: new Date(startDate).toISOString(),
-            endTime: new Date(endDate).toISOString(),
+          const res = await apiPost<{
+            results: Array<{ cameraId: string; cameraName: string; channel: number; recordings: Recording[] }>
+            unsupportedNvr: boolean
+            authError?: boolean
+            nvrModel?: string
+            nvrName?: string
+            errors: Array<{ code: string; message: string; cameraId?: string }>
+            cameraCount: number
+          }>('/recordings/batch-search', {
+            nvrId,
+            cameraIds,
+            from: start.toISOString(),
+            to:   end.toISOString(),
           })
-          if (res?.source) foundSource = res.source
-          return (res?.recordings ?? []).map((r): RecordingWithCamera => ({
-            ...r,
-            cameraId,
-            cameraName: cam?.name || 'Desconocida',
-            nvrName: cam?.nvr?.name || '',
-          }))
+
+          const nvrName  = res.nvrName  ?? fallbackNvrName
+          const nvrModel = res.nvrModel
+
+          if (res.unsupportedNvr) {
+            unsupportedNVRs.add(nvrId)
+            errByNvr.set(`${nvrId}_ISAPI_UNSUPPORTED`, {
+              nvrId, nvrName, nvrModel,
+              code: 'ISAPI_UNSUPPORTED',
+              cameraCount: res.cameraCount,
+              cameraNames: res.results.map(r => r.cameraName).slice(0, 3),
+            })
+            return
+          }
+
+          if (res.authError) {
+            errByNvr.set(`${nvrId}_NVR_AUTH_ERROR`, {
+              nvrId, nvrName, nvrModel,
+              code: 'NVR_AUTH_ERROR',
+              cameraCount: res.cameraCount,
+              cameraNames: [],
+            })
+            return
+          }
+
+          for (const camResult of res.results) {
+            if (camResult.recordings.length > 0) foundSource = 'nvr_isapi'
+            for (const rec of camResult.recordings) {
+              allRecordings.push({
+                ...rec,
+                cameraId:   camResult.cameraId,
+                cameraName: camResult.cameraName,
+                nvrName,
+              })
+            }
+          }
         } catch (err: any) {
-          const code = err?.response?.data?.code || err?.code || 'NVR_ERROR'
-          errors.push({
-            cameraId,
-            cameraName: cam?.name || 'Desconocida',
+          const code    = err?.response?.data?.code ?? 'NVR_ERROR'
+          const nvrName = err?.response?.data?.nvrName ?? fallbackNvrName
+          if (code === 'ISAPI_UNSUPPORTED') unsupportedNVRs.add(nvrId)
+          errByNvr.set(`${nvrId}_${code}`, {
+            nvrId, nvrName,
             nvrModel: err?.response?.data?.nvrModel,
             code,
+            cameraCount: cameraIds.length,
+            cameraNames: cameraIds
+              .map(cid => cameras.find(c => c.id === cid)?.name ?? 'Desconocida')
+              .slice(0, 3),
           })
-          return []
         }
       })
     )
 
-    const all: RecordingWithCamera[] = results
-      .filter((r): r is PromiseFulfilledResult<RecordingWithCamera[]> => r.status === 'fulfilled')
-      .flatMap(r => r.value)
-      .sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
-
-    setRecordings(all)
-    setIsapiErrors(errors)
+    const sorted = allRecordings.sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
+    setRecordings(sorted)
+    setNvrErrors([...errByNvr.values()])
     if (foundSource) setSearchSource(foundSource)
-    if (all.length === 0 && errors.length === 0) toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
+    if (sorted.length === 0 && errByNvr.size === 0) toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
     setIsSearching(false)
   }
 
@@ -141,9 +209,9 @@ export function RecordingsPage() {
     setSelectedRec(rec)
     try {
       const result = await apiPost<{ url: string }>('/recordings/playback', {
-        cameraId: rec.cameraId,
+        cameraId:  rec.cameraId,
         startTime: rec.startTime,
-        endTime: rec.endTime,
+        endTime:   rec.endTime,
       })
       setPlaybackUrl(result.url)
     } catch {
@@ -168,6 +236,12 @@ export function RecordingsPage() {
     ? 'Seleccionar cámaras'
     : `${selectedCameras.size} cámara${selectedCameras.size > 1 ? 's' : ''} seleccionada${selectedCameras.size > 1 ? 's' : ''}`
 
+  const triggerDatePicker = (ref: React.RefObject<HTMLInputElement | null>) => {
+    const el = ref.current
+    if (!el) return
+    try { (el as any).showPicker?.() } catch { el.focus() }
+  }
+
   return (
     <div className="p-5 space-y-4 animate-fade-in">
       <h2 className="text-base font-semibold text-surface-100">Grabaciones</h2>
@@ -176,7 +250,7 @@ export function RecordingsPage() {
       <div className="card p-4 space-y-3">
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
 
-          {/* Filtro NVR */}
+          {/* NVR */}
           <div>
             <label className="label">NVR</label>
             <div className="relative">
@@ -194,7 +268,7 @@ export function RecordingsPage() {
             </div>
           </div>
 
-          {/* Selector cámaras (dropdown con checkboxes) */}
+          {/* Cámaras */}
           <div>
             <label className="label">Cámaras</label>
             <div className="relative">
@@ -211,25 +285,19 @@ export function RecordingsPage() {
 
               {showCameraList && (
                 <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-surface-800 border border-surface-600 rounded-lg shadow-xl max-h-72 overflow-y-auto">
-                  {/* Controles rápidos */}
                   <div className="sticky top-0 bg-surface-800 border-b border-surface-700 px-3 py-2 flex items-center gap-2">
-                    <button onClick={selectAll} className="text-xs text-brand-400 hover:text-brand-300">
-                      Seleccionar todo
-                    </button>
+                    <button onClick={selectAll} className="text-xs text-brand-400 hover:text-brand-300">Seleccionar todo</button>
                     <span className="text-surface-600">·</span>
-                    <button onClick={clearAll} className="text-xs text-surface-400 hover:text-surface-200">
-                      Limpiar
-                    </button>
+                    <button onClick={clearAll} className="text-xs text-surface-400 hover:text-surface-200">Limpiar</button>
                     <span className="ml-auto text-xs text-surface-500">{selectedCameras.size} sel.</span>
                   </div>
 
-                  {/* Lista por NVR */}
                   {[...camerasByNVR.entries()].map(([nvrId, { nvrName, cameras: cams }]) => {
-                    const allSel = cams.every(c => selectedCameras.has(c.id))
+                    const allSel  = cams.every(c => selectedCameras.has(c.id))
                     const someSel = cams.some(c => selectedCameras.has(c.id))
+                    const isUnsupported = unsupportedNVRs.has(nvrId)
                     return (
                       <div key={nvrId}>
-                        {/* Header NVR */}
                         <button
                           onClick={() => toggleAllInNVR(nvrId)}
                           className="w-full flex items-center gap-2 px-3 py-2 bg-surface-750 hover:bg-surface-700 transition-colors text-left"
@@ -241,9 +309,11 @@ export function RecordingsPage() {
                               : <Square size={13} className="text-surface-500 flex-shrink-0" />
                           }
                           <span className="text-xs font-medium text-surface-200 uppercase tracking-wide">{nvrName}</span>
+                          {isUnsupported && (
+                            <span className="text-[9px] px-1 py-0.5 rounded bg-amber-900/40 text-amber-500 ml-1">sin ISAPI</span>
+                          )}
                           <span className="ml-auto text-xs text-surface-500">{cams.length}ch</span>
                         </button>
-                        {/* Cámaras del NVR */}
                         {cams.map((cam) => (
                           <button
                             key={cam.id}
@@ -255,10 +325,7 @@ export function RecordingsPage() {
                               : <Square size={12} className="text-surface-600 flex-shrink-0" />
                             }
                             <span className="text-xs text-surface-300 truncate">{cam.name}</span>
-                            <span className={clsx(
-                              'ml-auto text-xs flex-shrink-0',
-                              cam.online ? 'text-green-500' : 'text-surface-600'
-                            )}>
+                            <span className={clsx('ml-auto text-xs flex-shrink-0', cam.online ? 'text-green-500' : 'text-surface-600')}>
                               {cam.online ? '●' : '○'}
                             </span>
                           </button>
@@ -274,45 +341,64 @@ export function RecordingsPage() {
           {/* Fecha inicio */}
           <div>
             <label className="label">Desde</label>
-            <input
-              type="datetime-local"
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-              className="input"
-            />
+            <div className="flex items-center gap-1">
+              <input
+                ref={startInputRef}
+                type="datetime-local"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                className="input flex-1 min-w-0"
+              />
+              <button
+                type="button"
+                onClick={() => triggerDatePicker(startInputRef)}
+                className="p-2 rounded-lg bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors flex-shrink-0"
+                title="Abrir calendario"
+              >
+                <Calendar size={13} />
+              </button>
+            </div>
           </div>
 
           {/* Fecha fin */}
           <div>
             <label className="label">Hasta</label>
-            <input
-              type="datetime-local"
-              value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
-              className="input"
-            />
+            <div className="flex items-center gap-1">
+              <input
+                ref={endInputRef}
+                type="datetime-local"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                className="input flex-1 min-w-0"
+              />
+              <button
+                type="button"
+                onClick={() => triggerDatePicker(endInputRef)}
+                className="p-2 rounded-lg bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors flex-shrink-0"
+                title="Abrir calendario"
+              >
+                <Calendar size={13} />
+              </button>
+            </div>
           </div>
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          {/* Shortcuts de fechas */}
+          {/* Accesos rápidos */}
           <div className="flex gap-2 flex-wrap flex-1">
             {[
-              { label: 'Última hora', fn: () => { setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm")); setStartDate(format(subHours(new Date(), 1), "yyyy-MM-dd'T'HH:mm")) } },
-              { label: 'Hoy', fn: () => { setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm")); setStartDate(format(subHours(new Date(), 24), "yyyy-MM-dd'T'HH:mm")) } },
-              { label: 'Ayer', fn: () => { setEndDate(format(subDays(new Date(), 1), "yyyy-MM-dd'T'HH:mm")); setStartDate(format(subDays(new Date(), 2), "yyyy-MM-dd'T'HH:mm")) } },
-              { label: 'Últimos 7 días', fn: () => { setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm")); setStartDate(format(subDays(new Date(), 7), "yyyy-MM-dd'T'HH:mm")) } },
+              { label: 'Última hora', fn: () => setQuick(subHours(new Date(), 1), new Date()) },
+              { label: 'Hoy',         fn: () => setQuick(startOfDay(new Date()), new Date()) },
+              { label: 'Ayer',        fn: () => setQuick(startOfDay(subDays(new Date(), 1)), endOfDay(subDays(new Date(), 1))) },
+              { label: 'Últimos 7d',  fn: () => setQuick(startOfDay(subDays(new Date(), 7)), new Date()) },
             ].map(({ label, fn }) => (
-              <button
-                key={label}
-                onClick={fn}
+              <button key={label} onClick={fn}
                 className="text-xs px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors"
               >
                 {label}
               </button>
             ))}
           </div>
-
           <button
             onClick={handleSearch}
             disabled={isSearching || selectedCameras.size === 0}
@@ -324,10 +410,7 @@ export function RecordingsPage() {
         </div>
       </div>
 
-      {/* Cerrar dropdown al hacer click fuera */}
-      {showCameraList && (
-        <div className="fixed inset-0 z-40" onClick={() => setShowCameraList(false)} />
-      )}
+      {showCameraList && <div className="fixed inset-0 z-40" onClick={() => setShowCameraList(false)} />}
 
       {/* Source banner */}
       {searchSource === 'nvr_isapi' && recordings.length > 0 && (
@@ -337,20 +420,38 @@ export function RecordingsPage() {
         </div>
       )}
 
-      {/* ISAPI errors */}
-      {isapiErrors.length > 0 && (
+      {/* Error agrupado por NVR — un banner por NVR, no uno por cámara */}
+      {nvrErrors.length > 0 && (
         <div className="space-y-1.5">
-          {isapiErrors.map((err) => (
-            <div key={err.cameraId} className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-900/20 border border-amber-800/40 text-xs">
-              <AlertTriangle size={12} className="text-amber-400 flex-shrink-0 mt-0.5" />
-              <div>
-                <span className="text-amber-300 font-medium">{err.cameraName}</span>
-                {err.code === 'ISAPI_UNSUPPORTED' ? (
-                  <span className="text-amber-500"> — NVR no soporta búsqueda ISAPI{err.nvrModel ? ` (${err.nvrModel})` : ''}</span>
-                ) : err.code === 'NVR_AUTH_ERROR' ? (
-                  <span className="text-amber-500"> — Error de autenticación con el NVR</span>
+          {nvrErrors.map((grp) => (
+            <div key={`${grp.nvrId}_${grp.code}`}
+              className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-amber-900/20 border border-amber-800/40 text-xs"
+            >
+              {grp.code === 'ISAPI_UNSUPPORTED'
+                ? <Info size={13} className="text-amber-400 flex-shrink-0 mt-0.5" />
+                : <AlertTriangle size={13} className="text-amber-400 flex-shrink-0 mt-0.5" />
+              }
+              <div className="flex-1 min-w-0">
+                <span className="text-amber-300 font-medium">{grp.nvrName}</span>
+                {grp.nvrModel && <span className="text-amber-500 ml-1">({grp.nvrModel})</span>}
+                {grp.code === 'ISAPI_UNSUPPORTED' ? (
+                  <p className="text-amber-500 mt-0.5">
+                    Este NVR no soporta búsqueda de grabaciones vía ISAPI
+                    {grp.cameraCount > 1 && ` · ${grp.cameraCount} cámaras omitidas`}
+                    . Se requiere SDK o acceso local al NVR.
+                  </p>
+                ) : grp.code === 'NVR_AUTH_ERROR' ? (
+                  <p className="text-amber-500 mt-0.5">Error de autenticación — verifica usuario/contraseña del NVR.</p>
                 ) : (
-                  <span className="text-amber-500"> — No se pudo contactar el NVR</span>
+                  <p className="text-amber-500 mt-0.5">
+                    No se pudo contactar el NVR
+                    {grp.cameraCount > 1 && ` (${grp.cameraCount} cámaras afectadas)`}.
+                  </p>
+                )}
+                {grp.cameraNames.length > 0 && (
+                  <p className="text-amber-700 mt-0.5 truncate">
+                    {grp.cameraNames.join(', ')}{grp.cameraCount > grp.cameraNames.length ? ` +${grp.cameraCount - grp.cameraNames.length} más` : ''}
+                  </p>
                 )}
               </div>
             </div>
@@ -427,7 +528,7 @@ export function RecordingsPage() {
         {/* Reproductor */}
         <div className="card overflow-hidden">
           <div className="px-4 py-3 border-b border-surface-600">
-            <h3 className="text-sm font-medium text-surface-100">
+            <h3 className="text-sm font-medium text-surface-100 truncate">
               {selectedRec
                 ? `${selectedRec.nvrName} · ${selectedRec.cameraName} — ${format(new Date(selectedRec.startTime), 'dd/MM HH:mm')}`
                 : 'Reproductor'}
@@ -435,20 +536,12 @@ export function RecordingsPage() {
           </div>
           <div className="aspect-video bg-surface-900 flex items-center justify-center">
             {playbackUrl ? (
-              <video
-                key={playbackUrl}
-                src={playbackUrl}
-                controls
-                autoPlay
-                className="w-full h-full"
-              />
+              <video key={playbackUrl} src={playbackUrl} controls autoPlay className="w-full h-full" />
             ) : (
               <div className="text-center">
                 <Play size={32} className="text-surface-700 mx-auto mb-2" />
                 <p className="text-xs text-surface-500">
-                  {recordings.length > 0
-                    ? 'Selecciona una grabación para reproducir'
-                    : 'Busca grabaciones primero'}
+                  {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
                 </p>
               </div>
             )}

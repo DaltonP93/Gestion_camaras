@@ -666,6 +666,8 @@ export function LiveViewPage() {
     setFocusStreamInfo(null)
     setFocusStreamError(null)
     setFocusStreamType('main')  // always targeting main in focus view
+    // Clear any stale sub-stream error from the grid so it doesn't leak into the focus view
+    setStreamErrors(prev => { const n = { ...prev }; delete n[camera.id]; return n })
 
     // Proactively block known HEVC main stream only when transcoding is unavailable.
     // When transcoding is available, let the backend handle the auto-redirect to main_h264.
@@ -988,6 +990,7 @@ export function LiveViewPage() {
                     onFullscreen={() => handleEnterFocus(camera)}
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
+                    onPlaying={(cid) => setStreamErrors(prev => { const n = { ...prev }; delete n[cid]; return n })}
                     onRetry={handleGridCameraRetry}
                     className="w-full h-full"
                     playbackError={

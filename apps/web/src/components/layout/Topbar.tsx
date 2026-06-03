@@ -132,7 +132,7 @@ function NotificationPanel({ onClose }: { onClose: () => void }) {
 // ─── Topbar ───────────────────────────────────────────────────────────────────
 export function Topbar() {
   const location = useLocation()
-  const { unreadCount, setUnreadCount } = useAlertStore()
+  const { alerts, setAlerts, unreadCount, setUnreadCount } = useAlertStore()
   const { nvrs, loadNVRs, loadCameras } = useCameraStore()
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [search, setSearch] = useState('')
@@ -146,6 +146,13 @@ export function Topbar() {
       .then(({ count }) => setUnreadCount(count))
       .catch(() => {})
   }, [])
+
+  // Load alert list the first time the panel opens (or if empty on re-open)
+  useEffect(() => {
+    if (panelOpen && alerts.length === 0) {
+      apiGet<Alert[]>('/alerts?limit=50').then(setAlerts).catch(() => {})
+    }
+  }, [panelOpen])
 
   // Close panel on outside click
   useEffect(() => {
