@@ -85,6 +85,9 @@ export const apiPost = <T>(url: string, data?: object) =>
 export const apiPut = <T>(url: string, data?: object) =>
   api.put<T>(url, data).then((r) => r.data)
 
+export const apiPatch = <T>(url: string, data?: object) =>
+  api.patch<T>(url, data).then((r) => r.data)
+
 export const apiDelete = <T>(url: string, data?: unknown) =>
   api.delete<T>(url, data !== undefined ? { data } : undefined).then((r) => r.data)
 

@@ -1,15 +1,15 @@
 // src/pages/NVRDetailPage.tsx
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, RefreshCw, Power, Wifi, WifiOff,
   HardDrive, Camera, Users, Wrench, Activity,
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
-  Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search,
+  Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
   Copy, Download, ChevronDown, Zap,
 } from 'lucide-react'
-import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
+import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
 import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics } from '@/types'
 import { clsx } from 'clsx'
@@ -892,6 +892,44 @@ function CamerasTab({
   const [showDebug, setShowDebug] = useState(false)
   const [cameraSearch, setCameraSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<'all' | 'online' | 'offline'>('all')
+  // Inline name editing
+  const [editingNameId, setEditingNameId] = useState<string | null>(null)
+  const [editingNameValue, setEditingNameValue] = useState('')
+  const [savingNameId, setSavingNameId] = useState<string | null>(null)
+  const editNameRef = useRef<HTMLInputElement>(null)
+
+  const startEditName = (cam: CameraType) => {
+    setEditingNameId(cam.id)
+    setEditingNameValue(cam.name)
+    setTimeout(() => editNameRef.current?.select(), 30)
+  }
+
+  const cancelEditName = () => {
+    setEditingNameId(null)
+    setEditingNameValue('')
+  }
+
+  const handleSaveName = async (camId: string) => {
+    const trimmed = editingNameValue.trim()
+    if (!trimmed) return cancelEditName()
+    setSavingNameId(camId)
+    try {
+      const updated = await apiPatch<CameraType>(`/cameras/${camId}/name`, { name: trimmed })
+      // Update local list without re-fetching
+      if (cameras) {
+        const newDb = cameras.fromDb.map((c) => c.id === camId ? { ...c, name: updated.name } : c)
+        // cameras is prop-passed so we can't mutate; parent re-fetch on next interaction
+        // For immediate UI update we track renames locally
+      }
+      toast.success('Nombre actualizado')
+      onRefresh()
+    } catch {
+      // error handled by api lib
+    } finally {
+      setSavingNameId(null)
+      setEditingNameId(null)
+    }
+  }
 
   const handleIsapDebug = async () => {
     setShowDebug(true)
@@ -1030,8 +1068,50 @@ function CamerasTab({
                   <td className="px-3 py-2 text-surface-300 font-mono">
                     <Highlight text={cam.channelCode || `D${cam.channel}`} query={q} />
                   </td>
-                  <td className="px-3 py-2 text-surface-100 font-medium max-w-[140px] truncate" title={cam.name}>
-                    <Highlight text={cam.name} query={q} />
+                  <td className="px-3 py-2 max-w-[160px]">
+                    {editingNameId === cam.id ? (
+                      <div className="flex items-center gap-1">
+                        <input
+                          ref={editNameRef}
+                          value={editingNameValue}
+                          onChange={(e) => setEditingNameValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter')  handleSaveName(cam.id)
+                            if (e.key === 'Escape') cancelEditName()
+                          }}
+                          className="flex-1 min-w-0 bg-surface-900 border border-brand-500 rounded px-1.5 py-0.5 text-xs text-surface-100 outline-none"
+                          disabled={savingNameId === cam.id}
+                          autoFocus
+                        />
+                        {savingNameId === cam.id
+                          ? <Loader2 size={11} className="animate-spin text-surface-400 flex-shrink-0" />
+                          : (
+                            <>
+                              <button onClick={() => handleSaveName(cam.id)} className="p-0.5 text-green-400 hover:text-green-300" title="Guardar (Enter)">
+                                <Check size={11} />
+                              </button>
+                              <button onClick={cancelEditName} className="p-0.5 text-surface-500 hover:text-surface-300" title="Cancelar (Esc)">
+                                <X size={11} />
+                              </button>
+                            </>
+                          )}
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1 group/name">
+                        <span className="text-surface-100 font-medium truncate" title={cam.name}>
+                          <Highlight text={cam.name} query={q} />
+                        </span>
+                        {isAdmin && (
+                          <button
+                            onClick={() => startEditName(cam)}
+                            className="opacity-0 group-hover/name:opacity-100 p-0.5 rounded text-surface-500 hover:text-surface-200 transition-all flex-shrink-0"
+                            title="Editar nombre"
+                          >
+                            <Pencil size={10} />
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2 text-surface-400 whitespace-nowrap">
                     {(cam.ipAddress || fromNvr?.ipAddress) ? (

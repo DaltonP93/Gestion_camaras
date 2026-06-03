@@ -495,6 +495,39 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const camera = await server.prisma.camera.update({ where: { id }, data })
     return reply.send(camera)
   })
+
+  // PATCH /api/cameras/:id/name — Rename camera (local DB only)
+  // Persists the name locally and audits the change.
+  // A separate endpoint handles pushing the name to the NVR via ISAPI.
+  server.patch('/:id/name', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const user   = request.user
+    const body   = request.body as { name?: unknown }
+
+    const newName = typeof body?.name === 'string' ? body.name.trim() : ''
+    if (!newName || newName.length < 1 || newName.length > 100) {
+      return reply.status(400).send({ message: 'El nombre debe tener entre 1 y 100 caracteres' })
+    }
+
+    const existing = await server.prisma.camera.findUnique({ where: { id } })
+    if (!existing) return reply.status(404).send({ message: 'Cámara no encontrada' })
+
+    const prevName = existing.name
+    if (prevName === newName) return reply.send(existing)
+
+    const camera = await server.prisma.camera.update({
+      where: { id },
+      data:  { name: newName },
+    })
+
+    await AuditAction(server.prisma, user.sub, 'CAMERA_RENAME', id, request, {
+      previousName: prevName,
+      newName,
+      nvrId: existing.nvrId,
+    })
+
+    return reply.send(camera)
+  })
 }
 
 function user(request: any) { return request.user }
