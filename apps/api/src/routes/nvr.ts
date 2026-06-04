@@ -1511,56 +1511,6 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({ success: true })
   })
 
-  // GET /api/nvrs/:id/recording-capabilities
-  server.get('/:id/recording-capabilities', { preHandler: [server.authenticate] }, async (request, reply) => {
-    const { id } = request.params as { id: string }
-    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
-    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
-    return reply.send({
-      nvrId:                    id,
-      recordingProvider:        (nvr as any).recordingProvider ?? 'ISAPI',
-      supportsIsapiRecording:   (nvr as any).supportsIsapiRecording ?? null,
-      supportsSdkRecording:     (nvr as any).supportsSdkRecording ?? false,
-      recordingCapabilityAt:    (nvr as any).recordingCapabilityAt ?? null,
-      recordingCapabilityError: (nvr as any).recordingCapabilityError ?? null,
-      playbackWebUrl:           (nvr as any).playbackWebUrl ?? null,
-      sdkEnabled:               (nvr as any).sdkEnabled ?? false,
-    })
-  })
-
-  // POST /api/nvrs/:id/recording-capabilities/check — Run ISAPI check and persist result
-  server.post('/:id/recording-capabilities/check', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
-    const { id } = request.params as { id: string }
-    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
-    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
-
-    const { checkIsapiRecordingSupport, detectProviderFromCapabilities } = await import('../services/recordingProvider')
-    const decPass = decryptPassword(nvr.password)
-    const result = await checkIsapiRecordingSupport({ ipAddress: nvr.ipAddress, port: nvr.port, username: nvr.username, password: decPass })
-    const provider = detectProviderFromCapabilities(result.supported)
-
-    const updated = await server.prisma.nVR.update({
-      where: { id },
-      data: {
-        recordingProvider:        provider,
-        supportsIsapiRecording:   result.supported,
-        recordingCapabilityAt:    new Date(),
-        recordingCapabilityError: result.error ?? null,
-      } as any,
-    })
-
-    return reply.send({
-      nvrId:                    id,
-      recordingProvider:        (updated as any).recordingProvider ?? provider,
-      supportsIsapiRecording:   result.supported,
-      supportsSdkRecording:     (updated as any).supportsSdkRecording ?? false,
-      recordingCapabilityAt:    (updated as any).recordingCapabilityAt,
-      recordingCapabilityError: result.error ?? null,
-      playbackWebUrl:           (updated as any).playbackWebUrl ?? null,
-      sdkEnabled:               (updated as any).sdkEnabled ?? false,
-    })
-  })
-
   // GET /api/nvrs/:id/video-audio — Get all channel configs from ISAPI
   server.get('/:id/video-audio', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
