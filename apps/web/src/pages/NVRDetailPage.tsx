@@ -7,17 +7,17 @@ import {
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
   Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
-  Copy, Download, ChevronDown, Zap, Video as VideoIcon,
-  Save, History, Film, ExternalLink,
+  Copy, Download, ChevronDown, Zap, Video as VideoIcon, Film, ExternalLink,
+  Search,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
-import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, VideoStreamConfig, VideoStreamUpdate, RecordingCapabilities } from '@/types'
+import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, RecordingCapabilities } from '@/types'
 import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
 
-type Tab = 'summary' | 'cameras' | 'storage' | 'users' | 'maintenance' | 'diagnostics' | 'video' | 'recordings'
+type Tab = 'summary' | 'cameras' | 'video' | 'recordings' | 'storage' | 'users' | 'maintenance' | 'diagnostics'
 
 export function NVRDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -61,6 +61,15 @@ export function NVRDetailPage() {
   const [loadingRecordingCaps, setLoadingRecordingCaps] = useState(false)
   const [checkingRecordingCaps, setCheckingRecordingCaps] = useState(false)
 
+  // Video/Audio tab
+  const [videoConfigs, setVideoConfigs] = useState<ChannelVideoConfig[]>([])
+  const [loadingVideo, setLoadingVideo] = useState(false)
+
+  // Recordings capabilities tab
+  const [recordingCaps, setRecordingCaps] = useState<RecordingCapabilities | null>(null)
+  const [loadingRecordingCaps, setLoadingRecordingCaps] = useState(false)
+  const [checkingCaps, setCheckingCaps] = useState(false)
+
   const isAdmin = user?.role === 'ADMIN'
   const isSupervisor = user?.role === 'SUPERVISOR' || isAdmin
 
@@ -72,6 +81,8 @@ export function NVRDetailPage() {
   useEffect(() => {
     if (!id || !nvr) return
     if (tab === 'cameras' && !cameras) loadCameras()
+    if (tab === 'video') loadVideoConfigs()
+    if (tab === 'recordings') loadRecordingCaps()
     if (tab === 'storage') loadStorage()
     if (tab === 'users') loadUsers()
     if (tab === 'recordings') loadRecordingCaps()
@@ -102,13 +113,25 @@ export function NVRDetailPage() {
     }
   }
 
+  const loadVideoConfigs = async () => {
+    try {
+      setLoadingVideo(true)
+      const data = await apiGet<ChannelVideoConfig[]>(`/nvrs/${id}/video-audio`)
+      setVideoConfigs(data)
+    } catch {
+      toast.error('Error al cargar configuración de video')
+    } finally {
+      setLoadingVideo(false)
+    }
+  }
+
   const loadRecordingCaps = async () => {
     try {
       setLoadingRecordingCaps(true)
       const data = await apiGet<RecordingCapabilities>(`/nvrs/${id}/recording-capabilities`)
       setRecordingCaps(data)
     } catch {
-      toast.error('Error al cargar capacidades de grabación')
+      // Endpoint may not exist yet — ignore
     } finally {
       setLoadingRecordingCaps(false)
     }
@@ -116,14 +139,14 @@ export function NVRDetailPage() {
 
   const checkRecordingCaps = async () => {
     try {
-      setCheckingRecordingCaps(true)
+      setCheckingCaps(true)
       const data = await apiPost<RecordingCapabilities>(`/nvrs/${id}/recording-capabilities/check`, {})
       setRecordingCaps(data)
-      toast.success('Capacidades de grabación actualizadas')
+      toast.success(data.supportsIsapiRecording ? 'ISAPI soportado' : 'ISAPI no soportado')
     } catch {
-      toast.error('Error al verificar capacidades de grabación')
+      toast.error('Error al verificar compatibilidad')
     } finally {
-      setCheckingRecordingCaps(false)
+      setCheckingCaps(false)
     }
   }
 
@@ -478,12 +501,20 @@ export function NVRDetailPage() {
           validatingHealth={validatingHealth}
         />
       )}
-      {tab === 'video' && <VideoAudioTab nvrId={nvr.id} dbCameras={cameras?.fromDb || []} />}
+      {tab === 'video' && (
+        <VideoAudioTab
+          nvrId={nvr.id}
+          configs={videoConfigs}
+          loading={loadingVideo}
+          onRefresh={loadVideoConfigs}
+          isAdmin={isAdmin}
+        />
+      )}
       {tab === 'recordings' && (
         <RecordingsCapTab
           caps={recordingCaps}
           loading={loadingRecordingCaps}
-          checking={checkingRecordingCaps}
+          checking={checkingCaps}
           onRefresh={loadRecordingCaps}
           onCheck={checkRecordingCaps}
           isAdmin={isAdmin}
@@ -879,21 +910,28 @@ function hasRealCameraNames(cameras: CameraType[]): boolean {
   })
 }
 
-function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolean | null | undefined): React.ReactNode {
+function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolean | null | undefined, camOnline?: boolean): React.ReactNode {
   if (isapIStatus === 'no_permission') {
     return <span className="text-amber-500/70 text-[11px]">Sin permiso</span>
   }
   if (isapIStatus === 'unsupported') {
     return <span className="text-surface-600 text-[11px]">No soportado</span>
   }
-  // Show per-camera NVR state only when InputProxy endpoint was accessible
   if (isapIStatus === 'available') {
     if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online NVR</span>
-    if (camOnlineInNvr === false) return <span className="text-surface-500 text-[11px]">Offline NVR</span>
-    // null = InputProxy returned unknown state — don't claim camera is offline
-    return <span className="text-surface-600 text-[11px]">No leído</span>
+    if (camOnlineInNvr === false) {
+      // Distinguish: if the RTSP health check says online, show "No verificado" rather than "Offline NVR"
+      if (camOnline) return <span className="text-surface-500 text-[11px]">No sincronizado</span>
+      return <span className="text-surface-500 text-[11px]">Offline NVR</span>
+    }
+    // null = unknown — use RTSP health as proxy
+    if (camOnline === true) return <span className="text-green-400/70 text-[11px]">Online (RTSP)</span>
+    return <span className="text-surface-600 text-[11px]">No verificado</span>
   }
-  return <span className="text-surface-600 text-[11px]">No leído</span>
+  // No ISAPI data — use DB health status as proxy
+  if (camOnline === true)  return <span className="text-green-400/70 text-[11px]">Online</span>
+  if (camOnline === false) return <span className="text-surface-500 text-[11px]">Offline</span>
+  return <span className="text-surface-600 text-[11px]">No verificado</span>
 }
 
 // Highlight matching substring in text
@@ -1176,7 +1214,7 @@ function CamerasTab({
                     </span>
                   </td>
                   <td className="px-3 py-2 text-xs">
-                    {isapIStatusCell(isapIStatus, (cam as any).onlineInNvr)}
+                    {isapIStatusCell(isapIStatus, (cam as any).onlineInNvr, cam.online)}
                   </td>
                   <td className="px-3 py-2">
                     {codec ? (
@@ -1230,10 +1268,12 @@ function CamerasTab({
         )}
       </div>
 
-      {/* nameSource notice — only when sync genuinely found no real names AND list has none */}
+      {/* nameSource notice — shown after a sync that found no real names AND cameras don't already have real names */}
       {lastSyncResult?.nameSource === 'none' &&
        (lastSyncResult?.nameCandidates ?? 0) === 0 &&
-       !hasRealCameraNames(list) && (
+       !hasRealCameraNames(list) &&
+       lastSyncResult?.sourceUsed !== 'inputproxy_channels_secure' &&
+       lastSyncResult?.sourceUsed !== 'inputproxy_channels' && (
         <div className="flex items-start gap-2 px-3 py-2 text-xs text-amber-500/80 bg-amber-900/10 border border-amber-900/20 rounded-lg">
           <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
           <span>
@@ -1259,614 +1299,258 @@ function CamerasTab({
 
 // ─── Video / Audio Tab ────────────────────────────────────────
 
-function StreamConfigCard({ config, label }: { config: VideoStreamConfig; label: string }) {
-  const isH265 = config.videoCodecType.toLowerCase().includes('h.265') || config.videoCodecType.toLowerCase().includes('h265') || config.videoCodecType.toLowerCase().includes('hevc')
-
-  const rows: [string, React.ReactNode][] = [
-    ['Codec',     <span className={clsx(isH265 ? 'text-amber-400 font-medium' : 'text-surface-200')}>{config.videoCodecType || '—'}{config.h265Plus && <span className="ml-1 text-[10px] bg-amber-900/40 text-amber-400 px-1 rounded">H.265+</span>}</span>],
-    ['Resolución', `${config.width}×${config.height}` === '0×0' ? '—' : `${config.width}×${config.height}`],
-    ['FPS',       config.fps > 0 ? `${config.fps} fps` : '—'],
-    ['Bitrate',   config.bitrateType ? `${config.bitrateType} · ${config.bitrateMax > 0 ? `${config.bitrateMax} kbps` : '—'}` : '—'],
-    ['Calidad',   config.qualityLevel || '—'],
-    ['Escaneo',   config.videoScanType || '—'],
-    ['Audio',     config.audioEnabled ? `Activo · ${config.audioCodecType || '—'} · ${config.audioBitrate > 0 ? `${config.audioBitrate} kbps` : '—'}` : 'Desactivado'],
-  ]
-
-  return (
-    <div className="bg-surface-750 rounded-lg p-4">
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-xs font-semibold text-surface-300">{label}</span>
-        {isH265 && (
-          <span className="flex items-center gap-1 text-[10px] text-amber-400 bg-amber-900/20 border border-amber-900/40 px-1.5 py-0.5 rounded">
-            <AlertTriangle size={9} /> HEVC — puede requerir transcodificación en navegadores
-          </span>
-        )}
-      </div>
-      <dl className="space-y-1.5">
-        {rows.map(([lbl, val]) => (
-          <div key={lbl} className="flex items-center justify-between text-xs">
-            <dt className="text-surface-500 w-24 flex-shrink-0">{lbl}</dt>
-            <dd className="text-surface-200 text-right">{val}</dd>
-          </div>
-        ))}
-      </dl>
-    </div>
-  )
-}
-
-type VideoFilter = 'all' | 'h265' | 'h264' | 'audio' | 'nodata'
-
-function isH265Codec(codec?: string | null): boolean {
-  if (!codec) return false
-  const c = codec.toLowerCase()
-  return c.includes('h.265') || c.includes('h265') || c.includes('hevc')
-}
-
-const CODEC_OPTIONS  = ['H.264', 'H.265', 'H.264+', 'H.265+']
-const RES_OPTIONS    = ['3840x2160', '2560x1440', '1920x1080', '1280x720', '704x576', '704x480', '640x480', '352x288', '352x240']
-const AUDIO_CODECS   = ['G.711ulaw', 'G.711alaw', 'G.726', 'AAC', 'G.722.1', 'G.729']
-const QUALITY_OPTS   = ['lowest', 'lower', 'low', 'medium', 'high', 'higher', 'highest']
-
-function streamToUpdate(cfg: VideoStreamConfig): VideoStreamUpdate {
-  return {
-    videoCodecType: cfg.videoCodecType,
-    width:          cfg.width,
-    height:         cfg.height,
-    fps:            cfg.fps,
-    bitrateType:    cfg.bitrateType,
-    bitrateMax:     cfg.bitrateMax,
-    qualityLevel:   cfg.qualityLevel,
-    audioEnabled:   cfg.audioEnabled,
-    audioCodecType: cfg.audioCodecType,
-    audioBitrate:   cfg.audioBitrate,
-  }
-}
-
-function StreamEditForm({
-  initial,
-  onSave,
-  onCancel,
-  saving,
-}: {
-  initial: VideoStreamUpdate
-  onSave:  (v: VideoStreamUpdate) => void
-  onCancel: () => void
-  saving:  boolean
+function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
+  nvrId: string
+  configs: ChannelVideoConfig[]
+  loading: boolean
+  onRefresh: () => void
+  isAdmin: boolean
 }) {
-  const [v, setV] = useState<VideoStreamUpdate>(initial)
-  const set = (k: keyof VideoStreamUpdate, val: any) => setV((p) => ({ ...p, [k]: val }))
-
-  const resStr = v.width && v.height ? `${v.width}x${v.height}` : ''
-  const customRes = resStr && !RES_OPTIONS.includes(resStr)
-
-  return (
-    <div className="bg-surface-750 rounded-lg p-4 space-y-3 border border-brand-600/30">
-      <div className="grid grid-cols-2 gap-3">
-        {/* Codec */}
-        <div>
-          <label className="block text-[10px] text-surface-500 mb-1">Codec</label>
-          <select className="input text-xs py-1.5 w-full" value={v.videoCodecType || ''} onChange={e => set('videoCodecType', e.target.value)}>
-            {CODEC_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-        </div>
-        {/* Resolution */}
-        <div>
-          <label className="block text-[10px] text-surface-500 mb-1">Resolución</label>
-          <select
-            className="input text-xs py-1.5 w-full"
-            value={customRes ? 'custom' : resStr}
-            onChange={e => {
-              if (e.target.value === 'custom') return
-              const [w, h] = e.target.value.split('x').map(Number)
-              set('width', w); set('height', h)
-            }}
-          >
-            {RES_OPTIONS.map(r => <option key={r} value={r}>{r}</option>)}
-            {customRes && <option value="custom">{resStr} (actual)</option>}
-          </select>
-        </div>
-        {/* FPS */}
-        <div>
-          <label className="block text-[10px] text-surface-500 mb-1">FPS</label>
-          <input type="number" min={1} max={60} className="input text-xs py-1.5 w-full"
-            value={v.fps ?? ''} onChange={e => set('fps', parseInt(e.target.value) || 0)} />
-        </div>
-        {/* Bitrate type */}
-        <div>
-          <label className="block text-[10px] text-surface-500 mb-1">Tipo bitrate</label>
-          <div className="flex gap-1">
-            {['CBR', 'VBR'].map(t => (
-              <button key={t} type="button"
-                onClick={() => set('bitrateType', t)}
-                className={clsx('flex-1 text-xs px-2 py-1.5 rounded border transition-colors',
-                  v.bitrateType === t
-                    ? 'bg-brand-600/20 border-brand-600/40 text-brand-300'
-                    : 'border-surface-600 text-surface-400 hover:text-surface-200'
-                )}
-              >{t}</button>
-            ))}
-          </div>
-        </div>
-        {/* Bitrate max */}
-        <div>
-          <label className="block text-[10px] text-surface-500 mb-1">Bitrate máx (kbps)</label>
-          <input type="number" min={32} max={16384} className="input text-xs py-1.5 w-full"
-            value={v.bitrateMax ?? ''} onChange={e => set('bitrateMax', parseInt(e.target.value) || 0)} />
-        </div>
-        {/* Quality (VBR) */}
-        {v.bitrateType === 'VBR' && (
-          <div>
-            <label className="block text-[10px] text-surface-500 mb-1">Calidad (VBR)</label>
-            <select className="input text-xs py-1.5 w-full" value={v.qualityLevel || ''} onChange={e => set('qualityLevel', e.target.value)}>
-              {QUALITY_OPTS.map(q => <option key={q} value={q}>{q}</option>)}
-            </select>
-          </div>
-        )}
-      </div>
-
-      {/* Audio section */}
-      <div className="border-t border-surface-700 pt-3 space-y-2">
-        <div className="flex items-center gap-2">
-          <label className="flex items-center gap-2 cursor-pointer select-none text-xs text-surface-300">
-            <input type="checkbox" className="accent-brand-500 w-3.5 h-3.5"
-              checked={!!v.audioEnabled} onChange={e => set('audioEnabled', e.target.checked)} />
-            Audio activo
-          </label>
-        </div>
-        {v.audioEnabled && (
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-[10px] text-surface-500 mb-1">Codec audio</label>
-              <select className="input text-xs py-1.5 w-full" value={v.audioCodecType || ''} onChange={e => set('audioCodecType', e.target.value)}>
-                {AUDIO_CODECS.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-[10px] text-surface-500 mb-1">Bitrate audio (kbps)</label>
-              <input type="number" min={8} max={320} className="input text-xs py-1.5 w-full"
-                value={v.audioBitrate ?? ''} onChange={e => set('audioBitrate', parseInt(e.target.value) || 0)} />
-            </div>
-          </div>
-        )}
-      </div>
-
-      <div className="flex items-center gap-2 pt-1">
-        <button type="button" disabled={saving} onClick={() => onSave(v)} className="btn-primary text-xs flex items-center gap-1.5">
-          {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
-          Guardar cambios
-        </button>
-        <button type="button" disabled={saving} onClick={onCancel} className="btn-ghost text-xs">
-          <X size={12} /> Cancelar
-        </button>
-      </div>
-    </div>
-  )
-}
-
-function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraType[] }) {
-  const [configs, setConfigs] = useState<ChannelVideoConfig[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [selectedChannel, setSelectedChannel] = useState<number | null>(null)
-  const [loadingSingle, setLoadingSingle] = useState(false)
   const [search, setSearch] = useState('')
-  const [filter, setFilter] = useState<VideoFilter>('all')
-
-  // Edit state
-  const [editStream, setEditStream] = useState<'main' | 'sub' | null>(null)
-  const [editValues, setEditValues] = useState<VideoStreamUpdate>({})
+  const [filterCodec, setFilterCodec] = useState<'all' | 'h264' | 'h265' | 'nodata'>('all')
+  const [selectedChannel, setSelectedChannel] = useState<number | null>(null)
+  const [editMode, setEditMode] = useState(false)
+  const [editForm, setEditForm] = useState<Partial<{ mainFps: number; mainBitrate: number; subFps: number; subBitrate: number }>>({})
   const [saving, setSaving] = useState(false)
-  const [restoring, setRestoring] = useState(false)
-  const [confirmSave, setConfirmSave] = useState<{ streamType: 'main' | 'sub'; values: VideoStreamUpdate } | null>(null)
 
-  const selectedConfig = configs.find((c) => c.channel === selectedChannel)
+  const filtered = configs.filter(c => {
+    const nameMatch = !search || c.cameraName.toLowerCase().includes(search.toLowerCase()) || String(c.channel).includes(search)
+    if (!nameMatch) return false
+    if (filterCodec === 'h264') return (c.main?.codec ?? '').toLowerCase().includes('h.264') || (c.main?.codec ?? '').toLowerCase().includes('h264')
+    if (filterCodec === 'h265') return (c.main?.codec ?? '').toLowerCase().includes('h.265') || (c.main?.codec ?? '').toLowerCase().includes('hevc') || (c.main?.codec ?? '').toLowerCase().includes('h265')
+    if (filterCodec === 'nodata') return !c.main && !c.sub
+    return true
+  })
 
-  const loadAll = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const data = await apiGet<ChannelVideoConfig[]>(`/nvrs/${nvrId}/channels/video-config`)
-      setConfigs(data)
-      if (data.length > 0 && selectedChannel === null) setSelectedChannel(data[0].channel)
-    } catch (e: any) {
-      setError(e?.response?.data?.message || 'Error al obtener configuración de video')
-    } finally {
-      setLoading(false)
-    }
-  }
+  const selected = configs.find(c => c.channel === selectedChannel)
 
-  const loadSingle = async (channel: number) => {
-    setLoadingSingle(true)
-    try {
-      const data = await apiGet<ChannelVideoConfig>(`/nvrs/${nvrId}/channels/${channel}/video-config`)
-      setConfigs((prev) => {
-        const idx = prev.findIndex((c) => c.channel === channel)
-        if (idx >= 0) return prev.map((c) => c.channel === channel ? data : c)
-        return [...prev, data].sort((a, b) => a.channel - b.channel)
-      })
-    } catch { /* handled by api lib */ } finally {
-      setLoadingSingle(false)
-    }
-  }
-
-  const handleEdit = (streamType: 'main' | 'sub') => {
-    const cfg = selectedConfig?.[streamType]
-    if (!cfg) return
-    setEditValues(streamToUpdate(cfg))
-    setEditStream(streamType)
-  }
-
-  const handleSaveRequest = (values: VideoStreamUpdate) => {
-    if (!editStream) return
-    setConfirmSave({ streamType: editStream, values })
-  }
-
-  const handleSaveConfirm = async () => {
-    if (!confirmSave || selectedChannel === null) return
+  const handleSave = async () => {
+    if (!selected) return
     setSaving(true)
-    setConfirmSave(null)
     try {
-      const res = await apiPut<{ success: boolean; error?: string; config?: ChannelVideoConfig }>(
-        `/nvrs/${nvrId}/channels/${selectedChannel}/video-config`,
-        { streamType: confirmSave.streamType, update: confirmSave.values }
-      )
-      if (!res.success) throw new Error(res.error || 'Error al guardar')
-      if (res.config) {
-        setConfigs((prev) => prev.map((c) => c.channel === selectedChannel ? res.config! : c))
-      }
-      setEditStream(null)
-      toast.success('Configuración guardada en el NVR')
+      await apiPut(`/nvrs/${nvrId}/video-audio/${selected.channel}`, editForm)
+      toast.success('Configuración guardada')
+      setEditMode(false)
+      onRefresh()
     } catch (e: any) {
-      toast.error(e?.response?.data?.message || e?.message || 'Error al escribir en el NVR')
+      toast.error(e?.response?.data?.message ?? 'Error al guardar')
     } finally {
       setSaving(false)
     }
   }
 
-  const handleRestore = async () => {
-    if (selectedChannel === null) return
-    if (!window.confirm('¿Restaurar la última configuración guardada antes del último cambio? Esto sobrescribirá la configuración actual en el NVR.')) return
-    setRestoring(true)
-    try {
-      const res = await apiPost<{ success: boolean; error?: string; config?: ChannelVideoConfig }>(
-        `/nvrs/${nvrId}/channels/${selectedChannel}/video-config/restore`,
-        { streamType: editStream || 'main' }
-      )
-      if (!res.success) throw new Error(res.error || 'Error al restaurar')
-      if (res.config) {
-        setConfigs((prev) => prev.map((c) => c.channel === selectedChannel ? res.config! : c))
-      }
-      setEditStream(null)
-      toast.success('Configuración restaurada desde backup')
-    } catch (e: any) {
-      toast.error(e?.response?.data?.message || e?.message || 'Error al restaurar backup')
-    } finally {
-      setRestoring(false)
-    }
-  }
-
-  useEffect(() => {
-    if (dbCameras.length > 0) loadAll()
-  }, [nvrId])
-
-  // Reset edit when channel changes
-  useEffect(() => { setEditStream(null) }, [selectedChannel])
-
-  // ── Stats ──────────────────────────────────────────────────
-  const stats = {
-    total:   configs.length,
-    h265:    configs.filter(c => c.main && isH265Codec(c.main.videoCodecType)).length,
-    h264:    configs.filter(c => c.main && !isH265Codec(c.main.videoCodecType)).length,
-    audio:   configs.filter(c => c.main?.audioEnabled || c.sub?.audioEnabled).length,
-    nodata:  configs.filter(c => !!c.error || (!c.main && !c.sub)).length,
-  }
-
-  // ── Filter + search ─────────────────────────────────────────
-  const q = search.trim().toLowerCase()
-  const visible = configs.filter((cfg) => {
-    const cam = dbCameras.find(c => c.channel === cfg.channel)
-    const code = (cam as any)?.channelCode || `D${cfg.channel}`
-    const name = cam?.name || `Canal ${cfg.channel}`
-    const mainCodec = cfg.main?.videoCodecType || ''
-    const mainRes   = cfg.main ? `${cfg.main.width}x${cfg.main.height}` : ''
-
-    if (filter === 'h265'   && !isH265Codec(mainCodec)) return false
-    if (filter === 'h264'   && (isH265Codec(mainCodec) || !mainCodec)) return false
-    if (filter === 'audio'  && !cfg.main?.audioEnabled && !cfg.sub?.audioEnabled) return false
-    if (filter === 'nodata' && !cfg.error && (cfg.main || cfg.sub)) return false
-
-    if (!q) return true
-    return code.toLowerCase().includes(q) ||
-           name.toLowerCase().includes(q) ||
-           mainCodec.toLowerCase().includes(q) ||
-           mainRes.includes(q)
-  })
-
-  const selected = selectedChannel !== null ? dbCameras.find((c) => c.channel === selectedChannel) : null
-
-  if (loading) return (
-    <div className="card p-8 text-center space-y-2">
-      <Loader2 size={20} className="animate-spin text-surface-400 mx-auto" />
-      <p className="text-sm text-surface-400">Consultando ISAPI para {dbCameras.length} canales...</p>
-      <p className="text-xs text-surface-600">Esto puede tomar algunos segundos</p>
-    </div>
-  )
+  if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
 
   return (
-    <div className="space-y-4">
-      {/* Confirm modal */}
-      {confirmSave && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="bg-surface-800 border border-surface-600 rounded-xl p-6 max-w-sm w-full mx-4 space-y-4 shadow-xl">
-            <div className="flex items-start gap-3">
-              <AlertTriangle size={18} className="text-amber-400 flex-shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-surface-100">Confirmar escritura en NVR</p>
-                <p className="text-xs text-surface-400 mt-1">
-                  Se guardará la configuración del flujo <span className="font-medium text-surface-200">{confirmSave.streamType === 'main' ? 'principal (Main)' : 'secundario (Sub)'}</span> directamente en el NVR vía ISAPI. La configuración actual se respaldará automáticamente antes de escribir.
-                </p>
-              </div>
-            </div>
-            <div className="flex gap-2 pt-1">
-              <button onClick={handleSaveConfirm} disabled={saving} className="btn-primary flex-1 text-sm flex items-center justify-center gap-1.5">
-                {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
-                Confirmar escritura
-              </button>
-              <button onClick={() => setConfirmSave(null)} disabled={saving} className="btn-ghost text-sm">
-                Cancelar
-              </button>
-            </div>
-          </div>
+    <div className="space-y-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="relative flex-1 max-w-xs">
+          <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-surface-500" />
+          <input
+            className="input pl-7 text-xs"
+            placeholder="Buscar canal..."
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+          />
         </div>
-      )}
-
-      {/* Header */}
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <p className="text-sm font-medium text-surface-200">Video y audio por canal</p>
-          <p className="text-xs text-surface-500 mt-0.5">Lectura y escritura vía ISAPI — backup automático antes de cada cambio</p>
+        <div className="flex gap-1">
+          {[
+            { key: 'all', label: 'Todos' },
+            { key: 'h264', label: 'H.264' },
+            { key: 'h265', label: 'H.265' },
+            { key: 'nodata', label: 'Sin datos' },
+          ].map(f => (
+            <button
+              key={f.key}
+              onClick={() => setFilterCodec(f.key as typeof filterCodec)}
+              className={clsx('text-xs px-2 py-1 rounded transition-colors',
+                filterCodec === f.key ? 'bg-brand-600/30 text-brand-400' : 'text-surface-400 hover:text-surface-200 hover:bg-surface-700'
+              )}
+            >
+              {f.label}
+            </button>
+          ))}
         </div>
-        <button onClick={loadAll} disabled={loading} className="btn-secondary text-xs flex-shrink-0">
-          <RefreshCw size={12} /> Actualizar
+        <span className="text-xs text-surface-500 ml-auto">{configs.length} canales</span>
+        <button onClick={onRefresh} disabled={loading} className="btn-ghost text-xs">
+          <RefreshCw size={12} /> Recargar
         </button>
       </div>
 
-      {error && (
-        <div className="flex items-start gap-2 p-3 bg-red-900/20 border border-red-900/40 rounded-lg text-xs text-red-400">
-          <XCircle size={13} className="flex-shrink-0 mt-0.5" />
-          <div><p className="font-medium">No se pudo leer la configuración</p><p className="mt-0.5 opacity-80">{error}</p></div>
-        </div>
-      )}
-
-      {configs.length === 0 && !loading && !error && (
-        <div className="card p-8 text-center space-y-2">
-          <VideoIcon size={20} className="mx-auto text-surface-500" />
-          <p className="text-sm text-surface-400">Sin canales disponibles</p>
-          <p className="text-xs text-surface-600">Sincroniza las cámaras IP primero</p>
-        </div>
-      )}
-
-      {configs.length > 0 && (
-        <>
-          {/* Stats strip */}
-          <div className="grid grid-cols-5 gap-2">
-            {[
-              { label: 'Total',      value: stats.total,  color: 'text-surface-300' },
-              { label: 'H.264 Main', value: stats.h264,   color: 'text-green-400' },
-              { label: 'H.265 Main', value: stats.h265,   color: 'text-amber-400' },
-              { label: 'Con audio',  value: stats.audio,  color: 'text-blue-400' },
-              { label: 'Sin datos',  value: stats.nodata, color: stats.nodata > 0 ? 'text-red-400' : 'text-surface-500' },
-            ].map(({ label, value, color }) => (
-              <div key={label} className="bg-surface-750 rounded-lg p-3 text-center border border-surface-700">
-                <div className={clsx('text-xl font-bold', color)}>{value}</div>
-                <div className="text-[10px] text-surface-500 mt-0.5">{label}</div>
-              </div>
-            ))}
-          </div>
-
-          {/* Search + filters */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <div className="relative flex-1 min-w-[160px]">
-              <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-surface-500 pointer-events-none" />
-              <input
-                type="text"
-                placeholder="Buscar canal, nombre, codec..."
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                className="input pl-8 text-xs py-1.5"
-              />
-            </div>
-            {(['all', 'h264', 'h265', 'audio', 'nodata'] as VideoFilter[]).map((f) => (
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+        {/* Channel list */}
+        <div className="lg:col-span-1 card overflow-hidden">
+          <div className="divide-y divide-surface-700/50 max-h-[600px] overflow-y-auto">
+            {filtered.length === 0 ? (
+              <div className="py-8 text-center text-surface-500 text-xs">Sin canales</div>
+            ) : filtered.map(c => (
               <button
-                key={f}
-                onClick={() => setFilter(f)}
+                key={c.channel}
+                onClick={() => { setSelectedChannel(c.channel); setEditMode(false) }}
                 className={clsx(
-                  'text-xs px-2.5 py-1.5 rounded-lg border transition-colors',
-                  filter === f
-                    ? 'bg-brand-600/20 border-brand-600/40 text-brand-300'
-                    : 'border-surface-600 text-surface-400 hover:text-surface-200 hover:border-surface-500'
+                  'w-full flex items-center gap-2 px-3 py-2.5 text-left hover:bg-surface-700/50 transition-colors text-xs',
+                  selectedChannel === c.channel && 'bg-surface-700/80'
                 )}
               >
-                {{ all: 'Todos', h264: 'H.264', h265: 'H.265', audio: 'Con audio', nodata: 'Sin datos' }[f]}
+                <span className="text-surface-500 font-mono w-7 flex-shrink-0">
+                  {c.channelCode ?? `D${c.channel}`}
+                </span>
+                <span className="flex-1 truncate text-surface-300">{c.cameraName}</span>
+                {c.error ? (
+                  <AlertTriangle size={10} className="text-amber-400 flex-shrink-0" />
+                ) : c.main ? (
+                  <span className={clsx('text-[9px] px-1 rounded flex-shrink-0',
+                    /hevc|h\.265|h265/i.test(c.main.codec) ? 'bg-amber-900/30 text-amber-400' : 'bg-green-900/30 text-green-400'
+                  )}>
+                    {/hevc|h\.265|h265/i.test(c.main.codec) ? 'H.265' : 'H.264'}
+                  </span>
+                ) : (
+                  <span className="text-[9px] text-surface-600">—</span>
+                )}
               </button>
             ))}
           </div>
+        </div>
 
-          {/* Split: table + detail */}
-          <div className="flex gap-3 min-h-0">
-            {/* Compact channel table */}
-            <div className="w-[340px] flex-shrink-0 overflow-auto rounded-lg border border-surface-700 max-h-[500px]">
-              <table className="w-full text-xs">
-                <thead className="bg-surface-800 sticky top-0 z-10">
-                  <tr>
-                    <th className="text-left px-3 py-2 text-surface-500 font-medium whitespace-nowrap">Canal</th>
-                    <th className="text-left px-2 py-2 text-surface-500 font-medium">Nombre</th>
-                    <th className="text-left px-2 py-2 text-surface-500 font-medium whitespace-nowrap">Main</th>
-                    <th className="text-left px-2 py-2 text-surface-500 font-medium whitespace-nowrap">Sub</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-surface-700/50">
-                  {visible.length === 0 && (
-                    <tr><td colSpan={4} className="text-center py-6 text-surface-500">Sin resultados</td></tr>
-                  )}
-                  {visible.map((cfg) => {
-                    const cam     = dbCameras.find(c => c.channel === cfg.channel)
-                    const code    = (cam as any)?.channelCode || `D${cfg.channel}`
-                    const name    = cam?.name || `Canal ${cfg.channel}`
-                    const mainH265 = cfg.main && isH265Codec(cfg.main.videoCodecType)
-                    const mainRes = cfg.main ? (cfg.main.width > 0 ? `${cfg.main.width}×${cfg.main.height}` : null) : null
-                    const subRes  = cfg.sub  ? (cfg.sub.width  > 0 ? `${cfg.sub.width}×${cfg.sub.height}` : null)  : null
-                    const isSelected = cfg.channel === selectedChannel
-                    const hasErr  = !!cfg.error
-
-                    return (
-                      <tr
-                        key={cfg.channel}
-                        onClick={() => setSelectedChannel(cfg.channel)}
-                        className={clsx(
-                          'cursor-pointer transition-colors',
-                          isSelected ? 'bg-brand-600/10' : 'hover:bg-surface-700/30'
-                        )}
-                      >
-                        <td className="px-3 py-2 whitespace-nowrap">
-                          <div className="flex items-center gap-1.5">
-                            <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0',
-                              hasErr ? 'bg-surface-600' : cam?.online ? 'bg-green-400' : 'bg-surface-600'
-                            )} />
-                            <span className="font-mono font-semibold text-surface-200">{code}</span>
-                          </div>
-                        </td>
-                        <td className="px-2 py-2 max-w-[100px]">
-                          <span className="text-surface-300 truncate block">{name}</span>
-                        </td>
-                        <td className="px-2 py-2 whitespace-nowrap">
-                          {hasErr ? (
-                            <span className="text-surface-600">—</span>
-                          ) : cfg.main ? (
-                            <div>
-                              <span className={clsx('font-medium', mainH265 ? 'text-amber-400' : 'text-green-400')}>
-                                {cfg.main.videoCodecType.replace('H.', 'H').replace('HEVC', 'H.265') || '—'}
-                              </span>
-                              {mainRes && <span className="text-surface-500 ml-1 text-[10px]">{mainRes}</span>}
-                            </div>
-                          ) : <span className="text-surface-600">—</span>}
-                        </td>
-                        <td className="px-2 py-2 whitespace-nowrap">
-                          {cfg.sub && !hasErr ? (
-                            <span className="text-surface-400 text-[10px]">{subRes || cfg.sub.videoCodecType || '—'}</span>
-                          ) : <span className="text-surface-600">—</span>}
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
+        {/* Detail panel */}
+        <div className="lg:col-span-2">
+          {!selected ? (
+            <div className="card p-8 text-center text-surface-500 text-sm">
+              Selecciona un canal para ver o editar su configuración
             </div>
-
-            {/* Detail panel */}
-            <div className="flex-1 min-w-0">
-              {selectedConfig ? (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between gap-2 flex-wrap">
-                    <div>
-                      <p className="text-sm font-medium text-surface-100">
-                        {(selected as any)?.channelCode || `D${selectedConfig.channel}`} — {selected?.name || `Canal ${selectedConfig.channel}`}
-                      </p>
-                      <p className="text-[10px] text-surface-500 mt-0.5">
-                        Leído {new Date(selectedConfig.fetchedAt).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <button
-                        onClick={handleRestore}
-                        disabled={restoring || saving}
-                        className="btn-ghost text-xs flex items-center gap-1"
-                        title="Restaurar configuración desde el último backup automático"
-                      >
-                        {restoring ? <Loader2 size={11} className="animate-spin" /> : <History size={11} />}
-                        Restaurar backup
-                      </button>
-                      <button
-                        onClick={() => { setEditStream(null); loadSingle(selectedConfig.channel) }}
-                        disabled={loadingSingle || saving}
-                        className="btn-ghost text-xs"
-                      >
-                        {loadingSingle ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-                        Releer NVR
-                      </button>
-                    </div>
+          ) : (
+            <div className="card p-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium text-surface-200">
+                    {selected.channelCode ?? `D${selected.channel}`} — {selected.cameraName}
                   </div>
+                  <div className="text-xs text-surface-500 mt-0.5">
+                    Última lectura: {selected.fetchedAt ? format(new Date(selected.fetchedAt), 'dd/MM/yyyy HH:mm') : '—'}
+                  </div>
+                </div>
+                {isAdmin && !selected.error && (
+                  <button
+                    onClick={() => {
+                      setEditMode(!editMode)
+                      if (!editMode) {
+                        setEditForm({
+                          mainFps: selected.main?.fps,
+                          mainBitrate: selected.main?.bitrate,
+                          subFps: selected.sub?.fps,
+                          subBitrate: selected.sub?.bitrate,
+                        })
+                      }
+                    }}
+                    className="btn-secondary text-xs"
+                  >
+                    <Pencil size={11} /> {editMode ? 'Cancelar' : 'Editar'}
+                  </button>
+                )}
+              </div>
 
-                  {selectedConfig.error ? (
-                    <div className="p-4 bg-surface-750 rounded-lg text-xs text-surface-500 text-center">
-                      <XCircle size={16} className="mx-auto mb-2 text-surface-600" />
-                      {selectedConfig.error}
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                      {/* Main stream */}
-                      {selectedConfig.main && (
-                        <div className="space-y-2">
-                          {editStream === 'main' ? (
-                            <StreamEditForm
-                              initial={editValues}
-                              onSave={handleSaveRequest}
-                              onCancel={() => setEditStream(null)}
-                              saving={saving}
-                            />
-                          ) : (
-                            <div className="relative group">
-                              <StreamConfigCard config={selectedConfig.main} label="Flujo principal (Main)" />
-                              <button
-                                onClick={() => handleEdit('main')}
-                                className="absolute top-3 right-3 btn-ghost text-[10px] py-0.5 px-1.5 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
-                              >
-                                <Pencil size={10} /> Editar
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                      {/* Sub stream */}
-                      {selectedConfig.sub && (
-                        <div className="space-y-2">
-                          {editStream === 'sub' ? (
-                            <StreamEditForm
-                              initial={editValues}
-                              onSave={handleSaveRequest}
-                              onCancel={() => setEditStream(null)}
-                              saving={saving}
-                            />
-                          ) : (
-                            <div className="relative group">
-                              <StreamConfigCard config={selectedConfig.sub} label="Flujo secundario (Sub)" />
-                              <button
-                                onClick={() => handleEdit('sub')}
-                                className="absolute top-3 right-3 btn-ghost text-[10px] py-0.5 px-1.5 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
-                              >
-                                <Pencil size={10} /> Editar
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                      {!selectedConfig.main && !selectedConfig.sub && (
-                        <div className="col-span-2 p-6 bg-surface-750 rounded-lg text-center text-xs text-surface-500">
-                          Sin datos de configuración para este canal
-                        </div>
-                      )}
-                    </div>
-                  )}
+              {selected.error ? (
+                <div className="flex items-center gap-2 p-2 bg-amber-900/15 border border-amber-700/30 rounded text-xs text-amber-400">
+                  <AlertTriangle size={12} />
+                  <span>{selected.error}</span>
                 </div>
               ) : (
-                <div className="card p-8 text-center text-xs text-surface-500">
-                  Selecciona un canal de la tabla para ver su configuración
-                </div>
+                <>
+                  {/* Warning for ADMIN edit */}
+                  {editMode && (
+                    <div className="flex items-start gap-2 p-2 bg-amber-900/15 border border-amber-700/30 rounded text-xs text-amber-400">
+                      <AlertTriangle size={12} className="flex-shrink-0 mt-0.5" />
+                      <span>Esto modifica la configuración real del NVR. Se guardará backup automático antes de aplicar.</span>
+                    </div>
+                  )}
+
+                  {/* Main stream */}
+                  <div className="space-y-2">
+                    <div className="text-xs font-medium text-surface-400 uppercase tracking-wide">Stream Principal</div>
+                    {selected.main ? (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        {[
+                          ['Codec', selected.main.codec],
+                          ['Resolución', selected.main.resolution],
+                          ['FPS', editMode ? null : String(selected.main.fps)],
+                          ['Bitrate', editMode ? null : `${selected.main.bitrate} kbps`],
+                        ].map(([k, v]) => v !== null ? (
+                          <div key={k as string}>
+                            <div className="text-[10px] text-surface-500">{k}</div>
+                            <div className="text-xs text-surface-200">{v}</div>
+                          </div>
+                        ) : null)}
+                        {editMode && (
+                          <>
+                            <div>
+                              <label className="text-[10px] text-surface-500">FPS</label>
+                              <input className="input text-xs mt-0.5" type="number" min="1" max="30"
+                                value={editForm.mainFps ?? ''} onChange={e => setEditForm(f => ({ ...f, mainFps: Number(e.target.value) }))} />
+                            </div>
+                            <div>
+                              <label className="text-[10px] text-surface-500">Bitrate (kbps)</label>
+                              <input className="input text-xs mt-0.5" type="number" min="128" max="16384"
+                                value={editForm.mainBitrate ?? ''} onChange={e => setEditForm(f => ({ ...f, mainBitrate: Number(e.target.value) }))} />
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-surface-500">Sin datos de stream principal</div>
+                    )}
+                  </div>
+
+                  {/* Sub stream */}
+                  <div className="space-y-2">
+                    <div className="text-xs font-medium text-surface-400 uppercase tracking-wide">Sub-stream</div>
+                    {selected.sub ? (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        {[
+                          ['Codec', selected.sub.codec],
+                          ['Resolución', selected.sub.resolution],
+                          ['FPS', editMode ? null : String(selected.sub.fps)],
+                          ['Bitrate', editMode ? null : `${selected.sub.bitrate} kbps`],
+                        ].map(([k, v]) => v !== null ? (
+                          <div key={k as string}>
+                            <div className="text-[10px] text-surface-500">{k}</div>
+                            <div className="text-xs text-surface-200">{v}</div>
+                          </div>
+                        ) : null)}
+                        {editMode && (
+                          <>
+                            <div>
+                              <label className="text-[10px] text-surface-500">FPS</label>
+                              <input className="input text-xs mt-0.5" type="number" min="1" max="15"
+                                value={editForm.subFps ?? ''} onChange={e => setEditForm(f => ({ ...f, subFps: Number(e.target.value) }))} />
+                            </div>
+                            <div>
+                              <label className="text-[10px] text-surface-500">Bitrate (kbps)</label>
+                              <input className="input text-xs mt-0.5" type="number" min="64" max="4096"
+                                value={editForm.subBitrate ?? ''} onChange={e => setEditForm(f => ({ ...f, subBitrate: Number(e.target.value) }))} />
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-surface-500">Sin datos de sub-stream</div>
+                    )}
+                  </div>
+
+                  {editMode && (
+                    <div className="flex gap-2 justify-end">
+                      <button onClick={() => setEditMode(false)} className="btn-secondary text-xs">Cancelar</button>
+                      <button onClick={handleSave} disabled={saving} className="btn-primary text-xs">
+                        {saving ? <Loader2 size={11} className="animate-spin" /> : null}
+                        {saving ? 'Guardando...' : 'Guardar cambios'}
+                      </button>
+                    </div>
+                  )}
+                </>
               )}
             </div>
-          </div>
-        </>
-      )}
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -1934,16 +1618,14 @@ function RecordingsCapTab({ caps, loading, checking, onRefresh, onCheck, isAdmin
               </div>
               <div>
                 <div className="text-xs text-surface-500 mb-1">ISAPI de búsqueda</div>
-                <span className={clsx('text-sm font-medium flex items-center gap-1', caps.supportsIsapiRecording ? 'text-green-400' : caps.supportsIsapiRecording === false ? 'text-red-400' : 'text-surface-400')}>
+                <span className={clsx('text-sm font-medium flex items-center gap-1',
+                  caps.supportsIsapiRecording ? 'text-green-400'
+                    : caps.supportsIsapiRecording === false ? 'text-red-400'
+                    : 'text-surface-400'
+                )}>
                   {caps.supportsIsapiRecording === true && <><CheckCircle2 size={12} /> Soportado</>}
                   {caps.supportsIsapiRecording === false && <><XCircle size={12} /> No soportado</>}
                   {caps.supportsIsapiRecording === null && '—'}
-                </span>
-              </div>
-              <div>
-                <div className="text-xs text-surface-500 mb-1">SDK Hikvision</div>
-                <span className={clsx('text-sm font-medium flex items-center gap-1', caps.supportsSdkRecording ? 'text-green-400' : 'text-surface-500')}>
-                  {caps.supportsSdkRecording ? <><CheckCircle2 size={12} /> Habilitado</> : '—'}
                 </span>
               </div>
               <div>
@@ -1966,19 +1648,15 @@ function RecordingsCapTab({ caps, loading, checking, onRefresh, onCheck, isAdmin
             <div className="card p-4 space-y-2">
               <h3 className="text-sm font-medium text-surface-200 flex items-center gap-2">
                 <ExternalLink size={14} className="text-surface-400" />
-                Reproducción web del NVR
+                Reproducción web
               </h3>
-              <p className="text-xs text-surface-500">
-                Este NVR usa su propia interfaz web para reproducción de grabaciones.
-              </p>
               <a
                 href={caps.playbackWebUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="btn-secondary text-xs inline-flex items-center gap-1.5"
               >
-                <ExternalLink size={12} />
-                Abrir reproducción web
+                <ExternalLink size={12} /> Abrir reproducción web del NVR
               </a>
             </div>
           )}
@@ -1990,7 +1668,7 @@ function RecordingsCapTab({ caps, loading, checking, onRefresh, onCheck, isAdmin
                 <div>
                   <p className="text-sm font-medium text-amber-400">Reproducción manual requerida</p>
                   <p className="text-xs text-surface-400 mt-1">
-                    Este NVR no soporta búsqueda ISAPI. Configura la URL de reproducción web del NVR para que los usuarios puedan acceder a sus grabaciones.
+                    ISAPI no está soportado. Configura la URL de reproducción web del NVR para que los usuarios puedan acceder a las grabaciones.
                   </p>
                 </div>
               </div>

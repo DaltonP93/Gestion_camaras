@@ -1974,3 +1974,59 @@ export async function captureSnapshot(nvr: NVR, channel: number): Promise<Buffer
     return null
   }
 }
+
+// ─── Obtener configuración de video/audio de un canal ────────
+
+export interface HikChannelVideoConfig {
+  channel:    number
+  main:       { codec: string; resolution: string; fps: number; bitrate: number } | null
+  sub:        { codec: string; resolution: string; fps: number; bitrate: number } | null
+  fetchedAt:  string
+}
+
+export async function fetchChannelVideoConfig(nvr: NVR, channel: number): Promise<HikChannelVideoConfig> {
+  const enc = await getVideoEncodingConfig(nvr, channel)
+  const fetchedAt = new Date().toISOString()
+  if (!enc) {
+    return { channel, main: null, sub: null, fetchedAt }
+  }
+  return {
+    channel,
+    main: { codec: enc.mainCodec, resolution: enc.mainResolution, fps: enc.mainFps, bitrate: enc.mainBitrate },
+    sub:  { codec: enc.subCodec,  resolution: enc.subResolution,  fps: enc.subFps,  bitrate: enc.subBitrate  },
+    fetchedAt,
+  }
+}
+
+export async function updateChannelFpsAndBitrate(
+  nvr: NVR,
+  channel: number,
+  updates: { mainFps?: number; mainBitrate?: number; subFps?: number; subBitrate?: number },
+): Promise<void> {
+  const client = createHikClient(nvr)
+  const ch = String(channel).padStart(2, '0')
+
+  const applyToStream = async (streamId: string, fps?: number, bitrate?: number) => {
+    if (fps === undefined && bitrate === undefined) return
+    const res = await client.get(`/ISAPI/Streaming/channels/${streamId}`)
+    const xml: string = typeof res.data === 'string' ? res.data : ''
+    if (!xml) return
+
+    let patched = xml
+    if (fps !== undefined) {
+      const maxFrameRate = fps * 100
+      patched = patched.replace(/<maxFrameRate>\d+<\/maxFrameRate>/, `<maxFrameRate>${maxFrameRate}</maxFrameRate>`)
+      patched = patched.replace(/<frameRate>\d+<\/frameRate>/, `<frameRate>${fps}</frameRate>`)
+    }
+    if (bitrate !== undefined) {
+      patched = patched.replace(/<videoBitRate>\d+<\/videoBitRate>/, `<videoBitRate>${bitrate}</videoBitRate>`)
+      patched = patched.replace(/<constantBitRate>\d+<\/constantBitRate>/, `<constantBitRate>${bitrate}</constantBitRate>`)
+    }
+    await client.put(`/ISAPI/Streaming/channels/${streamId}`, patched, {
+      headers: { 'Content-Type': 'application/xml' },
+    })
+  }
+
+  await applyToStream(`${ch}01`, updates.mainFps, updates.mainBitrate)
+  await applyToStream(`${ch}02`, updates.subFps, updates.subBitrate)
+}

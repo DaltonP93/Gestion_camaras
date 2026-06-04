@@ -9,6 +9,7 @@ import { useAppearanceStore } from '@/stores/appearanceStore'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
 import type { AppearanceSettings } from '@/types'
+import { invalidateAppearanceCache, applyAppearanceToDocument } from '@/hooks/useAppearance'
 
 // ─── Constants ───────────────────────────────────────────────
 const THEMES = [
@@ -333,32 +334,11 @@ export function AppearancePage() {
   const handleSave = async () => {
     setIsSaving(true)
     try {
-      const payload: Partial<AppearanceSettings> = {
-        siteName:          settings.siteName,
-        logoText:          settings.logoText,
-        primaryColor:      settings.primaryColor,
-        accentColor:       settings.accentColor,
-        theme:             settings.theme,
-        sidebarWidth:      settings.sidebarWidth,
-        showNVRsInSidebar: settings.showNVRsInSidebar,
-        customCss:         settings.customCss,
-        logoUrl:           settings.logoUrl,
-        sidebarLogoUrl:    settings.sidebarLogoUrl,
-        faviconUrl:        settings.faviconUrl,
-      }
-      const updated = await apiPut<AppearanceSettings>('/appearance', payload)
-      const clean: AppearanceSettings = {
-        ...DEFAULTS,
-        ...updated,
-        customCss:      updated.customCss      ?? '',
-        logoUrl:        updated.logoUrl        ?? '',
-        sidebarLogoUrl: updated.sidebarLogoUrl ?? '',
-        faviconUrl:     updated.faviconUrl     ?? '',
-      }
-      setSaved(clean)
-      setSettings(clean)
-      applyAppearance(clean)
-      applyGlobal(clean)  // propagate to all components via store
+      const updated = await apiPut<AppearanceSettings>('/appearance', settings)
+      setSaved(updated)
+      setSettings(updated)
+      invalidateAppearanceCache()
+      applyAppearanceToDocument(updated)
       toast.success('Apariencia guardada')
     } catch {
       toast.error('Error al guardar apariencia')

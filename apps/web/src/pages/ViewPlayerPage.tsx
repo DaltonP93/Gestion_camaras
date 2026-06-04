@@ -3,8 +3,8 @@ import { useEffect, useState, useRef, useCallback, type MutableRefObject } from 
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, LayoutGrid, ChevronLeft, ChevronRight,
-  Play, Pause, Globe, Lock, Monitor, AlertTriangle,
-  Maximize2, Minimize2, ScanLine, Crop,
+  Play, Pause, Clock, Globe, Lock, Monitor, AlertTriangle,
+  Maximize2, Minimize2,
 } from 'lucide-react'
 import { apiGet, apiPost } from '@/lib/api'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
@@ -46,11 +46,25 @@ export function ViewPlayerPage() {
   const [error, setError] = useState<string | null>(null)
   const [objectFit, setObjectFit] = useState<'cover' | 'contain'>('cover')
 
-  // Pagination / slideshow
-  const slotsPerPage = view ? getSlotsPerPage(view.layout) : 9
-  const filledSlots  = slots.filter((s) => s.cameraId)
-  const totalPages   = Math.max(1, Math.ceil(filledSlots.length / slotsPerPage))
-  const [currentPage, setCurrentPage]       = useState(0)
+  // Fullscreen state — which camera is expanded to HD
+  const [fullscreenCamId, setFullscreenCamId] = useState<string | null>(null)
+  const [hdStream, setHdStream] = useState<StreamInfo | null>(null)
+  const [hdLoading, setHdLoading] = useState(false)
+
+  // Pagination/slideshow
+  const slotsPerPage = view ? (() => {
+    const layout = view.layout
+    if (layout === '1x1') return 1
+    if (layout === '2x2') return 4
+    if (layout === '3x3') return 9
+    if (layout === '4x4') return 16
+    if (layout === 'featured') return 8
+    return 9
+  })() : 9
+
+  const filledSlots = slots.filter((s) => s.cameraId)
+  const totalPages = Math.max(1, Math.ceil(filledSlots.length / slotsPerPage))
+  const [currentPage, setCurrentPage] = useState(0)
   const [slideshowActive, setSlideshowActive] = useState(false)
   const slideshowRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -167,12 +181,13 @@ export function ViewPlayerPage() {
     apiGet<CameraView>(`/views/${id}`)
       .then(async (v) => {
         setView(v)
-        const assignedSlots = v.cameraSlots.filter((s) => s.cameraId)
-        const assignedIds   = assignedSlots.map((s) => s.cameraId!)
+        const assignedIds = v.cameraSlots
+          .filter((s) => s.cameraId)
+          .map((s) => s.cameraId!)
 
-        const camerasArr = assignedIds.length > 0
-          ? await apiPost<Camera[]>('/cameras/batch', { ids: assignedIds })
-          : []
+        const camerasData = await Promise.allSettled(
+          assignedIds.map((cid) => apiGet<Camera>(`/cameras/${cid}`))
+        )
         const cameraMap = new Map<string, Camera>()
         camerasArr.forEach((c) => cameraMap.set(c.id, c))
 
@@ -180,15 +195,8 @@ export function ViewPlayerPage() {
         const perPage      = getSlotsPerPage(v.layout)
         const firstPageIds = assignedIds.slice(0, perPage)
 
-        const streamResults = await Promise.allSettled(
-          firstPageIds.map((cid) =>
-            apiPost<StreamInfo>(`/cameras/${cid}/start-stream`, {}).then((s) => {
-              const cam  = cameraMap.get(cid)
-              const st   = getStreamTypeFromPath(s.streamPath ?? '')
-              console.info(`[ViewPlayer] start cameraId=${cid} name=${cam?.name ?? '?'} requested=sub actual=${st} streamPath=${s.streamPath}`)
-              return s
-            })
-          )
+        const streamData = await Promise.allSettled(
+          assignedIds.map((cid) => apiGet<StreamInfo>(`/cameras/${cid}/stream`))
         )
         const streamMap = new Map<string, StreamInfo>()
         streamResults.forEach((r, i) => {
@@ -205,7 +213,6 @@ export function ViewPlayerPage() {
       .finally(() => setIsLoading(false))
   }, [id])
 
-  // ─── Lazy-load streams when page changes ────────────────────────────────────
   useEffect(() => {
     if (!view) return
     const perPage  = getSlotsPerPage(view.layout)
@@ -249,8 +256,76 @@ export function ViewPlayerPage() {
     return () => { if (slideshowRef.current) clearInterval(slideshowRef.current) }
   }, [slideshowActive, view, totalPages])
 
-  const prevPage = useCallback(() => setCurrentPage((p) => (p - 1 + totalPages) % totalPages), [totalPages])
-  const nextPage = useCallback(() => setCurrentPage((p) => (p + 1) % totalPages), [totalPages])
+  // Cleanup HD stream on unmount
+  useEffect(() => {
+    return () => {
+      if (fullscreenCamId) {
+        apiPost(`/cameras/${fullscreenCamId}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      }
+    }
+  }, [fullscreenCamId])
+
+  const enterFullscreen = useCallback(async (cameraId: string) => {
+    // Toggle: double-click same camera exits fullscreen
+    if (fullscreenCamId === cameraId) {
+      // Exit
+      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      console.log(`[ViewPlayer] fullscreenExit cameraId=${cameraId} restore=sub`)
+      setFullscreenCamId(null)
+      setHdStream(null)
+      return
+    }
+
+    // Stop previous HD stream if any
+    if (fullscreenCamId) {
+      apiPost(`/cameras/${fullscreenCamId}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      console.log(`[ViewPlayer] fullscreenExit cameraId=${fullscreenCamId} restore=sub`)
+    }
+
+    const slot = slots.find(s => s.cameraId === cameraId)
+    const camera = slot?.camera
+    const mainIsHevc = camera?.mainCodec
+      ? /hevc|h\.265|h265/i.test(camera.mainCodec)
+      : false
+
+    setFullscreenCamId(cameraId)
+    setHdStream(null)
+    setHdLoading(true)
+
+    if (mainIsHevc) {
+      console.log(`[ViewPlayer] fullscreenQualitySwitch cameraId=${cameraId} codec=HEVC no-transcode available`)
+      setHdLoading(false)
+      return
+    }
+
+    try {
+      console.log(`[ViewPlayer] fullscreenQualitySwitch cameraId=${cameraId} from=sub to=main`)
+      const result = await apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: 'main' })
+      setHdStream(result)
+      console.log(`[ViewPlayer] playing cameraId=${cameraId} streamType=main`)
+    } catch (e) {
+      console.warn(`[ViewPlayer] HD stream failed for ${cameraId}, staying on sub`, e)
+      setHdStream(null)
+    } finally {
+      setHdLoading(false)
+    }
+  }, [fullscreenCamId, slots])
+
+  const exitFullscreen = useCallback(() => {
+    if (!fullscreenCamId) return
+    apiPost(`/cameras/${fullscreenCamId}/stop-stream`, { streamType: 'main' }).catch(() => {})
+    console.log(`[ViewPlayer] fullscreenExit cameraId=${fullscreenCamId} restore=sub`)
+    setFullscreenCamId(null)
+    setHdStream(null)
+  }, [fullscreenCamId])
+
+  const prevPage = useCallback(() => {
+    setCurrentPage((p) => (p - 1 + totalPages) % totalPages)
+  }, [totalPages])
+
+  const nextPage = useCallback(() => {
+    setCurrentPage((p) => (p + 1) % totalPages)
+  }, [totalPages])
 
   // ─── Loading / error states ──────────────────────────────────────────────────
   if (isLoading) {
@@ -278,9 +353,77 @@ export function ViewPlayerPage() {
     )
   }
 
-  // ─── Current page slots ──────────────────────────────────────────────────────
-  const pageSlots: SlotWithCamera[] = filledSlots.slice(currentPage * slotsPerPage, (currentPage + 1) * slotsPerPage)
-  // Pad to a full grid so rows don't collapse when there are fewer cameras than cells
+  // Fullscreen single-camera view
+  if (fullscreenCamId) {
+    const fsSlot = slots.find(s => s.cameraId === fullscreenCamId)
+    const fsCamera = fsSlot?.camera
+    const activeHls = hdStream?.hls ?? fsSlot?.stream?.hls
+    const isHd = !!hdStream
+    const mainIsHevc = fsCamera?.mainCodec
+      ? /hevc|h\.265|h265/i.test(fsCamera.mainCodec)
+      : false
+
+    return (
+      <div className="flex flex-col h-full bg-black">
+        {/* Fullscreen header */}
+        <div className="flex items-center gap-3 px-4 py-2.5 bg-surface-900/80 backdrop-blur-sm border-b border-surface-700/50 flex-shrink-0">
+          <button onClick={exitFullscreen} className="p-1.5 rounded text-surface-500 hover:text-surface-200 hover:bg-surface-700 transition-colors" title="Salir de pantalla completa (o doble clic)">
+            <Minimize2 size={14} />
+          </button>
+          <LayoutGrid size={14} className="text-brand-400" />
+          <span className="text-sm font-medium text-surface-100">{view.name}</span>
+          <span className="text-xs text-surface-500">·</span>
+          <span className="text-sm text-surface-300">{fsCamera?.name ?? 'Cámara'}</span>
+          {hdLoading && (
+            <span className="ml-2 text-xs text-surface-400 animate-pulse">Cargando HD...</span>
+          )}
+          {isHd && (
+            <span className="ml-2 text-xs px-1.5 py-0.5 bg-brand-900/40 text-brand-400 rounded font-medium">
+              HD
+            </span>
+          )}
+          {!isHd && !hdLoading && mainIsHevc && (
+            <span className="ml-2 text-xs text-amber-400">H.265 — sin transcodificación</span>
+          )}
+          <button
+            onClick={() => navigate('/views')}
+            className="ml-auto p-1.5 rounded text-surface-500 hover:text-surface-200 hover:bg-surface-700 transition-colors"
+          >
+            <ArrowLeft size={14} />
+          </button>
+        </div>
+
+        {/* Full-screen video */}
+        <div className="flex-1 overflow-hidden">
+          {activeHls ? (
+            <VideoPlayer
+              hlsUrl={activeHls}
+              cameraName={fsCamera?.name ?? ''}
+              cameraId={fullscreenCamId}
+              streamType={isHd ? 'main' : 'sub'}
+              streamCodec={isHd ? (fsCamera?.mainCodec ?? undefined) : (fsCamera?.subCodec ?? undefined)}
+              streamResolution={isHd ? (fsCamera?.mainResolution ?? undefined) : (fsCamera?.subResolution ?? undefined)}
+              onFullscreen={exitFullscreen}
+              className="w-full h-full"
+            />
+          ) : (
+            <div className="w-full h-full flex flex-col items-center justify-center gap-2">
+              <Monitor size={24} className="text-surface-600" />
+              <span className="text-sm text-surface-400">{fsCamera?.name ?? 'Sin stream'}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Hint */}
+        <div className="py-1.5 bg-surface-900/60 border-t border-surface-700/50 text-center">
+          <span className="text-[10px] text-surface-600">Doble clic o <Minimize2 size={9} className="inline" /> para salir · Usando {isHd ? 'stream principal (HD)' : 'sub-stream'}</span>
+        </div>
+      </div>
+    )
+  }
+
+  // Normal grid view
+  const pageSlots = filledSlots.slice(currentPage * slotsPerPage, (currentPage + 1) * slotsPerPage)
   while (pageSlots.length < slotsPerPage) {
     pageSlots.push({ slotIndex: -1, cameraId: null, size: 'normal' })
   }
@@ -289,10 +432,52 @@ export function ViewPlayerPage() {
   const rows       = Math.ceil(pageSlots.length / cols)
   const isFeatured = view.layout === 'featured'
 
-  // CSS overlay fullscreen (fallback when native FS unavailable)
-  const fullscreenSlot = fullscreenCamId
-    ? pageSlots.find((s) => s.cameraId === fullscreenCamId)
-    : null
+  const renderCell = (slot: SlotWithCamera) => {
+    if (!slot.cameraId || !slot.camera) {
+      return (
+        <div className="h-full min-h-[80px] bg-surface-900 rounded flex items-center justify-center">
+          <Monitor size={16} className="text-surface-700" />
+        </div>
+      )
+    }
+
+    const isFs = slot.cameraId === fullscreenCamId
+    const camera = slot.camera
+
+    return (
+      <div className="h-full min-h-[80px] rounded overflow-hidden bg-surface-900 relative group">
+        {slot.stream ? (
+          <VideoPlayer
+            hlsUrl={slot.stream.hls}
+            cameraName={camera.name}
+            cameraId={slot.cameraId}
+            streamType="sub"
+            streamCodec={camera.subCodec ?? undefined}
+            streamResolution={camera.subResolution ?? undefined}
+            onFullscreen={() => enterFullscreen(slot.cameraId!)}
+            className="w-full h-full"
+          />
+        ) : (
+          <div className="w-full h-full flex flex-col items-center justify-center gap-1.5">
+            <Monitor size={16} className="text-surface-600" />
+            <span className="text-xs text-surface-500">{camera.name}</span>
+            <span className="text-[10px] text-surface-600">Sin stream</span>
+          </div>
+        )}
+        {/* Expand button */}
+        <button
+          onClick={() => enterFullscreen(slot.cameraId!)}
+          className={clsx(
+            'absolute top-2 left-2 p-1 rounded bg-black/60 text-white transition-opacity',
+            isFs ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+          )}
+          title="Pantalla completa HD (o doble clic)"
+        >
+          <Maximize2 size={10} />
+        </button>
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col h-full bg-black select-none">
@@ -335,10 +520,9 @@ export function ViewPlayerPage() {
             : <Lock size={11} className="text-amber-400" />}
         </div>
 
-        {/* Pagination */}
         {totalPages > 1 && (
-          <div className="flex items-center gap-1 ml-2 flex-shrink-0">
-            <button onClick={prevPage} className="p-1 rounded text-surface-400 hover:text-surface-200 hover:bg-surface-700 transition-colors">
+          <div className="flex items-center gap-1.5 ml-2">
+            <button onClick={prevPage} className="p-1.5 rounded text-surface-400 hover:text-surface-200 hover:bg-surface-700 transition-colors">
               <ChevronLeft size={14} />
             </button>
             <div className="flex items-center gap-1">
@@ -350,9 +534,10 @@ export function ViewPlayerPage() {
                 />
               ))}
             </div>
-            <button onClick={nextPage} className="p-1 rounded text-surface-400 hover:text-surface-200 hover:bg-surface-700 transition-colors">
+            <button onClick={nextPage} className="p-1.5 rounded text-surface-400 hover:text-surface-200 hover:bg-surface-700 transition-colors">
               <ChevronRight size={14} />
             </button>
+
             <button
               onClick={() => setSlideshowActive(!slideshowActive)}
               className={clsx(
@@ -371,20 +556,21 @@ export function ViewPlayerPage() {
       {/* flex-1 + min-h-0 lets this div fill all remaining height without overflow */}
       <div className="flex-1 min-h-0 p-0.5">
         {isFeatured ? (
-          <FeaturedGrid
-            slots={pageSlots}
-            tileRefs={tileRefs}
-            objectFit={objectFit}
-            onFullscreen={enterFullscreen}
-          />
+          <div className="h-full grid gap-1" style={{ gridTemplateColumns: '2fr 1fr', gridTemplateRows: '2fr 1fr' }}>
+            <div className="row-span-1">{renderCell(pageSlots[0])}</div>
+            <div className="grid gap-1" style={{ gridTemplateRows: '1fr 1fr' }}>
+              {pageSlots.slice(1, 3).map((s, i) => (
+                <div key={i}>{renderCell(s)}</div>
+              ))}
+            </div>
+            <div className="grid gap-1 col-span-2" style={{ gridTemplateColumns: 'repeat(5, 1fr)' }}>
+              {pageSlots.slice(3, 8).map((s, i) => (
+                <div key={i}>{renderCell(s)}</div>
+              ))}
+            </div>
+          </div>
         ) : (
-          <div
-            className="w-full h-full grid gap-0.5"
-            style={{
-              gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-              gridTemplateRows:    `repeat(${rows}, minmax(0, 1fr))`,
-            }}
-          >
+          <div className="h-full grid gap-1" style={{ gridTemplateColumns: `repeat(${cols}, 1fr)` }}>
             {pageSlots.map((s, i) => (
               <CameraCell
                 key={s.cameraId ?? `empty-${i}`}
@@ -398,204 +584,13 @@ export function ViewPlayerPage() {
         )}
       </div>
 
-      {/* ── CSS overlay fullscreen (fallback) ───────────────────────────────── */}
-      {fullscreenSlot && !document.fullscreenElement && (
-        <div className="fixed inset-0 z-50 bg-black flex flex-col">
-          <div className="flex items-center justify-between px-3 py-2 bg-surface-900/80 flex-shrink-0">
-            <span className="text-sm text-surface-200 font-medium">
-              {fullscreenSlot.camera?.name ?? 'Cámara'}
-            </span>
-            <button
-              onClick={exitFullscreen}
-              className="p-1.5 rounded bg-surface-700 text-surface-300 hover:text-white hover:bg-surface-600 transition-colors"
-            >
-              <Minimize2 size={14} />
-            </button>
-          </div>
-          <div className="flex-1 min-h-0">
-            {fullscreenSlot.stream ? (() => {
-              // Use main stream for HD quality if available, else fall back to sub
-              const fsStream = fullscreenMainStream ?? fullscreenSlot.stream
-              const fsPath   = fsStream.streamPath ?? ''
-              const fsType   = getStreamTypeFromPath(fsPath)
-              const fsCam    = fullscreenSlot.camera
-              const fsCodec  = fsType === 'sub' ? fsCam?.subCodec : fsCam?.mainCodec
-              const fsRes    = fsType === 'main_h264' ? undefined : (fsType === 'sub' ? fsCam?.subResolution : fsCam?.mainResolution)
-              return (
-                <VideoPlayer
-                  key={`fs-${fullscreenSlot.cameraId}-${fsType}`}
-                  hlsUrl={fsStream.hls}
-                  cameraName={fsCam?.name ?? ''}
-                  cameraId={fullscreenSlot.cameraId ?? undefined}
-                  className="w-full h-full rounded-none"
-                  objectFit={objectFit}
-                  onFullscreen={exitFullscreen}
-                  streamType={fsType}
-                  streamCodec={fsCodec ?? undefined}
-                  streamResolution={fsRes ?? undefined}
-                />
-              )
-            })() : (
-              <OfflinePlaceholder name={fullscreenSlot.camera?.name} />
-            )}
-          </div>
+      {totalPages > 1 && (
+        <div className="flex items-center justify-center gap-2 py-1.5 bg-surface-900/60 border-t border-surface-700/50 flex-shrink-0">
+          <span className="text-xs text-surface-500">
+            Página {currentPage + 1} de {totalPages}
+            {slideshowActive && <span className="text-brand-400 ml-2">· Presentación activa</span>}
+          </span>
         </div>
-      )}
-    </div>
-  )
-}
-
-// ─── Derive streamType / codec / resolution from slot data ───────────────────
-
-function resolveStreamProps(slot: SlotWithCamera): {
-  streamType?: 'sub' | 'main' | 'main_h264'
-  streamCodec?: string
-  streamResolution?: string
-} {
-  if (!slot.stream || !slot.camera) return {}
-  const st = getStreamTypeFromPath(slot.stream.streamPath ?? '')
-  const cam = slot.camera
-  const codec      = st === 'sub' ? cam.subCodec      : cam.mainCodec
-  const resolution = st === 'sub' ? cam.subResolution : cam.mainResolution
-  return { streamType: st, streamCodec: codec ?? undefined, streamResolution: resolution ?? undefined }
-}
-
-// ─── Camera tile ──────────────────────────────────────────────────────────────
-
-function CameraCell({
-  slot,
-  tileRefs,
-  objectFit,
-  onFullscreen,
-}: {
-  slot: SlotWithCamera
-  tileRefs: MutableRefObject<Map<string, HTMLDivElement>>
-  objectFit: 'cover' | 'contain'
-  onFullscreen: (cameraId: string) => void
-}) {
-  if (!slot.cameraId || !slot.camera) {
-    return (
-      <div className="w-full h-full bg-surface-900/50 flex items-center justify-center border border-surface-800">
-        <Monitor size={14} className="text-surface-700" />
-      </div>
-    )
-  }
-
-  const isOffline = slot.camera.online === false
-  const { streamType, streamCodec, streamResolution } = resolveStreamProps(slot)
-
-  return (
-    <div
-      ref={(el) => {
-        if (el) tileRefs.current.set(slot.cameraId!, el)
-        else    tileRefs.current.delete(slot.cameraId!)
-      }}
-      className="relative w-full h-full overflow-hidden bg-black border border-surface-800/60 group"
-    >
-      {isOffline ? (
-        <OfflinePlaceholder name={slot.camera.name} />
-      ) : slot.stream ? (
-        <VideoPlayer
-          key={`vp-${slot.cameraId}-${slot.stream.hls}`}
-          hlsUrl={slot.stream.hls}
-          cameraName={slot.camera.name}
-          cameraId={slot.cameraId}
-          className="w-full h-full rounded-none"
-          objectFit={objectFit}
-          streamType={streamType}
-          streamCodec={streamCodec}
-          streamResolution={streamResolution}
-          onFullscreen={() => onFullscreen(slot.cameraId!)}
-          onPlaying={(cid) => {
-            const st = getStreamTypeFromPath(slot.stream?.streamPath ?? '')
-            console.info(`[ViewPlayer] playing cameraId=${cid} streamType=${st}`)
-          }}
-          onStreamError={(cid, err) => {
-            console.warn(`[ViewPlayer] error cameraId=${cid} streamType=${streamType} code=${err.code}`)
-          }}
-        />
-      ) : (
-        <OfflinePlaceholder name={slot.camera.name} loading />
-      )}
-
-      {/* Hover maximize button (separate from VideoPlayer's own fullscreen button) */}
-      {!isOffline && (
-        <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-          <button
-            onClick={(e) => { e.stopPropagation(); onFullscreen(slot.cameraId!) }}
-            className="pointer-events-auto p-1 rounded bg-black/60 text-surface-400 hover:text-white transition-colors"
-            title="Pantalla completa (doble clic)"
-          >
-            <Maximize2 size={10} />
-          </button>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ─── Featured layout (1 large + 2 right + 5 bottom) ─────────────────────────
-
-function FeaturedGrid({
-  slots,
-  tileRefs,
-  objectFit,
-  onFullscreen,
-}: {
-  slots: SlotWithCamera[]
-  tileRefs: MutableRefObject<Map<string, HTMLDivElement>>
-  objectFit: 'cover' | 'contain'
-  onFullscreen: (cameraId: string) => void
-}) {
-  return (
-    <div className="w-full h-full grid gap-0.5" style={{ gridTemplateColumns: '2fr 1fr', gridTemplateRows: '2fr 1fr' }}>
-      {/* Main large tile: col 1, row 1 */}
-      <CameraCell
-        slot={slots[0] ?? { slotIndex: 0, cameraId: null, size: 'normal' }}
-        tileRefs={tileRefs}
-        objectFit={objectFit}
-        onFullscreen={onFullscreen}
-      />
-      {/* Right column: 2 stacked tiles, col 2, rows 1-1 */}
-      <div className="grid gap-0.5" style={{ gridTemplateRows: '1fr 1fr' }}>
-        {slots.slice(1, 3).map((s, i) => (
-          <CameraCell
-            key={s.cameraId ?? `r${i}`}
-            slot={s}
-            tileRefs={tileRefs}
-            objectFit={objectFit}
-            onFullscreen={onFullscreen}
-          />
-        ))}
-      </div>
-      {/* Bottom row: up to 5 tiles, spanning both columns */}
-      <div className="col-span-2 grid gap-0.5" style={{ gridTemplateColumns: 'repeat(5, 1fr)' }}>
-        {slots.slice(3, 8).map((s, i) => (
-          <CameraCell
-            key={s.cameraId ?? `b${i}`}
-            slot={s}
-            tileRefs={tileRefs}
-            objectFit={objectFit}
-            onFullscreen={onFullscreen}
-          />
-        ))}
-      </div>
-    </div>
-  )
-}
-
-// ─── Offline / loading placeholder ───────────────────────────────────────────
-
-function OfflinePlaceholder({ name, loading }: { name?: string; loading?: boolean }) {
-  return (
-    <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-surface-900">
-      {loading ? (
-        <div className="w-4 h-4 border-2 border-brand-500 border-t-transparent rounded-full animate-spin" />
-      ) : (
-        <Monitor size={14} className="text-surface-700" />
-      )}
-      {name && (
-        <span className="text-[10px] text-surface-600 text-center px-2 truncate max-w-full">{name}</span>
       )}
     </div>
   )

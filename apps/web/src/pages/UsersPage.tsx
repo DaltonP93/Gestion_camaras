@@ -36,7 +36,7 @@ const EMPTY_FORM: UserFormData = {
   username: '', email: '', fullName: '', password: '', role: 'OPERATOR', forcePasswordChange: false,
 }
 
-// ─── Permissions panel ──────────────────────────────────────────────────────
+// ─── Permissions Modal (redesigned) ─────────────────────────────────────────
 
 interface PermMatrix {
   nvrId?:         string
@@ -47,30 +47,9 @@ interface PermMatrix {
   canHighQuality: boolean
 }
 
-// ─── Feature permission labels ───────────────────────────────────────────────
-const FEATURE_LABELS: { key: keyof UserFeaturePermissions; label: string; icon: React.ReactNode; group: string }[] = [
-  { key: 'canViewDashboard',    label: 'Ver Dashboard',          icon: <Settings size={11} />,    group: 'Vistas' },
-  { key: 'canViewLive',         label: 'Ver en vivo',            icon: <Monitor size={11} />,     group: 'Vistas' },
-  { key: 'canViewRecordings',   label: 'Ver grabaciones',        icon: <Film size={11} />,        group: 'Vistas' },
-  { key: 'canViewAlerts',       label: 'Ver alertas',            icon: <AlertTriangle size={11} />, group: 'Vistas' },
-  { key: 'canViewDiagnostics',  label: 'Ver diagnósticos',       icon: <Database size={11} />,    group: 'Vistas' },
-  { key: 'canManageNVRs',       label: 'Administrar NVRs',       icon: <Server size={11} />,      group: 'Administración' },
-  { key: 'canManageCameras',    label: 'Administrar cámaras',    icon: <Video size={11} />,       group: 'Administración' },
-  { key: 'canManageUsers',      label: 'Administrar usuarios',   icon: <UserCheck size={11} />,   group: 'Administración' },
-  { key: 'canManageAppearance', label: 'Administrar apariencia', icon: <Star size={11} />,        group: 'Administración' },
-  { key: 'canResolveAlerts',    label: 'Resolver alertas',       icon: <Check size={11} />,       group: 'Acciones' },
-  { key: 'canRestartStreams',   label: 'Reiniciar streams',      icon: <RefreshCw size={11} />,   group: 'Acciones' },
-  { key: 'canTranscode',        label: 'Transcodificar H.265',   icon: <Zap size={11} />,         group: 'Acciones' },
-]
+type PermTab = 'cameras' | 'recordings' | 'advanced'
 
-function PermissionsPanel({
-  user,
-  onClose,
-}: {
-  user: User
-  onClose: () => void
-}) {
-  const [tab, setTab] = useState<'resources' | 'features' | 'sessions'>('resources')
+function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }) {
   const [nvrs, setNvrs] = useState<NVR[]>([])
   const [cameras, setCameras] = useState<Camera[]>([])
   const [perms, setPerms] = useState<PermMatrix[]>([])
@@ -78,7 +57,9 @@ function PermissionsPanel({
   const [sessions, setSessions] = useState<UserSession[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
-  const [expandedNvr, setExpandedNvr] = useState<string | null>(null)
+  const [activeTab, setActiveTab] = useState<PermTab>('cameras')
+  const [search, setSearch] = useState('')
+  const [expandedNvrs, setExpandedNvrs] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     setIsLoading(true)
@@ -90,60 +71,56 @@ function PermissionsPanel({
       setNvrs(n)
       setCameras(c)
       setPerms(u.permissions ?? [])
-      setFeaturePerms(u.featurePermissions ?? {})
-      setSessions(u.sessions ?? [])
+      // Expand all NVRs by default
+      setExpandedNvrs(new Set(n.map(nv => nv.id)))
     }).finally(() => setIsLoading(false))
   }, [user.id])
 
   const getPerm = useCallback((nvrId?: string, cameraId?: string): PermMatrix => {
-    const found = perms.find((p) =>
-      p.nvrId === (nvrId ?? undefined) && p.cameraId === (cameraId ?? undefined)
-    )
-    return found ?? { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false, canHighQuality: false }
+    const found = perms.find(p => p.nvrId === nvrId && p.cameraId === cameraId)
+    return found ?? { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false }
   }, [perms])
 
-  const setPerm = (nvrId: string | undefined, cameraId: string | undefined, field: keyof Pick<PermMatrix, 'canView' | 'canPlayback' | 'canPtz' | 'canHighQuality'>, value: boolean) => {
-    setPerms((prev) => {
-      const idx = prev.findIndex((p) =>
-        p.nvrId === nvrId && p.cameraId === cameraId
-      )
-      const entry: PermMatrix = idx >= 0 ? { ...prev[idx] } : { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false, canHighQuality: false }
+  const setPerm = (nvrId: string | undefined, cameraId: string | undefined, field: keyof Pick<PermMatrix, 'canView' | 'canPlayback' | 'canPtz'>, value: boolean) => {
+    setPerms(prev => {
+      const idx = prev.findIndex(p => p.nvrId === nvrId && p.cameraId === cameraId)
+      const entry: PermMatrix = idx >= 0 ? { ...prev[idx] } : { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false }
       entry[field] = value
-      if ((field === 'canPlayback' || field === 'canPtz' || field === 'canHighQuality') && value) entry.canView = true
-
-      if (idx >= 0) {
-        const copy = [...prev]
-        copy[idx] = entry
-        return copy
-      }
+      if ((field === 'canPlayback' || field === 'canPtz') && value) entry.canView = true
+      if (idx >= 0) { const copy = [...prev]; copy[idx] = entry; return copy }
       return [...prev, entry]
     })
   }
 
-  const setNvrAll = (nvrId: string, checked: boolean) => {
-    const nvr = nvrs.find((n) => n.id === nvrId)
-    if (!nvr) return
-    const nvCams = cameras.filter((c) => c.nvrId === nvrId)
-
-    setPerms((prev) => {
-      const next = prev.filter((p) => p.nvrId !== nvrId)
+  const toggleNvrAll = (nvrId: string, checked: boolean) => {
+    const nvCams = cameras.filter(c => c.nvrId === nvrId)
+    setPerms(prev => {
+      const next = prev.filter(p => p.nvrId !== nvrId)
       if (checked) {
-        next.push({ nvrId, cameraId: undefined, canView: true, canPlayback: false, canPtz: false, canHighQuality: false })
-        nvCams.forEach((cam) => {
-          next.push({ nvrId, cameraId: cam.id, canView: true, canPlayback: false, canPtz: false, canHighQuality: false })
-        })
+        next.push({ nvrId, cameraId: undefined, canView: true, canPlayback: false, canPtz: false })
+        nvCams.forEach(cam => next.push({ nvrId, cameraId: cam.id, canView: true, canPlayback: false, canPtz: false }))
       }
       return next
     })
   }
 
-  const isNvrChecked = (nvrId: string) =>
-    perms.some((p) => p.nvrId === nvrId && p.canView)
+  const selectAllCameras = () => {
+    const all: PermMatrix[] = []
+    nvrs.forEach(nvr => {
+      all.push({ nvrId: nvr.id, cameraId: undefined, canView: true, canPlayback: false, canPtz: false })
+      cameras.filter(c => c.nvrId === nvr.id).forEach(cam =>
+        all.push({ nvrId: nvr.id, cameraId: cam.id, canView: true, canPlayback: false, canPtz: false })
+      )
+    })
+    setPerms(all)
+  }
+
+  const clearAllCameras = () => setPerms([])
 
   const handleSaveResources = async () => {
     setIsSaving(true)
     try {
-      const toSave = perms.filter((p) => p.canView || p.canPlayback || p.canPtz || p.canHighQuality)
+      const toSave = perms.filter(p => p.canView || p.canPlayback || p.canPtz)
       await apiPost(`/users/${user.id}/permissions`, toSave)
       toast.success('Permisos de recursos guardados')
     } finally {
@@ -161,280 +138,253 @@ function PermissionsPanel({
     }
   }
 
-  const revokeSession = async (sessionId: string) => {
-    try {
-      await apiDelete(`/users/${user.id}/sessions`)
-      setSessions([])
-      toast.success('Todas las sesiones del usuario cerradas')
-    } catch {
-      toast.error('Error al cerrar sesiones')
-    }
-  }
+  const isAdmin = user.role === 'ADMIN'
+  const totalCams = cameras.length
+  const allowedCams = [...new Set(perms.filter(p => p.cameraId && p.canView).map(p => p.cameraId))].length
+  const allowedRec  = [...new Set(perms.filter(p => p.cameraId && p.canPlayback).map(p => p.cameraId))].length
 
-  const PermToggle = ({
-    label, icon, checked, onChange, disabled,
-  }: {
-    label: string; icon: React.ReactNode; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean
-  }) => (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={clsx(
-        'flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors',
-        checked
-          ? 'bg-brand-600/20 text-brand-300 border border-brand-600/30'
-          : 'bg-surface-700 text-surface-500 border border-transparent hover:border-surface-500',
-        disabled && 'opacity-40 cursor-not-allowed'
-      )}
-    >
-      {icon}
-      {label}
-    </button>
-  )
+  const filteredNvrs = nvrs.filter(nvr => {
+    if (!search) return true
+    const nvrMatch = nvr.name.toLowerCase().includes(search.toLowerCase())
+    const camMatch = cameras.filter(c => c.nvrId === nvr.id).some(c => c.name.toLowerCase().includes(search.toLowerCase()))
+    return nvrMatch || camMatch
+  })
 
   return (
-    <div className="fixed inset-0 z-50 flex">
-      <div className="flex-1 bg-black/40" onClick={onClose} />
-      <div className="w-[420px] bg-surface-800 border-l border-surface-600 flex flex-col shadow-2xl animate-slide-in">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+      <div className="w-full max-w-2xl bg-surface-800 border border-surface-600 rounded-xl flex flex-col shadow-2xl max-h-[85vh] animate-fade-in">
         {/* Header */}
-        {/* Header */}
-        <div className="flex items-center gap-3 px-4 py-4 border-b border-surface-700">
-          <div className="w-8 h-8 rounded-full bg-brand-700 flex items-center justify-center text-white text-sm font-semibold flex-shrink-0">
+        <div className="flex items-center gap-3 px-5 py-4 border-b border-surface-700 flex-shrink-0">
+          <div className="w-9 h-9 rounded-full bg-brand-700 flex items-center justify-center text-white text-sm font-semibold flex-shrink-0">
             {user.fullName.charAt(0)}
           </div>
           <div className="flex-1 min-w-0">
-            <div className="text-sm font-medium text-surface-100">{user.fullName}</div>
-            <div className="text-xs text-surface-500">{user.username} · Gestión de permisos</div>
+            <div className="text-sm font-semibold text-surface-100">{user.fullName}</div>
+            <div className="text-xs text-surface-500">@{user.username} · {ROLE_OPTIONS.find(r => r.value === user.role)?.label ?? user.role}</div>
+          </div>
+          <div className="flex items-center gap-2 text-xs text-surface-400">
+            <span className="px-2 py-0.5 bg-surface-700 rounded">{allowedCams}/{totalCams} cámaras</span>
           </div>
           <button onClick={onClose} className="p-1.5 rounded text-surface-500 hover:text-surface-200 hover:bg-surface-700">
             <X size={14} />
           </button>
         </div>
 
-        {/* Tabs */}
-        <div className="flex border-b border-surface-700 px-1">
-          {[
-            { id: 'resources', label: 'Recursos' },
-            { id: 'features',  label: 'Funcionalidades' },
-            { id: 'sessions',  label: `Sesiones${sessions.length > 0 ? ` (${sessions.length})` : ''}` },
-          ].map(({ id, label }) => (
-            <button
-              key={id}
-              onClick={() => setTab(id as any)}
-              className={clsx(
-                'px-3 py-2.5 text-xs font-medium border-b-2 transition-colors -mb-px',
-                tab === id
-                  ? 'border-brand-500 text-brand-400'
-                  : 'border-transparent text-surface-500 hover:text-surface-300'
-              )}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        {user.role === 'ADMIN' && tab === 'resources' && (
-          <div className="mx-4 mt-3 px-3 py-2 rounded-lg bg-brand-900/30 border border-brand-700/30 text-xs text-brand-300">
+        {isAdmin && (
+          <div className="mx-5 mt-3 px-3 py-2 rounded-lg bg-brand-900/30 border border-brand-700/30 text-xs text-brand-300">
             Los administradores tienen acceso total independientemente de los permisos asignados.
           </div>
         )}
 
+        {/* Tabs */}
+        <div className="flex gap-1 px-5 pt-3 border-b border-surface-700 flex-shrink-0">
+          {[
+            { id: 'cameras' as PermTab, label: 'Cámaras en vivo', badge: `${allowedCams}/${totalCams}` },
+            { id: 'recordings' as PermTab, label: 'Grabaciones', badge: allowedRec > 0 ? String(allowedRec) : undefined },
+            { id: 'advanced' as PermTab, label: 'Avanzado', badge: undefined },
+          ].map(tab => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={clsx(
+                'flex items-center gap-1.5 px-3 pb-2 text-xs font-medium border-b-2 transition-colors',
+                activeTab === tab.id
+                  ? 'border-brand-500 text-brand-400'
+                  : 'border-transparent text-surface-400 hover:text-surface-200'
+              )}
+            >
+              {tab.label}
+              {tab.badge && (
+                <span className={clsx('text-[10px] px-1 rounded',
+                  activeTab === tab.id ? 'bg-brand-900/40 text-brand-400' : 'bg-surface-700 text-surface-500'
+                )}>
+                  {tab.badge}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+
         {/* Body */}
-        <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
-          {/* ── Resources tab ── */}
-          {tab === 'resources' && (isLoading ? (
-            <div className="text-center py-12 text-surface-500 text-xs">Cargando...</div>
-          ) : nvrs.length === 0 ? (
-            <div className="text-center py-12 text-surface-500 text-xs">No hay NVRs configurados</div>
-          ) : nvrs.map((nvr) => {
-            const nvrCameras = cameras.filter((c) => c.nvrId === nvr.id)
-            const isOpen = expandedNvr === nvr.id
-            const nvrPerm = getPerm(nvr.id, undefined)
-            const checked = isNvrChecked(nvr.id)
-
-            return (
-              <div key={nvr.id} className="border border-surface-700 rounded-lg overflow-hidden">
-                {/* NVR row */}
-                <div className="flex items-center gap-2 px-3 py-2.5 bg-surface-750 hover:bg-surface-700 transition-colors">
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={(e) => setNvrAll(nvr.id, e.target.checked)}
-                    className="accent-brand-500"
-                    onClick={(e) => e.stopPropagation()}
-                  />
-                  <Server size={12} className="text-surface-400 flex-shrink-0" />
-                  <span className="flex-1 text-xs font-medium text-surface-200">{nvr.name}</span>
-                  <div className="flex items-center gap-1">
-                    <PermToggle
-                      label="Ver" icon={<Eye size={8} />}
-                      checked={nvrPerm.canView}
-                      onChange={(v) => setPerm(nvr.id, undefined, 'canView', v)}
-                    />
-                    <PermToggle
-                      label="Grab." icon={<Video size={8} />}
-                      checked={nvrPerm.canPlayback}
-                      onChange={(v) => setPerm(nvr.id, undefined, 'canPlayback', v)}
-                    />
-                  </div>
-                  <button
-                    onClick={() => setExpandedNvr(isOpen ? null : nvr.id)}
-                    className="p-1 text-surface-500 hover:text-surface-200 transition-colors"
-                  >
-                    <ChevronRight size={12} className={clsx('transition-transform', isOpen && 'rotate-90')} />
-                  </button>
-                </div>
-
-                {/* Cameras */}
-                {isOpen && (
-                  <div className="divide-y divide-surface-700/50">
-                    {nvrCameras.length === 0 ? (
-                      <div className="px-8 py-2 text-xs text-surface-500">Sin cámaras</div>
-                    ) : nvrCameras.map((cam) => {
-                      const cp = getPerm(nvr.id, cam.id)
-                      return (
-                        <div key={cam.id} className="flex items-center gap-2 px-3 py-2 pl-8 bg-surface-800/50 hover:bg-surface-800 transition-colors">
-                          <input
-                            type="checkbox"
-                            checked={cp.canView}
-                            onChange={(e) => setPerm(nvr.id, cam.id, 'canView', e.target.checked)}
-                            className="accent-brand-500"
-                          />
-                          <Monitor size={10} className={clsx('flex-shrink-0', cam.online ? 'text-green-400' : 'text-surface-500')} />
-                          <span className="flex-1 text-xs text-surface-300 truncate">{cam.name}</span>
-                          <span className="text-[10px] text-surface-600">ch{cam.channel}</span>
-                          <div className="flex items-center gap-1">
-                            <PermToggle
-                              label="Ver" icon={<Eye size={8} />}
-                              checked={cp.canView}
-                              onChange={(v) => setPerm(nvr.id, cam.id, 'canView', v)}
-                            />
-                            <PermToggle
-                              label="HQ" icon={<Zap size={8} />}
-                              checked={cp.canHighQuality}
-                              onChange={(v) => setPerm(nvr.id, cam.id, 'canHighQuality', v)}
-                              disabled={!cp.canView}
-                            />
-                            <PermToggle
-                              label="Grab." icon={<PlayCircle size={8} />}
-                              checked={cp.canPlayback}
-                              onChange={(v) => setPerm(nvr.id, cam.id, 'canPlayback', v)}
-                              disabled={!cp.canView}
-                            />
-                            {cam.ptzEnabled && (
-                              <PermToggle
-                                label="PTZ" icon={<Key size={8} />}
-                                checked={cp.canPtz}
-                                onChange={(v) => setPerm(nvr.id, cam.id, 'canPtz', v)}
-                                disabled={!cp.canView}
-                              />
-                            )}
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )}
-              </div>
-            )
-          }))}
-
-          {/* ── Features tab ── */}
-          {tab === 'features' && (
-            <div className="space-y-3">
-              {user.role === 'ADMIN' && (
-                <div className="px-3 py-2 rounded-lg bg-brand-900/30 border border-brand-700/30 text-xs text-brand-300">
-                  Los administradores tienen todas las funcionalidades habilitadas.
-                </div>
-              )}
-              {['Vistas', 'Administración', 'Acciones'].map((group) => (
-                <div key={group} className="border border-surface-700 rounded-lg overflow-hidden">
-                  <div className="px-3 py-2 bg-surface-750 text-[10px] font-medium text-surface-400 uppercase tracking-wide">
-                    {group}
-                  </div>
-                  <div className="divide-y divide-surface-700/50">
-                    {FEATURE_LABELS.filter((f) => f.group === group).map(({ key, label, icon }) => {
-                      const val = featurePerms[key] ?? false
-                      return (
-                        <label key={key} className="flex items-center gap-3 px-3 py-2.5 hover:bg-surface-700/30 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={val}
-                            onChange={(e) => setFeaturePerms((prev) => ({ ...prev, [key]: e.target.checked }))}
-                            className="accent-brand-500"
-                            disabled={user.role === 'ADMIN'}
-                          />
-                          <span className="text-surface-400 flex-shrink-0">{icon}</span>
-                          <span className="text-xs text-surface-200 flex-1">{label}</span>
-                        </label>
-                      )
-                    })}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* ── Sessions tab ── */}
-          {tab === 'sessions' && (
-            <div className="space-y-2">
-              {sessions.length === 0 ? (
-                <div className="text-center py-8 text-xs text-surface-500">Sin sesiones activas</div>
-              ) : (
-                <>
-                  <div className="flex justify-end">
-                    <button
-                      onClick={() => revokeSession('')}
-                      className="text-xs text-red-400 hover:text-red-300 transition-colors"
-                    >
-                      Cerrar todas las sesiones
-                    </button>
-                  </div>
-                  {sessions.map((s) => (
-                    <div key={s.id} className="flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-700/40 border border-surface-700">
-                      <Monitor size={12} className="text-surface-400 flex-shrink-0 mt-0.5" />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-xs font-medium text-surface-200">{s.deviceName || 'Dispositivo desconocido'}</div>
-                        <div className="text-[10px] text-surface-500 mt-0.5">
-                          {s.ipAddress && <span>{s.ipAddress} · </span>}
-                          Iniciada {formatDistanceToNow(new Date(s.createdAt), { locale: es, addSuffix: true })}
-                        </div>
-                        {s.lastUsedAt && (
-                          <div className="text-[10px] text-surface-600">
-                            Última actividad {formatDistanceToNow(new Date(s.lastUsedAt), { locale: es, addSuffix: true })}
-                          </div>
-                        )}
-                      </div>
+        <div className="flex-1 overflow-y-auto">
+          {isLoading ? (
+            <div className="text-center py-16 text-surface-500 text-sm">Cargando...</div>
+          ) : (
+            <>
+              {/* Tab: Cámaras en vivo */}
+              {activeTab === 'cameras' && (
+                <div className="p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-surface-500" />
+                      <input className="input pl-7 text-xs" placeholder="Buscar NVR o cámara..." value={search} onChange={e => setSearch(e.target.value)} />
                     </div>
-                  ))}
-                </>
+                    <button onClick={selectAllCameras} className="text-xs text-brand-400 hover:text-brand-300 whitespace-nowrap">Seleccionar todo</button>
+                    <button onClick={clearAllCameras} className="text-xs text-surface-400 hover:text-surface-200 whitespace-nowrap">Limpiar</button>
+                  </div>
+
+                  {filteredNvrs.length === 0 ? (
+                    <div className="text-center py-8 text-surface-500 text-xs">Sin NVRs configurados</div>
+                  ) : filteredNvrs.map(nvr => {
+                    const nvrCams = cameras.filter(c => c.nvrId === nvr.id && (!search || c.name.toLowerCase().includes(search.toLowerCase()) || nvr.name.toLowerCase().includes(search.toLowerCase())))
+                    const isOpen = expandedNvrs.has(nvr.id)
+                    const allCamsAllowed = nvrCams.length > 0 && nvrCams.every(c => getPerm(nvr.id, c.id).canView)
+                    const someCamsAllowed = nvrCams.some(c => getPerm(nvr.id, c.id).canView)
+                    const allowedCount = nvrCams.filter(c => getPerm(nvr.id, c.id).canView).length
+
+                    return (
+                      <div key={nvr.id} className="border border-surface-700 rounded-lg overflow-hidden">
+                        <div className="flex items-center gap-2.5 px-3 py-2.5 bg-surface-750 hover:bg-surface-700/70 transition-colors">
+                          <input
+                            type="checkbox"
+                            checked={allCamsAllowed}
+                            ref={el => { if (el) el.indeterminate = someCamsAllowed && !allCamsAllowed }}
+                            onChange={e => toggleNvrAll(nvr.id, e.target.checked)}
+                            className="accent-brand-500 w-3.5 h-3.5"
+                            onClick={e => e.stopPropagation()}
+                          />
+                          <Server size={12} className="text-surface-400 flex-shrink-0" />
+                          <span className="flex-1 text-xs font-medium text-surface-200">{nvr.name}</span>
+                          <span className="text-[10px] text-surface-500">{allowedCount}/{nvrCams.length}</span>
+                          <button onClick={() => setExpandedNvrs(prev => { const n = new Set(prev); n.has(nvr.id) ? n.delete(nvr.id) : n.add(nvr.id); return n })} className="p-1 text-surface-500 hover:text-surface-200">
+                            <ChevronRight size={11} className={clsx('transition-transform', isOpen && 'rotate-90')} />
+                          </button>
+                        </div>
+
+                        {isOpen && nvrCams.map(cam => {
+                          const cp = getPerm(nvr.id, cam.id)
+                          return (
+                            <div key={cam.id} className="flex items-center gap-2.5 px-3 py-2 pl-9 border-t border-surface-700/50 bg-surface-800/50 hover:bg-surface-800 transition-colors">
+                              <input
+                                type="checkbox"
+                                checked={cp.canView}
+                                onChange={e => setPerm(nvr.id, cam.id, 'canView', e.target.checked)}
+                                className="accent-brand-500 w-3.5 h-3.5"
+                              />
+                              <Monitor size={10} className={clsx('flex-shrink-0', cam.online ? 'text-green-400' : 'text-surface-600')} />
+                              <span className="flex-1 text-xs text-surface-300 truncate">{cam.name}</span>
+                              <span className="text-[10px] text-surface-600 font-mono">D{cam.channel}</span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )
+                  })}
+                </div>
               )}
-            </div>
+
+              {/* Tab: Grabaciones */}
+              {activeTab === 'recordings' && (
+                <div className="p-4 space-y-3">
+                  <p className="text-xs text-surface-400">
+                    Selecciona las cámaras para las que este usuario puede acceder a grabaciones.
+                    Solo aparecen las cámaras permitidas en "Cámaras en vivo".
+                  </p>
+
+                  {nvrs.map(nvr => {
+                    const allowedCamsInNvr = cameras.filter(c => c.nvrId === nvr.id && getPerm(nvr.id, c.id).canView)
+                    if (allowedCamsInNvr.length === 0) return null
+                    const allRec = allowedCamsInNvr.every(c => getPerm(nvr.id, c.id).canPlayback)
+                    const someRec = allowedCamsInNvr.some(c => getPerm(nvr.id, c.id).canPlayback)
+
+                    return (
+                      <div key={nvr.id} className="border border-surface-700 rounded-lg overflow-hidden">
+                        <div className="flex items-center gap-2.5 px-3 py-2.5 bg-surface-750">
+                          <input
+                            type="checkbox"
+                            checked={allRec}
+                            ref={el => { if (el) el.indeterminate = someRec && !allRec }}
+                            onChange={e => {
+                              allowedCamsInNvr.forEach(c => setPerm(nvr.id, c.id, 'canPlayback', e.target.checked))
+                            }}
+                            className="accent-brand-500 w-3.5 h-3.5"
+                          />
+                          <Server size={12} className="text-surface-400 flex-shrink-0" />
+                          <span className="flex-1 text-xs font-medium text-surface-200">{nvr.name}</span>
+                        </div>
+                        <div className="divide-y divide-surface-700/50">
+                          {allowedCamsInNvr.map(cam => {
+                            const cp = getPerm(nvr.id, cam.id)
+                            return (
+                              <div key={cam.id} className="flex items-center gap-2.5 px-3 py-2 pl-9 bg-surface-800/50 hover:bg-surface-800 transition-colors">
+                                <input
+                                  type="checkbox"
+                                  checked={cp.canPlayback}
+                                  onChange={e => setPerm(nvr.id, cam.id, 'canPlayback', e.target.checked)}
+                                  className="accent-brand-500 w-3.5 h-3.5"
+                                />
+                                <Video size={10} className="text-surface-500 flex-shrink-0" />
+                                <span className="flex-1 text-xs text-surface-300 truncate">{cam.name}</span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )
+                  })}
+
+                  {cameras.filter(c => getPerm(c.nvrId, c.id).canView).length === 0 && (
+                    <div className="text-center py-8 text-surface-500 text-sm">
+                      Primero asigna acceso a cámaras en la pestaña "Cámaras en vivo"
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Tab: Avanzado */}
+              {activeTab === 'advanced' && (
+                <div className="p-4 space-y-3">
+                  <p className="text-xs text-surface-400">Permisos PTZ para cámaras habilitadas.</p>
+                  {nvrs.map(nvr => {
+                    const ptzCams = cameras.filter(c => c.nvrId === nvr.id && c.ptzEnabled && getPerm(nvr.id, c.id).canView)
+                    if (ptzCams.length === 0) return null
+                    return (
+                      <div key={nvr.id} className="border border-surface-700 rounded-lg overflow-hidden">
+                        <div className="px-3 py-2.5 bg-surface-750">
+                          <span className="text-xs font-medium text-surface-200">{nvr.name}</span>
+                        </div>
+                        <div className="divide-y divide-surface-700/50">
+                          {ptzCams.map(cam => {
+                            const cp = getPerm(nvr.id, cam.id)
+                            return (
+                              <div key={cam.id} className="flex items-center gap-2.5 px-3 py-2 pl-9 bg-surface-800/50 hover:bg-surface-800 transition-colors">
+                                <input
+                                  type="checkbox"
+                                  checked={cp.canPtz}
+                                  onChange={e => setPerm(nvr.id, cam.id, 'canPtz', e.target.checked)}
+                                  className="accent-brand-500 w-3.5 h-3.5"
+                                />
+                                <Key size={10} className="text-surface-500 flex-shrink-0" />
+                                <span className="flex-1 text-xs text-surface-300 truncate">{cam.name}</span>
+                                <span className="text-[10px] text-brand-500">PTZ</span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )
+                  })}
+                  {cameras.filter(c => c.ptzEnabled && getPerm(c.nvrId, c.id).canView).length === 0 && (
+                    <div className="text-center py-8 text-surface-500 text-sm">
+                      No hay cámaras PTZ con acceso asignado
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
           )}
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-3 border-t border-surface-700 flex items-center justify-between gap-2">
-          {tab === 'resources' && (
-            <span className="text-xs text-surface-500">
-              {perms.filter((p) => p.canView || p.canPlayback || p.canPtz).length} permisos asignados
-            </span>
-          )}
-          {tab === 'features' && <span className="text-xs text-surface-500">Sobreescribe los valores por defecto del rol</span>}
-          {tab === 'sessions' && <span className="text-xs text-surface-500">{sessions.length} sesiones activas</span>}
-          <div className="flex gap-2 ml-auto">
-            <button onClick={onClose} className="btn-secondary">Cerrar</button>
-            {tab === 'resources' && (
-              <button onClick={handleSaveResources} disabled={isSaving} className="btn-primary">
-                {isSaving ? 'Guardando...' : <><Check size={13} /> Guardar recursos</>}
-              </button>
-            )}
-            {tab === 'features' && (
-              <button onClick={handleSaveFeatures} disabled={isSaving} className="btn-primary">
-                {isSaving ? 'Guardando...' : <><Check size={13} /> Guardar funciones</>}
-              </button>
-            )}
+        <div className="px-5 py-3 border-t border-surface-700 flex items-center justify-between gap-2 flex-shrink-0">
+          <span className="text-xs text-surface-500">
+            {allowedCams} cámaras · {allowedRec} con grabaciones
+          </span>
+          <div className="flex gap-2">
+            <button onClick={onClose} className="btn-secondary text-xs">Cancelar</button>
+            <button onClick={handleSave} disabled={isSaving || isAdmin} className="btn-primary text-xs" title={isAdmin ? 'Admin tiene acceso total' : ''}>
+              {isSaving ? 'Guardando...' : <><Check size={12} /> Guardar permisos</>}
+            </button>
           </div>
         </div>
       </div>

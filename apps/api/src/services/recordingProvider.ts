@@ -1,149 +1,52 @@
-// apps/api/src/services/recordingProvider.ts
-import axios from 'axios'
-import crypto from 'crypto'
-import type { NvrCredentials } from './nvr-config/hikvision'
+// services/recordingProvider.ts
+import http from 'http'
+import https from 'https'
 
-export type RecordingProviderType =
-  | 'ISAPI'
-  | 'HIKVISION_SDK'
-  | 'MEDIAMTX_LOCAL'
-  | 'MANUAL_NVR'
-  | 'UNSUPPORTED'
+export type RecordingProviderType = 'ISAPI' | 'HIKVISION_SDK' | 'MEDIAMTX_LOCAL' | 'MANUAL_NVR' | 'UNSUPPORTED'
 
-// ─── Digest auth helper ───────────────────────────────────────
+interface NvrCreds { ipAddress: string; port: number; username: string; password: string }
 
-function buildDigest(
-  username: string, password: string, method: string, uri: string, wwwAuth: string
-): string {
-  const realm  = (wwwAuth.match(/realm="([^"]+)"/)  || [])[1] ?? ''
-  const nonce  = (wwwAuth.match(/nonce="([^"]+)"/)  || [])[1] ?? ''
-  const qop    = (wwwAuth.match(/qop="?([^",]+)"?/) || [])[1]
-  const nc     = '00000001'
-  const cnonce = crypto.randomBytes(8).toString('hex')
-  const md5    = (s: string) => crypto.createHash('md5').update(s).digest('hex')
-  const ha1    = md5(`${username}:${realm}:${password}`)
-  const ha2    = md5(`${method}:${uri}`)
-  const resp   = qop ? md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`) : md5(`${ha1}:${nonce}:${ha2}`)
-  let h = `Digest username="${username}", realm="${realm}", nonce="${nonce}", uri="${uri}", response="${resp}"`
-  if (qop) h += `, qop=${qop}, nc=${nc}, cnonce="${cnonce}"`
-  return h
-}
+export async function checkIsapiRecordingSupport(creds: NvrCreds): Promise<{ supported: boolean; error?: string }> {
+  const now = new Date()
+  const start = new Date(now.getTime() - 5000).toISOString().replace('T', 'T').slice(0, 19)
+  const end   = now.toISOString().slice(0, 19)
 
-/**
- * Check if an NVR supports ISAPI recording search.
- *
- * Strategy:
- *   - POST /ISAPI/ContentMgmt/search with a minimal 5-second window
- *   - HTTP 200 or 400 (even bad request) → supported
- *   - HTTP 401 or 403                    → auth_error
- *   - Any other 4xx or network error     → unsupported
- *
- * Returns { supported: boolean, error?: string }
- */
-export async function checkIsapiRecordingSupport(
-  creds: NvrCredentials
-): Promise<{ supported: boolean; error?: string }> {
-  const { ipAddress, port, username, password } = creds
-  const uri = '/ISAPI/ContentMgmt/search'
-  const baseUrl = `http://${ipAddress}:${port}`
+  const body = `<CMSearchDescription><searchID>1</searchID><timeSpanList><timeSpan><startTime>${start}</startTime><endTime>${end}</endTime></timeSpan></timeSpanList><maxResults>1</maxResults><searchResultPosition>0</searchResultPosition></CMSearchDescription>`
 
-  // Dummy search body: 5-second window starting now
-  const now   = new Date()
-  const end   = new Date(now.getTime() + 5000)
-  const fmt   = (d: Date) =>
-    d.toISOString().replace('T', 'T').replace(/\.\d{3}Z$/, 'Z')
-  const body = `<?xml version="1.0" encoding="UTF-8"?>
-<CMSearchDescription>
-  <searchID>00000000-0000-0000-0000-000000000001</searchID>
-  <trackList>
-    <trackID>101</trackID>
-  </trackList>
-  <timeSpanList>
-    <timeSpan>
-      <startTime>${fmt(now)}</startTime>
-      <endTime>${fmt(end)}</endTime>
-    </timeSpan>
-  </timeSpanList>
-  <maxResults>1</maxResults>
-  <searchResultPostion>0</searchResultPostion>
-  <metadataList>
-    <metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>
-  </metadataList>
-</CMSearchDescription>`
-
-  const client = axios.create({
-    baseURL: baseUrl,
-    timeout: 12000,
-    validateStatus: () => true,   // never throw on HTTP error
-  })
-
-  // First attempt (no auth)
-  let res = await client.post(uri, body, {
-    headers: { 'Content-Type': 'application/xml', Accept: 'application/xml, text/xml, */*' },
-  }).catch((err: any) => {
-    return { status: 0, headers: {}, _networkError: err?.message ?? 'network_error' } as any
-  })
-
-  // Network error → unsupported
-  if (res.status === 0) {
-    return { supported: false, error: `Network error: ${res._networkError}` }
-  }
-
-  // Need Digest auth
-  if (res.status === 401) {
-    const wwwAuth: string = res.headers?.['www-authenticate'] ?? ''
-    if (wwwAuth.toLowerCase().startsWith('digest')) {
-      const authHeader = buildDigest(username, password, 'POST', uri, wwwAuth)
-      res = await client.post(uri, body, {
-        headers: {
-          'Content-Type': 'application/xml',
-          Accept: 'application/xml, text/xml, */*',
-          Authorization: authHeader,
-        },
-      }).catch((err: any) => {
-        return { status: 0, _networkError: err?.message ?? 'network_error' } as any
-      })
-    } else {
-      // Basic auth fallback
-      res = await client.post(uri, body, {
-        auth: { username, password },
-        headers: { 'Content-Type': 'application/xml', Accept: 'application/xml, text/xml, */*' },
-      }).catch((err: any) => {
-        return { status: 0, _networkError: err?.message ?? 'network_error' } as any
-      })
+  return new Promise((resolve) => {
+    const auth = Buffer.from(`${creds.username}:${creds.password}`).toString('base64')
+    const options = {
+      hostname: creds.ipAddress,
+      port: creds.port || 80,
+      path: '/ISAPI/ContentMgmt/search',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/xml',
+        'Authorization': `Basic ${auth}`,
+        'Content-Length': Buffer.byteLength(body),
+      },
+      timeout: 8000,
     }
-  }
 
-  if (res.status === 0) {
-    return { supported: false, error: `Network error after auth: ${res._networkError}` }
-  }
+    const req = (creds.port === 443 ? https : http).request(options, (res) => {
+      const code = res.statusCode ?? 0
+      if (code === 401 || code === 403) {
+        resolve({ supported: false, error: `Auth failed: HTTP ${code}` })
+      } else if (code >= 200 && code < 500) {
+        resolve({ supported: true })
+      } else {
+        resolve({ supported: false, error: `HTTP ${code}` })
+      }
+      res.resume()
+    })
 
-  const status = res.status as number
-
-  // 200 or 400 (bad request) → endpoint exists, supported
-  if (status === 200 || status === 400) {
-    return { supported: true }
-  }
-
-  // Auth errors → report specifically
-  if (status === 401 || status === 403) {
-    return { supported: false, error: `auth_error: HTTP ${status}` }
-  }
-
-  // Any other 4xx or 5xx → not supported by this NVR
-  return { supported: false, error: `HTTP ${status}` }
+    req.on('error', (e) => resolve({ supported: false, error: e.message }))
+    req.on('timeout', () => { req.destroy(); resolve({ supported: false, error: 'timeout' }) })
+    req.write(body)
+    req.end()
+  })
 }
 
-/**
- * Derive a recording provider from ISAPI capability.
- *
- * - true  → ISAPI (confirmed working)
- * - false → MANUAL_NVR (not supported, manual access required)
- * - null  → MANUAL_NVR (unchecked / unknown)
- */
-export function detectProviderFromCapabilities(
-  supportsIsapi: boolean | null
-): RecordingProviderType {
-  if (supportsIsapi === true) return 'ISAPI'
-  return 'MANUAL_NVR'
+export function detectProviderFromCapabilities(supportsIsapi: boolean): RecordingProviderType {
+  return supportsIsapi ? 'ISAPI' : 'MANUAL_NVR'
 }
