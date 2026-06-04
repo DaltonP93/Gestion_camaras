@@ -1614,20 +1614,18 @@ export async function searchRecordings(
 ): Promise<HikRecording[]> {
   const client = createHikClient(nvr)
   const trackID = channel * 100 + 1
-  const fmt = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, '+00:00')
+  const fmt = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, 'Z')
   const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
 <CMSearchDescription>
   <searchID>search_${Date.now()}</searchID>
   <trackList>
-    <TrackDescriptor>
-      <trackID>${trackID}</trackID>
-    </TrackDescriptor>
+    <trackID>${trackID}</trackID>
   </trackList>
   <timeSpanList>
-    <TimeSpan>
+    <timeSpan>
       <startTime>${fmt(startTime)}</startTime>
       <endTime>${fmt(endTime)}</endTime>
-    </TimeSpan>
+    </timeSpan>
   </timeSpanList>
   <maxResults>200</maxResults>
   <searchResultPostion>0</searchResultPostion>

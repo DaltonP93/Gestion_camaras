@@ -580,8 +580,16 @@ export async function startStream(
   // ── Publish to MediaMTX ───────────────────────────────────────────────
   const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
   const streamPath = getStreamPath(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
+  const rtspMasked = `rtsp://${nvr.username}:***@${nvr.ipAddress}:${nvr.rtspPort}/...`
+  console.info(
+    `[startStream] publish cameraId=${cameraId} nvrId=${camera.nvr.id} ch=${camera.channel}` +
+    ` streamType=${effectiveType} path=${streamPath} rtsp=${rtspMasked}`
+  )
   const published = await publishStream(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
   if (!published) {
+    console.error(
+      `[startStream] publish_failed cameraId=${cameraId} nvrId=${camera.nvr.id} ch=${camera.channel} path=${streamPath}`
+    )
     return { hlsUrl: '', webrtcUrl: '', streamPath: '',
       error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar stream en el servidor de medios' } }
   }
