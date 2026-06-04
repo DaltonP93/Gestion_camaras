@@ -2,6 +2,7 @@
 import { useEffect } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from '@/stores/authStore'
+import { useAppearanceStore } from '@/stores/appearanceStore'
 import { Layout } from '@/components/layout/Layout'
 import { LoginPage } from '@/pages/LoginPage'
 import { DashboardPage } from '@/pages/DashboardPage'
@@ -17,13 +18,19 @@ import { ViewsPage } from '@/pages/ViewsPage'
 import { ViewPlayerPage } from '@/pages/ViewPlayerPage'
 import { AppearancePage } from '@/pages/AppearancePage'
 import { ProfilePage } from '@/pages/ProfilePage'
+import { ForgotPasswordPage } from '@/pages/ForgotPasswordPage'
+import { ResetPasswordPage } from '@/pages/ResetPasswordPage'
 import { ProtectedRoute } from '@/components/layout/ProtectedRoute'
 
 export default function App() {
   const { isAuthenticated, loadUser } = useAuthStore()
+  const { load: loadAppearance } = useAppearanceStore()
 
   useEffect(() => {
-    if (isAuthenticated) loadUser()
+    // Validate/rehydrate session on every page load.
+    loadUser()
+    // Load appearance and apply globally (title, favicon, CSS vars).
+    loadAppearance()
   }, [])
 
   // Limpiar sesión sin recargar la página cuando el refresh falla.
@@ -42,6 +49,8 @@ export default function App() {
       <Route path="/login" element={
         isAuthenticated ? <Navigate to="/" replace /> : <LoginPage />
       } />
+      <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+      <Route path="/reset-password" element={<ResetPasswordPage />} />
 
       <Route element={<ProtectedRoute />}>
         <Route element={<Layout />}>

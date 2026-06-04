@@ -71,6 +71,49 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     return reply.send(cameras)
   })
 
+  // POST /api/cameras/batch — cargar múltiples cámaras por IDs (máx. 50)
+  server.post('/batch', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const body = request.body as { ids?: unknown }
+    if (!Array.isArray(body?.ids)) return reply.status(400).send({ message: 'ids debe ser un array' })
+    const ids = (body.ids as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 50)
+    if (ids.length === 0) return reply.send([])
+
+    const user = request.user
+    let cameras
+    if (['ADMIN', 'SUPERVISOR'].includes(user.role)) {
+      cameras = await server.prisma.camera.findMany({
+        where: { id: { in: ids } },
+        include: { nvr: { select: { id: true, name: true, ipAddress: true } } },
+      })
+    } else {
+      const perms = await server.prisma.userPermission.findMany({
+        where: { userId: user.sub, cameraId: { in: ids }, canView: true },
+        select: { cameraId: true },
+      })
+      const allowed = perms.map((p: any) => p.cameraId!).filter(Boolean)
+      cameras = await server.prisma.camera.findMany({
+        where: { id: { in: allowed } },
+        include: { nvr: { select: { id: true, name: true, ipAddress: true } } },
+      })
+    }
+    return reply.send(cameras)
+  })
+
+  // GET /api/cameras/:id — cámara individual con NVR
+  server.get('/:id', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const user = request.user
+    const camera = await server.prisma.camera.findUnique({
+      where: { id },
+      include: { nvr: { select: { id: true, name: true, ipAddress: true } } },
+    })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
+      return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
+    }
+    return reply.send(camera)
+  })
+
   // GET /api/cameras/:id/stream — Obtener URLs de streaming
   server.get('/:id/stream', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
@@ -296,18 +339,28 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const body = request.body as any
-    const streamType: 'sub' | 'main' = body?.streamType === 'main' ? 'main' : 'sub'
+    const streamType: 'sub' | 'main' | 'main_h264' =
+      body?.streamType === 'main'      ? 'main'      :
+      body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
+    const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
 
-    const result = await startStream(server, user.sub, id, undefined, streamType)
+    const result = await startStream(server, user.sub, id, viewId, streamType)
     if (result.error) {
       // Si el error es del servidor de medios (no de límites ni de estado de salud),
       // marcar la cámara como MEDIA_SERVER_ERROR
       const isLimitError = result.error.code === 'STREAM_LIMIT_REACHED' || result.error.code === 'STREAM_LIMIT_GLOBAL'
-      const isHealthError = Object.prototype.hasOwnProperty.call({ RTSP_SUB_NOT_FOUND: 1, CODEC_UNSUPPORTED_HEVC: 1, AUTH_FAILED: 1, OFFLINE: 1, RTSP_MAIN_NOT_FOUND: 1 }, result.error.code)
+      const isHealthError = Object.prototype.hasOwnProperty.call({ RTSP_SUB_NOT_FOUND: 1, CODEC_UNSUPPORTED_HEVC: 1, AUTH_FAILED: 1, OFFLINE: 1, RTSP_MAIN_NOT_FOUND: 1, TRANSCODING_DISABLED: 1, TRANSCODE_LIMIT_REACHED: 1, CAMERA_OFFLINE: 1, TRANSCODE_NOT_READY: 1, TRANSCODE_PROCESS_EXITED: 1 }, result.error.code)
       if (!isLimitError && !isHealthError) {
         await server.prisma.camera.update({
           where: { id },
           data: { streamHealthStatus: 'MEDIA_SERVER_ERROR' } as any,
+        }).catch(() => {})
+      }
+      // Persist RTSP_SUB_NOT_FOUND to DB so future requests are blocked at the frontend
+      if (result.error.code === 'RTSP_SUB_NOT_FOUND') {
+        await server.prisma.camera.update({
+          where: { id },
+          data: { rtspSubOk: false, streamHealthStatus: 'RTSP_SUB_NOT_FOUND' } as any,
         }).catch(() => {})
       }
       return reply.status(400).send(result.error)
@@ -342,8 +395,11 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const { id } = request.params as { id: string }
     const user = request.user
     const body = request.body as any
-    const streamType: 'sub' | 'main' = body?.streamType === 'main' ? 'main' : 'sub'
-    await stopStream(server, user.sub, id, streamType)
+    const streamType: 'sub' | 'main' | 'main_h264' =
+      body?.streamType === 'main'      ? 'main'      :
+      body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
+    const reason = typeof body?.reason === 'string' ? body.reason : undefined
+    await stopStream(server, user.sub, id, streamType, reason)
     return reply.send({ ok: true })
   })
 
@@ -437,6 +493,39 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const { id } = request.params as { id: string }
     const data = cameraUpdateSchema.parse(request.body)
     const camera = await server.prisma.camera.update({ where: { id }, data })
+    return reply.send(camera)
+  })
+
+  // PATCH /api/cameras/:id/name — Rename camera (local DB only)
+  // Persists the name locally and audits the change.
+  // A separate endpoint handles pushing the name to the NVR via ISAPI.
+  server.patch('/:id/name', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const user   = request.user
+    const body   = request.body as { name?: unknown }
+
+    const newName = typeof body?.name === 'string' ? body.name.trim() : ''
+    if (!newName || newName.length < 1 || newName.length > 100) {
+      return reply.status(400).send({ message: 'El nombre debe tener entre 1 y 100 caracteres' })
+    }
+
+    const existing = await server.prisma.camera.findUnique({ where: { id } })
+    if (!existing) return reply.status(404).send({ message: 'Cámara no encontrada' })
+
+    const prevName = existing.name
+    if (prevName === newName) return reply.send(existing)
+
+    const camera = await server.prisma.camera.update({
+      where: { id },
+      data:  { name: newName },
+    })
+
+    await AuditAction(server.prisma, user.sub, 'CAMERA_RENAME', id, request, {
+      previousName: prevName,
+      newName,
+      nvrId: existing.nvrId,
+    })
+
     return reply.send(camera)
   })
 }

@@ -5,7 +5,7 @@ import type { ErrorData } from 'hls.js'
 import {
   Maximize2, Volume2, VolumeX, RefreshCw,
   Circle, AlertTriangle, Loader2, Stethoscope,
-  WifiOff, Lock, Clock, Film, Server,
+  WifiOff, Lock, Clock, Film, Server, Cpu,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 
@@ -22,6 +22,8 @@ export type CameraPlaybackErrorCode =
   | 'MEDIAMTX_NOT_READY'
   | 'HLS_MANIFEST_NOT_FOUND'
   | 'HLS_SESSION_EXPIRED'
+  | 'TRANSCODE_NOT_READY'
+  | 'TRANSCODE_PROCESS_EXITED'
   | 'PLAYER_TIMEOUT'
   | 'UNKNOWN'
 
@@ -43,9 +45,11 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   MEDIAMTX_ROUTE_MISSING:  { icon: <Server size={16} />,       label: 'Ruta MediaMTX no existe',    color: 'text-orange-400' },
   MEDIAMTX_NOT_READY:      { icon: <Server size={16} />,       label: 'Stream MediaMTX no listo',   color: 'text-orange-400' },
   HLS_MANIFEST_NOT_FOUND:  { icon: <Film size={16} />,         label: 'HLS manifest no encontrado', color: 'text-orange-400' },
-  HLS_SESSION_EXPIRED:     { icon: <Clock size={16} />,        label: 'Sesión HLS expirada',         color: 'text-amber-400' },
-  PLAYER_TIMEOUT:          { icon: <Clock size={16} />,        label: 'Sin frames (timeout)',        color: 'text-surface-400' },
-  UNKNOWN:                 { icon: <AlertTriangle size={16} />, label: 'Error desconocido',          color: 'text-surface-400' },
+  HLS_SESSION_EXPIRED:        { icon: <Clock size={16} />,        label: 'Sesión HLS expirada',          color: 'text-amber-400' },
+  TRANSCODE_NOT_READY:        { icon: <Cpu size={16} />,          label: 'Transcodificación no lista',   color: 'text-purple-400' },
+  TRANSCODE_PROCESS_EXITED:   { icon: <Cpu size={16} />,          label: 'FFmpeg finalizó inesperadamente', color: 'text-purple-400' },
+  PLAYER_TIMEOUT:             { icon: <Clock size={16} />,        label: 'Sin frames (timeout)',         color: 'text-surface-400' },
+  UNKNOWN:                    { icon: <AlertTriangle size={16} />, label: 'Error desconocido',           color: 'text-surface-400' },
 }
 
 function isHevcCodec(codec?: string): boolean {
@@ -92,13 +96,17 @@ interface Props {
   onFullscreen?: () => void
   onDiagnostic?: (cameraId: string) => void
   onStreamError?: (cameraId: string, err: CameraPlaybackError) => void
-  onQualitySwitch?: (quality: 'sub' | 'main') => void
+  onPlaying?: (cameraId: string) => void
+  onQualitySwitch?: (quality: 'sub' | 'main' | 'main_h264') => void
+  onRetry?: (cameraId: string) => void
   className?: string
   error?: boolean
   playbackError?: CameraPlaybackError
-  streamType?: 'sub' | 'main'
+  streamType?: 'sub' | 'main' | 'main_h264'
   streamCodec?: string        // e.g. "hevc", "h264"
   streamResolution?: string   // e.g. "1920×1080", "640×360"
+  transcodingAvailable?: boolean
+  objectFit?: 'cover' | 'contain'  // default: 'contain'
 }
 
 type Status = 'loading' | 'playing' | 'error' | 'offline'
@@ -111,21 +119,34 @@ export function VideoPlayer({
   onFullscreen,
   onDiagnostic,
   onStreamError,
+  onPlaying,
   onQualitySwitch,
+  onRetry,
   className,
   error,
   playbackError: externalError,
   streamType,
   streamCodec,
   streamResolution,
+  transcodingAvailable,
+  objectFit = 'contain',
 }: Props) {
+  // Whether the current stream is the transcoded (HEVC→H.264) variant
+  const isTranscoded = streamType === 'main_h264'
+  // Ref so the HLS error closure can read current streamType without stale closure issues
+  const streamTypeRef = useRef(streamType)
+  streamTypeRef.current = streamType
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const firstFrameTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Ref mirrors playing state so firstFrameTimer closure reads current value, not stale snapshot
-  const isPlayingRef = useRef(false)
+  const isPlayingRef   = useRef(false)
+  // True once the first fragment was loaded in this mount — drives "Reconectando" vs "Preparando"
+  const hasPlayedOnce  = useRef(false)
   const [status, setStatus] = useState<Status>('loading')
   const [internalError, setInternalError] = useState<CameraPlaybackError | null>(null)
+  // Message shown in the loading overlay during transcoding startup (HLS 500 retry window)
+  const [transcodeStartMsg, setTranscodeStartMsg] = useState<string | null>(null)
   const [muted, setMuted] = useState(true)
   const [showControls, setShowControls] = useState(false)
   const [retryCount, setRetryCount] = useState(0)
@@ -137,9 +158,11 @@ export function VideoPlayer({
 
     hlsRef.current?.destroy()
     if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
-    isPlayingRef.current = false
+    isPlayingRef.current  = false
+    hasPlayedOnce.current = false
     setStatus('loading')
     setInternalError(null)
+    setTranscodeStartMsg(null)
 
     if (Hls.isSupported()) {
       const hls = new Hls({
@@ -162,27 +185,39 @@ export function VideoPlayer({
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoRef.current?.play().catch(() => {})
-        // Timeout si no llegan frames tras 15s — use ref, not state, to avoid stale closure
+        // Transcoded streams (main_h264) need more time: GOP=2s → segments ~2s,
+        // but startup (FFmpeg connect + first keyframe) can take up to 30-45s.
+        const frameTimeoutMs = streamTypeRef.current === 'main_h264' ? 60_000 : 15_000
         firstFrameTimer.current = setTimeout(() => {
           if (!isPlayingRef.current) {
-            const err: CameraPlaybackError = { code: 'PLAYER_TIMEOUT', message: 'Sin frames tras 15 segundos', technicalDetail: hlsUrl }
+            const secs = frameTimeoutMs / 1000
+            const err: CameraPlaybackError = { code: 'PLAYER_TIMEOUT', message: `Sin frames tras ${secs} segundos`, technicalDetail: hlsUrl }
             setStatus('error')
             setInternalError(err)
             if (cameraId) onStreamError?.(cameraId, err)
           }
-        }, 15000)
+        }, frameTimeoutMs)
       })
 
       hls.on(Hls.Events.FRAG_LOADED, () => {
         if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
-        isPlayingRef.current = true
+        isPlayingRef.current  = true
+        hasPlayedOnce.current = true
         setStatus('playing')
         setInternalError(null)
+        setTranscodeStartMsg(null)
+        if (cameraId) onPlaying?.(cameraId)
       })
 
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
-          const errorCode = classifyHlsError(data)
+          const rawCode   = classifyHlsError(data)
+          // For transcoded streams, unclassified errors are almost always transient
+          // encoding/buffering issues — show a more informative label than "Error desconocido".
+          const errorCode: CameraPlaybackErrorCode =
+            rawCode === 'UNKNOWN' && streamTypeRef.current === 'main_h264'
+              ? 'TRANSCODE_NOT_READY'
+              : rawCode
 
           // 401 — MediaMTX HLS session expired (cookie expired or muxer destroyed)
           if (data.response?.code === 401) {
@@ -202,21 +237,44 @@ export function VideoPlayer({
           }
 
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            // 500 → MediaMTX source error (HEVC/RTSP fail / muxer destroyed) → max 1 retry
-            // 404 → stream still starting up → max 2 retries
-            // other network errors → max 5 retries with backoff
+            // 500 on main_h264: FFmpeg may still be starting even after backend wait — retry briefly
+            // 500 otherwise: MediaMTX source/muxer error → fail immediately
+            // 404: stream still registering → 1 retry
+            // other network errors: up to 5 retries with backoff
             const statusCode = data.response?.code
             const is500 = statusCode === 500
             const is404 = statusCode === 404
-            if (is500) console.warn('[VideoPlayer] HLS 500 — MediaMTX muxer/source error', { cameraId, details: data.details })
-            const maxRetries = is500 ? 1 : is404 ? 2 : 5
+            const isTranscodedStream = streamTypeRef.current === 'main_h264'
+            if (is500) console.warn('[VideoPlayer] HLS 500', { cameraId, isTranscoded: isTranscodedStream, details: data.details })
+            // Transcoded 500: retry 40×800ms ≈ 32s grace period while FFmpeg starts.
+            // Show "Preparando transcodificación..." in loading overlay during wait.
+            // Normal 500: fail immediately (source/muxer error, not a startup delay).
+            // Transcoded 404: retry 20×1000ms = 20s (publisher may still be connecting).
+            // Normal 404: 1 retry.
+            const maxRetries = is500
+              ? (isTranscodedStream ? 40 : 0)
+              : is404
+                ? (isTranscodedStream ? 20 : 1)
+                : 5
             setRetryCount((r) => {
+              if (r === 0 && is500 && isTranscodedStream) {
+                setTranscodeStartMsg(
+                  hasPlayedOnce.current
+                    ? 'Reconectando transcodificación...'
+                    : 'Preparando transcodificación...'
+                )
+              } else if (r >= 5 && is500 && isTranscodedStream) {
+                setTranscodeStartMsg('Reconectando transcodificación...')
+              }
               if (r >= maxRetries) {
+                setTranscodeStartMsg(null)
                 const err: CameraPlaybackError = {
                   code: errorCode,
-                  message: is500 ? 'Error en servidor de streaming (MediaMTX 500)'
-                          : is404 ? 'Stream no disponible en el servidor'
-                          :         'Sin respuesta del servidor de streaming',
+                  message: is500 && isTranscodedStream
+                    ? 'Transcodificación no disponible — el stream no pudo iniciarse a tiempo'
+                    : is500 ? 'Stream no disponible'
+                    : is404 ? 'Stream no disponible en el servidor'
+                    :         'Sin respuesta del servidor de streaming',
                   technicalDetail: `HTTP ${statusCode ?? 'err'} ${data.details}. URL: ${hlsUrl}`,
                 }
                 setStatus('error')
@@ -224,7 +282,10 @@ export function VideoPlayer({
                 if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              const delay = is500 ? 5000 : is404 ? 4000 : 3000 * (r + 1)
+              const delay = is500 && isTranscodedStream ? 800
+                : is404 && isTranscodedStream ? 1000
+                : is404 ? 4000
+                : 3000 * (r + 1)
               setTimeout(() => hls.startLoad(), delay)
               return r + 1
             })
@@ -298,6 +359,16 @@ export function VideoPlayer({
     initPlayer()
   }
 
+  const handleRetrySmart = () => {
+    if (onRetry && cameraId) {
+      onRetry(cameraId)
+    } else {
+      setRetryCount(0)
+      setInternalError(null)
+      initPlayer()
+    }
+  }
+
   const activeError = displayError
   const errCfg = activeError ? ERROR_CONFIG[activeError.code] : null
 
@@ -306,14 +377,25 @@ export function VideoPlayer({
       className={clsx('relative bg-black overflow-hidden group rounded-lg', className)}
       onMouseEnter={() => setShowControls(true)}
       onMouseLeave={() => setShowControls(false)}
-      onDoubleClick={() => onFullscreen?.()}
+      onDoubleClick={(e) => { e.stopPropagation(); onFullscreen?.() }}
     >
-      <video ref={videoRef} className="w-full h-full object-contain" muted={muted} autoPlay playsInline />
+      <video
+        ref={videoRef}
+        className={clsx('w-full h-full', objectFit === 'cover' ? 'object-cover' : 'object-contain')}
+        muted={muted}
+        autoPlay
+        playsInline
+      />
 
       {/* Loading */}
       {status === 'loading' && !activeError && (
-        <div className="absolute inset-0 flex items-center justify-center bg-surface-900/80">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-surface-900/80">
           <Loader2 size={24} className="text-surface-400 animate-spin" />
+          {transcodeStartMsg && (
+            <p className="text-[10px] text-purple-300 text-center max-w-[160px] leading-snug">
+              {transcodeStartMsg}
+            </p>
+          )}
         </div>
       )}
 
@@ -334,7 +416,7 @@ export function VideoPlayer({
                 <p className="text-[10px] text-surface-400 text-center leading-snug max-w-[200px]">
                   El flujo principal está en H.265/HEVC. Para alta calidad web se requiere H.264 o transcodificación.
                 </p>
-                <div className="flex gap-1.5 mt-1">
+                <div className="flex flex-wrap gap-1.5 mt-1 justify-center">
                   {onQualitySwitch && (
                     <button
                       onClick={() => onQualitySwitch('sub')}
@@ -343,11 +425,20 @@ export function VideoPlayer({
                       Usar baja calidad
                     </button>
                   )}
+                  {onQualitySwitch && transcodingAvailable && (
+                    <button
+                      onClick={() => onQualitySwitch('main_h264')}
+                      className="btn-ghost text-[10px] px-2 py-1 text-purple-400 hover:text-purple-300"
+                      title="Transcodificar H.265→H.264 via FFmpeg"
+                    >
+                      <Cpu size={10} /> Transcodificar H.264
+                    </button>
+                  )}
                   <button
-                    onClick={() => onQualitySwitch ? onQualitySwitch('main') : handleRetry()}
+                    onClick={() => onQualitySwitch ? onQualitySwitch('main') : handleRetrySmart()}
                     className="btn-ghost text-[10px] px-2 py-1"
                   >
-                    <RefreshCw size={10} /> Reintentar alta calidad
+                    <RefreshCw size={10} /> Reintentar
                   </button>
                 </div>
               </>
@@ -363,7 +454,7 @@ export function VideoPlayer({
                   </p>
                 )}
                 <div className="flex gap-1.5 mt-1">
-                  <button onClick={handleRetry} className="btn-ghost text-[10px] px-2 py-1">
+                  <button onClick={handleRetrySmart} className="btn-ghost text-[10px] px-2 py-1">
                     <RefreshCw size={10} /> Reintentar
                   </button>
                   {onDiagnostic && cameraId && (
@@ -391,10 +482,10 @@ export function VideoPlayer({
             </>
           )}
           {streamType && status === 'playing' && (
-            <span className="text-[9px] text-surface-300 font-medium leading-none">
-              {streamType === 'main' ? 'Main' : 'Sub'}
+            <span className={clsx('text-[9px] font-medium leading-none', isTranscoded ? 'text-purple-300' : 'text-surface-300')}>
+              {isTranscoded ? 'Trans' : streamType === 'main' ? 'Main' : 'Sub'}
               {streamResolution && ` ${formatResolution(streamResolution)}`}
-              {streamCodec && ` ${formatBadgeCodec(streamCodec)}`}
+              {isTranscoded ? ' H.264' : streamCodec ? ` ${formatBadgeCodec(streamCodec)}` : ''}
             </span>
           )}
         </div>
@@ -452,6 +543,16 @@ export function VideoPlayer({
             >
               Alta
             </button>
+            {transcodingAvailable && (
+              <button
+                onClick={() => onQualitySwitch('main_h264')}
+                className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
+                  isTranscoded ? 'bg-purple-700 text-white' : 'text-purple-300 hover:text-white')}
+                title="Transcodificado H.264"
+              >
+                Trans
+              </button>
+            )}
           </div>
         )}
       </div>

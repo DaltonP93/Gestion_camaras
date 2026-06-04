@@ -141,18 +141,61 @@ export function startHealthWorker(server: FastifyInstance) {
               }
             }
 
-            // Actualizar onlineInNvr desde ISAPI (informativo; no toca camera.online)
-            // camera.online se gestiona exclusivamente por el validador RTSP
+            // Actualizar onlineInNvr desde ISAPI y gestionar alertas CAMERA_OFFLINE
             const channels = await getNVRChannels(nvrDecrypted as any)
+            const offlineCameraIds: string[] = []
+            const onlineCameraIds: string[] = []
+
             for (const channel of channels) {
               const camera = nvr.cameras.find((c) => c.channel === channel.id)
               if (!camera) continue
-              const onlineInNvr = channel.online
               // Only update onlineInNvr — never overwrite RTSP-based online field here
               await server.prisma.camera.update({
                 where: { id: camera.id },
-                data: { onlineInNvr, lastCheck: new Date() } as any,
+                data: { onlineInNvr: channel.online, lastCheck: new Date() } as any,
               })
+              if (channel.online) {
+                onlineCameraIds.push(camera.id)
+              } else {
+                offlineCameraIds.push(camera.id)
+              }
+            }
+
+            // Resolver alertas para cámaras que volvieron online (batch)
+            if (onlineCameraIds.length > 0) {
+              await server.prisma.alert.updateMany({
+                where: { cameraId: { in: onlineCameraIds }, type: 'CAMERA_OFFLINE', resolved: false },
+                data: { resolved: true, resolvedAt: new Date() },
+              })
+            }
+
+            // Crear alertas para cámaras que siguen offline (evitar duplicados)
+            for (const cameraId of offlineCameraIds) {
+              const existingCamAlert = await server.prisma.alert.findFirst({
+                where: { cameraId, type: 'CAMERA_OFFLINE', resolved: false },
+              })
+              if (!existingCamAlert) {
+                const camera = nvr.cameras.find((c) => c.id === cameraId)!
+                const alert = await server.prisma.alert.create({
+                  data: {
+                    cameraId,
+                    nvrId: nvr.id,
+                    type: 'CAMERA_OFFLINE',
+                    severity: 'HIGH',
+                    message: `Cámara ${camera.name} sin señal en ${nvr.name}`,
+                    detail: { channel: camera.channel, nvrName: nvr.name },
+                  },
+                })
+                broadcastAlert({
+                  type: 'alert',
+                  alert: { ...alert, nvrName: nvr.name },
+                })
+                sendAlertNotification(server.prisma, {
+                  id: alert.id, type: alert.type, severity: alert.severity,
+                  message: alert.message, detail: alert.detail,
+                  cameraId: alert.cameraId, nvrId: alert.nvrId,
+                }).catch((e) => server.log.error(`Email CAMERA_OFFLINE: ${e}`))
+              }
             }
 
             await server.prisma.nVR.update({
@@ -193,6 +236,9 @@ export function startHealthWorker(server: FastifyInstance) {
         }
         const nvrDecrypted = { ...nvr, password: plainPass }
         for (const camera of nvr.cameras) {
+          // Skip cameras where RTSP is confirmed down — don't register paths that will 500
+          const camRtspSubOk = (camera as any).rtspSubOk as boolean | null
+          if (camera.online === false || camRtspSubOk === false) continue
           const path = getStreamPath(nvrDecrypted as any, camera)
           if (!mediamtxPaths.has(path)) {
             // Path ausente en MediaMTX (p.ej. reinicio de MediaMTX) — re-registrar

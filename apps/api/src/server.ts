@@ -4,6 +4,10 @@ import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
 import websocket from '@fastify/websocket'
+import staticFiles from '@fastify/static'
+import multipart from '@fastify/multipart'
+import path from 'path'
+import fs from 'fs'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -19,6 +23,8 @@ import appearancePlugin from './routes/appearance'
 import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
+import { searchRoutes } from './routes/search'
+import { nvrConfigRoutes } from './routes/nvrConfig'
 import { startHealthWorker } from './jobs/healthWorker'
 import { publishStream } from './services/stream'
 import CryptoJS from 'crypto-js'
@@ -101,6 +107,20 @@ async function main() {
   await server.register(authPlugin)
   await server.register(websocket)
 
+  // ─── Plugins de archivos estáticos y multipart ───────────
+  const uploadsDir = process.env.UPLOADS_DIR || '/app/uploads'
+  fs.mkdirSync(path.join(uploadsDir, 'branding'), { recursive: true })
+
+  await server.register(staticFiles, {
+    root: uploadsDir,
+    prefix: '/uploads/',
+    decorateReply: false,
+  })
+
+  await server.register(multipart, {
+    limits: { fileSize: 2 * 1024 * 1024, files: 4 },
+  })
+
   // ─── Rutas de la API ─────────────────────────────────────
   await server.register(authRoutes, { prefix: '/api/auth' })
   await server.register(nvrRoutes, { prefix: '/api/nvrs' })
@@ -113,14 +133,58 @@ async function main() {
   await server.register(profileRoutes, { prefix: '/api/profile' })
   await server.register(alertSettingsRoutes, { prefix: '/api/alerts' })
   await server.register(liveViewRoutes, { prefix: '/api/live-view' })
+  await server.register(searchRoutes, { prefix: '/api/search' })
+  await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
   await server.register(wsHandler, { prefix: '/ws' })
 
-  // ─── Health check ─────────────────────────────────────────
-  server.get('/health', async () => ({
+  const COMMIT_SHA = process.env.COMMIT_SHA || 'development'
+
+  // ─── Health checks (public, no auth) ──────────────────────
+  // /health        — acceso directo en puerto 4000
+  // /api/health    — accesible vía nginx (mismo contenido)
+  // /api/health/deep — comprueba DB y Redis
+
+  const healthResponse = () => ({
     status: 'ok',
     timestamp: new Date().toISOString(),
     version: '1.0.0',
-  }))
+    commit: COMMIT_SHA,
+  })
+
+  server.get('/health',     async () => healthResponse())
+  server.get('/api/health', async () => healthResponse())
+
+  server.get('/api/health/deep', async (_request, reply) => {
+    let dbOk = false
+    let dbLatencyMs = -1
+    try {
+      const t0 = Date.now()
+      await server.prisma.$queryRaw`SELECT 1`
+      dbLatencyMs = Date.now() - t0
+      dbOk = true
+    } catch {}
+
+    let redisOk = false
+    let redisLatencyMs = -1
+    try {
+      const t0 = Date.now()
+      await server.redis.ping()
+      redisLatencyMs = Date.now() - t0
+      redisOk = true
+    } catch {}
+
+    const healthy = dbOk && redisOk
+    return reply.status(healthy ? 200 : 503).send({
+      status: healthy ? 'ok' : 'degraded',
+      timestamp: new Date().toISOString(),
+      version: '1.0.0',
+      commit: COMMIT_SHA,
+      checks: {
+        db:    { ok: dbOk,    latencyMs: dbLatencyMs },
+        redis: { ok: redisOk, latencyMs: redisLatencyMs },
+      },
+    })
+  })
 
   // ─── Jobs en background ───────────────────────────────────
   startHealthWorker(server)
@@ -130,7 +194,7 @@ async function main() {
   const port = parseInt(process.env.API_PORT || '4000')
 
   await server.listen({ host, port })
-  server.log.info(`VisionCore API corriendo en http://${host}:${port}`)
+  server.log.info(`VisionCore API v1.0.0 commit=${COMMIT_SHA} corriendo en http://${host}:${port}`)
 
   // Re-registrar todos los streams en MediaMTX al arrancar
   // MediaMTX pierde los paths dinámicos al reiniciarse; este bloque los restaura

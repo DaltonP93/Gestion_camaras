@@ -3,6 +3,7 @@ import type { FastifyPluginAsync } from 'fastify'
 import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
+import { checkPasswordPolicy, addToPasswordHistory, resolveFeaturePermissions } from '../services/totp'
 
 const createUserSchema = z.object({
   username: z.string().min(3).max(50),
@@ -13,19 +14,70 @@ const createUserSchema = z.object({
 })
 
 const updateUserSchema = z.object({
-  email: z.string().email().optional(),
-  fullName: z.string().min(1).max(100).optional(),
-  role: z.enum(['ADMIN', 'SUPERVISOR', 'OPERATOR', 'AUDITOR']).optional(),
-  active: z.boolean().optional(),
-  password: z.string().min(8).optional(),
+  email:              z.string().email().optional(),
+  fullName:           z.string().min(1).max(100).optional(),
+  role:               z.enum(['ADMIN', 'SUPERVISOR', 'OPERATOR', 'AUDITOR']).optional(),
+  active:             z.boolean().optional(),
+  password:           z.string().min(8).optional(),
+  forcePasswordChange: z.boolean().optional(),
 })
 
 const permissionSchema = z.object({
-  nvrId: z.string().optional(),
-  cameraId: z.string().optional(),
-  canView: z.boolean().default(true),
-  canPlayback: z.boolean().default(false),
-  canPtz: z.boolean().default(false),
+  nvrId:          z.string().optional(),
+  cameraId:       z.string().optional(),
+  canView:        z.boolean().default(true),
+  canPlayback:    z.boolean().default(false),
+  canPtz:         z.boolean().default(false),
+  canHighQuality: z.boolean().default(false),
+})
+
+const featurePermSchema = z.object({
+  canViewDashboard:      z.boolean().optional(),
+  canViewLive:           z.boolean().optional(),
+  canViewRecordings:     z.boolean().optional(),
+  canViewAlerts:         z.boolean().optional(),
+  canViewDiagnostics:    z.boolean().optional(),
+  canManageNVRs:         z.boolean().optional(),
+  canManageCameras:      z.boolean().optional(),
+  canManageUsers:        z.boolean().optional(),
+  canManageAppearance:   z.boolean().optional(),
+  canResolveAlerts:      z.boolean().optional(),
+  canRestartStreams:      z.boolean().optional(),
+  canTranscode:          z.boolean().optional(),
+  canDownloadRecordings: z.boolean().optional(),
+  canManageViews:        z.boolean().optional(),
+  canManageSettings:     z.boolean().optional(),
+})
+
+const nvrPermissionSchema = z.object({
+  nvrId:            z.string(),
+  canView:          z.boolean().default(true),
+  canViewCameras:   z.boolean().default(true),
+  canViewRecordings: z.boolean().default(false),
+  canManage:        z.boolean().default(false),
+  canEditVideoAudio: z.boolean().default(false),
+  canSync:          z.boolean().default(false),
+  canRevalidate:    z.boolean().default(false),
+  canRestart:       z.boolean().default(false),
+})
+
+const cameraPermissionSchema = z.object({
+  cameraId:        z.string(),
+  canView:         z.boolean().default(true),
+  canViewLive:     z.boolean().default(true),
+  canPlayback:     z.boolean().default(false),
+  canDownload:     z.boolean().default(false),
+  canHighQuality:  z.boolean().default(false),
+  canUseMainStream: z.boolean().default(false),
+  canUseTranscode:  z.boolean().default(false),
+  canAddToViews:    z.boolean().default(false),
+  canReceiveAlerts: z.boolean().default(false),
+})
+
+const putPermissionsSchema = z.object({
+  featurePermissions: featurePermSchema.optional(),
+  nvrPermissions:    z.array(nvrPermissionSchema).optional(),
+  cameraPermissions: z.array(cameraPermissionSchema).optional(),
 })
 
 export const userRoutes: FastifyPluginAsync = async (server) => {
@@ -61,14 +113,10 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
   }, async (request, reply) => {
     const users = await server.prisma.user.findMany({
       select: {
-        id: true,
-        username: true,
-        email: true,
-        fullName: true,
-        role: true,
-        active: true,
-        createdAt: true,
-        updatedAt: true,
+        id: true, username: true, email: true, fullName: true,
+        role: true, active: true, createdAt: true, updatedAt: true,
+        twoFactorEnabled: true, forcePasswordChange: true,
+        lockedUntil: true, failedLoginAttempts: true,
         _count: { select: { permissions: true, sessions: true } },
       },
       orderBy: { createdAt: 'desc' },
@@ -86,30 +134,36 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     const user = await server.prisma.user.findUnique({
       where: { id },
       select: {
-        id: true,
-        username: true,
-        email: true,
-        fullName: true,
-        role: true,
-        active: true,
-        createdAt: true,
+        id: true, username: true, email: true, fullName: true,
+        role: true, active: true, createdAt: true,
+        twoFactorEnabled: true, forcePasswordChange: true,
+        lockedUntil: true, failedLoginAttempts: true, passwordChangedAt: true,
         permissions: {
           include: {
-            nvr: { select: { id: true, name: true } },
+            nvr:    { select: { id: true, name: true } },
             camera: { select: { id: true, name: true, channel: true } },
           },
         },
+        featurePermissions: true,
         sessions: {
-          select: { id: true, userAgent: true, ipAddress: true, createdAt: true, expiresAt: true },
+          select: {
+            id: true, userAgent: true, ipAddress: true, deviceName: true,
+            createdAt: true, expiresAt: true, lastUsedAt: true,
+          },
           orderBy: { createdAt: 'desc' },
-          take: 10,
+          take: 20,
         },
       },
     })
 
     if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
 
-    return reply.send(user)
+    const { featurePermissions, ...rest } = user as any
+    return reply.send({
+      ...rest,
+      featurePermissions: resolveFeaturePermissions(user.role, featurePermissions),
+    })
+
   })
 
   // POST /api/users — Crear usuario (solo ADMIN)
@@ -163,7 +217,15 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     const updateData: any = { ...data }
 
     if (data.password) {
-      updateData.passwordHash = await bcrypt.hash(data.password, 12)
+      const policy = checkPasswordPolicy(data.password)
+      if (!policy.valid) {
+        return reply.status(400).send({ message: 'Contraseña no cumple la política', errors: policy.errors })
+      }
+      const newHash = await bcrypt.hash(data.password, 12)
+      const existing = await server.prisma.user.findUnique({ where: { id }, select: { passwordHistory: true } })
+      updateData.passwordHash = newHash
+      updateData.passwordHistory = await addToPasswordHistory(newHash, existing?.passwordHistory ?? null)
+      updateData.passwordChangedAt = new Date()
       delete updateData.password
     }
 
@@ -196,6 +258,148 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({ message: 'Usuario eliminado' })
   })
 
+  // GET /api/users/:id/permissions — Obtener permisos granulares
+  server.get('/:id/permissions', {
+    preHandler: [server.authorize(['ADMIN', 'SUPERVISOR', 'OPERATOR', 'AUDITOR'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const caller = request.user
+
+    // Solo ADMIN o el propio usuario pueden ver
+    if (caller.role !== 'ADMIN' && caller.sub !== id) {
+      return reply.status(403).send({ message: 'Acceso denegado' })
+    }
+
+    const user = await server.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } })
+    if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
+
+    const [featurePermissions, allPerms] = await Promise.all([
+      server.prisma.userFeaturePermissions.findUnique({ where: { userId: id } }),
+      server.prisma.userPermission.findMany({
+        where: { userId: id },
+        include: {
+          nvr:    { select: { id: true, name: true, model: true } },
+          camera: { select: { id: true, name: true, channel: true, nvrId: true } },
+        },
+      }),
+    ])
+
+    const nvrPermissions    = allPerms.filter((p) => p.nvrId && !p.cameraId)
+    const cameraPermissions = allPerms.filter((p) => !!p.cameraId)
+
+    return reply.send({ featurePermissions, nvrPermissions, cameraPermissions })
+  })
+
+  // PUT /api/users/:id/permissions — Upsert permisos granulares (solo ADMIN)
+  server.put('/:id/permissions', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const body = putPermissionsSchema.parse(request.body)
+
+    const user = await server.prisma.user.findUnique({ where: { id }, select: { id: true } })
+    if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
+
+    const ops: Promise<any>[] = []
+
+    if (body.featurePermissions) {
+      ops.push(server.prisma.userFeaturePermissions.upsert({
+        where:  { userId: id },
+        create: { userId: id, ...body.featurePermissions },
+        update: body.featurePermissions,
+      }))
+    }
+
+    if (body.nvrPermissions) {
+      for (const p of body.nvrPermissions) {
+        const { nvrId, ...fields } = p
+        ops.push(server.prisma.userPermission.upsert({
+          where:  { userId_nvrId_cameraId: { userId: id, nvrId, cameraId: null as any } },
+          create: { userId: id, nvrId, cameraId: null, ...fields },
+          update: fields,
+        }))
+      }
+    }
+
+    if (body.cameraPermissions) {
+      for (const p of body.cameraPermissions) {
+        const { cameraId, ...fields } = p
+        // Determine nvrId from camera record for the unique constraint
+        const cam = await server.prisma.camera.findUnique({ where: { id: cameraId }, select: { nvrId: true } })
+        if (!cam) continue
+        ops.push(server.prisma.userPermission.upsert({
+          where:  { userId_nvrId_cameraId: { userId: id, nvrId: cam.nvrId, cameraId } },
+          create: { userId: id, nvrId: cam.nvrId, cameraId, ...fields },
+          update: fields,
+        }))
+      }
+    }
+
+    await Promise.all(ops)
+
+    await AuditAction(server.prisma, request.user.sub, 'PERMISSIONS_UPDATED', id, request, {
+      nvrCount:    body.nvrPermissions?.length ?? 0,
+      cameraCount: body.cameraPermissions?.length ?? 0,
+    })
+
+    return reply.send({ message: 'Permisos actualizados' })
+  })
+
+  // GET /api/users/:id/effective-permissions — Permisos efectivos calculados
+  server.get('/:id/effective-permissions', {
+    preHandler: [server.authorize(['ADMIN', 'SUPERVISOR', 'OPERATOR', 'AUDITOR'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const caller = request.user
+
+    if (caller.role !== 'ADMIN' && caller.sub !== id) {
+      return reply.status(403).send({ message: 'Acceso denegado' })
+    }
+
+    const user = await server.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } })
+    if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
+
+    const isAdmin = user.role === 'ADMIN'
+
+    if (isAdmin) {
+      return reply.send({ isAdmin: true, nvrs: {}, cameras: {} })
+    }
+
+    const perms = await server.prisma.userPermission.findMany({ where: { userId: id } })
+
+    const nvrs: Record<string, object> = {}
+    const cameras: Record<string, object> = {}
+
+    for (const p of perms) {
+      if (p.nvrId && !p.cameraId) {
+        nvrs[p.nvrId] = {
+          canView:          p.canView,
+          canViewCameras:   p.canViewCameras,
+          canViewRecordings: p.canViewRecordings,
+          canManage:        p.canManage,
+          canEditVideoAudio: p.canEditVideoAudio,
+          canSync:          p.canSync,
+          canRevalidate:    p.canRevalidate,
+          canRestart:       p.canRestart,
+        }
+      } else if (p.cameraId) {
+        cameras[p.cameraId] = {
+          canView:         p.canView,
+          canViewLive:     p.canViewLive,
+          canPlayback:     p.canPlayback,
+          canDownload:     p.canDownload,
+          canHighQuality:  p.canHighQuality,
+          canUseMainStream: p.canUseMainStream,
+          canUseTranscode:  p.canUseTranscode,
+          canAddToViews:    p.canAddToViews,
+          canReceiveAlerts: p.canReceiveAlerts,
+        }
+      }
+    }
+
+    return reply.send({ isAdmin: false, nvrs, cameras })
+  })
+
   // POST /api/users/:id/permissions — Asignar permisos (solo ADMIN)
   server.post('/:id/permissions', {
     preHandler: [server.authorize(['ADMIN'])],
@@ -208,12 +412,13 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
 
     const created = await server.prisma.userPermission.createMany({
       data: permissions.map((p) => ({
-        userId: id,
-        nvrId: p.nvrId || null,
-        cameraId: p.cameraId || null,
-        canView: p.canView,
-        canPlayback: p.canPlayback,
-        canPtz: p.canPtz,
+        userId:         id,
+        nvrId:          p.nvrId || null,
+        cameraId:       p.cameraId || null,
+        canView:        p.canView,
+        canPlayback:    p.canPlayback,
+        canPtz:         p.canPtz,
+        canHighQuality: p.canHighQuality,
       })),
     })
 
@@ -222,6 +427,86 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     })
 
     return reply.send({ message: 'Permisos actualizados', count: created.count })
+  })
+
+  // POST /api/users/:id/feature-permissions — Permisos de funcionalidades
+  server.post('/:id/feature-permissions', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const data = featurePermSchema.parse(request.body)
+
+    const user = await server.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } })
+    if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
+
+    await server.prisma.userFeaturePermissions.upsert({
+      where:  { userId: id },
+      create: { userId: id, ...data },
+      update: data,
+    })
+
+    await AuditAction(server.prisma, request.user.sub, 'FEATURE_PERMISSIONS_UPDATED', id, request)
+    return reply.send({ message: 'Permisos de funcionalidades actualizados' })
+  })
+
+  // POST /api/users/:id/reset-2fa — Admin resetea 2FA
+  server.post('/:id/reset-2fa', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    if (id === request.user.sub) {
+      return reply.status(400).send({ message: 'Usa el panel de seguridad para gestionar tu propio 2FA' })
+    }
+
+    await server.prisma.user.update({
+      where: { id },
+      data: { twoFactorEnabled: false, twoFactorSecret: null, twoFactorBackupCodes: null },
+    })
+
+    await AuditAction(server.prisma, request.user.sub, 'TWO_FA_RESET_BY_ADMIN', id, request)
+    return reply.send({ message: '2FA del usuario ha sido deshabilitado' })
+  })
+
+  // POST /api/users/:id/unlock — Desbloquear cuenta
+  server.post('/:id/unlock', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    await server.prisma.user.update({
+      where: { id },
+      data: { failedLoginAttempts: 0, lockedUntil: null },
+    })
+
+    await AuditAction(server.prisma, request.user.sub, 'USER_UNLOCKED', id, request)
+    return reply.send({ message: 'Cuenta desbloqueada' })
+  })
+
+  // GET /api/users/:id/sessions — Sesiones activas (admin)
+  server.get('/:id/sessions', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const sessions = await server.prisma.session.findMany({
+      where: { userId: id },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true, userAgent: true, ipAddress: true, deviceName: true,
+        createdAt: true, expiresAt: true, lastUsedAt: true,
+      },
+    })
+    return reply.send(sessions)
+  })
+
+  // DELETE /api/users/:id/sessions — Revocar todas las sesiones (admin)
+  server.delete('/:id/sessions', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const { count } = await server.prisma.session.deleteMany({ where: { userId: id } })
+    await AuditAction(server.prisma, request.user.sub, 'USER_SESSIONS_REVOKED', id, request, { count })
+    return reply.send({ message: `${count} sesiones revocadas` })
   })
 
 }

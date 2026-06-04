@@ -6,7 +6,7 @@ import {
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet } from '@/lib/api'
-import { format, subDays } from 'date-fns'
+import { format, subDays, subHours, startOfDay, endOfDay } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
 import toast from 'react-hot-toast'
@@ -46,8 +46,8 @@ export function RecordingsPage() {
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
   const [selectedNVR, setSelectedNVR] = useState<string>('all')
   const [selectedCameras, setSelectedCameras] = useState<Set<string>>(new Set())
-  const [startDate, setStartDate] = useState(format(subDays(new Date(), 1), "yyyy-MM-dd'T'HH:mm"))
-  const [endDate, setEndDate]     = useState(format(new Date(), "yyyy-MM-dd'T'HH:mm"))
+  const [startDate, setStartDate] = useState(toLocalDatetimeString(subHours(new Date(), 1)))
+  const [endDate, setEndDate]     = useState(toLocalDatetimeString(new Date()))
   const [recordings, setRecordings] = useState<RecordingWithCamera[]>([])
   const [isSearching, setIsSearching] = useState(false)
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
@@ -103,8 +103,18 @@ export function RecordingsPage() {
   const selectAll = () => setSelectedCameras(new Set(filteredCameras.map(c => c.id)))
   const clearAll  = () => setSelectedCameras(new Set())
 
+  const setQuick = (from: Date, to: Date) => {
+    setStartDate(toLocalDatetimeString(from))
+    setEndDate(toLocalDatetimeString(to))
+  }
+
   const handleSearch = async () => {
     if (selectedCameras.size === 0) { toast.error('Selecciona al menos una cámara'); return }
+    const start = new Date(startDate)
+    const end   = new Date(endDate)
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) { toast.error('Fechas inválidas'); return }
+    if (start >= end) { toast.error('La fecha Desde debe ser anterior a Hasta'); return }
+
     setIsSearching(true)
     setPlaybackUrl(null)
     setRecordings([])
@@ -201,9 +211,9 @@ export function RecordingsPage() {
     setSelectedRec(rec)
     try {
       const result = await apiPost<{ url: string }>('/recordings/playback', {
-        cameraId: rec.cameraId,
+        cameraId:  rec.cameraId,
         startTime: rec.startTime,
-        endTime: rec.endTime,
+        endTime:   rec.endTime,
       })
       setPlaybackUrl(result.url)
     } catch {
@@ -227,6 +237,28 @@ export function RecordingsPage() {
   const selectedLabel = selectedCameras.size === 0
     ? 'Seleccionar cámaras'
     : `${selectedCameras.size} cámara${selectedCameras.size > 1 ? 's' : ''} seleccionada${selectedCameras.size > 1 ? 's' : ''}`
+
+  const handleRevalidateCapability = async (nvrId: string) => {
+    setRevalidatingNvr(nvrId)
+    try {
+      await apiPost(`/nvrs/${nvrId}/recording-capabilities/check`)
+      toast.success('Compatibilidad revalidada. Vuelve a buscar para aplicar el resultado.')
+      // Clear unsupported cache so next search tries again
+      unsupportedNVRs.delete(nvrId)
+      // Update the error group to clear it
+      setNvrErrors(prev => prev.filter(g => g.nvrId !== nvrId))
+    } catch (e: any) {
+      toast.error(e?.response?.data?.message || 'Error al revalidar compatibilidad')
+    } finally {
+      setRevalidatingNvr(null)
+    }
+  }
+
+  const triggerDatePicker = (ref: React.RefObject<HTMLInputElement | null>) => {
+    const el = ref.current
+    if (!el) return
+    try { (el as any).showPicker?.() } catch { el.focus() }
+  }
 
   return (
     <div className="p-5 space-y-4 animate-fade-in">
@@ -277,8 +309,9 @@ export function RecordingsPage() {
                   </div>
 
                   {[...camerasByNVR.entries()].map(([nvrId, { nvrName, cameras: cams }]) => {
-                    const allSel = cams.every(c => selectedCameras.has(c.id))
+                    const allSel  = cams.every(c => selectedCameras.has(c.id))
                     const someSel = cams.some(c => selectedCameras.has(c.id))
+                    const isUnsupported = unsupportedNVRs.has(nvrId)
                     return (
                       <div key={nvrId}>
                         <button
@@ -289,6 +322,9 @@ export function RecordingsPage() {
                             : someSel ? <CheckSquare size={13} className="text-brand-400/50 flex-shrink-0" />
                             : <Square size={13} className="text-surface-500 flex-shrink-0" />}
                           <span className="text-xs font-medium text-surface-200 uppercase tracking-wide">{nvrName}</span>
+                          {isUnsupported && (
+                            <span className="text-[9px] px-1 py-0.5 rounded bg-amber-900/40 text-amber-500 ml-1">sin ISAPI</span>
+                          )}
                           <span className="ml-auto text-xs text-surface-500">{cams.length}ch</span>
                         </button>
                         {cams.map((cam) => (
@@ -328,24 +364,18 @@ export function RecordingsPage() {
         <div className="flex items-center gap-3 flex-wrap">
           <div className="flex gap-2 flex-wrap flex-1">
             {[
-              { label: 'Última hora', hours: 1 },
-              { label: 'Hoy', hours: 24 },
-              { label: 'Ayer', hours: 48 },
-              { label: 'Últimos 7 días', hours: 168 },
-            ].map(({ label, hours }) => (
-              <button
-                key={label}
-                onClick={() => {
-                  setEndDate(format(new Date(), "yyyy-MM-dd'T'HH:mm"))
-                  setStartDate(format(subDays(new Date(), hours / 24), "yyyy-MM-dd'T'HH:mm"))
-                }}
+              { label: 'Última hora', fn: () => setQuick(subHours(new Date(), 1), new Date()) },
+              { label: 'Hoy',         fn: () => setQuick(startOfDay(new Date()), new Date()) },
+              { label: 'Ayer',        fn: () => setQuick(startOfDay(subDays(new Date(), 1)), endOfDay(subDays(new Date(), 1))) },
+              { label: 'Últimos 7d',  fn: () => setQuick(startOfDay(subDays(new Date(), 7)), new Date()) },
+            ].map(({ label, fn }) => (
+              <button key={label} onClick={fn}
                 className="text-xs px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors"
               >
                 {label}
               </button>
             ))}
           </div>
-
           <button
             onClick={handleSearch}
             disabled={isSearching || selectedCameras.size === 0}
@@ -444,17 +474,24 @@ export function RecordingsPage() {
                     <Play size={12} className="text-brand-400 fill-brand-400" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="text-xs text-surface-300 font-medium truncate">
-                      {rec.nvrName} · {rec.cameraName}
+                    <div className="flex items-center gap-1.5 mb-0.5">
+                      <span className="text-xs text-surface-300 font-medium truncate">
+                        {rec.nvrName} · {rec.cameraName}
+                      </span>
+                      {rec.type && rec.type !== 'video/mp4' && (
+                        <span className="text-[9px] px-1 py-0.5 rounded bg-surface-700 text-surface-400 uppercase tracking-wide flex-shrink-0">
+                          {rec.type.replace('video/', '').replace('//recordType.meta.std-cgi.com/', '')}
+                        </span>
+                      )}
                     </div>
-                    <div className="text-xs text-surface-100 mt-0.5">
+                    <div className="text-xs text-surface-100">
                       {format(new Date(rec.startTime), 'dd/MM/yyyy HH:mm:ss')}
                     </div>
                     <div className="text-xs text-surface-400 flex items-center gap-2 mt-0.5">
                       <span className="flex items-center gap-1">
                         <Clock size={10} /> {formatDuration(rec.startTime, rec.endTime)}
                       </span>
-                      <span>{formatSize(rec.size)}</span>
+                      {rec.size > 0 && <span>{formatSize(rec.size)}</span>}
                     </div>
                   </div>
                   <button
@@ -473,7 +510,7 @@ export function RecordingsPage() {
         {/* Reproductor */}
         <div className="card overflow-hidden">
           <div className="px-4 py-3 border-b border-surface-600">
-            <h3 className="text-sm font-medium text-surface-100">
+            <h3 className="text-sm font-medium text-surface-100 truncate">
               {selectedRec
                 ? `${selectedRec.nvrName} · ${selectedRec.cameraName} — ${format(new Date(selectedRec.startTime), 'dd/MM HH:mm')}`
                 : 'Reproductor'}
@@ -486,9 +523,7 @@ export function RecordingsPage() {
               <div className="text-center">
                 <Play size={32} className="text-surface-700 mx-auto mb-2" />
                 <p className="text-xs text-surface-500">
-                  {recordings.length > 0
-                    ? 'Selecciona una grabación para reproducir'
-                    : 'Busca grabaciones primero'}
+                  {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
                 </p>
               </div>
             )}

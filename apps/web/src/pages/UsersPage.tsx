@@ -3,14 +3,18 @@ import { useEffect, useState, useCallback } from 'react'
 import {
   Plus, Pencil, Trash2, Shield, Eye, EyeOff,
   UserCheck, UserX, Search, Key, X, Check, ChevronRight,
-  Server, Monitor, Video, PlayCircle
+  Server, Monitor, Video, PlayCircle, ShieldCheck, ShieldOff,
+  Lock, Unlock, Smartphone, Zap, Settings, Clock, AlertTriangle,
+  RefreshCw, Database, Star, Film,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
 import { clsx } from 'clsx'
-import type { User, Role, NVR, Camera, UserPermission } from '@/types'
-import { format } from 'date-fns'
+import type { User, Role, NVR, Camera, UserPermission, UserFeaturePermissions, UserSession } from '@/types'
+import { format, formatDistanceToNow } from 'date-fns'
+import { es } from 'date-fns/locale'
 import toast from 'react-hot-toast'
 import { useAuthStore } from '@/stores/authStore'
+import { UserPermissionsModal } from '@/components/UserPermissionsModal'
 
 const ROLE_OPTIONS: { value: Role; label: string; color: string }[] = [
   { value: 'ADMIN',      label: 'Administrador', color: 'text-brand-400' },
@@ -20,25 +24,27 @@ const ROLE_OPTIONS: { value: Role; label: string; color: string }[] = [
 ]
 
 interface UserFormData {
-  username: string
-  email: string
-  fullName: string
-  password: string
-  role: Role
+  username:            string
+  email:               string
+  fullName:            string
+  password:            string
+  role:                Role
+  forcePasswordChange: boolean
 }
 
 const EMPTY_FORM: UserFormData = {
-  username: '', email: '', fullName: '', password: '', role: 'OPERATOR',
+  username: '', email: '', fullName: '', password: '', role: 'OPERATOR', forcePasswordChange: false,
 }
 
 // ─── Permissions Modal (redesigned) ─────────────────────────────────────────
 
 interface PermMatrix {
-  nvrId?: string
-  cameraId?: string
-  canView: boolean
-  canPlayback: boolean
-  canPtz: boolean
+  nvrId?:         string
+  cameraId?:      string
+  canView:        boolean
+  canPlayback:    boolean
+  canPtz:         boolean
+  canHighQuality: boolean
 }
 
 type PermTab = 'cameras' | 'recordings' | 'advanced'
@@ -47,6 +53,8 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
   const [nvrs, setNvrs] = useState<NVR[]>([])
   const [cameras, setCameras] = useState<Camera[]>([])
   const [perms, setPerms] = useState<PermMatrix[]>([])
+  const [featurePerms, setFeaturePerms] = useState<Partial<UserFeaturePermissions>>({})
+  const [sessions, setSessions] = useState<UserSession[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [activeTab, setActiveTab] = useState<PermTab>('cameras')
@@ -109,13 +117,22 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
 
   const clearAllCameras = () => setPerms([])
 
-  const handleSave = async () => {
+  const handleSaveResources = async () => {
     setIsSaving(true)
     try {
       const toSave = perms.filter(p => p.canView || p.canPlayback || p.canPtz)
       await apiPost(`/users/${user.id}/permissions`, toSave)
-      toast.success('Permisos guardados')
-      onClose()
+      toast.success('Permisos de recursos guardados')
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const handleSaveFeatures = async () => {
+    setIsSaving(true)
+    try {
+      await apiPost(`/users/${user.id}/feature-permissions`, featurePerms)
+      toast.success('Permisos de funcionalidades guardados')
     } finally {
       setIsSaving(false)
     }
@@ -387,6 +404,7 @@ export function UsersPage() {
   const [showPass, setShowPass] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [permUser, setPermUser] = useState<User | null>(null)
+  const [granularPermUser, setGranularPermUser] = useState<User | null>(null)
 
   const loadUsers = async () => {
     setIsLoading(true)
@@ -408,7 +426,7 @@ export function UsersPage() {
 
   const openEdit = (u: User) => {
     setEditingUser(u)
-    setForm({ username: u.username, email: u.email, fullName: u.fullName, password: '', role: u.role })
+    setForm({ username: u.username, email: u.email, fullName: u.fullName, password: '', role: u.role, forcePasswordChange: u.forcePasswordChange ?? false })
     setShowModal(true)
   }
 
@@ -452,6 +470,23 @@ export function UsersPage() {
     try {
       await apiDelete(`/users/${u.id}`)
       toast.success('Usuario eliminado')
+      loadUsers()
+    } catch {}
+  }
+
+  const handleReset2FA = async (u: User) => {
+    if (!confirm(`¿Deshabilitar el 2FA del usuario "${u.username}"?`)) return
+    try {
+      await apiPost(`/users/${u.id}/reset-2fa`, {})
+      toast.success('2FA deshabilitado para el usuario')
+      loadUsers()
+    } catch {}
+  }
+
+  const handleUnlock = async (u: User) => {
+    try {
+      await apiPost(`/users/${u.id}/unlock`, {})
+      toast.success('Cuenta desbloqueada')
       loadUsers()
     } catch {}
   }
@@ -530,19 +565,45 @@ export function UsersPage() {
                     {format(new Date(u.createdAt), 'dd/MM/yyyy')}
                   </td>
                   <td className="px-4 py-3">
-                    <span className={clsx(
-                      'text-xs px-2 py-0.5 rounded-full font-medium',
-                      u.active ? 'bg-green-900/40 text-green-400' : 'bg-surface-700 text-surface-500'
-                    )}>
-                      {u.active ? 'Activo' : 'Inactivo'}
-                    </span>
+                    <div className="flex flex-col gap-1">
+                      <span className={clsx(
+                        'text-xs px-2 py-0.5 rounded-full font-medium w-fit',
+                        u.active ? 'bg-green-900/40 text-green-400' : 'bg-surface-700 text-surface-500'
+                      )}>
+                        {u.active ? 'Activo' : 'Inactivo'}
+                      </span>
+                      <div className="flex gap-1 flex-wrap">
+                        {u.twoFactorEnabled && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-brand-900/40 text-brand-400 border border-brand-800/40 flex items-center gap-0.5">
+                            <ShieldCheck size={8} /> 2FA
+                          </span>
+                        )}
+                        {u.lockedUntil && new Date(u.lockedUntil) > new Date() && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-red-900/40 text-red-400 border border-red-800/40 flex items-center gap-0.5">
+                            <Lock size={8} /> Bloqueado
+                          </span>
+                        )}
+                        {u.forcePasswordChange && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-900/40 text-amber-400 border border-amber-800/40 flex items-center gap-0.5">
+                            <Key size={8} /> Cambiar pass
+                          </span>
+                        )}
+                      </div>
+                    </div>
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1 justify-end">
                       <button
+                        onClick={() => setGranularPermUser(u)}
+                        className="p-1.5 rounded text-surface-500 hover:text-brand-400 hover:bg-brand-900/20 transition-colors"
+                        title="Permisos granulares"
+                      >
+                        <Shield size={12} />
+                      </button>
+                      <button
                         onClick={() => setPermUser(u)}
                         className="p-1.5 rounded text-surface-500 hover:text-amber-400 hover:bg-amber-900/20 transition-colors"
-                        title="Gestionar permisos"
+                        title="Gestionar permisos (legacy)"
                       >
                         <Key size={12} />
                       </button>
@@ -561,6 +622,24 @@ export function UsersPage() {
                       >
                         {u.active ? <UserX size={12} /> : <UserCheck size={12} />}
                       </button>
+                      {u.twoFactorEnabled && u.id !== currentUser?.id && (
+                        <button
+                          onClick={() => handleReset2FA(u)}
+                          className="p-1.5 rounded text-surface-500 hover:text-brand-400 hover:bg-brand-900/20 transition-colors"
+                          title="Resetear 2FA"
+                        >
+                          <ShieldOff size={12} />
+                        </button>
+                      )}
+                      {u.lockedUntil && new Date(u.lockedUntil) > new Date() && (
+                        <button
+                          onClick={() => handleUnlock(u)}
+                          className="p-1.5 rounded text-surface-500 hover:text-green-400 hover:bg-green-900/20 transition-colors"
+                          title="Desbloquear cuenta"
+                        >
+                          <Unlock size={12} />
+                        </button>
+                      )}
                       {u.id !== currentUser?.id && (
                         <button
                           onClick={() => handleDelete(u)}
@@ -630,6 +709,18 @@ export function UsersPage() {
                   </button>
                 </div>
               </div>
+
+              {editingUser && (
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.forcePasswordChange}
+                    onChange={(e) => setForm({ ...form, forcePasswordChange: e.target.checked })}
+                    className="accent-brand-500"
+                  />
+                  <span className="text-xs text-surface-300">Forzar cambio de contraseña en próximo inicio de sesión</span>
+                </label>
+              )}
             </div>
 
             <div className="flex gap-2 mt-6 justify-end">
@@ -642,11 +733,19 @@ export function UsersPage() {
         </div>
       )}
 
-      {/* Permissions panel */}
+      {/* Permissions panel (legacy) */}
       {permUser && (
         <PermissionsPanel
           user={permUser}
           onClose={() => setPermUser(null)}
+        />
+      )}
+
+      {/* Granular permissions modal */}
+      {granularPermUser && (
+        <UserPermissionsModal
+          user={granularPermUser}
+          onClose={() => setGranularPermUser(null)}
         />
       )}
     </div>

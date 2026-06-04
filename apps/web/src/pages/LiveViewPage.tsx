@@ -10,7 +10,7 @@ import { VideoPlayer, type CameraPlaybackError } from '@/components/cameras/Vide
 import { PTZControls } from '@/components/cameras/PTZControls'
 import { CameraDiagnosticModal } from '@/components/cameras/CameraDiagnosticModal'
 import { useAuthStore } from '@/stores/authStore'
-import { apiPost } from '@/lib/api'
+import { apiGet, apiPost } from '@/lib/api'
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
 
@@ -25,10 +25,10 @@ const STAGGER_MS: Record<GridLayout, number> = { 1: 0, 4: 250, 9: 400, 16: 500, 
 
 // ─── Health status config ────────────────────────────────────
 const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; blockStream: boolean }> = {
-  USING_MAIN_STREAM:       { icon: <Film size={12} />,          label: 'Main stream',           blockStream: false },
+  USING_MAIN_STREAM:       { icon: <Film size={12} />,          label: 'Sub no disponible',     blockStream: false },
   RTSP_SUB_NOT_FOUND:      { icon: <AlertTriangle size={12} />, label: 'Substream 404',         blockStream: true },
   RTSP_MAIN_NOT_FOUND:     { icon: <AlertTriangle size={12} />, label: 'RTSP no encontrado',    blockStream: true },
-  CODEC_UNSUPPORTED_HEVC:  { icon: <Film size={12} />,          label: 'HEVC no compatible',    blockStream: true },
+  CODEC_UNSUPPORTED_HEVC:  { icon: <Film size={12} />,          label: 'HEVC no compatible',    blockStream: false },
   STREAM_UNSTABLE:         { icon: <AlertTriangle size={12} />, label: 'Stream inestable',      blockStream: false },
   MEDIA_SERVER_ERROR:      { icon: <AlertTriangle size={12} />, label: 'Error servidor',        blockStream: false },
   AUTH_FAILED:             { icon: <Lock size={12} />,          label: 'Auth fallida',          blockStream: true },
@@ -36,16 +36,14 @@ const HEALTH_CONFIG: Record<string, { icon: React.ReactNode; label: string; bloc
 }
 
 function isBlockedByHealth(camera: Camera): boolean {
-  // If both RTSP streams confirmed failed (explicit false), block regardless of health status
-  if (camera.rtspSubOk === false && camera.rtspMainOk === false) return true
-
+  // RTSP validator confirmed camera unreachable
+  if (camera.online === false) return true
   const status = camera.streamHealthStatus
+  // USING_MAIN_STREAM: sub is down but main H264 works — backend auto-redirects, never block
+  if (status === 'USING_MAIN_STREAM') return false
+  // Sub RTSP specifically confirmed down — grid always requests sub
+  if (camera.rtspSubOk === false) return true
   if (!status || status === 'UNKNOWN' || status === 'HEALTHY' || status === 'STREAM_UNSTABLE') return false
-  if (status === 'USING_MAIN_STREAM') {
-    const mc = ((camera as any).mainCodec || '').toLowerCase()
-    if (mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')) return true
-    return false
-  }
   return HEALTH_CONFIG[status]?.blockStream ?? false
 }
 
@@ -54,6 +52,7 @@ function getHealthError(status: StreamHealthStatus, channel: number): CameraPlay
   const codeMap: Record<string, CameraPlaybackError['code']> = {
     RTSP_SUB_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
     RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
+    USING_MAIN_STREAM:      'RTSP_CHANNEL_NOT_FOUND',
     CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
     AUTH_FAILED:            'AUTH_FAILED',
     OFFLINE:                'CAMERA_OFFLINE',
@@ -67,9 +66,11 @@ function getHealthError(status: StreamHealthStatus, channel: number): CameraPlay
       : cfg?.label ?? status,
     technicalDetail: status === 'RTSP_SUB_NOT_FOUND'
       ? `Substream /Streaming/Channels/${channel}02 devolvió 404`
-      : status === 'CODEC_UNSUPPORTED_HEVC'
-        ? 'Recomendación: cambiar el codec del substream a H.264 en la interfaz del NVR (Configuración → Video → Substream → Codec: H.264)'
-        : undefined,
+      : status === 'USING_MAIN_STREAM'
+        ? 'Substream no disponible — doble clic para ver en pantalla completa'
+        : status === 'CODEC_UNSUPPORTED_HEVC'
+          ? 'Recomendación: cambiar el codec del substream a H.264 en la interfaz del NVR (Configuración → Video → Substream → Codec: H.264)'
+          : undefined,
   }
 }
 
@@ -88,7 +89,8 @@ function makeViewId(): string {
 
 export function LiveViewPage() {
   const [searchParams] = useSearchParams()
-  const nvrFilter = searchParams.get('nvr')
+  const nvrFilter    = searchParams.get('nvr')
+  const cameraFilter = searchParams.get('camera')
 
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
   const { user } = useAuthStore()
@@ -96,22 +98,41 @@ export function LiveViewPage() {
   const [gridLayout, setGridLayout]   = useState<GridLayout>(9)
   const [selectedNVR, setSelectedNVR] = useState<string>(nvrFilter || 'all')
   const [page, setPage]               = useState(0)
+  const [highlightCamera, setHighlightCamera] = useState<string | null>(null)
+  // Tracks the last cameraFilter value already applied — prevents re-running when cameras
+  // array updates but cameraFilter hasn't changed. Stores the camera id, not a boolean,
+  // so a new search result (different camera) correctly triggers re-navigation.
+  const appliedCameraQuery = useRef<string | null>(null)
   const [streams, setStreams]         = useState<Record<string, StreamInfo>>({})
   const [loadingStreams, setLoadingStreams] = useState<Record<string, boolean>>({})
   const [streamErrors, setStreamErrors]    = useState<Record<string, CameraPlaybackError>>({})
+  const streamErrorsRef = useRef<Record<string, CameraPlaybackError>>({})
+  streamErrorsRef.current = streamErrors  // keep ref current without triggering re-renders
   const [focusCamera, setFocusCamera]      = useState<string | null>(null)
-  const [focusStreamInfo, setFocusStreamInfo]   = useState<StreamInfo | null>(null)
-  const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
   // Track the intended stream type separately — focusStreamInfo alone can't tell us 'main'
   // when HEVC blocks the stream before the API call (focusStreamInfo stays null).
-  const [focusStreamType, setFocusStreamType]   = useState<'sub' | 'main'>('sub')
+  const [focusStreamType, setFocusStreamType]   = useState<'sub' | 'main' | 'main_h264'>('sub')
+  // Refs for focus state — used by async HLS error callbacks to avoid stale closures
+  const focusCameraRef      = useRef<string | null>(null)
+  focusCameraRef.current    = focusCamera
+  const focusStreamTypeRef  = useRef<'sub' | 'main' | 'main_h264'>('sub')
+  focusStreamTypeRef.current = focusStreamType
+  const [focusStreamInfo, setFocusStreamInfo]   = useState<StreamInfo | null>(null)
+  const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
+  const [streamCapabilities, setStreamCapabilities] = useState<{ ffmpegAvailable: boolean; transcodingEnabled: boolean } | null>(null)
 
   // playerKeys forces VideoPlayer remount (new HLS instance) when incremented for a camera
   const [playerKeys, setPlayerKeys] = useState<Record<string, number>>({})
 
   // Stable ID for this browser tab — used by backend to track sessions per view
   const [viewId] = useState<string>(makeViewId)
+
+  // Error codes that belong exclusively to focus/main_h264 streams.
+  // Grid tiles show sub streams — showing these errors on a tile is always stale/misleading.
+  const TRANSCODE_ONLY_CODES = new Set<CameraPlaybackError['code']>([
+    'TRANSCODE_NOT_READY', 'TRANSCODE_PROCESS_EXITED',
+  ])
 
   // Track which cameraIds have active sessions in the backend
   const activeSessions = useRef<Set<string>>(new Set())
@@ -133,8 +154,55 @@ export function LiveViewPage() {
   // without a forward-reference compile error.
   const loadStreamRef = useRef<((camera: Camera) => Promise<void>) | null>(null)
 
-  useEffect(() => { loadNVRs(); loadCameras() }, [])
+  useEffect(() => {
+    loadNVRs()
+    loadCameras()
+    // Clear any stale sessions from a previous page visit
+    apiPost('/cameras/cleanup-my-sessions', {}).catch(() => {})
+  }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
+
+  // Handle camera query param: once cameras are loaded, navigate to the correct NVR/page
+  // and highlight the target camera. Tracks by value (not boolean) so navigating to a
+  // second search result correctly re-fires even if we're already on /live.
+  useEffect(() => {
+    if (!cameraFilter || appliedCameraQuery.current === cameraFilter || cameras.length === 0) return
+    const cam = cameras.find(c => c.id === cameraFilter)
+    if (!cam) {
+      console.info(`[LiveView] queryCameraResolved cameraId=${cameraFilter} found=false`)
+      return
+    }
+    appliedCameraQuery.current = cameraFilter
+
+    const targetNvrId = cam.nvrId
+    const nvrCams     = cameras.filter(c => c.nvrId === targetNvrId)
+    const camIdx      = nvrCams.findIndex(c => c.id === cameraFilter)
+    const targetPage  = camIdx >= 0 ? Math.floor(camIdx / gridLayout) : 0
+    console.info(`[LiveView] queryCameraResolved cameraId=${cameraFilter} nvrId=${targetNvrId} index=${camIdx} page=${targetPage}`)
+
+    // Start highlight immediately so it's visible once the grid settles
+    setHighlightCamera(cameraFilter)
+    setTimeout(() => setHighlightCamera(null), 4000)
+
+    const needsNvrSwitch  = selectedNVR !== targetNvrId
+    const needsPageSwitch = safePage !== targetPage
+
+    if (needsNvrSwitch || needsPageSwitch) {
+      // Stop all active streams before switching NVR/page — mirrors handleNVRChange/handlePageChange
+      stopAllSessions('camera_query').then(() => {
+        prevVisibleIds.current = []
+        setSelectedNVR(targetNvrId)
+        setPage(targetPage)
+      })
+    }
+    // If camera is already visible (same NVR, same page) only the highlight is needed
+  }, [cameras, cameraFilter, gridLayout]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    apiGet<{ ffmpegAvailable: boolean; transcodingEnabled: boolean }>('/live-view/capabilities')
+      .then(caps => setStreamCapabilities(caps))
+      .catch(() => setStreamCapabilities({ ffmpegAvailable: false, transcodingEnabled: false }))
+  }, [])
 
   // Derived visible cameras
   const allFiltered = cameras.filter((c) =>
@@ -206,15 +274,20 @@ export function LiveViewPage() {
         CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
         AUTH_FAILED:            'AUTH_FAILED',
         OFFLINE:                'CAMERA_OFFLINE',
+        CAMERA_OFFLINE:         'CAMERA_OFFLINE',
         MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
         CAMERA_NOT_FOUND:       'UNKNOWN',
         CAMERA_DISABLED:        'UNKNOWN',
+        TRANSCODING_DISABLED:    'CODEC_UNSUPPORTED',
+        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
       }
       const isHevc = err.code === 'CODEC_UNSUPPORTED_HEVC'
       setStreamErrors(prev => ({
         ...prev,
         [cameraId]: {
-          code: errCodeMap[err.code] || 'UNKNOWN',
+          code: (errCodeMap[err.code] || 'UNKNOWN') as any,
           message: isHevc
             ? 'HEVC/H.265 no es compatible con navegadores. Configura H.264 en la cámara o habilita transcodificación en el NVR.'
             : err.message,
@@ -234,9 +307,19 @@ export function LiveViewPage() {
     if (visibleCameraIds.length === 0) return
     if (!useAuthStore.getState().isAuthenticated) return
     try {
+      // Don't re-queue cameras with permanent blocking errors — prevents MediaMTX RTSP retry spam
+      const PERMANENT_ERROR_CODES: CameraPlaybackError['code'][] = [
+        'RTSP_CHANNEL_NOT_FOUND', 'CAMERA_OFFLINE', 'AUTH_FAILED',
+        'CODEC_UNSUPPORTED', 'SUBSTREAM_DISABLED', 'NVR_OFFLINE',
+      ]
+      const filteredIds = visibleCameraIds.filter(id => {
+        const err = streamErrorsRef.current[id]
+        return !err || !PERMANENT_ERROR_CODES.includes(err.code)
+      })
+      if (filteredIds.length === 0) return
       const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', {
         viewId,
-        visibleCameraIds,
+        visibleCameraIds: filteredIds,
       })
       applyHeartbeat(result)
     } catch (err: any) {
@@ -311,11 +394,12 @@ export function LiveViewPage() {
   }, [sendHeartbeat])
 
   // ─── Stop sessions for a set of cameraIds ───────────────────
-  const stopSessions = useCallback(async (cameraIds: string[]) => {
+  const stopSessions = useCallback(async (cameraIds: string[], reason?: string) => {
     const toStop = cameraIds.filter(id => activeSessions.current.has(id))
     if (toStop.length === 0) return
+    console.info(`[LiveView] stopSessions reason=${reason || 'unspecified'} count=${toStop.length} ids=[${toStop.join(',')}]`)
     await Promise.allSettled(
-      toStop.map(id => apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {}))
+      toStop.map(id => apiPost(`/cameras/${id}/stop-stream`, { streamType: 'sub' }).catch(() => {}))
     )
     toStop.forEach(id => {
       activeSessions.current.delete(id)
@@ -330,10 +414,10 @@ export function LiveViewPage() {
   }, [])
 
   // ─── Stop ALL current sessions + clear state ────────────────
-  const stopAllSessions = useCallback(async () => {
+  const stopAllSessions = useCallback(async (reason?: string) => {
     clearStaggerTimers()
     const allActive = Array.from(activeSessions.current)
-    await stopSessions(allActive)
+    await stopSessions(allActive, reason || 'stop_all')
     setStreams({})
     setStreamErrors({})
     setLoadingStreams({})
@@ -361,11 +445,9 @@ export function LiveViewPage() {
 
     // Block cameras with known bad health
     if (isBlockedByHealth(camera)) {
-      let effectiveStatus = camera.streamHealthStatus
-      if (effectiveStatus === 'USING_MAIN_STREAM') effectiveStatus = 'CODEC_UNSUPPORTED_HEVC' as any
       const blockError: CameraPlaybackError =
-        effectiveStatus && effectiveStatus !== 'UNKNOWN'
-          ? getHealthError(effectiveStatus as StreamHealthStatus, camera.channel)
+        camera.streamHealthStatus && camera.streamHealthStatus !== 'UNKNOWN'
+          ? getHealthError(camera.streamHealthStatus as StreamHealthStatus, camera.channel)
           : { code: 'CAMERA_OFFLINE', message: 'Sin señal — cámara offline o sin RTSP disponible' }
       setStreamErrors(prev => ({ ...prev, [camera.id]: blockError }))
       return
@@ -389,25 +471,30 @@ export function LiveViewPage() {
       const rawMsg: string = body.message || body.error || ''
 
       if (code === 'STREAM_LIMIT_REACHED' || code === 'STREAM_LIMIT_GLOBAL') {
-        await handleLimitHit(camera)
+        await handleLimitHit(camera, body.current as number | undefined, body.max as number | undefined)
         return
       }
 
       const errCodeMap: Record<string, CameraPlaybackError['code']> = {
-        RTSP_SUB_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
-        RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
-        CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
-        AUTH_FAILED:            'AUTH_FAILED',
-        OFFLINE:                'CAMERA_OFFLINE',
-        MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
-        CAMERA_NOT_FOUND:       'UNKNOWN',
-        CAMERA_DISABLED:        'UNKNOWN',
+        RTSP_SUB_NOT_FOUND:      'RTSP_CHANNEL_NOT_FOUND',
+        RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
+        CODEC_UNSUPPORTED_HEVC:  'CODEC_UNSUPPORTED',
+        AUTH_FAILED:             'AUTH_FAILED',
+        OFFLINE:                 'CAMERA_OFFLINE',
+        CAMERA_OFFLINE:          'CAMERA_OFFLINE',
+        MEDIA_SERVER_ERROR:      'MEDIAMTX_NOT_READY',
+        CAMERA_NOT_FOUND:        'UNKNOWN',
+        CAMERA_DISABLED:         'UNKNOWN',
+        TRANSCODING_DISABLED:    'CODEC_UNSUPPORTED',
+        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
       }
 
       setStreamErrors(prev => ({
         ...prev,
         [camera.id]: {
-          code: errCodeMap[code] || 'UNKNOWN',
+          code: (errCodeMap[code] || 'UNKNOWN') as any,
           message: rawMsg || 'No se pudo obtener el stream',
           technicalDetail: body.details,
         },
@@ -420,7 +507,7 @@ export function LiveViewPage() {
   loadStreamRef.current = loadStream  // keep ref current for flushHlsExpiry
 
   // ─── Handle stream limit: cleanup non-visible then retry ────
-  const handleLimitHit = useCallback(async (camera: Camera) => {
+  const handleLimitHit = useCallback(async (camera: Camera, current?: number, max?: number) => {
     const visibleIds = new Set(filteredCameras.map(c => c.id))
     const nonVisible = Array.from(activeSessions.current).filter(id => !visibleIds.has(id))
 
@@ -434,20 +521,32 @@ export function LiveViewPage() {
       pendingStarts.current.delete(camera.id)
       await loadStream(camera)
     } else {
+      const limitMsg = current !== undefined && max !== undefined
+        ? `Límite de streams alcanzado (${current}/${max} activos)`
+        : `Límite de streams alcanzado`
       setStreamErrors(prev => ({
         ...prev,
-        [camera.id]: { code: 'UNKNOWN', message: `Límite de streams alcanzado (${gridLayout} máx)` },
+        [camera.id]: { code: 'UNKNOWN', message: limitMsg },
       }))
       setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
     }
-  }, [filteredCameras, gridLayout, stopSessions, loadStream])
+  }, [filteredCameras, stopSessions, loadStream])
 
   // ─── Start visible streams with stagger ─────────────────────
+  // Blocked cameras (offline / known bad health) are loaded immediately without stagger
+  // so their error overlay appears right away without a spinner delay.
   const startVisibleStreams = useCallback((cams: Camera[]) => {
     const delay = STAGGER_MS[gridLayout] ?? 500
-    cams.forEach((cam, idx) => {
-      const timer = setTimeout(() => loadStream(cam), idx * delay)
-      staggerTimers.current.push(timer)
+    let staggerIdx = 0
+    cams.forEach((cam) => {
+      if (isBlockedByHealth(cam)) {
+        // Immediate — no timer needed, loadStream returns synchronously for blocked cameras
+        loadStream(cam)
+      } else {
+        const timer = setTimeout(() => loadStream(cam), staggerIdx * delay)
+        staggerTimers.current.push(timer)
+        staggerIdx++
+      }
     })
   }, [gridLayout, loadStream])
 
@@ -494,7 +593,7 @@ export function LiveViewPage() {
 
     clearStaggerTimers()
 
-    stopSessions(leaving).then(() => {
+    stopSessions(leaving, 'viewport_change').then(() => {
       if (leaving.length > 0) {
         setStreams(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
         setStreamErrors(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
@@ -507,21 +606,21 @@ export function LiveViewPage() {
 
   // ─── Layout / NVR / page selection → stop all + restart ─────
   const handleLayoutChange = useCallback(async (layout: GridLayout) => {
-    await stopAllSessions()
+    await stopAllSessions('layout_change')
     prevVisibleIds.current = []
     setGridLayout(layout)
     setPage(0)
   }, [stopAllSessions])
 
   const handleNVRChange = useCallback(async (nvrId: string) => {
-    await stopAllSessions()
+    await stopAllSessions('nvr_change')
     prevVisibleIds.current = []
     setSelectedNVR(nvrId)
     setPage(0)
   }, [stopAllSessions])
 
   const handlePageChange = useCallback(async (newPage: number) => {
-    await stopAllSessions()
+    await stopAllSessions('page_change')
     prevVisibleIds.current = []
     setPage(newPage)
   }, [stopAllSessions])
@@ -543,6 +642,18 @@ export function LiveViewPage() {
     if (cam) setTimeout(() => loadStream(cam), 3000)
   }, [cameras, loadStream, bumpPlayerKeys])
 
+  // ─── Retry a single grid camera (full stream restart) ───────
+  const handleGridCameraRetry = useCallback((cameraId: string) => {
+    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'sub', reason: 'grid_retry' }).catch(() => {})
+    activeSessions.current.delete(cameraId)
+    setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+    setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+    pendingStarts.current.delete(cameraId)
+    bumpPlayerKeys([cameraId])
+    const cam = cameras.find(c => c.id === cameraId)
+    if (cam) setTimeout(() => loadStream(cam), 300)
+  }, [cameras, loadStream, bumpPlayerKeys])
+
   // ─── HLS fatal error from VideoPlayer ───────────────────────
   // HLS_SESSION_EXPIRED is coalesced: batches simultaneous 401s into one
   // heartbeat (2s window) so N cameras expiring together get 1 backend call.
@@ -550,9 +661,15 @@ export function LiveViewPage() {
     console.warn('[LiveView] stream error', { cameraId, code: err.code, message: err.message, detail: err.technicalDetail })
 
     if (err.code === 'HLS_SESSION_EXPIRED') {
-      // HLS session cookie expired — backend RTSP→MediaMTX source is still running.
-      // Do NOT stop the backend stream; just coalesce and remount the player so
-      // HLS.js re-establishes its session against the running source.
+      // Focus main/main_h264 session expired → show reconnecting state and re-request stream.
+      // Grid cameras go through the coalesced heartbeat path below.
+      const isFocusH264 = cameraId === focusCameraRef.current &&
+        (focusStreamTypeRef.current === 'main_h264' || focusStreamTypeRef.current === 'main')
+      if (isFocusH264) {
+        console.info(`[LiveView] HLS_SESSION_EXPIRED focus cameraId=${cameraId} — reconnecting transcodificación`)
+        setFocusStreamError({ code: 'TRANSCODE_NOT_READY', message: 'Reconectando transcodificación...' })
+        return
+      }
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
       hlsExpiryQueue.current.add(cameraId)
@@ -562,13 +679,28 @@ export function LiveViewPage() {
       return
     }
 
-    // For all other fatal errors, stop the backend stream
+    // For focus-camera main/main_h264 errors: route to focusStreamError, NOT streamErrors.
+    // Use refs (not state) to avoid stale-closure issues in async HLS error callbacks
+    // (e.g. user exits focus, then a pending HLS retry fires — closure would read null).
+    const isFocusStream = cameraId === focusCameraRef.current &&
+      (focusStreamTypeRef.current === 'main_h264' || focusStreamTypeRef.current === 'main')
+    if (isFocusStream) {
+      console.info(`[LiveView] stream_error focus cameraId=${cameraId} type=${focusStreamTypeRef.current} code=${err.code} — routing to focusStreamError`)
+      setFocusStreamError(err)
+      return
+    }
+
+    // For all other fatal errors, stop the backend stream using the correct type.
+    // Focus camera non-transcode: use focusStreamType. Grid camera: always sub.
+    // Pass reason=hls_fatal_error so backend does NOT kill FFmpeg (transient error).
     if (activeSessions.current.has(cameraId)) {
-      apiPost(`/cameras/${cameraId}/stop-stream`, {}).catch(() => {})
+      const st = cameraId === focusCamera ? focusStreamType : 'sub'
+      console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${st} reason=hls_fatal_error code=${err.code}`)
+      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: st, reason: 'hls_fatal_error' }).catch(() => {})
       activeSessions.current.delete(cameraId)
     }
     setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
-  }, [cameras, bumpPlayerKeys, flushHlsExpiry])
+  }, [flushHlsExpiry, focusCamera, focusStreamType])
 
   // ─── Enter focus/fullscreen — start main stream ─────────────
   const handleEnterFocus = useCallback(async (camera: Camera) => {
@@ -576,9 +708,13 @@ export function LiveViewPage() {
     setFocusStreamInfo(null)
     setFocusStreamError(null)
     setFocusStreamType('main')  // always targeting main in focus view
+    // Clear any stale sub-stream error from the grid so it doesn't leak into the focus view
+    setStreamErrors(prev => { const n = { ...prev }; delete n[camera.id]; return n })
 
-    // Proactively block known HEVC main stream before wasting a backend call
-    if (isHevcCodec(camera.mainCodec)) {
+    // Proactively block known HEVC main stream only when transcoding is unavailable.
+    // When transcoding is available, let the backend handle the auto-redirect to main_h264.
+    const transcodingAvailable = streamCapabilities?.ffmpegAvailable && streamCapabilities?.transcodingEnabled
+    if (isHevcCodec(camera.mainCodec) && !transcodingAvailable) {
       setFocusStreamError({
         code: 'CODEC_UNSUPPORTED',
         message: 'El flujo principal está en H.265/HEVC. Los navegadores no pueden reproducir H.265.',
@@ -588,59 +724,111 @@ export function LiveViewPage() {
     }
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main' })
+      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main', viewId })
+      // Backend may auto-redirect main→main_h264 (HEVC camera + transcoding enabled).
+      // Detect the actual stream type from the response so stop-stream/quality-switch
+      // use the correct type key.
+      const actualType: 'sub' | 'main' | 'main_h264' =
+        (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
+          ? 'main_h264'
+          : 'main'
+      if (actualType !== focusStreamType) {
+        console.info(`[LiveView] enterFocus redirect cameraId=${camera.id} requested=main actual=${actualType}`)
+        setFocusStreamType(actualType)
+      }
       setFocusStreamInfo(info)
       bumpPlayerKeys([camera.id])
     } catch (err: any) {
       const body = err?.response?.data || {}
       const errCodeMap: Record<string, CameraPlaybackError['code']> = {
-        CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
-        AUTH_FAILED:            'AUTH_FAILED',
-        OFFLINE:                'CAMERA_OFFLINE',
-        MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
-        RTSP_MAIN_NOT_FOUND:    'RTSP_CHANNEL_NOT_FOUND',
+        CODEC_UNSUPPORTED_HEVC:  'CODEC_UNSUPPORTED',
+        AUTH_FAILED:             'AUTH_FAILED',
+        OFFLINE:                 'CAMERA_OFFLINE',
+        MEDIA_SERVER_ERROR:      'MEDIAMTX_NOT_READY',
+        RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
+        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
+        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
       }
       setFocusStreamError({
-        code: errCodeMap[body.error] || 'UNKNOWN',
+        code: (errCodeMap[body.error] || 'UNKNOWN') as any,
         message: body.message || 'Error al iniciar stream principal',
         technicalDetail: body.details,
       })
     }
-  }, [bumpPlayerKeys])
+  }, [bumpPlayerKeys, streamCapabilities, focusStreamType])
 
-  // ─── Quality switch from VideoPlayer (Baja/Alta buttons) ────
-  const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main') => {
+  // ─── Quality switch from VideoPlayer (Baja/Alta/Trans buttons) ─
+  const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main' | 'main_h264') => {
     if (!focusCamera) return
+
     if (quality === 'sub') {
-      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      // Explicitly switching back to sub — stop both main streams so FFmpeg is killed.
+      console.info(`[LiveView] qualitySwitch cameraId=${focusCamera} from=${focusStreamType} to=sub reason=switch_to_sub`)
+      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main',      reason: 'switch_to_sub' }).catch(() => {})
+      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main_h264', reason: 'switch_to_sub' }).catch(() => {})
       setFocusStreamInfo(null)
       setFocusStreamError(null)
       setFocusStreamType('sub')
       bumpPlayerKeys([focusCamera])
-    } else {
-      setFocusStreamInfo(null)
-      setFocusStreamError(null)
-      setFocusStreamType('main')
-      try {
-        const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: 'main' })
-        setFocusStreamInfo(info)
-        bumpPlayerKeys([focusCamera])
-      } catch (err: any) {
-        const body = err?.response?.data || {}
-        const errCodeMap: Record<string, CameraPlaybackError['code']> = {
-          CODEC_UNSUPPORTED_HEVC: 'CODEC_UNSUPPORTED',
-          AUTH_FAILED:            'AUTH_FAILED',
-          OFFLINE:                'CAMERA_OFFLINE',
-          MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
-        }
-        setFocusStreamError({
-          code: errCodeMap[body.error] || 'UNKNOWN',
-          message: body.message || 'Error al iniciar stream principal',
-          technicalDetail: body.details,
-        })
-      }
+      return
     }
-  }, [focusCamera, bumpPlayerKeys])
+
+    if (quality === focusStreamType) {
+      // Same type — this is a retry. Remount the player without killing FFmpeg.
+      // The supervisor keeps FFmpeg alive; a fresh HLS.js instance will reconnect.
+      console.info(`[LiveView] qualitySwitch retry cameraId=${focusCamera} type=${quality} — remounting player only`)
+      setFocusStreamError(null)
+      bumpPlayerKeys([focusCamera])
+      return
+    }
+
+    // Switching to a different type (e.g. sub→main, main→main_h264, main_h264→main)
+    const prevType = focusStreamType
+    console.info(`[LiveView] qualitySwitch cameraId=${focusCamera} from=${prevType} to=${quality}`)
+
+    // Only stop 'main' session — never stop 'main_h264' here because:
+    // a) On HEVC cameras, 'main' redirects to 'main_h264' anyway (same FFmpeg).
+    // b) Stopping main_h264 kills FFmpeg, then start-stream immediately re-spawns it
+    //    causing the "closing existing publisher" duplicate in MediaMTX.
+    if (prevType === 'main') {
+      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main', reason: 'quality_switch' }).catch(() => {})
+    }
+
+    setFocusStreamInfo(null)
+    setFocusStreamError(null)
+    setFocusStreamType(quality)
+
+    try {
+      const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality, viewId })
+      const actualType: 'sub' | 'main' | 'main_h264' =
+        (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
+          ? 'main_h264' : quality
+      if (actualType !== quality) {
+        console.info(`[LiveView] qualitySwitch redirect cameraId=${focusCamera} requested=${quality} actual=${actualType}`)
+        setFocusStreamType(actualType)
+      }
+      setFocusStreamInfo(info)
+      bumpPlayerKeys([focusCamera])
+    } catch (err: any) {
+      const body = err?.response?.data || {}
+      const errCodeMap: Record<string, CameraPlaybackError['code']> = {
+        CODEC_UNSUPPORTED_HEVC:  'CODEC_UNSUPPORTED',
+        AUTH_FAILED:             'AUTH_FAILED',
+        OFFLINE:                 'CAMERA_OFFLINE',
+        MEDIA_SERVER_ERROR:      'MEDIAMTX_NOT_READY',
+        RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
+        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
+        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
+        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+      }
+      setFocusStreamError({
+        code: (errCodeMap[body.error] || 'UNKNOWN') as any,
+        message: body.message || `Error al iniciar stream ${quality === 'main_h264' ? 'transcodificado' : 'principal'}`,
+        technicalDetail: body.details,
+      })
+    }
+  }, [focusCamera, focusStreamType, bumpPlayerKeys])
 
   // ─── Exit fullscreen/focus view ──────────────────────────────
   // On return from fullscreen, stop the focus camera and restart the grid cameras.
@@ -652,9 +840,10 @@ export function LiveViewPage() {
     setFocusStreamError(null)
     setFocusStreamType('sub')
 
-    // Stop main stream only — sub stream stays alive for the grid
+    // Stop main/main_h264 streams — sub stream stays alive for the grid
     if (prevFocusId) {
-      apiPost(`/cameras/${prevFocusId}/stop-stream`, { streamType: 'main' }).catch(() => {})
+      apiPost(`/cameras/${prevFocusId}/stop-stream`, { streamType: 'main',      reason: 'exit_focus' }).catch(() => {})
+      apiPost(`/cameras/${prevFocusId}/stop-stream`, { streamType: 'main_h264', reason: 'exit_focus' }).catch(() => {})
     }
 
     // Reconcile the grid cameras after returning from fullscreen.
@@ -754,10 +943,20 @@ export function LiveViewPage() {
               // the stream was blocked before the API call (focusStreamInfo=null).
               const focusType  = focusStreamType
               const focusHls   = isMain ? focusStreamInfo!.hls : (stream?.hls || '')
-              const focusCodec = focusStreamType === 'main' ? cam.mainCodec : cam.subCodec
-              const focusRes   = focusStreamType === 'main' ? cam.mainResolution : cam.subResolution
+              const focusCodec = focusStreamType === 'main' || focusStreamType === 'main_h264'
+                ? cam.mainCodec
+                : cam.subCodec
+              // For transcoded streams the output resolution depends on TRANSCODE_WIDTH env var,
+              // not the camera's native mainResolution — don't show misleading metadata.
+              const focusRes   = focusStreamType === 'main_h264'
+                ? undefined
+                : focusStreamType === 'main'
+                  ? cam.mainResolution
+                  : cam.subResolution
+              const canTryMainStream = focusStreamType === 'sub' && !focusStreamError
+              const transcodingAvailable = !!(streamCapabilities?.ffmpegAvailable && streamCapabilities?.transcodingEnabled)
               return (
-                <div className="h-full flex gap-2">
+                <div className="h-full flex flex-col gap-0 relative">
                   <VideoPlayer
                     key={`focus-${focusCamera}-${focusType}-${playerKeys[focusCamera] ?? 0}`}
                     hlsUrl={focusHls}
@@ -768,14 +967,36 @@ export function LiveViewPage() {
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
                     onQualitySwitch={handleQualitySwitch}
-                    className="flex-1 h-full"
+                    onRetry={focusType === 'main_h264' ? () => {
+                      // Remount the player so HLS.js reconnects to the existing stream.
+                      // Do NOT call handleQualitySwitch — that would kill FFmpeg unnecessarily.
+                      // The supervisor keeps FFmpeg alive; VideoPlayer reconnects on remount.
+                      setFocusStreamError(null)
+                      bumpPlayerKeys([focusCamera!])
+                    } : undefined}
+                    className="flex-1 min-h-0"
                     playbackError={focusStreamError || streamErrors[focusCamera]}
                     streamType={focusType}
                     streamCodec={focusCodec}
                     streamResolution={focusRes}
+                    transcodingAvailable={transcodingAvailable}
                   />
+                  {/* Intentar alta calidad — visible button when watching sub in focus */}
+                  {canTryMainStream && (
+                    <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20">
+                      <button
+                        onClick={() => handleQualitySwitch('main')}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-black/70 text-surface-200 text-xs hover:bg-black/90 transition-colors border border-surface-600/50"
+                        title="Intentar stream principal HD (puede ser H.265 en algunas cámaras)"
+                      >
+                        ↑ Intentar alta calidad
+                      </button>
+                    </div>
+                  )}
                   {(user?.role === 'ADMIN' || user?.role === 'SUPERVISOR') && cam.ptzEnabled && (
-                    <PTZControls cameraId={cam.id} />
+                    <div className="flex-shrink-0">
+                      <PTZControls cameraId={cam.id} />
+                    </div>
                   )}
                 </div>
               )
@@ -784,27 +1005,27 @@ export function LiveViewPage() {
         ) : (
           <div className={clsx('grid gap-1.5 h-full', currentGrid.cols)}>
             {filteredCameras.map(camera => {
-              const stream = streams[camera.id]
-              const health = camera.streamHealthStatus
+              const stream    = streams[camera.id]
+              const health    = camera.streamHealthStatus
+              const isHighlit = highlightCamera === camera.id
               return (
                 <div
                   key={camera.id}
-                  className="relative min-h-0 rounded-lg overflow-hidden border border-surface-700"
+                  className={clsx(
+                    'relative min-h-0 rounded-lg overflow-hidden border transition-all duration-300',
+                    isHighlit
+                      ? 'border-brand-400 ring-2 ring-brand-400/60 shadow-lg shadow-brand-400/20'
+                      : 'border-surface-700'
+                  )}
                 >
                   {/* Health badge */}
                   {(() => {
                     if (!health || health === 'HEALTHY' || health === 'UNKNOWN' || !HEALTH_CONFIG[health]) return null
-                    const mc = ((camera as any).mainCodec || '').toLowerCase()
-                    const mainIsHevc = mc.includes('hevc') || mc.includes('h265') || mc.includes('h.265')
-                    const isHevcMain = health === 'USING_MAIN_STREAM' && mainIsHevc
-                    const badgeLabel = isHevcMain ? 'Main HEVC' : HEALTH_CONFIG[health].label
-                    const bgClass = isHevcMain ? 'bg-amber-900/70' : health === 'USING_MAIN_STREAM' ? 'bg-blue-900/70' : 'bg-black/70'
-                    const iconClass = isHevcMain ? 'text-amber-400' : health === 'USING_MAIN_STREAM' ? 'text-blue-400' : 'text-amber-400'
-                    const textClass = isHevcMain ? 'text-amber-300' : health === 'USING_MAIN_STREAM' ? 'text-blue-300' : 'text-amber-300'
+                    const badgeLabel = HEALTH_CONFIG[health].label
                     return (
-                      <div className={clsx('absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5', bgClass)}>
-                        <span className={iconClass}>{HEALTH_CONFIG[health].icon}</span>
-                        <span className={clsx('text-[9px] font-medium', textClass)}>{badgeLabel}</span>
+                      <div className="absolute top-1.5 left-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5 bg-black/70">
+                        <span className="text-amber-400">{HEALTH_CONFIG[health].icon}</span>
+                        <span className="text-[9px] font-medium text-amber-300">{badgeLabel}</span>
                       </div>
                     )
                   })()}
@@ -817,8 +1038,14 @@ export function LiveViewPage() {
                     onFullscreen={() => handleEnterFocus(camera)}
                     onDiagnostic={handleDiagnostic}
                     onStreamError={handleStreamError}
+                    onPlaying={(cid) => setStreamErrors(prev => { const n = { ...prev }; delete n[cid]; return n })}
+                    onRetry={handleGridCameraRetry}
                     className="w-full h-full"
-                    playbackError={streamErrors[camera.id]}
+                    playbackError={
+                      streamErrors[camera.id] && TRANSCODE_ONLY_CODES.has(streamErrors[camera.id]!.code)
+                        ? undefined
+                        : streamErrors[camera.id]
+                    }
                     streamType="sub"
                     streamCodec={camera.subCodec}
                     streamResolution={camera.subResolution}

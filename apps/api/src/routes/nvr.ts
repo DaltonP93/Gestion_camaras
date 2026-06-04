@@ -11,6 +11,7 @@ import {
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
 import { AuditAction } from '../services/audit'
+import { checkIsapiRecordingSupport, detectProviderFromCapabilities } from '../services/recordingProvider'
 import CryptoJS from 'crypto-js'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
@@ -253,9 +254,14 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const user = request.user
     let nvrs
 
+    const nvrInclude = {
+      cameras: { select: { id: true, channel: true, name: true, online: true, active: true, channelCode: true } },
+      hdds: { orderBy: { diskNumber: 'asc' as const } },
+    }
+
     if (['ADMIN', 'SUPERVISOR'].includes(user.role)) {
       nvrs = await server.prisma.nVR.findMany({
-        include: { cameras: { select: { id: true, channel: true, name: true, online: true, active: true, channelCode: true } } },
+        include: nvrInclude,
         orderBy: { name: 'asc' },
       })
     } else {
@@ -266,7 +272,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       const nvrIds = permissions.map((p: any) => p.nvrId!).filter(Boolean)
       nvrs = await server.prisma.nVR.findMany({
         where: { id: { in: nvrIds } },
-        include: { cameras: { select: { id: true, channel: true, name: true, online: true, active: true, channelCode: true } } },
+        include: nvrInclude,
         orderBy: { name: 'asc' },
       })
     }
@@ -1226,6 +1232,102 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     await server.prisma.nVR.delete({ where: { id } })
     await AuditAction(server.prisma, request.user.sub, 'NVR_DELETED', id, request)
     return reply.send({ message: 'NVR eliminado' })
+  })
+
+  // ─── Recording capabilities ────────────────────────────────
+
+  // GET /api/nvrs/:id/recording-capabilities
+  server.get('/:id/recording-capabilities', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const u = request.user
+    if (!await userCanAccessNvr(u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    return reply.send({
+      nvrId:                    nvr.id,
+      recordingProvider:        (nvr as any).recordingProvider        ?? 'ISAPI',
+      supportsIsapiRecording:   (nvr as any).supportsIsapiRecording   ?? null,
+      supportsSdkRecording:     (nvr as any).supportsSdkRecording     ?? false,
+      recordingCapabilityAt:    (nvr as any).recordingCapabilityAt    ?? null,
+      recordingCapabilityError: (nvr as any).recordingCapabilityError ?? null,
+      playbackWebUrl:           (nvr as any).playbackWebUrl           ?? null,
+      sdkEnabled:               (nvr as any).sdkEnabled               ?? false,
+    })
+  })
+
+  // POST /api/nvrs/:id/recording-capabilities/check
+  server.post('/:id/recording-capabilities/check', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const plain = safeDecrypt(nvr.password)
+    if (!plain) {
+      return reply.status(422).send({ success: false, errorCode: 'DECRYPT_ERROR', message: 'Contraseña no descifrable.' })
+    }
+
+    const creds = { ipAddress: nvr.ipAddress, port: nvr.port, username: nvr.username, password: plain }
+    const { supported, error } = await checkIsapiRecordingSupport(creds)
+    const provider = detectProviderFromCapabilities(supported)
+
+    const updated = await server.prisma.nVR.update({
+      where: { id },
+      data: {
+        recordingProvider:        provider,
+        supportsIsapiRecording:   supported,
+        recordingCapabilityAt:    new Date(),
+        recordingCapabilityError: error ?? null,
+      } as any,
+    })
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_RECORDING_CAPABILITY_CHECKED', id, request, { supported, provider, error })
+
+    return reply.send({
+      nvrId:                    updated.id,
+      recordingProvider:        (updated as any).recordingProvider        ?? provider,
+      supportsIsapiRecording:   (updated as any).supportsIsapiRecording   ?? supported,
+      supportsSdkRecording:     (updated as any).supportsSdkRecording     ?? false,
+      recordingCapabilityAt:    (updated as any).recordingCapabilityAt    ?? new Date().toISOString(),
+      recordingCapabilityError: (updated as any).recordingCapabilityError ?? null,
+      playbackWebUrl:           (updated as any).playbackWebUrl           ?? null,
+      sdkEnabled:               (updated as any).sdkEnabled               ?? false,
+    })
+  })
+
+  // PUT /api/nvrs/:id/recording-capabilities
+  server.put('/:id/recording-capabilities', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+
+    const schema = z.object({
+      recordingProvider: z.enum(['ISAPI', 'HIKVISION_SDK', 'MEDIAMTX_LOCAL', 'MANUAL_NVR', 'UNSUPPORTED']).optional(),
+      playbackWebUrl:    z.string().url().nullable().optional(),
+      sdkEnabled:        z.boolean().optional(),
+    })
+    const body = schema.parse(request.body)
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const updated = await server.prisma.nVR.update({
+      where: { id },
+      data: body as any,
+    })
+
+    await AuditAction(server.prisma, request.user.sub, 'NVR_RECORDING_CAPABILITIES_UPDATED', id, request, body)
+
+    return reply.send({
+      nvrId:                    updated.id,
+      recordingProvider:        (updated as any).recordingProvider        ?? 'ISAPI',
+      supportsIsapiRecording:   (updated as any).supportsIsapiRecording   ?? null,
+      supportsSdkRecording:     (updated as any).supportsSdkRecording     ?? false,
+      recordingCapabilityAt:    (updated as any).recordingCapabilityAt    ?? null,
+      recordingCapabilityError: (updated as any).recordingCapabilityError ?? null,
+      playbackWebUrl:           (updated as any).playbackWebUrl           ?? null,
+      sdkEnabled:               (updated as any).sdkEnabled               ?? false,
+    })
   })
 
   // GET /api/nvrs/:id/free-channels — Canales libres para adoptar cámara

@@ -9,6 +9,8 @@ import {
 import { useAuthStore } from '@/stores/authStore'
 import { useAlertStore } from '@/stores/alertStore'
 import { useCameraStore } from '@/stores/cameraStore'
+import { useAppearanceStore } from '@/stores/appearanceStore'
+import { resolveAssetUrl } from '@/lib/api'
 import { clsx } from 'clsx'
 
 const ROLE_LABEL: Record<string, string> = {
@@ -29,6 +31,7 @@ export function Sidebar() {
   const { user, logout } = useAuthStore()
   const { unreadCount } = useAlertStore()
   const { nvrs } = useCameraStore()
+  const { settings: appearance } = useAppearanceStore()
   const navigate = useNavigate()
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -80,11 +83,22 @@ export function Sidebar() {
       {/* Logo */}
       <div className="px-4 py-4 border-b border-surface-600">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center flex-shrink-0">
-            <Shield size={16} className="text-white" />
-          </div>
+          {resolveAssetUrl(appearance.sidebarLogoUrl) ? (
+            <img
+              src={resolveAssetUrl(appearance.sidebarLogoUrl)!}
+              alt="logo"
+              className="w-8 h-8 object-contain rounded-lg flex-shrink-0"
+              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+            />
+          ) : (
+            <div className="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center flex-shrink-0">
+              <Shield size={16} className="text-white" />
+            </div>
+          )}
           <div>
-            <div className="text-sm font-semibold text-surface-50">VisionCore</div>
+            <div className="text-sm font-semibold text-surface-50">
+              {appearance.logoText || appearance.siteName || 'VisionCore'}
+            </div>
             <div className="text-xs text-surface-400">NVR Management</div>
           </div>
         </div>
@@ -181,7 +195,7 @@ export function Sidebar() {
           className="w-full flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-surface-700 transition-colors cursor-pointer"
         >
           {user?.avatarUrl ? (
-            <img src={user.avatarUrl} alt="" className="w-7 h-7 rounded-full object-cover flex-shrink-0" />
+            <img src={resolveAssetUrl(user.avatarUrl) ?? user.avatarUrl} alt="" className="w-7 h-7 rounded-full object-cover flex-shrink-0" />
           ) : (
             <div className="w-7 h-7 rounded-full bg-brand-600 flex items-center justify-center flex-shrink-0 text-white text-xs font-semibold">
               {user?.fullName?.charAt(0).toUpperCase() || 'U'}

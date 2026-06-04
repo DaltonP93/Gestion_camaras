@@ -14,6 +14,69 @@ export type StreamHealthStatus =
   | 'OFFLINE'
   | 'UNKNOWN'
 
+export interface UserFeaturePermissions {
+  canViewDashboard:      boolean
+  canViewLive:           boolean
+  canViewRecordings:     boolean
+  canViewAlerts:         boolean
+  canViewDiagnostics:    boolean
+  canManageNVRs:         boolean
+  canManageCameras:      boolean
+  canManageUsers:        boolean
+  canManageAppearance:   boolean
+  canResolveAlerts:      boolean
+  canRestartStreams:      boolean
+  canTranscode:          boolean
+  canDownloadRecordings: boolean
+  canManageViews:        boolean
+  canManageSettings:     boolean
+}
+
+export interface NvrPermission {
+  id?:              string
+  nvrId:            string
+  canView:          boolean
+  canViewCameras:   boolean
+  canViewRecordings: boolean
+  canManage:        boolean
+  canEditVideoAudio: boolean
+  canSync:          boolean
+  canRevalidate:    boolean
+  canRestart:       boolean
+  nvr?: { id: string; name: string; model: string }
+}
+
+export interface CameraPermission {
+  id?:             string
+  cameraId:        string
+  canView:         boolean
+  canViewLive:     boolean
+  canPlayback:     boolean
+  canDownload:     boolean
+  canHighQuality:  boolean
+  canUseMainStream: boolean
+  canUseTranscode:  boolean
+  canAddToViews:    boolean
+  canReceiveAlerts: boolean
+  camera?: { id: string; name: string; channel: number; nvrId: string }
+}
+
+export interface UserPermissionData {
+  featurePermissions: UserFeaturePermissions | null
+  nvrPermissions:     NvrPermission[]
+  cameraPermissions:  CameraPermission[]
+}
+
+export interface UserSession {
+  id:          string
+  userAgent?:  string | null
+  ipAddress?:  string | null
+  deviceName?: string | null
+  createdAt:   string
+  expiresAt:   string
+  lastUsedAt?: string | null
+}
+
 export interface User {
   id: string
   username: string
@@ -24,7 +87,15 @@ export interface User {
   avatarUrl?: string | null
   phone?: string | null
   createdAt: string
-  permissions?: UserPermission[]
+  twoFactorEnabled?:   boolean
+  forcePasswordChange?: boolean
+  lockedUntil?:        string | null
+  failedLoginAttempts?: number
+  passwordChangedAt?:  string | null
+  permissions?:         UserPermission[]
+  featurePermissions?:  UserFeaturePermissions
+  sessions?:            UserSession[]
+  _count?: { permissions: number; sessions: number }
 }
 
 export interface AlertSettings {
@@ -44,15 +115,49 @@ export interface AlertSettings {
 }
 
 export interface UserPermission {
-  id: string
-  userId: string
-  nvrId?: string
-  cameraId?: string
-  canView: boolean
-  canPlayback: boolean
-  canPtz: boolean
-  nvr?: { id: string; name: string }
+  id:              string
+  userId:          string
+  nvrId?:          string
+  cameraId?:       string
+  canView:         boolean
+  canPlayback:     boolean
+  canPtz:          boolean
+  canHighQuality:  boolean
+  // Granular NVR
+  canViewCameras?:   boolean
+  canViewRecordings?: boolean
+  canManage?:       boolean
+  canEditVideoAudio?: boolean
+  canSync?:         boolean
+  canRevalidate?:   boolean
+  canRestart?:      boolean
+  // Granular camera
+  canViewLive?:     boolean
+  canDownload?:     boolean
+  canUseMainStream?: boolean
+  canUseTranscode?:  boolean
+  canAddToViews?:    boolean
+  canReceiveAlerts?: boolean
+  nvr?:    { id: string; name: string }
   camera?: { id: string; name: string; channel: number }
+}
+
+export type RecordingProviderType =
+  | 'ISAPI'
+  | 'HIKVISION_SDK'
+  | 'MEDIAMTX_LOCAL'
+  | 'MANUAL_NVR'
+  | 'UNSUPPORTED'
+
+export interface RecordingCapabilities {
+  nvrId:                    string
+  recordingProvider:        RecordingProviderType
+  supportsIsapiRecording:   boolean | null
+  supportsSdkRecording:     boolean
+  recordingCapabilityAt:    string | null
+  recordingCapabilityError: string | null
+  playbackWebUrl:           string | null
+  sdkEnabled:               boolean
 }
 
 export interface NVR {
@@ -77,6 +182,14 @@ export interface NVR {
   lastSyncAt?: string
   lastRtspOkAt?: string
   isapIStatus?: 'available' | 'no_permission' | 'unsupported' | 'error' | 'unknown'
+  // Recording provider fields
+  recordingProvider?:        RecordingProviderType
+  supportsIsapiRecording?:   boolean | null
+  supportsSdkRecording?:     boolean
+  recordingCapabilityAt?:    string | null
+  recordingCapabilityError?: string | null
+  playbackWebUrl?:           string | null
+  sdkEnabled?:               boolean
   createdAt: string
   cameras?: Camera[]
   hdds?: NvrHdd[]
@@ -240,7 +353,8 @@ export interface Alert {
   message: string
   detail?: Record<string, unknown>
   resolved: boolean
-  resolvedAt?: string
+  resolvedAt?: string | null
+  readAt?: string | null
   createdAt: string
   nvrName?: string
 }
@@ -281,6 +395,47 @@ export interface ApiError {
 }
 
 export type GridLayout = 1 | 4 | 9 | 16 | 25
+
+// ─── NVR Video/Audio Config ───────────────────────────────────────────────────
+
+export interface VideoStreamConfig {
+  streamType:      'main' | 'sub'
+  videoCodecType:  string
+  videoScanType:   string
+  width:           number
+  height:          number
+  fps:             number
+  bitrateType:     string  // CBR | VBR
+  bitrateMax:      number  // kbps
+  qualityLevel:    string
+  h265Plus:        boolean
+  audioEnabled:    boolean
+  audioCodecType:  string
+  audioInputType:  string
+  audioBitrate:    number
+}
+
+export interface ChannelVideoConfig {
+  nvrId:     string
+  channel:   number
+  main:      VideoStreamConfig | null
+  sub:       VideoStreamConfig | null
+  fetchedAt: string
+  error?:    string
+}
+
+export interface VideoStreamUpdate {
+  videoCodecType?: string
+  width?:          number
+  height?:         number
+  fps?:            number
+  bitrateType?:    string
+  bitrateMax?:     number
+  qualityLevel?:   string
+  audioEnabled?:   boolean
+  audioCodecType?: string
+  audioBitrate?:   number
+}
 
 export type ViewLayout = '1x1' | '2x2' | '3x3' | '4x4' | 'featured' | 'custom'
 
