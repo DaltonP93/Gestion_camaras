@@ -415,13 +415,22 @@ export interface VideoStreamConfig {
   audioBitrate:    number
 }
 
+export interface ChannelStreamConfig {
+  codec:      string
+  resolution: string
+  fps:        number
+  bitrate:    number
+}
+
 export interface ChannelVideoConfig {
-  nvrId:     string
-  channel:   number
-  main:      VideoStreamConfig | null
-  sub:       VideoStreamConfig | null
-  fetchedAt: string
-  error?:    string
+  nvrId:       string
+  channel:     number
+  channelCode?: string
+  cameraName:  string
+  main:        ChannelStreamConfig | null
+  sub:         ChannelStreamConfig | null
+  fetchedAt:   string
+  error?:      string
 }
 
 export interface VideoStreamUpdate {
@@ -476,33 +485,3 @@ export interface AppearanceSettings {
   updatedAt: string
 }
 
-export type RecordingProviderType = 'ISAPI' | 'HIKVISION_SDK' | 'MEDIAMTX_LOCAL' | 'MANUAL_NVR' | 'UNSUPPORTED'
-
-export interface RecordingCapabilities {
-  nvrId: string
-  recordingProvider: RecordingProviderType
-  supportsIsapiRecording: boolean | null
-  supportsSdkRecording: boolean
-  recordingCapabilityAt: string | null
-  recordingCapabilityError: string | null
-  playbackWebUrl: string | null
-  sdkEnabled: boolean
-}
-
-export interface ChannelStreamConfig {
-  codec: string
-  resolution: string
-  fps: number
-  bitrate: number
-}
-
-export interface ChannelVideoConfig {
-  cameraId: string
-  channel: number
-  channelCode?: string
-  cameraName: string
-  main: ChannelStreamConfig | null
-  sub: ChannelStreamConfig | null
-  fetchedAt: string
-  error?: string
-}

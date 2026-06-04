@@ -413,19 +413,3 @@ model AlertSettings {
   @@map("alert_settings")
 }
 
-// ─── Backup de configuración de canales NVR ──────────────────
-model NvrChannelConfigBackup {
-  id              String   @id @default(cuid())
-  nvrId           String
-  cameraId        String?
-  channelNo       Int
-  streamType      String   // 'main' | 'sub' | 'both'
-  configJson      String   @db.Text  // JSON snapshot of ChannelVideoConfig
-  createdByUserId String
-  createdAt       DateTime @default(now())
-  reason          String   // 'before_edit' | 'manual' | 'restore'
-
-  nvr    NVR   @relation(fields: [nvrId], references: [id], onDelete: Cascade)
-
-  @@map("nvr_channel_config_backups")
-}

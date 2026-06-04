@@ -8,7 +8,6 @@ import {
   Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
   Copy, Download, ChevronDown, Zap, Video as VideoIcon, Film, ExternalLink,
-  Search,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
@@ -64,11 +63,6 @@ export function NVRDetailPage() {
   // Video/Audio tab
   const [videoConfigs, setVideoConfigs] = useState<ChannelVideoConfig[]>([])
   const [loadingVideo, setLoadingVideo] = useState(false)
-
-  // Recordings capabilities tab
-  const [recordingCaps, setRecordingCaps] = useState<RecordingCapabilities | null>(null)
-  const [loadingRecordingCaps, setLoadingRecordingCaps] = useState(false)
-  const [checkingCaps, setCheckingCaps] = useState(false)
 
   const isAdmin = user?.role === 'ADMIN'
   const isSupervisor = user?.role === 'SUPERVISOR' || isAdmin
@@ -139,14 +133,14 @@ export function NVRDetailPage() {
 
   const checkRecordingCaps = async () => {
     try {
-      setCheckingCaps(true)
+      setCheckingRecordingCaps(true)
       const data = await apiPost<RecordingCapabilities>(`/nvrs/${id}/recording-capabilities/check`, {})
       setRecordingCaps(data)
       toast.success(data.supportsIsapiRecording ? 'ISAPI soportado' : 'ISAPI no soportado')
     } catch {
       toast.error('Error al verificar compatibilidad')
     } finally {
-      setCheckingCaps(false)
+      setCheckingRecordingCaps(false)
     }
   }
 
@@ -514,7 +508,7 @@ export function NVRDetailPage() {
         <RecordingsCapTab
           caps={recordingCaps}
           loading={loadingRecordingCaps}
-          checking={checkingCaps}
+          checking={checkingRecordingCaps}
           onRefresh={loadRecordingCaps}
           onCheck={checkRecordingCaps}
           isAdmin={isAdmin}

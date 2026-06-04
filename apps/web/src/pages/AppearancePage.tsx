@@ -501,7 +501,7 @@ export function AppearancePage() {
                   <ImageUrlInput
                     label="Logo principal"
                     hint="Se muestra en la cabecera y pantalla de inicio de sesión."
-                    value={settings.logoUrl}
+                    value={settings.logoUrl ?? ''}
                     onChange={(v) => set('logoUrl', v)}
                     previewClass="h-10 max-w-[120px]"
                     fieldName="headerLogo"
@@ -510,7 +510,7 @@ export function AppearancePage() {
                   <ImageUrlInput
                     label="Logo barra lateral"
                     hint="Ícono pequeño en la parte superior de la barra lateral. Idealmente cuadrado (32×32 px o más)."
-                    value={settings.sidebarLogoUrl}
+                    value={settings.sidebarLogoUrl ?? ''}
                     onChange={(v) => set('sidebarLogoUrl', v)}
                     previewClass="h-8 w-8"
                     fieldName="sidebarLogo"
@@ -519,7 +519,7 @@ export function AppearancePage() {
                   <ImageUrlInput
                     label="Favicon"
                     hint="Ícono de la pestaña del navegador. Formatos recomendados: .ico, .png, .svg."
-                    value={settings.faviconUrl}
+                    value={settings.faviconUrl ?? ''}
                     onChange={(v) => set('faviconUrl', v)}
                     previewClass="h-6 w-6"
                     fieldName="favicon"
@@ -708,7 +708,7 @@ export function AppearancePage() {
                       Ten cuidado: el CSS puede romper el layout si no es correcto
                     </span>
                     <div className="flex items-center gap-2">
-                      {settings.customCss.length > 0 && (
+                      {(settings.customCss ?? '').length > 0 && (
                         <button
                           type="button"
                           onClick={() => set('customCss', '')}
@@ -719,9 +719,9 @@ export function AppearancePage() {
                       )}
                       <span className={clsx(
                         'text-xs tabular-nums',
-                        settings.customCss.length > 9000 ? 'text-amber-400' : 'text-surface-500',
+                        (settings.customCss ?? '').length > 9000 ? 'text-amber-400' : 'text-surface-500',
                       )}>
-                        {settings.customCss.length.toLocaleString()}/10 000
+                        {(settings.customCss ?? '').length.toLocaleString()}/10 000
                       </span>
                     </div>
                   </div>
@@ -775,10 +775,10 @@ export function AppearancePage() {
                   <span className="text-green-400 text-[10px]">✓ Configurado</span>
                 </div>
               )}
-              {settings.customCss.length > 0 && (
+              {(settings.customCss ?? '').length > 0 && (
                 <div className="flex items-center justify-between">
                   <span>CSS custom</span>
-                  <span className="text-surface-300 text-[10px]">{settings.customCss.length} chars</span>
+                  <span className="text-surface-300 text-[10px]">{(settings.customCss ?? '').length} chars</span>
                 </div>
               )}
             </div>

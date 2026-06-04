@@ -78,13 +78,13 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
 
   const getPerm = useCallback((nvrId?: string, cameraId?: string): PermMatrix => {
     const found = perms.find(p => p.nvrId === nvrId && p.cameraId === cameraId)
-    return found ?? { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false }
+    return found ?? { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false, canHighQuality: false }
   }, [perms])
 
   const setPerm = (nvrId: string | undefined, cameraId: string | undefined, field: keyof Pick<PermMatrix, 'canView' | 'canPlayback' | 'canPtz'>, value: boolean) => {
     setPerms(prev => {
       const idx = prev.findIndex(p => p.nvrId === nvrId && p.cameraId === cameraId)
-      const entry: PermMatrix = idx >= 0 ? { ...prev[idx] } : { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false }
+      const entry: PermMatrix = idx >= 0 ? { ...prev[idx] } : { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false, canHighQuality: false }
       entry[field] = value
       if ((field === 'canPlayback' || field === 'canPtz') && value) entry.canView = true
       if (idx >= 0) { const copy = [...prev]; copy[idx] = entry; return copy }
@@ -97,8 +97,8 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
     setPerms(prev => {
       const next = prev.filter(p => p.nvrId !== nvrId)
       if (checked) {
-        next.push({ nvrId, cameraId: undefined, canView: true, canPlayback: false, canPtz: false })
-        nvCams.forEach(cam => next.push({ nvrId, cameraId: cam.id, canView: true, canPlayback: false, canPtz: false }))
+        next.push({ nvrId, cameraId: undefined, canView: true, canPlayback: false, canPtz: false, canHighQuality: false })
+        nvCams.forEach(cam => next.push({ nvrId, cameraId: cam.id, canView: true, canPlayback: false, canPtz: false, canHighQuality: false }))
       }
       return next
     })
@@ -107,9 +107,9 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
   const selectAllCameras = () => {
     const all: PermMatrix[] = []
     nvrs.forEach(nvr => {
-      all.push({ nvrId: nvr.id, cameraId: undefined, canView: true, canPlayback: false, canPtz: false })
+      all.push({ nvrId: nvr.id, cameraId: undefined, canView: true, canPlayback: false, canPtz: false, canHighQuality: false })
       cameras.filter(c => c.nvrId === nvr.id).forEach(cam =>
-        all.push({ nvrId: nvr.id, cameraId: cam.id, canView: true, canPlayback: false, canPtz: false })
+        all.push({ nvrId: nvr.id, cameraId: cam.id, canView: true, canPlayback: false, canPtz: false, canHighQuality: false })
       )
     })
     setPerms(all)
@@ -382,7 +382,7 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
           </span>
           <div className="flex gap-2">
             <button onClick={onClose} className="btn-secondary text-xs">Cancelar</button>
-            <button onClick={handleSave} disabled={isSaving || isAdmin} className="btn-primary text-xs" title={isAdmin ? 'Admin tiene acceso total' : ''}>
+            <button onClick={handleSaveResources} disabled={isSaving || isAdmin} className="btn-primary text-xs" title={isAdmin ? 'Admin tiene acceso total' : ''}>
               {isSaving ? 'Guardando...' : <><Check size={12} /> Guardar permisos</>}
             </button>
           </div>

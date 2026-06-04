@@ -34,6 +34,11 @@ interface RecordingCapabilities {
   recordingCapabilityError: string | null
 }
 
+function toLocalDatetimeString(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
 function classifyError(err: any): 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFFLINE' | 'UNKNOWN' {
   const msg = (err?.response?.data?.message || err?.message || '').toLowerCase()
   if (msg.includes('isapi') || msg.includes('no soporta') || msg.includes('unsupported')) return 'ISAPI_UNSUPPORTED'
@@ -238,22 +243,6 @@ export function RecordingsPage() {
     ? 'Seleccionar cámaras'
     : `${selectedCameras.size} cámara${selectedCameras.size > 1 ? 's' : ''} seleccionada${selectedCameras.size > 1 ? 's' : ''}`
 
-  const handleRevalidateCapability = async (nvrId: string) => {
-    setRevalidatingNvr(nvrId)
-    try {
-      await apiPost(`/nvrs/${nvrId}/recording-capabilities/check`)
-      toast.success('Compatibilidad revalidada. Vuelve a buscar para aplicar el resultado.')
-      // Clear unsupported cache so next search tries again
-      unsupportedNVRs.delete(nvrId)
-      // Update the error group to clear it
-      setNvrErrors(prev => prev.filter(g => g.nvrId !== nvrId))
-    } catch (e: any) {
-      toast.error(e?.response?.data?.message || 'Error al revalidar compatibilidad')
-    } finally {
-      setRevalidatingNvr(null)
-    }
-  }
-
   const triggerDatePicker = (ref: React.RefObject<HTMLInputElement | null>) => {
     const el = ref.current
     if (!el) return
@@ -311,7 +300,7 @@ export function RecordingsPage() {
                   {[...camerasByNVR.entries()].map(([nvrId, { nvrName, cameras: cams }]) => {
                     const allSel  = cams.every(c => selectedCameras.has(c.id))
                     const someSel = cams.some(c => selectedCameras.has(c.id))
-                    const isUnsupported = unsupportedNVRs.has(nvrId)
+                    const isUnsupported = nvrErrors.some(e => e.nvrId === nvrId && e.code === 'ISAPI_UNSUPPORTED')
                     return (
                       <div key={nvrId}>
                         <button

@@ -4,7 +4,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, LayoutGrid, ChevronLeft, ChevronRight,
   Play, Pause, Clock, Globe, Lock, Monitor, AlertTriangle,
-  Maximize2, Minimize2,
+  Maximize2, Minimize2, Crop, ScanLine,
 } from 'lucide-react'
 import { apiGet, apiPost } from '@/lib/api'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
@@ -36,6 +36,57 @@ interface SlotWithCamera extends CameraSlot {
   stream?: StreamInfo
 }
 
+function CameraCell({
+  slot, tileRefs, objectFit, onFullscreen,
+}: {
+  slot: SlotWithCamera
+  tileRefs: MutableRefObject<Map<string, HTMLDivElement>>
+  objectFit: 'cover' | 'contain'
+  onFullscreen: (cameraId: string) => void
+}) {
+  if (!slot.cameraId || !slot.camera) {
+    return (
+      <div className="h-full min-h-[80px] bg-surface-900 rounded flex items-center justify-center">
+        <Monitor size={16} className="text-surface-700" />
+      </div>
+    )
+  }
+  const camera = slot.camera
+  return (
+    <div
+      ref={(el) => { if (el) tileRefs.current.set(slot.cameraId!, el) }}
+      className="h-full min-h-[80px] rounded overflow-hidden bg-surface-900 relative group"
+    >
+      {slot.stream ? (
+        <VideoPlayer
+          hlsUrl={slot.stream.hls}
+          cameraName={camera.name}
+          cameraId={slot.cameraId}
+          streamType="sub"
+          streamCodec={camera.subCodec ?? undefined}
+          streamResolution={camera.subResolution ?? undefined}
+          onFullscreen={() => onFullscreen(slot.cameraId!)}
+          objectFit={objectFit}
+          className="w-full h-full"
+        />
+      ) : (
+        <div className="w-full h-full flex flex-col items-center justify-center gap-1.5">
+          <Monitor size={16} className="text-surface-600" />
+          <span className="text-xs text-surface-500">{camera.name}</span>
+          <span className="text-[10px] text-surface-600">Sin stream</span>
+        </div>
+      )}
+      <button
+        onClick={() => onFullscreen(slot.cameraId!)}
+        className="absolute top-2 left-2 p-1 rounded bg-black/60 text-white transition-opacity opacity-0 group-hover:opacity-100"
+        title="Pantalla completa HD (o doble clic)"
+      >
+        <Maximize2 size={10} />
+      </button>
+    </div>
+  )
+}
+
 export function ViewPlayerPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -45,11 +96,6 @@ export function ViewPlayerPage() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [objectFit, setObjectFit] = useState<'cover' | 'contain'>('cover')
-
-  // Fullscreen state — which camera is expanded to HD
-  const [fullscreenCamId, setFullscreenCamId] = useState<string | null>(null)
-  const [hdStream, setHdStream] = useState<StreamInfo | null>(null)
-  const [hdLoading, setHdLoading] = useState(false)
 
   // Pagination/slideshow
   const slotsPerPage = view ? (() => {
@@ -189,7 +235,7 @@ export function ViewPlayerPage() {
           assignedIds.map((cid) => apiGet<Camera>(`/cameras/${cid}`))
         )
         const cameraMap = new Map<string, Camera>()
-        camerasArr.forEach((c) => cameraMap.set(c.id, c))
+        camerasData.forEach((r, i) => { if (r.status === 'fulfilled') cameraMap.set(assignedIds[i], r.value) })
 
         // Start streams for first-page cameras only (lazy-load the rest on page change)
         const perPage      = getSlotsPerPage(v.layout)
@@ -199,8 +245,8 @@ export function ViewPlayerPage() {
           assignedIds.map((cid) => apiGet<StreamInfo>(`/cameras/${cid}/stream`))
         )
         const streamMap = new Map<string, StreamInfo>()
-        streamResults.forEach((r, i) => {
-          if (r.status === 'fulfilled') streamMap.set(firstPageIds[i], r.value)
+        streamData.forEach((r, i) => {
+          if (r.status === 'fulfilled') streamMap.set(assignedIds[i], r.value)
         })
 
         setSlots(v.cameraSlots.map((s) => ({
@@ -256,69 +302,6 @@ export function ViewPlayerPage() {
     return () => { if (slideshowRef.current) clearInterval(slideshowRef.current) }
   }, [slideshowActive, view, totalPages])
 
-  // Cleanup HD stream on unmount
-  useEffect(() => {
-    return () => {
-      if (fullscreenCamId) {
-        apiPost(`/cameras/${fullscreenCamId}/stop-stream`, { streamType: 'main' }).catch(() => {})
-      }
-    }
-  }, [fullscreenCamId])
-
-  const enterFullscreen = useCallback(async (cameraId: string) => {
-    // Toggle: double-click same camera exits fullscreen
-    if (fullscreenCamId === cameraId) {
-      // Exit
-      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'main' }).catch(() => {})
-      console.log(`[ViewPlayer] fullscreenExit cameraId=${cameraId} restore=sub`)
-      setFullscreenCamId(null)
-      setHdStream(null)
-      return
-    }
-
-    // Stop previous HD stream if any
-    if (fullscreenCamId) {
-      apiPost(`/cameras/${fullscreenCamId}/stop-stream`, { streamType: 'main' }).catch(() => {})
-      console.log(`[ViewPlayer] fullscreenExit cameraId=${fullscreenCamId} restore=sub`)
-    }
-
-    const slot = slots.find(s => s.cameraId === cameraId)
-    const camera = slot?.camera
-    const mainIsHevc = camera?.mainCodec
-      ? /hevc|h\.265|h265/i.test(camera.mainCodec)
-      : false
-
-    setFullscreenCamId(cameraId)
-    setHdStream(null)
-    setHdLoading(true)
-
-    if (mainIsHevc) {
-      console.log(`[ViewPlayer] fullscreenQualitySwitch cameraId=${cameraId} codec=HEVC no-transcode available`)
-      setHdLoading(false)
-      return
-    }
-
-    try {
-      console.log(`[ViewPlayer] fullscreenQualitySwitch cameraId=${cameraId} from=sub to=main`)
-      const result = await apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: 'main' })
-      setHdStream(result)
-      console.log(`[ViewPlayer] playing cameraId=${cameraId} streamType=main`)
-    } catch (e) {
-      console.warn(`[ViewPlayer] HD stream failed for ${cameraId}, staying on sub`, e)
-      setHdStream(null)
-    } finally {
-      setHdLoading(false)
-    }
-  }, [fullscreenCamId, slots])
-
-  const exitFullscreen = useCallback(() => {
-    if (!fullscreenCamId) return
-    apiPost(`/cameras/${fullscreenCamId}/stop-stream`, { streamType: 'main' }).catch(() => {})
-    console.log(`[ViewPlayer] fullscreenExit cameraId=${fullscreenCamId} restore=sub`)
-    setFullscreenCamId(null)
-    setHdStream(null)
-  }, [fullscreenCamId])
-
   const prevPage = useCallback(() => {
     setCurrentPage((p) => (p - 1 + totalPages) % totalPages)
   }, [totalPages])
@@ -357,8 +340,8 @@ export function ViewPlayerPage() {
   if (fullscreenCamId) {
     const fsSlot = slots.find(s => s.cameraId === fullscreenCamId)
     const fsCamera = fsSlot?.camera
-    const activeHls = hdStream?.hls ?? fsSlot?.stream?.hls
-    const isHd = !!hdStream
+    const activeHls = fullscreenMainStream?.hls ?? fsSlot?.stream?.hls
+    const isHd = !!fullscreenMainStream
     const mainIsHevc = fsCamera?.mainCodec
       ? /hevc|h\.265|h265/i.test(fsCamera.mainCodec)
       : false
@@ -374,7 +357,7 @@ export function ViewPlayerPage() {
           <span className="text-sm font-medium text-surface-100">{view.name}</span>
           <span className="text-xs text-surface-500">·</span>
           <span className="text-sm text-surface-300">{fsCamera?.name ?? 'Cámara'}</span>
-          {hdLoading && (
+          {!isHd && !mainIsHevc && (
             <span className="ml-2 text-xs text-surface-400 animate-pulse">Cargando HD...</span>
           )}
           {isHd && (
@@ -382,7 +365,7 @@ export function ViewPlayerPage() {
               HD
             </span>
           )}
-          {!isHd && !hdLoading && mainIsHevc && (
+          {!isHd && mainIsHevc && (
             <span className="ml-2 text-xs text-amber-400">H.265 — sin transcodificación</span>
           )}
           <button
