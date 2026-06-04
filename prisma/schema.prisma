@@ -81,12 +81,20 @@ model NVR {
   lastErrorCode  String?
   lastError      String?
   isapIStatus    String?  @default("unknown") // available | no_permission | unsupported | error | unknown
+  recordingProvider           String   @default("ISAPI")
+  supportsIsapiRecording      Boolean?
+  supportsSdkRecording        Boolean  @default(false)
+  recordingCapabilityAt       DateTime?
+  recordingCapabilityError    String?  @db.Text
+  playbackWebUrl              String?
+  sdkEnabled                  Boolean  @default(false)
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
   cameras        Camera[]
   hdds           NvrHdd[]
   permissions    UserPermission[]
+  channelBackups NvrChannelConfigBackup[]
 
   @@map("nvrs")
 }
@@ -298,6 +306,21 @@ model NotificationDelivery {
 
   @@index([alertId])
   @@map("notification_deliveries")
+}
+
+// ─── Backup de configuración de canales NVR ─────────────────
+model NvrChannelConfigBackup {
+  id              String   @id @default(cuid())
+  nvrId           String
+  cameraId        String?
+  channelNo       Int
+  streamType      String   // 'main' | 'sub' | 'both'
+  configJson      String   @db.Text
+  createdByUserId String
+  createdAt       DateTime @default(now())
+  reason          String   // 'before_edit' | 'manual' | 'restore'
+  nvr    NVR   @relation(fields: [nvrId], references: [id], onDelete: Cascade)
+  @@map("nvr_channel_config_backups")
 }
 
 // ─── Configuración de alertas y correo ───────────────────────

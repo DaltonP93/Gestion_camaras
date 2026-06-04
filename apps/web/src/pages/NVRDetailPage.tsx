@@ -7,16 +7,17 @@ import {
   ChevronRight, AlertTriangle, CheckCircle2, XCircle,
   Loader2, Play, RotateCcw, Stethoscope, Plus, X,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
-  Copy, Download, ChevronDown, Zap,
+  Copy, Download, ChevronDown, Zap, Video as VideoIcon, Film, ExternalLink,
+  Search,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
-import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics } from '@/types'
+import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, RecordingCapabilities } from '@/types'
 import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
 
-type Tab = 'summary' | 'cameras' | 'storage' | 'users' | 'maintenance' | 'diagnostics'
+type Tab = 'summary' | 'cameras' | 'video' | 'recordings' | 'storage' | 'users' | 'maintenance' | 'diagnostics'
 
 export function NVRDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -57,6 +58,15 @@ export function NVRDetailPage() {
   const [diagResult, setDiagResult] = useState<CameraDiagnostics | null>(null)
   const [diagLoading, setDiagLoading] = useState(false)
 
+  // Video/Audio tab
+  const [videoConfigs, setVideoConfigs] = useState<ChannelVideoConfig[]>([])
+  const [loadingVideo, setLoadingVideo] = useState(false)
+
+  // Recordings capabilities tab
+  const [recordingCaps, setRecordingCaps] = useState<RecordingCapabilities | null>(null)
+  const [loadingRecordingCaps, setLoadingRecordingCaps] = useState(false)
+  const [checkingCaps, setCheckingCaps] = useState(false)
+
   const isAdmin = user?.role === 'ADMIN'
   const isSupervisor = user?.role === 'SUPERVISOR' || isAdmin
 
@@ -68,6 +78,8 @@ export function NVRDetailPage() {
   useEffect(() => {
     if (!id || !nvr) return
     if (tab === 'cameras' && !cameras) loadCameras()
+    if (tab === 'video') loadVideoConfigs()
+    if (tab === 'recordings') loadRecordingCaps()
     if (tab === 'storage') loadStorage()
     if (tab === 'users') loadUsers()
   }, [tab, nvr])
@@ -94,6 +106,43 @@ export function NVRDetailPage() {
       toast.error('Error al cargar cámaras del NVR')
     } finally {
       setLoadingCameras(false)
+    }
+  }
+
+  const loadVideoConfigs = async () => {
+    try {
+      setLoadingVideo(true)
+      const data = await apiGet<ChannelVideoConfig[]>(`/nvrs/${id}/video-audio`)
+      setVideoConfigs(data)
+    } catch {
+      toast.error('Error al cargar configuración de video')
+    } finally {
+      setLoadingVideo(false)
+    }
+  }
+
+  const loadRecordingCaps = async () => {
+    try {
+      setLoadingRecordingCaps(true)
+      const data = await apiGet<RecordingCapabilities>(`/nvrs/${id}/recording-capabilities`)
+      setRecordingCaps(data)
+    } catch {
+      // Endpoint may not exist yet — ignore
+    } finally {
+      setLoadingRecordingCaps(false)
+    }
+  }
+
+  const checkRecordingCaps = async () => {
+    try {
+      setCheckingCaps(true)
+      const data = await apiPost<RecordingCapabilities>(`/nvrs/${id}/recording-capabilities/check`, {})
+      setRecordingCaps(data)
+      toast.success(data.supportsIsapiRecording ? 'ISAPI soportado' : 'ISAPI no soportado')
+    } catch {
+      toast.error('Error al verificar compatibilidad')
+    } finally {
+      setCheckingCaps(false)
     }
   }
 
@@ -326,12 +375,14 @@ export function NVRDetailPage() {
   }
 
   const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
-    { id: 'summary',     label: 'Resumen',       icon: <Activity size={14} /> },
-    { id: 'cameras',     label: 'Cámaras IP',    icon: <Camera size={14} /> },
+    { id: 'summary',     label: 'Resumen',        icon: <Activity size={14} /> },
+    { id: 'cameras',     label: 'Cámaras IP',     icon: <Camera size={14} /> },
+    { id: 'video',       label: 'Video y audio',  icon: <VideoIcon size={14} /> },
+    { id: 'recordings',  label: 'Grabaciones',    icon: <Film size={14} /> },
     { id: 'storage',     label: 'Almacenamiento', icon: <HardDrive size={14} /> },
-    { id: 'users',       label: 'Usuarios NVR',  icon: <Users size={14} /> },
-    { id: 'maintenance', label: 'Mantenimiento', icon: <Wrench size={14} /> },
-    { id: 'diagnostics', label: 'Diagnóstico',   icon: <Stethoscope size={14} /> },
+    { id: 'users',       label: 'Usuarios NVR',   icon: <Users size={14} /> },
+    { id: 'maintenance', label: 'Mantenimiento',  icon: <Wrench size={14} /> },
+    { id: 'diagnostics', label: 'Diagnóstico',    icon: <Stethoscope size={14} /> },
   ]
 
   if (loading) {
@@ -441,6 +492,25 @@ export function NVRDetailPage() {
           lastSyncResult={lastSyncResult}
           onValidateHealth={handleValidateHealth}
           validatingHealth={validatingHealth}
+        />
+      )}
+      {tab === 'video' && (
+        <VideoAudioTab
+          nvrId={nvr.id}
+          configs={videoConfigs}
+          loading={loadingVideo}
+          onRefresh={loadVideoConfigs}
+          isAdmin={isAdmin}
+        />
+      )}
+      {tab === 'recordings' && (
+        <RecordingsCapTab
+          caps={recordingCaps}
+          loading={loadingRecordingCaps}
+          checking={checkingCaps}
+          onRefresh={loadRecordingCaps}
+          onCheck={checkRecordingCaps}
+          isAdmin={isAdmin}
         />
       )}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} supported={storageSupported} unsupportedReason={storageUnsupportedReason} onRefresh={loadStorage} />}
@@ -833,21 +903,28 @@ function hasRealCameraNames(cameras: CameraType[]): boolean {
   })
 }
 
-function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolean | null | undefined): React.ReactNode {
+function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolean | null | undefined, camOnline?: boolean): React.ReactNode {
   if (isapIStatus === 'no_permission') {
     return <span className="text-amber-500/70 text-[11px]">Sin permiso</span>
   }
   if (isapIStatus === 'unsupported') {
     return <span className="text-surface-600 text-[11px]">No soportado</span>
   }
-  // Show per-camera NVR state only when InputProxy endpoint was accessible
   if (isapIStatus === 'available') {
     if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online NVR</span>
-    if (camOnlineInNvr === false) return <span className="text-surface-500 text-[11px]">Offline NVR</span>
-    // null = InputProxy returned unknown state — don't claim camera is offline
-    return <span className="text-surface-600 text-[11px]">No leído</span>
+    if (camOnlineInNvr === false) {
+      // Distinguish: if the RTSP health check says online, show "No verificado" rather than "Offline NVR"
+      if (camOnline) return <span className="text-surface-500 text-[11px]">No sincronizado</span>
+      return <span className="text-surface-500 text-[11px]">Offline NVR</span>
+    }
+    // null = unknown — use RTSP health as proxy
+    if (camOnline === true) return <span className="text-green-400/70 text-[11px]">Online (RTSP)</span>
+    return <span className="text-surface-600 text-[11px]">No verificado</span>
   }
-  return <span className="text-surface-600 text-[11px]">No leído</span>
+  // No ISAPI data — use DB health status as proxy
+  if (camOnline === true)  return <span className="text-green-400/70 text-[11px]">Online</span>
+  if (camOnline === false) return <span className="text-surface-500 text-[11px]">Offline</span>
+  return <span className="text-surface-600 text-[11px]">No verificado</span>
 }
 
 function CamerasTab({
@@ -978,7 +1055,7 @@ function CamerasTab({
                     </span>
                   </td>
                   <td className="px-3 py-2 text-xs">
-                    {isapIStatusCell(isapIStatus, (cam as any).onlineInNvr)}
+                    {isapIStatusCell(isapIStatus, (cam as any).onlineInNvr, cam.online)}
                   </td>
                   <td className="px-3 py-2">
                     {codec ? (
@@ -1054,6 +1131,389 @@ function CamerasTab({
           onRetest={handleIsapDebug}
           onClose={() => setShowDebug(false)}
         />
+      )}
+    </div>
+  )
+}
+
+// ─── Video / Audio Tab ────────────────────────────────────────
+
+function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
+  nvrId: string
+  configs: ChannelVideoConfig[]
+  loading: boolean
+  onRefresh: () => void
+  isAdmin: boolean
+}) {
+  const [search, setSearch] = useState('')
+  const [filterCodec, setFilterCodec] = useState<'all' | 'h264' | 'h265' | 'nodata'>('all')
+  const [selectedChannel, setSelectedChannel] = useState<number | null>(null)
+  const [editMode, setEditMode] = useState(false)
+  const [editForm, setEditForm] = useState<Partial<{ mainFps: number; mainBitrate: number; subFps: number; subBitrate: number }>>({})
+  const [saving, setSaving] = useState(false)
+
+  const filtered = configs.filter(c => {
+    const nameMatch = !search || c.cameraName.toLowerCase().includes(search.toLowerCase()) || String(c.channel).includes(search)
+    if (!nameMatch) return false
+    if (filterCodec === 'h264') return (c.main?.codec ?? '').toLowerCase().includes('h.264') || (c.main?.codec ?? '').toLowerCase().includes('h264')
+    if (filterCodec === 'h265') return (c.main?.codec ?? '').toLowerCase().includes('h.265') || (c.main?.codec ?? '').toLowerCase().includes('hevc') || (c.main?.codec ?? '').toLowerCase().includes('h265')
+    if (filterCodec === 'nodata') return !c.main && !c.sub
+    return true
+  })
+
+  const selected = configs.find(c => c.channel === selectedChannel)
+
+  const handleSave = async () => {
+    if (!selected) return
+    setSaving(true)
+    try {
+      await apiPut(`/nvrs/${nvrId}/video-audio/${selected.channel}`, editForm)
+      toast.success('Configuración guardada')
+      setEditMode(false)
+      onRefresh()
+    } catch (e: any) {
+      toast.error(e?.response?.data?.message ?? 'Error al guardar')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="relative flex-1 max-w-xs">
+          <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-surface-500" />
+          <input
+            className="input pl-7 text-xs"
+            placeholder="Buscar canal..."
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+          />
+        </div>
+        <div className="flex gap-1">
+          {[
+            { key: 'all', label: 'Todos' },
+            { key: 'h264', label: 'H.264' },
+            { key: 'h265', label: 'H.265' },
+            { key: 'nodata', label: 'Sin datos' },
+          ].map(f => (
+            <button
+              key={f.key}
+              onClick={() => setFilterCodec(f.key as typeof filterCodec)}
+              className={clsx('text-xs px-2 py-1 rounded transition-colors',
+                filterCodec === f.key ? 'bg-brand-600/30 text-brand-400' : 'text-surface-400 hover:text-surface-200 hover:bg-surface-700'
+              )}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+        <span className="text-xs text-surface-500 ml-auto">{configs.length} canales</span>
+        <button onClick={onRefresh} disabled={loading} className="btn-ghost text-xs">
+          <RefreshCw size={12} /> Recargar
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+        {/* Channel list */}
+        <div className="lg:col-span-1 card overflow-hidden">
+          <div className="divide-y divide-surface-700/50 max-h-[600px] overflow-y-auto">
+            {filtered.length === 0 ? (
+              <div className="py-8 text-center text-surface-500 text-xs">Sin canales</div>
+            ) : filtered.map(c => (
+              <button
+                key={c.channel}
+                onClick={() => { setSelectedChannel(c.channel); setEditMode(false) }}
+                className={clsx(
+                  'w-full flex items-center gap-2 px-3 py-2.5 text-left hover:bg-surface-700/50 transition-colors text-xs',
+                  selectedChannel === c.channel && 'bg-surface-700/80'
+                )}
+              >
+                <span className="text-surface-500 font-mono w-7 flex-shrink-0">
+                  {c.channelCode ?? `D${c.channel}`}
+                </span>
+                <span className="flex-1 truncate text-surface-300">{c.cameraName}</span>
+                {c.error ? (
+                  <AlertTriangle size={10} className="text-amber-400 flex-shrink-0" />
+                ) : c.main ? (
+                  <span className={clsx('text-[9px] px-1 rounded flex-shrink-0',
+                    /hevc|h\.265|h265/i.test(c.main.codec) ? 'bg-amber-900/30 text-amber-400' : 'bg-green-900/30 text-green-400'
+                  )}>
+                    {/hevc|h\.265|h265/i.test(c.main.codec) ? 'H.265' : 'H.264'}
+                  </span>
+                ) : (
+                  <span className="text-[9px] text-surface-600">—</span>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Detail panel */}
+        <div className="lg:col-span-2">
+          {!selected ? (
+            <div className="card p-8 text-center text-surface-500 text-sm">
+              Selecciona un canal para ver o editar su configuración
+            </div>
+          ) : (
+            <div className="card p-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium text-surface-200">
+                    {selected.channelCode ?? `D${selected.channel}`} — {selected.cameraName}
+                  </div>
+                  <div className="text-xs text-surface-500 mt-0.5">
+                    Última lectura: {selected.fetchedAt ? format(new Date(selected.fetchedAt), 'dd/MM/yyyy HH:mm') : '—'}
+                  </div>
+                </div>
+                {isAdmin && !selected.error && (
+                  <button
+                    onClick={() => {
+                      setEditMode(!editMode)
+                      if (!editMode) {
+                        setEditForm({
+                          mainFps: selected.main?.fps,
+                          mainBitrate: selected.main?.bitrate,
+                          subFps: selected.sub?.fps,
+                          subBitrate: selected.sub?.bitrate,
+                        })
+                      }
+                    }}
+                    className="btn-secondary text-xs"
+                  >
+                    <Pencil size={11} /> {editMode ? 'Cancelar' : 'Editar'}
+                  </button>
+                )}
+              </div>
+
+              {selected.error ? (
+                <div className="flex items-center gap-2 p-2 bg-amber-900/15 border border-amber-700/30 rounded text-xs text-amber-400">
+                  <AlertTriangle size={12} />
+                  <span>{selected.error}</span>
+                </div>
+              ) : (
+                <>
+                  {/* Warning for ADMIN edit */}
+                  {editMode && (
+                    <div className="flex items-start gap-2 p-2 bg-amber-900/15 border border-amber-700/30 rounded text-xs text-amber-400">
+                      <AlertTriangle size={12} className="flex-shrink-0 mt-0.5" />
+                      <span>Esto modifica la configuración real del NVR. Se guardará backup automático antes de aplicar.</span>
+                    </div>
+                  )}
+
+                  {/* Main stream */}
+                  <div className="space-y-2">
+                    <div className="text-xs font-medium text-surface-400 uppercase tracking-wide">Stream Principal</div>
+                    {selected.main ? (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        {[
+                          ['Codec', selected.main.codec],
+                          ['Resolución', selected.main.resolution],
+                          ['FPS', editMode ? null : String(selected.main.fps)],
+                          ['Bitrate', editMode ? null : `${selected.main.bitrate} kbps`],
+                        ].map(([k, v]) => v !== null ? (
+                          <div key={k as string}>
+                            <div className="text-[10px] text-surface-500">{k}</div>
+                            <div className="text-xs text-surface-200">{v}</div>
+                          </div>
+                        ) : null)}
+                        {editMode && (
+                          <>
+                            <div>
+                              <label className="text-[10px] text-surface-500">FPS</label>
+                              <input className="input text-xs mt-0.5" type="number" min="1" max="30"
+                                value={editForm.mainFps ?? ''} onChange={e => setEditForm(f => ({ ...f, mainFps: Number(e.target.value) }))} />
+                            </div>
+                            <div>
+                              <label className="text-[10px] text-surface-500">Bitrate (kbps)</label>
+                              <input className="input text-xs mt-0.5" type="number" min="128" max="16384"
+                                value={editForm.mainBitrate ?? ''} onChange={e => setEditForm(f => ({ ...f, mainBitrate: Number(e.target.value) }))} />
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-surface-500">Sin datos de stream principal</div>
+                    )}
+                  </div>
+
+                  {/* Sub stream */}
+                  <div className="space-y-2">
+                    <div className="text-xs font-medium text-surface-400 uppercase tracking-wide">Sub-stream</div>
+                    {selected.sub ? (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        {[
+                          ['Codec', selected.sub.codec],
+                          ['Resolución', selected.sub.resolution],
+                          ['FPS', editMode ? null : String(selected.sub.fps)],
+                          ['Bitrate', editMode ? null : `${selected.sub.bitrate} kbps`],
+                        ].map(([k, v]) => v !== null ? (
+                          <div key={k as string}>
+                            <div className="text-[10px] text-surface-500">{k}</div>
+                            <div className="text-xs text-surface-200">{v}</div>
+                          </div>
+                        ) : null)}
+                        {editMode && (
+                          <>
+                            <div>
+                              <label className="text-[10px] text-surface-500">FPS</label>
+                              <input className="input text-xs mt-0.5" type="number" min="1" max="15"
+                                value={editForm.subFps ?? ''} onChange={e => setEditForm(f => ({ ...f, subFps: Number(e.target.value) }))} />
+                            </div>
+                            <div>
+                              <label className="text-[10px] text-surface-500">Bitrate (kbps)</label>
+                              <input className="input text-xs mt-0.5" type="number" min="64" max="4096"
+                                value={editForm.subBitrate ?? ''} onChange={e => setEditForm(f => ({ ...f, subBitrate: Number(e.target.value) }))} />
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-surface-500">Sin datos de sub-stream</div>
+                    )}
+                  </div>
+
+                  {editMode && (
+                    <div className="flex gap-2 justify-end">
+                      <button onClick={() => setEditMode(false)} className="btn-secondary text-xs">Cancelar</button>
+                      <button onClick={handleSave} disabled={saving} className="btn-primary text-xs">
+                        {saving ? <Loader2 size={11} className="animate-spin" /> : null}
+                        {saving ? 'Guardando...' : 'Guardar cambios'}
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Recordings Capabilities Tab ──────────────────────────────
+
+function RecordingsCapTab({ caps, loading, checking, onRefresh, onCheck, isAdmin }: {
+  caps: RecordingCapabilities | null
+  loading: boolean
+  checking: boolean
+  onRefresh: () => void
+  onCheck: () => void
+  isAdmin: boolean
+}) {
+  if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
+
+  const providerLabel: Record<string, string> = {
+    ISAPI: 'ISAPI (nativo)',
+    HIKVISION_SDK: 'Hikvision SDK',
+    MEDIAMTX_LOCAL: 'MediaMTX local',
+    MANUAL_NVR: 'Web del NVR (manual)',
+    UNSUPPORTED: 'No soportado',
+  }
+
+  const providerColor: Record<string, string> = {
+    ISAPI: 'text-green-400',
+    HIKVISION_SDK: 'text-blue-400',
+    MEDIAMTX_LOCAL: 'text-purple-400',
+    MANUAL_NVR: 'text-amber-400',
+    UNSUPPORTED: 'text-red-400',
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2 justify-end">
+        <button onClick={onRefresh} disabled={loading} className="btn-ghost text-xs">
+          <RefreshCw size={12} /> Actualizar
+        </button>
+        {isAdmin && (
+          <button onClick={onCheck} disabled={checking} className="btn-secondary text-xs">
+            {checking ? <Loader2 size={12} className="animate-spin" /> : <Activity size={12} />}
+            {checking ? 'Verificando...' : 'Revalidar compatibilidad'}
+          </button>
+        )}
+      </div>
+
+      {!caps ? (
+        <div className="card p-8 text-center space-y-2">
+          <Film size={20} className="mx-auto text-surface-500" />
+          <p className="text-sm text-surface-400">Sin datos de capacidades — haz clic en "Revalidar compatibilidad"</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <div className="card p-4 space-y-3">
+            <h3 className="text-sm font-medium text-surface-200 flex items-center gap-2">
+              <Film size={14} className="text-surface-400" />
+              Proveedor de grabaciones
+            </h3>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <div className="text-xs text-surface-500 mb-1">Proveedor activo</div>
+                <span className={clsx('text-sm font-medium', providerColor[caps.recordingProvider] ?? 'text-surface-300')}>
+                  {providerLabel[caps.recordingProvider] ?? caps.recordingProvider}
+                </span>
+              </div>
+              <div>
+                <div className="text-xs text-surface-500 mb-1">ISAPI de búsqueda</div>
+                <span className={clsx('text-sm font-medium flex items-center gap-1',
+                  caps.supportsIsapiRecording ? 'text-green-400'
+                    : caps.supportsIsapiRecording === false ? 'text-red-400'
+                    : 'text-surface-400'
+                )}>
+                  {caps.supportsIsapiRecording === true && <><CheckCircle2 size={12} /> Soportado</>}
+                  {caps.supportsIsapiRecording === false && <><XCircle size={12} /> No soportado</>}
+                  {caps.supportsIsapiRecording === null && '—'}
+                </span>
+              </div>
+              <div>
+                <div className="text-xs text-surface-500 mb-1">Última verificación</div>
+                <span className="text-xs text-surface-400">
+                  {caps.recordingCapabilityAt ? format(new Date(caps.recordingCapabilityAt), 'dd/MM/yyyy HH:mm') : '—'}
+                </span>
+              </div>
+            </div>
+
+            {caps.recordingCapabilityError && (
+              <div className="flex items-start gap-2 p-2 bg-red-900/20 border border-red-700/40 rounded text-xs text-red-400">
+                <AlertTriangle size={12} className="flex-shrink-0 mt-0.5" />
+                <span>{caps.recordingCapabilityError}</span>
+              </div>
+            )}
+          </div>
+
+          {caps.playbackWebUrl && (
+            <div className="card p-4 space-y-2">
+              <h3 className="text-sm font-medium text-surface-200 flex items-center gap-2">
+                <ExternalLink size={14} className="text-surface-400" />
+                Reproducción web
+              </h3>
+              <a
+                href={caps.playbackWebUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary text-xs inline-flex items-center gap-1.5"
+              >
+                <ExternalLink size={12} /> Abrir reproducción web del NVR
+              </a>
+            </div>
+          )}
+
+          {caps.recordingProvider === 'MANUAL_NVR' && !caps.playbackWebUrl && (
+            <div className="card p-4 bg-amber-900/10 border-amber-700/30">
+              <div className="flex items-start gap-2">
+                <AlertTriangle size={14} className="text-amber-400 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-medium text-amber-400">Reproducción manual requerida</p>
+                  <p className="text-xs text-surface-400 mt-1">
+                    ISAPI no está soportado. Configura la URL de reproducción web del NVR para que los usuarios puedan acceder a las grabaciones.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </div>
   )

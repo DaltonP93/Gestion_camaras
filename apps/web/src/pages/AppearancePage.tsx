@@ -8,6 +8,7 @@ import { apiGet, apiPut } from '@/lib/api'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
 import type { AppearanceSettings } from '@/types'
+import { invalidateAppearanceCache, applyAppearanceToDocument } from '@/hooks/useAppearance'
 
 const THEMES = [
   { value: 'dark',     label: 'Oscuro',     description: 'Fondo gris oscuro clásico',  bg: '#1e2130', accent: '#2a2e42' },
@@ -154,6 +155,8 @@ export function AppearancePage() {
       const updated = await apiPut<AppearanceSettings>('/appearance', settings)
       setSaved(updated)
       setSettings(updated)
+      invalidateAppearanceCache()
+      applyAppearanceToDocument(updated)
       toast.success('Apariencia guardada')
     } finally {
       setIsSaving(false)

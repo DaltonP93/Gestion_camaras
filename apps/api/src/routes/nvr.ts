@@ -1408,4 +1408,128 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     }
     return reply.send({ success: true })
   })
+
+  // GET /api/nvrs/:id/recording-capabilities
+  server.get('/:id/recording-capabilities', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+    return reply.send({
+      nvrId:                    id,
+      recordingProvider:        (nvr as any).recordingProvider ?? 'ISAPI',
+      supportsIsapiRecording:   (nvr as any).supportsIsapiRecording ?? null,
+      supportsSdkRecording:     (nvr as any).supportsSdkRecording ?? false,
+      recordingCapabilityAt:    (nvr as any).recordingCapabilityAt ?? null,
+      recordingCapabilityError: (nvr as any).recordingCapabilityError ?? null,
+      playbackWebUrl:           (nvr as any).playbackWebUrl ?? null,
+      sdkEnabled:               (nvr as any).sdkEnabled ?? false,
+    })
+  })
+
+  // POST /api/nvrs/:id/recording-capabilities/check — Run ISAPI check and persist result
+  server.post('/:id/recording-capabilities/check', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const { checkIsapiRecordingSupport, detectProviderFromCapabilities } = await import('../services/recordingProvider')
+    const decPass = decryptPassword(nvr.password)
+    const result = await checkIsapiRecordingSupport({ ipAddress: nvr.ipAddress, port: nvr.port, username: nvr.username, password: decPass })
+    const provider = detectProviderFromCapabilities(result.supported)
+
+    const updated = await server.prisma.nVR.update({
+      where: { id },
+      data: {
+        recordingProvider:        provider,
+        supportsIsapiRecording:   result.supported,
+        recordingCapabilityAt:    new Date(),
+        recordingCapabilityError: result.error ?? null,
+      } as any,
+    })
+
+    return reply.send({
+      nvrId:                    id,
+      recordingProvider:        (updated as any).recordingProvider ?? provider,
+      supportsIsapiRecording:   result.supported,
+      supportsSdkRecording:     (updated as any).supportsSdkRecording ?? false,
+      recordingCapabilityAt:    (updated as any).recordingCapabilityAt,
+      recordingCapabilityError: result.error ?? null,
+      playbackWebUrl:           (updated as any).playbackWebUrl ?? null,
+      sdkEnabled:               (updated as any).sdkEnabled ?? false,
+    })
+  })
+
+  // GET /api/nvrs/:id/video-audio — Get all channel configs from ISAPI
+  server.get('/:id/video-audio', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    // Get all cameras from DB for this NVR
+    const cameras = await server.prisma.camera.findMany({ where: { nvrId: id }, orderBy: { channel: 'asc' } })
+    if (cameras.length === 0) return reply.send([])
+
+    const decPass = decryptPassword(nvr.password)
+    const nvrDec = { ...nvr, password: decPass }
+
+    const { fetchChannelVideoConfig } = await import('../services/hikvision')
+
+    const results = await Promise.allSettled(
+      cameras.map(async (cam) => {
+        try {
+          const config = await fetchChannelVideoConfig(nvrDec as any, cam.channel)
+          return { cameraId: cam.id, channelCode: (cam as any).channelCode, cameraName: cam.name, ...config }
+        } catch (e: any) {
+          return { cameraId: cam.id, channel: cam.channel, channelCode: (cam as any).channelCode, cameraName: cam.name, error: e.message, main: null, sub: null, fetchedAt: new Date().toISOString() }
+        }
+      })
+    )
+
+    return reply.send(results.map(r => r.status === 'fulfilled' ? r.value : { error: 'fetch failed' }))
+  })
+
+  // PUT /api/nvrs/:id/video-audio/:channel — Update channel video config via ISAPI + backup
+  server.put('/:id/video-audio/:channel', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id, channel } = request.params as { id: string; channel: string }
+    const channelNo = parseInt(channel, 10)
+    if (isNaN(channelNo)) return reply.status(400).send({ message: 'Canal inválido' })
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const body = request.body as {
+      mainFps?: number; mainBitrate?: number
+      subFps?: number;  subBitrate?: number
+    }
+
+    const decPass = decryptPassword(nvr.password)
+    const nvrDec = { ...nvr, password: decPass }
+    const user = request.user
+
+    // 1. Read current config and save backup
+    const { fetchChannelVideoConfig, updateChannelFpsAndBitrate } = await import('../services/hikvision')
+    const current = await fetchChannelVideoConfig(nvrDec as any, channelNo).catch(() => null)
+
+    await server.prisma.nvrChannelConfigBackup.create({
+      data: {
+        nvrId: id,
+        channelNo,
+        streamType: 'both',
+        configJson: JSON.stringify(current ?? {}),
+        createdByUserId: user.sub,
+        reason: 'before_edit',
+      },
+    }).catch(() => {})
+
+    // 2. Apply changes via ISAPI
+    try {
+      await updateChannelFpsAndBitrate(nvrDec as any, channelNo, body)
+    } catch (e: any) {
+      return reply.status(422).send({ message: `Error al escribir configuración: ${e.message}` })
+    }
+
+    // 3. Reread and return
+    const updated = await fetchChannelVideoConfig(nvrDec as any, channelNo).catch(() => null)
+    return reply.send(updated ?? { message: 'Guardado — no se pudo releer' })
+  })
 }

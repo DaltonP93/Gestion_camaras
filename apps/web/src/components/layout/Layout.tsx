@@ -2,8 +2,10 @@
 import { Outlet } from 'react-router-dom'
 import { Sidebar } from './Sidebar'
 import { Topbar } from './Topbar'
+import { useAppearance } from '@/hooks/useAppearance'
 
 export function Layout() {
+  useAppearance()
   return (
     <div className="flex h-screen bg-surface-900 overflow-hidden">
       <Sidebar />
