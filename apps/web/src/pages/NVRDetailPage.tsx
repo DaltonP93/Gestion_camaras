@@ -8,16 +8,16 @@ import {
   Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
   Copy, Download, ChevronDown, Zap, Video as VideoIcon,
-  Save, History,
+  Save, History, Film, ExternalLink,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
-import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, VideoStreamConfig, VideoStreamUpdate } from '@/types'
+import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, ChannelVideoConfig, VideoStreamConfig, VideoStreamUpdate, RecordingCapabilities } from '@/types'
 import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
 
-type Tab = 'summary' | 'cameras' | 'storage' | 'users' | 'maintenance' | 'diagnostics' | 'video'
+type Tab = 'summary' | 'cameras' | 'storage' | 'users' | 'maintenance' | 'diagnostics' | 'video' | 'recordings'
 
 export function NVRDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -57,6 +57,9 @@ export function NVRDetailPage() {
   const [diagCamera, setDiagCamera] = useState<string>('')
   const [diagResult, setDiagResult] = useState<CameraDiagnostics | null>(null)
   const [diagLoading, setDiagLoading] = useState(false)
+  const [recordingCaps, setRecordingCaps] = useState<RecordingCapabilities | null>(null)
+  const [loadingRecordingCaps, setLoadingRecordingCaps] = useState(false)
+  const [checkingRecordingCaps, setCheckingRecordingCaps] = useState(false)
 
   const isAdmin = user?.role === 'ADMIN'
   const isSupervisor = user?.role === 'SUPERVISOR' || isAdmin
@@ -71,6 +74,7 @@ export function NVRDetailPage() {
     if (tab === 'cameras' && !cameras) loadCameras()
     if (tab === 'storage') loadStorage()
     if (tab === 'users') loadUsers()
+    if (tab === 'recordings') loadRecordingCaps()
   }, [tab, nvr])
 
   const loadNvr = async () => {
@@ -95,6 +99,31 @@ export function NVRDetailPage() {
       toast.error('Error al cargar cámaras del NVR')
     } finally {
       setLoadingCameras(false)
+    }
+  }
+
+  const loadRecordingCaps = async () => {
+    try {
+      setLoadingRecordingCaps(true)
+      const data = await apiGet<RecordingCapabilities>(`/nvrs/${id}/recording-capabilities`)
+      setRecordingCaps(data)
+    } catch {
+      toast.error('Error al cargar capacidades de grabación')
+    } finally {
+      setLoadingRecordingCaps(false)
+    }
+  }
+
+  const checkRecordingCaps = async () => {
+    try {
+      setCheckingRecordingCaps(true)
+      const data = await apiPost<RecordingCapabilities>(`/nvrs/${id}/recording-capabilities/check`, {})
+      setRecordingCaps(data)
+      toast.success('Capacidades de grabación actualizadas')
+    } catch {
+      toast.error('Error al verificar capacidades de grabación')
+    } finally {
+      setCheckingRecordingCaps(false)
     }
   }
 
@@ -333,6 +362,7 @@ export function NVRDetailPage() {
     { id: 'summary',     label: 'Resumen',        icon: <Activity size={14} /> },
     { id: 'cameras',     label: 'Cámaras IP',     icon: <Camera size={14} /> },
     { id: 'video',       label: 'Video y audio',  icon: <VideoIcon size={14} /> },
+    { id: 'recordings',  label: 'Grabaciones',    icon: <Film size={14} /> },
     { id: 'storage',     label: 'Almacenamiento', icon: <HardDrive size={14} /> },
     { id: 'users',       label: 'Usuarios NVR',   icon: <Users size={14} /> },
     { id: 'maintenance', label: 'Mantenimiento',  icon: <Wrench size={14} /> },
@@ -449,6 +479,16 @@ export function NVRDetailPage() {
         />
       )}
       {tab === 'video' && <VideoAudioTab nvrId={nvr.id} dbCameras={cameras?.fromDb || []} />}
+      {tab === 'recordings' && (
+        <RecordingsCapTab
+          caps={recordingCaps}
+          loading={loadingRecordingCaps}
+          checking={checkingRecordingCaps}
+          onRefresh={loadRecordingCaps}
+          onCheck={checkRecordingCaps}
+          isAdmin={isAdmin}
+        />
+      )}
       {tab === 'storage' && <StorageTab hdds={hdds} loading={loadingStorage} supported={storageSupported} unsupportedReason={storageUnsupportedReason} onRefresh={loadStorage} />}
       {tab === 'users'   && <UsersTab nvrId={nvr.id} users={nvrUsers} loading={loadingUsers} supported={usersSupported} unsupportedReason={usersUnsupportedReason} onRefresh={loadUsers} isAdmin={isAdmin} />}
       {tab === 'maintenance' && <MaintenanceTab nvr={nvr} onSync={handleSync} onReboot={handleReboot} onValidateHealth={handleValidateHealth} syncing={syncing} rebooting={rebooting} validatingHealth={validatingHealth} isAdmin={isAdmin} isSupervisor={isSupervisor} />}
@@ -1826,6 +1866,137 @@ function VideoAudioTab({ nvrId, dbCameras }: { nvrId: string; dbCameras: CameraT
             </div>
           </div>
         </>
+      )}
+    </div>
+  )
+}
+
+// ─── Recordings Capabilities Tab ──────────────────────────────
+
+function RecordingsCapTab({ caps, loading, checking, onRefresh, onCheck, isAdmin }: {
+  caps: RecordingCapabilities | null
+  loading: boolean
+  checking: boolean
+  onRefresh: () => void
+  onCheck: () => void
+  isAdmin: boolean
+}) {
+  if (loading) return <div className="flex justify-center py-12"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
+
+  const providerLabel: Record<string, string> = {
+    ISAPI: 'ISAPI (nativo)',
+    HIKVISION_SDK: 'Hikvision SDK',
+    MEDIAMTX_LOCAL: 'MediaMTX local',
+    MANUAL_NVR: 'Web del NVR (manual)',
+    UNSUPPORTED: 'No soportado',
+  }
+
+  const providerColor: Record<string, string> = {
+    ISAPI: 'text-green-400',
+    HIKVISION_SDK: 'text-blue-400',
+    MEDIAMTX_LOCAL: 'text-purple-400',
+    MANUAL_NVR: 'text-amber-400',
+    UNSUPPORTED: 'text-red-400',
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2 justify-end">
+        <button onClick={onRefresh} disabled={loading} className="btn-ghost text-xs">
+          <RefreshCw size={12} /> Actualizar
+        </button>
+        {isAdmin && (
+          <button onClick={onCheck} disabled={checking} className="btn-secondary text-xs">
+            {checking ? <Loader2 size={12} className="animate-spin" /> : <Activity size={12} />}
+            {checking ? 'Verificando...' : 'Revalidar compatibilidad'}
+          </button>
+        )}
+      </div>
+
+      {!caps ? (
+        <div className="card p-8 text-center space-y-2">
+          <Film size={20} className="mx-auto text-surface-500" />
+          <p className="text-sm text-surface-400">Sin datos de capacidades — haz clic en "Revalidar compatibilidad"</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <div className="card p-4 space-y-3">
+            <h3 className="text-sm font-medium text-surface-200 flex items-center gap-2">
+              <Film size={14} className="text-surface-400" />
+              Proveedor de grabaciones
+            </h3>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <div className="text-xs text-surface-500 mb-1">Proveedor activo</div>
+                <span className={clsx('text-sm font-medium', providerColor[caps.recordingProvider] ?? 'text-surface-300')}>
+                  {providerLabel[caps.recordingProvider] ?? caps.recordingProvider}
+                </span>
+              </div>
+              <div>
+                <div className="text-xs text-surface-500 mb-1">ISAPI de búsqueda</div>
+                <span className={clsx('text-sm font-medium flex items-center gap-1', caps.supportsIsapiRecording ? 'text-green-400' : caps.supportsIsapiRecording === false ? 'text-red-400' : 'text-surface-400')}>
+                  {caps.supportsIsapiRecording === true && <><CheckCircle2 size={12} /> Soportado</>}
+                  {caps.supportsIsapiRecording === false && <><XCircle size={12} /> No soportado</>}
+                  {caps.supportsIsapiRecording === null && '—'}
+                </span>
+              </div>
+              <div>
+                <div className="text-xs text-surface-500 mb-1">SDK Hikvision</div>
+                <span className={clsx('text-sm font-medium flex items-center gap-1', caps.supportsSdkRecording ? 'text-green-400' : 'text-surface-500')}>
+                  {caps.supportsSdkRecording ? <><CheckCircle2 size={12} /> Habilitado</> : '—'}
+                </span>
+              </div>
+              <div>
+                <div className="text-xs text-surface-500 mb-1">Última verificación</div>
+                <span className="text-xs text-surface-400">
+                  {caps.recordingCapabilityAt ? format(new Date(caps.recordingCapabilityAt), 'dd/MM/yyyy HH:mm') : '—'}
+                </span>
+              </div>
+            </div>
+
+            {caps.recordingCapabilityError && (
+              <div className="flex items-start gap-2 p-2 bg-red-900/20 border border-red-700/40 rounded text-xs text-red-400">
+                <AlertTriangle size={12} className="flex-shrink-0 mt-0.5" />
+                <span>{caps.recordingCapabilityError}</span>
+              </div>
+            )}
+          </div>
+
+          {caps.playbackWebUrl && (
+            <div className="card p-4 space-y-2">
+              <h3 className="text-sm font-medium text-surface-200 flex items-center gap-2">
+                <ExternalLink size={14} className="text-surface-400" />
+                Reproducción web del NVR
+              </h3>
+              <p className="text-xs text-surface-500">
+                Este NVR usa su propia interfaz web para reproducción de grabaciones.
+              </p>
+              <a
+                href={caps.playbackWebUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary text-xs inline-flex items-center gap-1.5"
+              >
+                <ExternalLink size={12} />
+                Abrir reproducción web
+              </a>
+            </div>
+          )}
+
+          {caps.recordingProvider === 'MANUAL_NVR' && !caps.playbackWebUrl && (
+            <div className="card p-4 bg-amber-900/10 border-amber-700/30">
+              <div className="flex items-start gap-2">
+                <AlertTriangle size={14} className="text-amber-400 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-medium text-amber-400">Reproducción manual requerida</p>
+                  <p className="text-xs text-surface-400 mt-1">
+                    Este NVR no soporta búsqueda ISAPI. Configura la URL de reproducción web del NVR para que los usuarios puedan acceder a sus grabaciones.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </div>
   )

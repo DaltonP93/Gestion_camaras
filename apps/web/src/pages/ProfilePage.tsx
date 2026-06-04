@@ -6,7 +6,7 @@ import {
   Monitor, Clock, MapPin, Key, AlertTriangle, CheckCircle2, Copy,
 } from 'lucide-react'
 import { useAuthStore } from '@/stores/authStore'
-import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
+import { apiGet, apiPost, apiPut, apiDelete, apiUpload, resolveAssetUrl } from '@/lib/api'
 import toast from 'react-hot-toast'
 import { clsx } from 'clsx'
 import { format, formatDistanceToNow } from 'date-fns'
@@ -482,19 +482,17 @@ export function ProfilePage() {
   const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    if (file.size > 500_000) { toast.error('La imagen no debe superar 500 KB'); return }
+    if (file.size > 2 * 1024 * 1024) { toast.error('La imagen no debe superar 2 MB'); return }
     setSavingAvatar(true)
     try {
-      const reader = new FileReader()
-      reader.onload = async () => {
-        await apiPut('/profile/avatar', { avatarUrl: reader.result as string })
-        await loadUser()
-        toast.success('Foto actualizada')
-        setSavingAvatar(false)
-      }
-      reader.readAsDataURL(file)
+      const formData = new FormData()
+      formData.append('file', file)
+      await apiUpload('/profile/avatar', formData)
+      await loadUser()
+      toast.success('Foto actualizada')
     } catch {
       toast.error('Error al subir la imagen')
+    } finally {
       setSavingAvatar(false)
     }
   }
@@ -522,7 +520,7 @@ export function ProfilePage() {
         <div className="flex items-center gap-5">
           <div className="relative">
             {user?.avatarUrl ? (
-              <img src={user.avatarUrl} alt="Avatar" className="w-20 h-20 rounded-full object-cover border-2 border-surface-600" />
+              <img src={resolveAssetUrl(user.avatarUrl) ?? user.avatarUrl} alt="Avatar" className="w-20 h-20 rounded-full object-cover border-2 border-surface-600" />
             ) : (
               <div className="w-20 h-20 rounded-full bg-brand-600 flex items-center justify-center text-white text-2xl font-bold border-2 border-surface-600">
                 {user?.fullName?.charAt(0).toUpperCase() || 'U'}
