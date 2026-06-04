@@ -32,18 +32,52 @@ const permissionSchema = z.object({
 })
 
 const featurePermSchema = z.object({
-  canViewDashboard:    z.boolean().optional(),
-  canViewLive:         z.boolean().optional(),
-  canViewRecordings:   z.boolean().optional(),
-  canViewAlerts:       z.boolean().optional(),
-  canViewDiagnostics:  z.boolean().optional(),
-  canManageNVRs:       z.boolean().optional(),
-  canManageCameras:    z.boolean().optional(),
-  canManageUsers:      z.boolean().optional(),
-  canManageAppearance: z.boolean().optional(),
-  canResolveAlerts:    z.boolean().optional(),
-  canRestartStreams:    z.boolean().optional(),
-  canTranscode:        z.boolean().optional(),
+  canViewDashboard:      z.boolean().optional(),
+  canViewLive:           z.boolean().optional(),
+  canViewRecordings:     z.boolean().optional(),
+  canViewAlerts:         z.boolean().optional(),
+  canViewDiagnostics:    z.boolean().optional(),
+  canManageNVRs:         z.boolean().optional(),
+  canManageCameras:      z.boolean().optional(),
+  canManageUsers:        z.boolean().optional(),
+  canManageAppearance:   z.boolean().optional(),
+  canResolveAlerts:      z.boolean().optional(),
+  canRestartStreams:      z.boolean().optional(),
+  canTranscode:          z.boolean().optional(),
+  canDownloadRecordings: z.boolean().optional(),
+  canManageViews:        z.boolean().optional(),
+  canManageSettings:     z.boolean().optional(),
+})
+
+const nvrPermissionSchema = z.object({
+  nvrId:            z.string(),
+  canView:          z.boolean().default(true),
+  canViewCameras:   z.boolean().default(true),
+  canViewRecordings: z.boolean().default(false),
+  canManage:        z.boolean().default(false),
+  canEditVideoAudio: z.boolean().default(false),
+  canSync:          z.boolean().default(false),
+  canRevalidate:    z.boolean().default(false),
+  canRestart:       z.boolean().default(false),
+})
+
+const cameraPermissionSchema = z.object({
+  cameraId:        z.string(),
+  canView:         z.boolean().default(true),
+  canViewLive:     z.boolean().default(true),
+  canPlayback:     z.boolean().default(false),
+  canDownload:     z.boolean().default(false),
+  canHighQuality:  z.boolean().default(false),
+  canUseMainStream: z.boolean().default(false),
+  canUseTranscode:  z.boolean().default(false),
+  canAddToViews:    z.boolean().default(false),
+  canReceiveAlerts: z.boolean().default(false),
+})
+
+const putPermissionsSchema = z.object({
+  featurePermissions: featurePermSchema.optional(),
+  nvrPermissions:    z.array(nvrPermissionSchema).optional(),
+  cameraPermissions: z.array(cameraPermissionSchema).optional(),
 })
 
 export const userRoutes: FastifyPluginAsync = async (server) => {
@@ -222,6 +256,148 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     await AuditAction(server.prisma, request.user.sub, 'USER_DELETED', id, request)
 
     return reply.send({ message: 'Usuario eliminado' })
+  })
+
+  // GET /api/users/:id/permissions — Obtener permisos granulares
+  server.get('/:id/permissions', {
+    preHandler: [server.authorize(['ADMIN', 'SUPERVISOR', 'OPERATOR', 'AUDITOR'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const caller = request.user
+
+    // Solo ADMIN o el propio usuario pueden ver
+    if (caller.role !== 'ADMIN' && caller.sub !== id) {
+      return reply.status(403).send({ message: 'Acceso denegado' })
+    }
+
+    const user = await server.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } })
+    if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
+
+    const [featurePermissions, allPerms] = await Promise.all([
+      server.prisma.userFeaturePermissions.findUnique({ where: { userId: id } }),
+      server.prisma.userPermission.findMany({
+        where: { userId: id },
+        include: {
+          nvr:    { select: { id: true, name: true, model: true } },
+          camera: { select: { id: true, name: true, channel: true, nvrId: true } },
+        },
+      }),
+    ])
+
+    const nvrPermissions    = allPerms.filter((p) => p.nvrId && !p.cameraId)
+    const cameraPermissions = allPerms.filter((p) => !!p.cameraId)
+
+    return reply.send({ featurePermissions, nvrPermissions, cameraPermissions })
+  })
+
+  // PUT /api/users/:id/permissions — Upsert permisos granulares (solo ADMIN)
+  server.put('/:id/permissions', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const body = putPermissionsSchema.parse(request.body)
+
+    const user = await server.prisma.user.findUnique({ where: { id }, select: { id: true } })
+    if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
+
+    const ops: Promise<any>[] = []
+
+    if (body.featurePermissions) {
+      ops.push(server.prisma.userFeaturePermissions.upsert({
+        where:  { userId: id },
+        create: { userId: id, ...body.featurePermissions },
+        update: body.featurePermissions,
+      }))
+    }
+
+    if (body.nvrPermissions) {
+      for (const p of body.nvrPermissions) {
+        const { nvrId, ...fields } = p
+        ops.push(server.prisma.userPermission.upsert({
+          where:  { userId_nvrId_cameraId: { userId: id, nvrId, cameraId: null as any } },
+          create: { userId: id, nvrId, cameraId: null, ...fields },
+          update: fields,
+        }))
+      }
+    }
+
+    if (body.cameraPermissions) {
+      for (const p of body.cameraPermissions) {
+        const { cameraId, ...fields } = p
+        // Determine nvrId from camera record for the unique constraint
+        const cam = await server.prisma.camera.findUnique({ where: { id: cameraId }, select: { nvrId: true } })
+        if (!cam) continue
+        ops.push(server.prisma.userPermission.upsert({
+          where:  { userId_nvrId_cameraId: { userId: id, nvrId: cam.nvrId, cameraId } },
+          create: { userId: id, nvrId: cam.nvrId, cameraId, ...fields },
+          update: fields,
+        }))
+      }
+    }
+
+    await Promise.all(ops)
+
+    await AuditAction(server.prisma, request.user.sub, 'PERMISSIONS_UPDATED', id, request, {
+      nvrCount:    body.nvrPermissions?.length ?? 0,
+      cameraCount: body.cameraPermissions?.length ?? 0,
+    })
+
+    return reply.send({ message: 'Permisos actualizados' })
+  })
+
+  // GET /api/users/:id/effective-permissions — Permisos efectivos calculados
+  server.get('/:id/effective-permissions', {
+    preHandler: [server.authorize(['ADMIN', 'SUPERVISOR', 'OPERATOR', 'AUDITOR'])],
+  }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const caller = request.user
+
+    if (caller.role !== 'ADMIN' && caller.sub !== id) {
+      return reply.status(403).send({ message: 'Acceso denegado' })
+    }
+
+    const user = await server.prisma.user.findUnique({ where: { id }, select: { id: true, role: true } })
+    if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
+
+    const isAdmin = user.role === 'ADMIN'
+
+    if (isAdmin) {
+      return reply.send({ isAdmin: true, nvrs: {}, cameras: {} })
+    }
+
+    const perms = await server.prisma.userPermission.findMany({ where: { userId: id } })
+
+    const nvrs: Record<string, object> = {}
+    const cameras: Record<string, object> = {}
+
+    for (const p of perms) {
+      if (p.nvrId && !p.cameraId) {
+        nvrs[p.nvrId] = {
+          canView:          p.canView,
+          canViewCameras:   p.canViewCameras,
+          canViewRecordings: p.canViewRecordings,
+          canManage:        p.canManage,
+          canEditVideoAudio: p.canEditVideoAudio,
+          canSync:          p.canSync,
+          canRevalidate:    p.canRevalidate,
+          canRestart:       p.canRestart,
+        }
+      } else if (p.cameraId) {
+        cameras[p.cameraId] = {
+          canView:         p.canView,
+          canViewLive:     p.canViewLive,
+          canPlayback:     p.canPlayback,
+          canDownload:     p.canDownload,
+          canHighQuality:  p.canHighQuality,
+          canUseMainStream: p.canUseMainStream,
+          canUseTranscode:  p.canUseTranscode,
+          canAddToViews:    p.canAddToViews,
+          canReceiveAlerts: p.canReceiveAlerts,
+        }
+      }
+    }
+
+    return reply.send({ isAdmin: false, nvrs, cameras })
   })
 
   // POST /api/users/:id/permissions — Asignar permisos (solo ADMIN)

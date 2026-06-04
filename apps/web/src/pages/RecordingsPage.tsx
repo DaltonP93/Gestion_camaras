@@ -3,9 +3,10 @@ import { useEffect, useState, useMemo, useRef } from 'react'
 import {
   Search, Play, Download, Calendar, Clock,
   ChevronDown, CheckSquare, Square, AlertTriangle, Server, Info,
+  ExternalLink, RefreshCw,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
-import { apiPost } from '@/lib/api'
+import { apiPost, apiGet } from '@/lib/api'
 import { format, subDays, subHours, startOfDay, endOfDay } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
@@ -24,6 +25,7 @@ interface NVRErrorGroup {
   code: string
   cameraCount: number
   cameraNames: string[]
+  playbackWebUrl?: string | null
 }
 
 function toLocalDatetimeString(d: Date): string {
@@ -45,6 +47,8 @@ export function RecordingsPage() {
   const [searchSource, setSearchSource] = useState<string | null>(null)
   // NVRs known to not support ISAPI search — skip in future searches
   const [unsupportedNVRs] = useState<Set<string>>(new Set())
+
+  const [revalidatingNvr, setRevalidatingNvr] = useState<string | null>(null)
 
   const startInputRef = useRef<HTMLInputElement>(null)
   const endInputRef   = useRef<HTMLInputElement>(null)
@@ -136,6 +140,7 @@ export function RecordingsPage() {
             authError?: boolean
             nvrModel?: string
             nvrName?: string
+            playbackWebUrl?: string | null
             errors: Array<{ code: string; message: string; cameraId?: string }>
             cameraCount: number
           }>('/recordings/batch-search', {
@@ -155,6 +160,7 @@ export function RecordingsPage() {
               code: 'ISAPI_UNSUPPORTED',
               cameraCount: res.cameraCount,
               cameraNames: res.results.map(r => r.cameraName).slice(0, 3),
+              playbackWebUrl: res.playbackWebUrl ?? null,
             })
             return
           }
@@ -235,6 +241,22 @@ export function RecordingsPage() {
   const selectedLabel = selectedCameras.size === 0
     ? 'Seleccionar cámaras'
     : `${selectedCameras.size} cámara${selectedCameras.size > 1 ? 's' : ''} seleccionada${selectedCameras.size > 1 ? 's' : ''}`
+
+  const handleRevalidateCapability = async (nvrId: string) => {
+    setRevalidatingNvr(nvrId)
+    try {
+      await apiPost(`/nvrs/${nvrId}/recording-capabilities/check`)
+      toast.success('Compatibilidad revalidada. Vuelve a buscar para aplicar el resultado.')
+      // Clear unsupported cache so next search tries again
+      unsupportedNVRs.delete(nvrId)
+      // Update the error group to clear it
+      setNvrErrors(prev => prev.filter(g => g.nvrId !== nvrId))
+    } catch (e: any) {
+      toast.error(e?.response?.data?.message || 'Error al revalidar compatibilidad')
+    } finally {
+      setRevalidatingNvr(null)
+    }
+  }
 
   const triggerDatePicker = (ref: React.RefObject<HTMLInputElement | null>) => {
     const el = ref.current
@@ -433,11 +455,42 @@ export function RecordingsPage() {
                 <span className="text-amber-300 font-medium">{grp.nvrName}</span>
                 {grp.nvrModel && <span className="text-amber-500 ml-1">({grp.nvrModel})</span>}
                 {grp.code === 'ISAPI_UNSUPPORTED' ? (
-                  <p className="text-amber-500 mt-0.5">
-                    Este NVR no soporta búsqueda de grabaciones vía ISAPI
-                    {grp.cameraCount > 1 && ` · ${grp.cameraCount} cámaras omitidas`}
-                    . Se requiere SDK o acceso local al NVR.
-                  </p>
+                  <>
+                    <p className="text-amber-500 mt-0.5">
+                      Este NVR (modelo {grp.nvrModel || 'desconocido'}) no soporta búsqueda de grabaciones vía ISAPI
+                      {grp.cameraCount > 1 && ` · ${grp.cameraCount} cámaras omitidas`}.
+                    </p>
+                    {grp.cameraNames.length > 0 && (
+                      <p className="text-amber-700 mt-0.5 truncate">
+                        {grp.cameraNames.join(', ')}{grp.cameraCount > grp.cameraNames.length ? ` +${grp.cameraCount - grp.cameraNames.length} más` : ''}
+                      </p>
+                    )}
+                    <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                      {grp.playbackWebUrl && (
+                        <a
+                          href={grp.playbackWebUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-amber-800/30 text-amber-300 hover:bg-amber-700/40 transition-colors"
+                        >
+                          <ExternalLink size={10} /> Abrir reproducción web del NVR
+                        </a>
+                      )}
+                      <button
+                        onClick={() => handleRevalidateCapability(grp.nvrId)}
+                        disabled={revalidatingNvr === grp.nvrId}
+                        className={clsx(
+                          'inline-flex items-center gap-1 px-2 py-1 rounded transition-colors',
+                          revalidatingNvr === grp.nvrId
+                            ? 'opacity-50 cursor-not-allowed text-amber-500'
+                            : 'bg-surface-700/50 text-amber-400 hover:bg-surface-600/50'
+                        )}
+                      >
+                        <RefreshCw size={10} className={revalidatingNvr === grp.nvrId ? 'animate-spin' : ''} />
+                        {revalidatingNvr === grp.nvrId ? 'Revalidando...' : 'Revalidar compatibilidad'}
+                      </button>
+                    </div>
+                  </>
                 ) : grp.code === 'NVR_AUTH_ERROR' ? (
                   <p className="text-amber-500 mt-0.5">Error de autenticación — verifica usuario/contraseña del NVR.</p>
                 ) : (
@@ -446,7 +499,7 @@ export function RecordingsPage() {
                     {grp.cameraCount > 1 && ` (${grp.cameraCount} cámaras afectadas)`}.
                   </p>
                 )}
-                {grp.cameraNames.length > 0 && (
+                {grp.code !== 'ISAPI_UNSUPPORTED' && grp.cameraNames.length > 0 && (
                   <p className="text-amber-700 mt-0.5 truncate">
                     {grp.cameraNames.join(', ')}{grp.cameraCount > grp.cameraNames.length ? ` +${grp.cameraCount - grp.cameraNames.length} más` : ''}
                   </p>

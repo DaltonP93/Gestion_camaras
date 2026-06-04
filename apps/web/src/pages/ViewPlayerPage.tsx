@@ -102,18 +102,24 @@ export function ViewPlayerPage() {
       setFullscreenCamId(cameraId)
     }
 
-    // Upgrade to main/main_h264 stream for HD quality in fullscreen.
-    // This is async but doesn't block the fullscreen entry above.
+    // Upgrade to HD quality in fullscreen.
+    // If main codec is H.265/HEVC → request main_h264 (transcoded) for browser compat.
+    // If main codec is H.264 → request main directly.
+    const cam = slots.find(s => s.cameraId === cameraId)?.camera
+    const mainIsHevc = cam?.mainCodec
+      ? /hevc|h\.265|h265/i.test(cam.mainCodec)
+      : false
+    const hdStreamType = mainIsHevc ? 'main_h264' : 'main'
     setFullscreenMainStream(null)
-    apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: 'main' })
+    apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType })
       .then((info) => {
-        console.info(`[ViewPlayer] fullscreen main stream cameraId=${cameraId} path=${info.streamPath}`)
+        console.info(`[ViewPlayer] fullscreen HD stream cameraId=${cameraId} type=${hdStreamType} path=${info.streamPath}`)
         setFullscreenMainStream(info)
       })
       .catch(() => {
-        // Main stream unavailable — CSS overlay uses sub stream as fallback
+        // HD stream unavailable — CSS overlay uses sub stream as fallback
       })
-  }, [fullscreenCamId])
+  }, [fullscreenCamId, slots])
 
   const exitFullscreen = useCallback(() => {
     if (document.fullscreenElement) {

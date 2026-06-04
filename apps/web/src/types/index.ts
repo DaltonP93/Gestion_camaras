@@ -15,18 +15,56 @@ export type StreamHealthStatus =
   | 'UNKNOWN'
 
 export interface UserFeaturePermissions {
-  canViewDashboard:    boolean
-  canViewLive:         boolean
-  canViewRecordings:   boolean
-  canViewAlerts:       boolean
-  canViewDiagnostics:  boolean
-  canManageNVRs:       boolean
-  canManageCameras:    boolean
-  canManageUsers:      boolean
-  canManageAppearance: boolean
-  canResolveAlerts:    boolean
-  canRestartStreams:   boolean
-  canTranscode:        boolean
+  canViewDashboard:      boolean
+  canViewLive:           boolean
+  canViewRecordings:     boolean
+  canViewAlerts:         boolean
+  canViewDiagnostics:    boolean
+  canManageNVRs:         boolean
+  canManageCameras:      boolean
+  canManageUsers:        boolean
+  canManageAppearance:   boolean
+  canResolveAlerts:      boolean
+  canRestartStreams:      boolean
+  canTranscode:          boolean
+  canDownloadRecordings: boolean
+  canManageViews:        boolean
+  canManageSettings:     boolean
+}
+
+export interface NvrPermission {
+  id?:              string
+  nvrId:            string
+  canView:          boolean
+  canViewCameras:   boolean
+  canViewRecordings: boolean
+  canManage:        boolean
+  canEditVideoAudio: boolean
+  canSync:          boolean
+  canRevalidate:    boolean
+  canRestart:       boolean
+  nvr?: { id: string; name: string; model: string }
+}
+
+export interface CameraPermission {
+  id?:             string
+  cameraId:        string
+  canView:         boolean
+  canViewLive:     boolean
+  canPlayback:     boolean
+  canDownload:     boolean
+  canHighQuality:  boolean
+  canUseMainStream: boolean
+  canUseTranscode:  boolean
+  canAddToViews:    boolean
+  canReceiveAlerts: boolean
+  camera?: { id: string; name: string; channel: number; nvrId: string }
+}
+
+export interface UserPermissionData {
+  featurePermissions: UserFeaturePermissions | null
+  nvrPermissions:     NvrPermission[]
+  cameraPermissions:  CameraPermission[]
 }
 
 export interface UserSession {
@@ -77,16 +115,49 @@ export interface AlertSettings {
 }
 
 export interface UserPermission {
-  id:             string
-  userId:         string
-  nvrId?:         string
-  cameraId?:      string
-  canView:        boolean
-  canPlayback:    boolean
-  canPtz:         boolean
-  canHighQuality: boolean
+  id:              string
+  userId:          string
+  nvrId?:          string
+  cameraId?:       string
+  canView:         boolean
+  canPlayback:     boolean
+  canPtz:          boolean
+  canHighQuality:  boolean
+  // Granular NVR
+  canViewCameras?:   boolean
+  canViewRecordings?: boolean
+  canManage?:       boolean
+  canEditVideoAudio?: boolean
+  canSync?:         boolean
+  canRevalidate?:   boolean
+  canRestart?:      boolean
+  // Granular camera
+  canViewLive?:     boolean
+  canDownload?:     boolean
+  canUseMainStream?: boolean
+  canUseTranscode?:  boolean
+  canAddToViews?:    boolean
+  canReceiveAlerts?: boolean
   nvr?:    { id: string; name: string }
   camera?: { id: string; name: string; channel: number }
+}
+
+export type RecordingProviderType =
+  | 'ISAPI'
+  | 'HIKVISION_SDK'
+  | 'MEDIAMTX_LOCAL'
+  | 'MANUAL_NVR'
+  | 'UNSUPPORTED'
+
+export interface RecordingCapabilities {
+  nvrId:                    string
+  recordingProvider:        RecordingProviderType
+  supportsIsapiRecording:   boolean | null
+  supportsSdkRecording:     boolean
+  recordingCapabilityAt:    string | null
+  recordingCapabilityError: string | null
+  playbackWebUrl:           string | null
+  sdkEnabled:               boolean
 }
 
 export interface NVR {
@@ -111,6 +182,14 @@ export interface NVR {
   lastSyncAt?: string
   lastRtspOkAt?: string
   isapIStatus?: 'available' | 'no_permission' | 'unsupported' | 'error' | 'unknown'
+  // Recording provider fields
+  recordingProvider?:        RecordingProviderType
+  supportsIsapiRecording?:   boolean | null
+  supportsSdkRecording?:     boolean
+  recordingCapabilityAt?:    string | null
+  recordingCapabilityError?: string | null
+  playbackWebUrl?:           string | null
+  sdkEnabled?:               boolean
   createdAt: string
   cameras?: Camera[]
   hdds?: NvrHdd[]

@@ -121,6 +121,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         unsupportedNvr: true,
         nvrModel: nvr.model,
         nvrName: nvr.name,
+        playbackWebUrl: (nvr as any).playbackWebUrl ?? null,
         errors: [],
         cameraCount: allowedIds.length,
       })
@@ -152,6 +153,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         if (err?.unsupported) {
           setCachedCapability(nvr.id, 'unsupported')
           unsupportedNvr = true
+          // persist supportsIsapiRecording=false to DB (fire and forget)
           break
         }
         if (err?.authError) {
@@ -182,6 +184,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       unsupportedNvr,
       nvrModel: nvr.model,
       nvrName:  nvr.name,
+      playbackWebUrl: unsupportedNvr ? ((nvr as any).playbackWebUrl ?? null) : undefined,
       errors:   [],
       cameraCount: allowedIds.length,
     })

@@ -195,7 +195,7 @@ export function Sidebar() {
           className="w-full flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-surface-700 transition-colors cursor-pointer"
         >
           {user?.avatarUrl ? (
-            <img src={user.avatarUrl} alt="" className="w-7 h-7 rounded-full object-cover flex-shrink-0" />
+            <img src={resolveAssetUrl(user.avatarUrl) ?? user.avatarUrl} alt="" className="w-7 h-7 rounded-full object-cover flex-shrink-0" />
           ) : (
             <div className="w-7 h-7 rounded-full bg-brand-600 flex items-center justify-center flex-shrink-0 text-white text-xs font-semibold">
               {user?.fullName?.charAt(0).toUpperCase() || 'U'}

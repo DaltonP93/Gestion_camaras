@@ -98,6 +98,16 @@ model NVR {
   lastErrorCode  String?
   lastError      String?
   isapIStatus    String?  @default("unknown") // available | no_permission | unsupported | error | unknown
+
+  // Grabaciones: proveedor y capacidades
+  recordingProvider           String   @default("ISAPI")  // ISAPI | HIKVISION_SDK | MEDIAMTX_LOCAL | MANUAL_NVR | UNSUPPORTED
+  supportsIsapiRecording      Boolean?
+  supportsSdkRecording        Boolean  @default(false)
+  recordingCapabilityAt       DateTime?
+  recordingCapabilityError    String?  @db.Text
+  playbackWebUrl              String?
+  sdkEnabled                  Boolean  @default(false)
+
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
@@ -198,10 +208,29 @@ model UserPermission {
   nvr            NVR?    @relation(fields: [nvrId], references: [id], onDelete: Cascade)
   cameraId       String?
   camera         Camera? @relation(fields: [cameraId], references: [id], onDelete: Cascade)
+
+  // Permisos base (NVR y cámara)
   canView        Boolean @default(true)
   canPlayback    Boolean @default(false)
   canPtz         Boolean @default(false)
-  canHighQuality Boolean @default(false)  // Alta calidad / H.265
+  canHighQuality Boolean @default(false)
+
+  // Permisos NVR granulares
+  canViewCameras     Boolean @default(true)
+  canViewRecordings  Boolean @default(false)
+  canManage          Boolean @default(false)
+  canEditVideoAudio  Boolean @default(false)
+  canSync            Boolean @default(false)
+  canRevalidate      Boolean @default(false)
+  canRestart         Boolean @default(false)
+
+  // Permisos cámara granulares
+  canViewLive        Boolean @default(true)
+  canDownload        Boolean @default(false)
+  canUseMainStream   Boolean @default(false)
+  canUseTranscode    Boolean @default(false)
+  canAddToViews      Boolean @default(false)
+  canReceiveAlerts   Boolean @default(false)
 
   @@unique([userId, nvrId, cameraId])
   @@map("user_permissions")
