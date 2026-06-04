@@ -18,9 +18,9 @@ const ISAPI_PATH = '/ISAPI/ContentMgmt/search'
 
 function buildBody(): string {
   const now   = new Date()
-  const start = new Date(now.getTime() - 5000).toISOString().slice(0, 19)
-  const end   = now.toISOString().slice(0, 19)
-  return `<CMSearchDescription><searchID>1</searchID><timeSpanList><timeSpan><startTime>${start}</startTime><endTime>${end}</endTime></timeSpan></timeSpanList><maxResults>1</maxResults><searchResultPosition>0</searchResultPosition></CMSearchDescription>`
+  const start = new Date(now.getTime() - 5000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const end   = now.toISOString().replace(/\.\d{3}Z$/, 'Z')
+  return `<?xml version="1.0" encoding="UTF-8"?><CMSearchDescription><searchID>1</searchID><trackList><trackID>101</trackID></trackList><timeSpanList><timeSpan><startTime>${start}</startTime><endTime>${end}</endTime></timeSpan></timeSpanList><maxResults>1</maxResults><searchResultPostion>0</searchResultPostion><metadataList><metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor></metadataList></CMSearchDescription>`
 }
 
 function buildDigestHeader(wwwAuth: string, username: string, password: string, method: string, uri: string): string {
@@ -88,13 +88,19 @@ export async function checkIsapiRecordingSupport(creds: NvrCreds): Promise<Check
       if (r2.code >= 200 && r2.code < 400) {
         return { supported: true }
       }
-      if (r2.code === 401 || r2.code === 403) {
+      if (r2.code === 403) {
+        return { supported: false, error: 'Credenciales válidas pero sin permiso ISAPI (HTTP 403)', errorCode: 'AUTH_FAILED' }
+      }
+      if (r2.code === 401) {
         return { supported: false, error: 'Credenciales inválidas (HTTP 401)', errorCode: 'AUTH_FAILED' }
       }
       return { supported: false, error: `ISAPI no disponible (HTTP ${r2.code})`, errorCode: 'UNSUPPORTED_MODEL' }
     }
 
-    if (r1.code === 401 || r1.code === 403) {
+    if (r1.code === 403) {
+      return { supported: false, error: 'Credenciales válidas pero sin permiso ISAPI (HTTP 403)', errorCode: 'AUTH_FAILED' }
+    }
+    if (r1.code === 401) {
       return { supported: false, error: 'Credenciales inválidas (HTTP 401)', errorCode: 'AUTH_FAILED' }
     }
 

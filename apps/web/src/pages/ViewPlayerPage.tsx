@@ -152,18 +152,13 @@ export function ViewPlayerPage() {
       return
     }
 
-    // Case 3: enter fullscreen
-    const el = tileRefs.current.get(cameraId)
-    // Synchronous native FS call — must be first, before any async work
-    if (el?.requestFullscreen) {
-      el.requestFullscreen().catch(() => {
-        // Native FS unavailable → CSS overlay fallback
-        setFullscreenCamId(cameraId)
-      })
-    } else if ((el as any)?.webkitRequestFullscreen) {
-      ;(el as any).webkitRequestFullscreen()
-    } else {
-      setFullscreenCamId(cameraId)
+    // Case 3: enter fullscreen — always render CSS overlay so HD stream is used.
+    // We also request OS-level fullscreen on the document root so it stays mounted.
+    setFullscreenCamId(cameraId)
+    if (document.documentElement.requestFullscreen) {
+      document.documentElement.requestFullscreen().catch(() => {})
+    } else if ((document.documentElement as any).webkitRequestFullscreen) {
+      ;(document.documentElement as any).webkitRequestFullscreen()
     }
 
     // Upgrade to HD quality in fullscreen.
@@ -462,7 +457,10 @@ export function ViewPlayerPage() {
     const camera = slot.camera
 
     return (
-      <div className="h-full min-h-[80px] rounded overflow-hidden bg-surface-900 relative group">
+      <div
+        ref={(el) => { if (el) tileRefs.current.set(slot.cameraId!, el) }}
+        className="h-full min-h-[80px] rounded overflow-hidden bg-surface-900 relative group"
+      >
         {slot.stream ? (
           <VideoPlayer
             hlsUrl={slot.stream.hls}
@@ -473,6 +471,7 @@ export function ViewPlayerPage() {
             streamResolution={camera.subResolution ?? undefined}
             onFullscreen={() => enterFullscreen(slot.cameraId!)}
             onStreamError={handleStreamError}
+            objectFit={objectFit}
             className="w-full h-full"
           />
         ) : (
