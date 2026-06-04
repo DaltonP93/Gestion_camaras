@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 import { apiGet, apiPost } from '@/lib/api'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
+import type { CameraPlaybackError } from '@/components/cameras/VideoPlayer'
 import { clsx } from 'clsx'
 import type { CameraView, CameraSlot, Camera, StreamInfo } from '@/types'
 
@@ -95,7 +96,7 @@ export function ViewPlayerPage() {
   const [slots, setSlots] = useState<SlotWithCamera[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [objectFit, setObjectFit] = useState<'cover' | 'contain'>('cover')
+  const [objectFit, setObjectFit] = useState<'cover' | 'contain'>('contain')
 
   // Pagination/slideshow
   const slotsPerPage = view ? (() => {
@@ -120,6 +121,8 @@ export function ViewPlayerPage() {
   const [fullscreenMainStream, setFullscreenMainStream] = useState<StreamInfo | null>(null)
   // DOM refs per tile — populated by CameraCell's ref callback
   const tileRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  // Tracks which camera has an active HD (main/main_h264) stream — covers both native and CSS FS
+  const hdCamIdRef = useRef<string | null>(null)
 
   // ─── Fullscreen (called directly from user-gesture handlers) ─────────────────
   // IMPORTANT: requestFullscreen must be called synchronously inside a user gesture.
@@ -141,6 +144,7 @@ export function ViewPlayerPage() {
     // Case 2: CSS overlay fullscreen is active → exit it
     if (fullscreenCamId !== null) {
       const prevCamId = fullscreenCamId
+      hdCamIdRef.current = null
       setFullscreenCamId(null)
       setFullscreenMainStream(null)
       apiPost(`/cameras/${prevCamId}/stop-stream`, { streamType: 'main', reason: 'exit_fullscreen' }).catch(() => {})
@@ -170,10 +174,11 @@ export function ViewPlayerPage() {
       ? /hevc|h\.265|h265/i.test(cam.mainCodec)
       : false
     const hdStreamType = mainIsHevc ? 'main_h264' : 'main'
+    // Track before async call so fullscreenchange handler can stop it even if FS resolves fast
+    hdCamIdRef.current = cameraId
     setFullscreenMainStream(null)
     apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType })
       .then((info) => {
-        console.info(`[ViewPlayer] fullscreen HD stream cameraId=${cameraId} type=${hdStreamType} path=${info.streamPath}`)
         setFullscreenMainStream(info)
       })
       .catch(() => {
@@ -182,13 +187,17 @@ export function ViewPlayerPage() {
   }, [fullscreenCamId, slots])
 
   const exitFullscreen = useCallback(() => {
-    if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {})
+    if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
+      // Native FS: trigger exit — fullscreenchange handler does the stream cleanup via hdCamIdRef
+      if (document.exitFullscreen) document.exitFullscreen().catch(() => {})
+      else (document as any).webkitExitFullscreen?.()
+      return
     }
-    const prevCamId = fullscreenCamId
+    // CSS overlay FS: clean up directly
+    const prevCamId = fullscreenCamId || hdCamIdRef.current
+    hdCamIdRef.current = null
     setFullscreenCamId(null)
     setFullscreenMainStream(null)
-    // Stop the main stream we started for fullscreen
     if (prevCamId) {
       apiPost(`/cameras/${prevCamId}/stop-stream`, { streamType: 'main', reason: 'exit_fullscreen' }).catch(() => {})
       apiPost(`/cameras/${prevCamId}/stop-stream`, { streamType: 'main_h264', reason: 'exit_fullscreen' }).catch(() => {})
@@ -198,15 +207,15 @@ export function ViewPlayerPage() {
   // Sync ESC / browser-native FS exit with React state
   useEffect(() => {
     const handler = () => {
-      if (!document.fullscreenElement) {
-        setFullscreenCamId((prev) => {
-          if (prev) {
-            // Stop main stream when native fullscreen exits
-            apiPost(`/cameras/${prev}/stop-stream`, { streamType: 'main', reason: 'exit_fullscreen' }).catch(() => {})
-            apiPost(`/cameras/${prev}/stop-stream`, { streamType: 'main_h264', reason: 'exit_fullscreen' }).catch(() => {})
-          }
-          return null
-        })
+      if (!document.fullscreenElement && !(document as any).webkitFullscreenElement) {
+        // Use ref (not state) so native FS exits always find the camera to stop
+        const camToStop = hdCamIdRef.current
+        hdCamIdRef.current = null
+        if (camToStop) {
+          apiPost(`/cameras/${camToStop}/stop-stream`, { streamType: 'main', reason: 'exit_fullscreen' }).catch(() => {})
+          apiPost(`/cameras/${camToStop}/stop-stream`, { streamType: 'main_h264', reason: 'exit_fullscreen' }).catch(() => {})
+        }
+        setFullscreenCamId(null)
         setFullscreenMainStream(null)
       }
     }
@@ -310,6 +319,30 @@ export function ViewPlayerPage() {
     setCurrentPage((p) => (p + 1) % totalPages)
   }, [totalPages])
 
+  // Retry stream on 401 (HLS_SESSION_EXPIRED) — cookie may have refreshed
+  const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
+    if (err.code === 'HLS_SESSION_EXPIRED') {
+      setTimeout(() => {
+        apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, {})
+          .then((info) => setSlots((prev) => prev.map((s) => s.cameraId === cameraId ? { ...s, stream: info } : s)))
+          .catch(() => {})
+      }, 2000)
+    }
+  }, [])
+
+  const handleFsStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
+    if (err.code === 'HLS_SESSION_EXPIRED') {
+      const cam = slots.find((s) => s.cameraId === cameraId)?.camera
+      const mainIsHevc = cam?.mainCodec ? /hevc|h\.265|h265/i.test(cam.mainCodec) : false
+      const hdStreamType: 'main' | 'main_h264' = mainIsHevc ? 'main_h264' : 'main'
+      setTimeout(() => {
+        apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType })
+          .then((info) => setFullscreenMainStream(info))
+          .catch(() => {})
+      }, 2000)
+    }
+  }, [slots])
+
   // ─── Loading / error states ──────────────────────────────────────────────────
   if (isLoading) {
     return (
@@ -387,6 +420,7 @@ export function ViewPlayerPage() {
               streamCodec={isHd ? (fsCamera?.mainCodec ?? undefined) : (fsCamera?.subCodec ?? undefined)}
               streamResolution={isHd ? (fsCamera?.mainResolution ?? undefined) : (fsCamera?.subResolution ?? undefined)}
               onFullscreen={exitFullscreen}
+              onStreamError={handleFsStreamError}
               className="w-full h-full"
             />
           ) : (
@@ -438,6 +472,7 @@ export function ViewPlayerPage() {
             streamCodec={camera.subCodec ?? undefined}
             streamResolution={camera.subResolution ?? undefined}
             onFullscreen={() => enterFullscreen(slot.cameraId!)}
+            onStreamError={handleStreamError}
             className="w-full h-full"
           />
         ) : (

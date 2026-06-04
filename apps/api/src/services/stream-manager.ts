@@ -70,6 +70,7 @@ const TRANSCODE_KILL_REASONS = new Set([
   'exit_focus', 'switch_to_sub', 'cleanup_unmount', 'idle_timeout',
   'force_stop', 'logout', 'session_cleanup', 'viewport_change',
   'layout_change', 'nvr_change', 'page_change', 'stop_all',
+  'exit_fullscreen',
 ])
 
 function getActiveTranscodeCount(): number {
