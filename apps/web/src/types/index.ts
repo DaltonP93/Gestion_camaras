@@ -150,14 +150,15 @@ export type RecordingProviderType =
   | 'UNSUPPORTED'
 
 export interface RecordingCapabilities {
-  nvrId:                    string
-  recordingProvider:        RecordingProviderType
-  supportsIsapiRecording:   boolean | null
-  supportsSdkRecording:     boolean
-  recordingCapabilityAt:    string | null
-  recordingCapabilityError: string | null
-  playbackWebUrl:           string | null
-  sdkEnabled:               boolean
+  nvrId:                        string
+  recordingProvider:            RecordingProviderType
+  supportsIsapiRecording:       boolean | null
+  supportsSdkRecording:         boolean
+  recordingCapabilityAt:        string | null
+  recordingCapabilityError:     string | null
+  recordingCapabilityErrorCode: 'AUTH_FAILED' | 'UNSUPPORTED_MODEL' | 'NETWORK_TIMEOUT' | 'NETWORK_ERROR' | 'PARSE_ERROR' | null
+  playbackWebUrl:               string | null
+  sdkEnabled:                   boolean
 }
 
 export interface NVR {

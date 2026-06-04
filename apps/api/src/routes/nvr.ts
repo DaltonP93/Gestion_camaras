@@ -1245,15 +1245,23 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
+    const capError: string | null = (nvr as any).recordingCapabilityError ?? null
+    const capErrorCode = capError
+      ? (/credencial|auth|401|403/i.test(capError) ? 'AUTH_FAILED'
+        : /timeout/i.test(capError) ? 'NETWORK_TIMEOUT'
+        : /red|network|econnrefused/i.test(capError) ? 'NETWORK_ERROR'
+        : 'UNSUPPORTED_MODEL')
+      : null
     return reply.send({
-      nvrId:                    nvr.id,
-      recordingProvider:        (nvr as any).recordingProvider        ?? 'ISAPI',
-      supportsIsapiRecording:   (nvr as any).supportsIsapiRecording   ?? null,
-      supportsSdkRecording:     (nvr as any).supportsSdkRecording     ?? false,
-      recordingCapabilityAt:    (nvr as any).recordingCapabilityAt    ?? null,
-      recordingCapabilityError: (nvr as any).recordingCapabilityError ?? null,
-      playbackWebUrl:           (nvr as any).playbackWebUrl           ?? null,
-      sdkEnabled:               (nvr as any).sdkEnabled               ?? false,
+      nvrId:                        nvr.id,
+      recordingProvider:            (nvr as any).recordingProvider        ?? 'ISAPI',
+      supportsIsapiRecording:       (nvr as any).supportsIsapiRecording   ?? null,
+      supportsSdkRecording:         (nvr as any).supportsSdkRecording     ?? false,
+      recordingCapabilityAt:        (nvr as any).recordingCapabilityAt    ?? null,
+      recordingCapabilityError:     capError,
+      recordingCapabilityErrorCode: capErrorCode,
+      playbackWebUrl:               (nvr as any).playbackWebUrl           ?? null,
+      sdkEnabled:                   (nvr as any).sdkEnabled               ?? false,
     })
   })
 
@@ -1270,7 +1278,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const creds = { ipAddress: nvr.ipAddress, port: nvr.port, username: nvr.username, password: plain }
-    const { supported, error } = await checkIsapiRecordingSupport(creds)
+    const { supported, error, errorCode } = await checkIsapiRecordingSupport(creds)
     const provider = detectProviderFromCapabilities(supported)
 
     const updated = await server.prisma.nVR.update({
@@ -1283,17 +1291,18 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       } as any,
     })
 
-    await AuditAction(server.prisma, request.user.sub, 'NVR_RECORDING_CAPABILITY_CHECKED', id, request, { supported, provider, error })
+    await AuditAction(server.prisma, request.user.sub, 'NVR_RECORDING_CAPABILITY_CHECKED', id, request, { supported, provider, error, errorCode })
 
     return reply.send({
-      nvrId:                    updated.id,
-      recordingProvider:        (updated as any).recordingProvider        ?? provider,
-      supportsIsapiRecording:   (updated as any).supportsIsapiRecording   ?? supported,
-      supportsSdkRecording:     (updated as any).supportsSdkRecording     ?? false,
-      recordingCapabilityAt:    (updated as any).recordingCapabilityAt    ?? new Date().toISOString(),
-      recordingCapabilityError: (updated as any).recordingCapabilityError ?? null,
-      playbackWebUrl:           (updated as any).playbackWebUrl           ?? null,
-      sdkEnabled:               (updated as any).sdkEnabled               ?? false,
+      nvrId:                      updated.id,
+      recordingProvider:          (updated as any).recordingProvider        ?? provider,
+      supportsIsapiRecording:     (updated as any).supportsIsapiRecording   ?? supported,
+      supportsSdkRecording:       (updated as any).supportsSdkRecording     ?? false,
+      recordingCapabilityAt:      (updated as any).recordingCapabilityAt    ?? new Date().toISOString(),
+      recordingCapabilityError:   (updated as any).recordingCapabilityError ?? null,
+      recordingCapabilityErrorCode: errorCode ?? null,
+      playbackWebUrl:             (updated as any).playbackWebUrl           ?? null,
+      sdkEnabled:                 (updated as any).sdkEnabled               ?? false,
     })
   })
 

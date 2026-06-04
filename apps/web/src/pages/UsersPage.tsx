@@ -14,7 +14,6 @@ import { format, formatDistanceToNow } from 'date-fns'
 import { es } from 'date-fns/locale'
 import toast from 'react-hot-toast'
 import { useAuthStore } from '@/stores/authStore'
-import { UserPermissionsModal } from '@/components/UserPermissionsModal'
 
 const ROLE_OPTIONS: { value: Role; label: string; color: string }[] = [
   { value: 'ADMIN',      label: 'Administrador', color: 'text-brand-400' },
@@ -404,7 +403,6 @@ export function UsersPage() {
   const [showPass, setShowPass] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [permUser, setPermUser] = useState<User | null>(null)
-  const [granularPermUser, setGranularPermUser] = useState<User | null>(null)
 
   const loadUsers = async () => {
     setIsLoading(true)
@@ -594,18 +592,11 @@ export function UsersPage() {
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1 justify-end">
                       <button
-                        onClick={() => setGranularPermUser(u)}
+                        onClick={() => setPermUser(u)}
                         className="p-1.5 rounded text-surface-500 hover:text-brand-400 hover:bg-brand-900/20 transition-colors"
-                        title="Permisos granulares"
+                        title="Gestionar permisos"
                       >
                         <Shield size={12} />
-                      </button>
-                      <button
-                        onClick={() => setPermUser(u)}
-                        className="p-1.5 rounded text-surface-500 hover:text-amber-400 hover:bg-amber-900/20 transition-colors"
-                        title="Gestionar permisos (legacy)"
-                      >
-                        <Key size={12} />
                       </button>
                       <button
                         onClick={() => openEdit(u)}
@@ -741,13 +732,6 @@ export function UsersPage() {
         />
       )}
 
-      {/* Granular permissions modal */}
-      {granularPermUser && (
-        <UserPermissionsModal
-          user={granularPermUser}
-          onClose={() => setGranularPermUser(null)}
-        />
-      )}
     </div>
   )
 }

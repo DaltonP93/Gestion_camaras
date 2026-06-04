@@ -4,7 +4,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import {
   ArrowLeft, RefreshCw, Power, Wifi, WifiOff,
   HardDrive, Camera, Users, Wrench, Activity,
-  ChevronRight, AlertTriangle, CheckCircle2, XCircle,
+  ChevronRight, AlertTriangle, CheckCircle2, XCircle, Lock,
   Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
   Copy, Download, ChevronDown, Zap, Video as VideoIcon, Film, ExternalLink,
@@ -1614,11 +1614,13 @@ function RecordingsCapTab({ caps, loading, checking, onRefresh, onCheck, isAdmin
                 <div className="text-xs text-surface-500 mb-1">ISAPI de búsqueda</div>
                 <span className={clsx('text-sm font-medium flex items-center gap-1',
                   caps.supportsIsapiRecording ? 'text-green-400'
+                    : caps.recordingCapabilityErrorCode === 'AUTH_FAILED' ? 'text-amber-400'
                     : caps.supportsIsapiRecording === false ? 'text-red-400'
                     : 'text-surface-400'
                 )}>
                   {caps.supportsIsapiRecording === true && <><CheckCircle2 size={12} /> Soportado</>}
-                  {caps.supportsIsapiRecording === false && <><XCircle size={12} /> No soportado</>}
+                  {caps.supportsIsapiRecording === false && caps.recordingCapabilityErrorCode === 'AUTH_FAILED' && <><Lock size={12} /> Error de autenticación</>}
+                  {caps.supportsIsapiRecording === false && caps.recordingCapabilityErrorCode !== 'AUTH_FAILED' && <><XCircle size={12} /> No soportado</>}
                   {caps.supportsIsapiRecording === null && '—'}
                 </span>
               </div>
