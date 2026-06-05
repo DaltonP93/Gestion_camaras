@@ -25,6 +25,7 @@ import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
 import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
+import { adminRoutes } from './routes/admin'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
 import { publishStream } from './services/stream'
@@ -136,6 +137,7 @@ async function main() {
   await server.register(liveViewRoutes, { prefix: '/api/live-view' })
   await server.register(searchRoutes, { prefix: '/api/search' })
   await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
+  await server.register(adminRoutes, { prefix: '/api/admin' })
   await server.register(wsHandler, { prefix: '/ws' })
 
   const COMMIT_SHA = process.env.COMMIT_SHA || 'development'
