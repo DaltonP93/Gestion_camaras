@@ -11,7 +11,7 @@ import {
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
 import { AuditAction } from '../services/audit'
-import { checkIsapiRecordingSupport, detectProviderFromCapabilities } from '../services/recordingProvider'
+import { checkIsapiRecordingSupport, detectProviderFromCapabilities, buildIsapiSearchXml } from '../services/recordingProvider'
 import CryptoJS from 'crypto-js'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
@@ -1250,6 +1250,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       ? (/credencial|auth|401|403/i.test(capError) ? 'AUTH_FAILED'
         : /timeout/i.test(capError) ? 'NETWORK_TIMEOUT'
         : /red|network|econnrefused/i.test(capError) ? 'NETWORK_ERROR'
+        : /xml|400|inválido|par[aá]metros/i.test(capError) ? 'INVALID_REQUEST'
         : 'UNSUPPORTED_MODEL')
       : null
     return reply.send({
@@ -1278,18 +1279,25 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const creds = { ipAddress: nvr.ipAddress, port: nvr.port, username: nvr.username, password: plain }
-    const { supported, error, errorCode } = await checkIsapiRecordingSupport(creds)
-    const provider = detectProviderFromCapabilities(supported)
+    const { supported, error, errorCode, httpStatus, responseBody } = await checkIsapiRecordingSupport(creds)
+
+    // INVALID_REQUEST (HTTP 400 from bad XML) does NOT mean the device is unsupported.
+    // Only set provider to MANUAL_NVR if the device truly doesn't support ISAPI search.
+    const provider = (errorCode === 'INVALID_REQUEST')
+      ? ((nvr as any).recordingProvider ?? 'ISAPI')  // preserve existing value
+      : detectProviderFromCapabilities(supported)
 
     const updated = await server.prisma.nVR.update({
       where: { id },
       data: {
         recordingProvider:        provider,
-        supportsIsapiRecording:   supported,
+        supportsIsapiRecording:   errorCode === 'INVALID_REQUEST' ? null : supported,
         recordingCapabilityAt:    new Date(),
         recordingCapabilityError: error ?? null,
       } as any,
     })
+
+    server.log.info(`[recording-check] nvrId=${id} supported=${supported} errorCode=${errorCode} httpStatus=${httpStatus} provider=${provider}`)
 
     await AuditAction(server.prisma, request.user.sub, 'NVR_RECORDING_CAPABILITY_CHECKED', id, request, { supported, provider, error, errorCode })
 
@@ -1336,6 +1344,40 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       recordingCapabilityError: (updated as any).recordingCapabilityError ?? null,
       playbackWebUrl:           (updated as any).playbackWebUrl           ?? null,
       sdkEnabled:               (updated as any).sdkEnabled               ?? false,
+    })
+  })
+
+  // GET /api/nvrs/:id/recording-capabilities/debug — ADMIN: diagnose ISAPI search capability
+  server.get('/:id/recording-capabilities/debug', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const query  = request.query as { channel?: string }
+    const channel = query.channel ? parseInt(query.channel) : 1
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const plain = safeDecrypt(nvr.password)
+    if (!plain) return reply.status(422).send({ message: 'Contraseña no descifrable.' })
+
+    const creds = { ipAddress: nvr.ipAddress, port: nvr.port, username: nvr.username, password: plain }
+    const result = await checkIsapiRecordingSupport(creds)
+
+    const now   = new Date()
+    const start = new Date(now.getTime() - 5000)
+    const xmlForChannel = buildIsapiSearchXml({ trackId: channel * 100 + 1, startTime: start, endTime: now, maxResults: 1 })
+
+    return reply.send({
+      nvrId:       id,
+      nvrIp:       nvr.ipAddress,
+      channel,
+      trackId:     channel * 100 + 1,
+      supported:   result.supported,
+      errorCode:   result.errorCode ?? null,
+      error:       result.error ?? null,
+      httpStatus:  result.httpStatus ?? null,
+      requestXml:  result.requestXml ?? null,
+      requestXmlForChannel: xmlForChannel,
+      responseBody: result.responseBody?.slice(0, 2000) ?? null,
     })
   })
 

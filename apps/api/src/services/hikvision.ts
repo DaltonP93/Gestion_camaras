@@ -1614,21 +1614,21 @@ export async function searchRecordings(
 ): Promise<HikRecording[]> {
   const client = createHikClient(nvr)
   const trackID = channel * 100 + 1
-  const fmt = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const now = new Date()
   const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
-<CMSearchDescription>
-  <searchID>search_${Date.now()}</searchID>
+<CMSearchDescription xmlns="http://www.hikvision.com/ver20/XMLSchema">
+  <searchID>${crypto.randomUUID()}</searchID>
   <trackList>
     <trackID>${trackID}</trackID>
   </trackList>
   <timeSpanList>
     <timeSpan>
-      <startTime>${fmt(startTime)}</startTime>
-      <endTime>${fmt(endTime)}</endTime>
+      <startTime>${startTime.toISOString().replace(/\.\d{3}Z$/, 'Z')}</startTime>
+      <endTime>${endTime.toISOString().replace(/\.\d{3}Z$/, 'Z')}</endTime>
     </timeSpan>
   </timeSpanList>
   <maxResults>200</maxResults>
-  <searchResultPostion>0</searchResultPostion>
+  <searchResultPosition>0</searchResultPosition>
   <metadataList>
     <metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>
   </metadataList>
@@ -1647,9 +1647,17 @@ export async function searchRecordings(
       e.authError = true
       throw e
     }
-    if (status === 404 || status === 400) {
+    // 400 = bad XML or unsupported parameters — NOT "not supported by device"
+    // 404/405/501 = endpoint truly not implemented
+    if (status === 404 || status === 405 || status === 501) {
       const e: any = new Error('ISAPI search not supported')
       e.unsupported = true
+      throw e
+    }
+    if (status === 400) {
+      const body = err?.response?.data ? String(err.response.data) : ''
+      const e: any = new Error(`ISAPI search returned 400 — XML rejected by NVR: ${body.slice(0, 300)}`)
+      e.invalidRequest = true
       throw e
     }
     throw err

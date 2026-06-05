@@ -1615,13 +1615,16 @@ function RecordingsCapTab({ caps, loading, checking, onRefresh, onCheck, isAdmin
                 <span className={clsx('text-sm font-medium flex items-center gap-1',
                   caps.supportsIsapiRecording ? 'text-green-400'
                     : caps.recordingCapabilityErrorCode === 'AUTH_FAILED' ? 'text-amber-400'
+                    : caps.recordingCapabilityErrorCode === 'INVALID_REQUEST' ? 'text-yellow-400'
                     : caps.supportsIsapiRecording === false ? 'text-red-400'
                     : 'text-surface-400'
                 )}>
                   {caps.supportsIsapiRecording === true && <><CheckCircle2 size={12} /> Soportado</>}
                   {caps.supportsIsapiRecording === false && caps.recordingCapabilityErrorCode === 'AUTH_FAILED' && <><Lock size={12} /> Error de autenticación</>}
-                  {caps.supportsIsapiRecording === false && caps.recordingCapabilityErrorCode !== 'AUTH_FAILED' && <><XCircle size={12} /> No soportado</>}
-                  {caps.supportsIsapiRecording === null && '—'}
+                  {caps.supportsIsapiRecording === null && caps.recordingCapabilityErrorCode === 'INVALID_REQUEST' && <><AlertTriangle size={12} /> XML rechazado (400)</>}
+                  {caps.supportsIsapiRecording === false && caps.recordingCapabilityErrorCode === 'INVALID_REQUEST' && <><AlertTriangle size={12} /> XML rechazado (400)</>}
+                  {caps.supportsIsapiRecording === false && caps.recordingCapabilityErrorCode !== 'AUTH_FAILED' && caps.recordingCapabilityErrorCode !== 'INVALID_REQUEST' && <><XCircle size={12} /> No soportado</>}
+                  {caps.supportsIsapiRecording === null && !caps.recordingCapabilityErrorCode && '—'}
                 </span>
               </div>
               <div>
