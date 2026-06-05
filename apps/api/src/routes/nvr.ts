@@ -1591,7 +1591,47 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     return reply.send(results.map(r => r.status === 'fulfilled' ? r.value : { error: 'fetch failed' }))
   })
 
-  // PUT /api/nvrs/:id/video-audio/:channel — Update channel video config via ISAPI + backup
+  // GET /api/nvrs/:id/video-audio/:channel — Get single channel video config
+  server.get('/:id/video-audio/:channel', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id, channel } = request.params as { id: string; channel: string }
+    const channelNo = parseInt(channel, 10)
+    if (isNaN(channelNo) || channelNo < 1) return reply.status(400).send({ message: 'Canal inválido' })
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const decPass = decryptPassword(nvr.password)
+    const nvrDec = { ...nvr, password: decPass }
+
+    const { fetchChannelVideoConfig } = await import('../services/hikvision')
+    const config = await fetchChannelVideoConfig(nvrDec as any, channelNo)
+    return reply.send(config)
+  })
+
+  // GET /api/nvrs/:id/video-audio/:channel/capabilities — Stream capabilities (codecs, resolutions, fps)
+  server.get('/:id/video-audio/:channel/capabilities', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { id, channel } = request.params as { id: string; channel: string }
+    const channelNo = parseInt(channel, 10)
+    if (isNaN(channelNo) || channelNo < 1) return reply.status(400).send({ message: 'Canal inválido' })
+
+    const nvr = await server.prisma.nVR.findUnique({ where: { id } })
+    if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+    const decPass = safeDecrypt(nvr.password)
+    if (!decPass) return reply.status(422).send({ message: 'Contraseña no descifrable.' })
+
+    const { getChannelCapabilities } = await import('../services/nvr-config/hikvision')
+    const caps = await getChannelCapabilities(id, {
+      ipAddress: nvr.ipAddress,
+      port:      nvr.port,
+      username:  nvr.username,
+      password:  decPass,
+    }, channelNo)
+
+    return reply.send(caps)
+  })
+
+  // PUT /api/nvrs/:id/video-audio/:channel — Update full channel video config via ISAPI + backup
   server.put('/:id/video-audio/:channel', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const { id, channel } = request.params as { id: string; channel: string }
     const channelNo = parseInt(channel, 10)
@@ -1601,8 +1641,26 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
     const body = request.body as {
-      mainFps?: number; mainBitrate?: number
-      subFps?: number;  subBitrate?: number
+      // Legacy short keys (mainFps, etc.) AND full field names accepted
+      streamType?: 'main' | 'sub' | 'both'
+      mainFps?: number;    mainBitrate?: number
+      subFps?: number;     subBitrate?: number
+      // Full field set (maps to main or sub depending on streamType)
+      videoCodecType?: string
+      width?: number;     height?: number
+      fps?: number;       bitrateMax?: number
+      bitrateType?: string
+      audioEnabled?: boolean
+      audioCodecType?: string
+      audioBitrate?: number
+    }
+
+    // Reject explicit 0 for fps or bitrate
+    if (body.mainFps === 0 || body.subFps === 0 || body.fps === 0) {
+      return reply.status(400).send({ message: 'FPS no puede ser 0' })
+    }
+    if (body.mainBitrate === 0 || body.subBitrate === 0 || body.bitrateMax === 0) {
+      return reply.status(400).send({ message: 'Bitrate no puede ser 0' })
     }
 
     const decPass = decryptPassword(nvr.password)
@@ -1611,24 +1669,56 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
     // 1. Read current config and save backup
     const { fetchChannelVideoConfig, updateChannelFpsAndBitrate } = await import('../services/hikvision')
+    const { putChannelVideoConfig: putConfig } = await import('../services/nvr-config/hikvision')
+
     const current = await fetchChannelVideoConfig(nvrDec as any, channelNo).catch(() => null)
 
     await server.prisma.nvrChannelConfigBackup.create({
       data: {
         nvrId: id,
         channelNo,
-        streamType: 'both',
+        streamType: body.streamType ?? 'both',
         configJson: JSON.stringify(current ?? {}),
         createdByUserId: user.sub,
         reason: 'before_edit',
       },
     }).catch(() => {})
 
-    // 2. Apply changes via ISAPI
-    try {
-      await updateChannelFpsAndBitrate(nvrDec as any, channelNo, body)
-    } catch (e: any) {
-      return reply.status(422).send({ message: `Error al escribir configuración: ${e.message}` })
+    const nvrCreds = { ipAddress: nvr.ipAddress, port: nvr.port, username: nvr.username, password: decPass }
+
+    // 2a. Legacy path: mainFps/mainBitrate/subFps/subBitrate keys
+    if (body.mainFps !== undefined || body.mainBitrate !== undefined || body.subFps !== undefined || body.subBitrate !== undefined) {
+      try {
+        await updateChannelFpsAndBitrate(nvrDec as any, channelNo, body)
+      } catch (e: any) {
+        return reply.status(422).send({ message: `Error al escribir configuración: ${e.message}` })
+      }
+    }
+
+    // 2b. Full field path: update with codec/resolution/fps/bitrate/audio via putConfig
+    if (body.streamType && body.streamType !== 'both' && (
+      body.videoCodecType !== undefined || body.width !== undefined || body.fps !== undefined ||
+      body.bitrateMax !== undefined || body.bitrateType !== undefined ||
+      body.audioEnabled !== undefined || body.audioCodecType !== undefined || body.audioBitrate !== undefined
+    )) {
+      const update: Record<string, any> = {}
+      if (body.videoCodecType !== undefined) update.videoCodecType = body.videoCodecType
+      if (body.width !== undefined)          update.width = body.width
+      if (body.height !== undefined)         update.height = body.height
+      if (body.fps !== undefined && body.fps > 0) update.fps = body.fps
+      if (body.bitrateType !== undefined)    update.bitrateType = body.bitrateType
+      if (body.bitrateMax !== undefined && body.bitrateMax > 0) update.bitrateMax = body.bitrateMax
+      if (body.audioEnabled !== undefined)   update.audioEnabled = body.audioEnabled
+      if (body.audioCodecType !== undefined) update.audioCodecType = body.audioCodecType
+      if (body.audioBitrate !== undefined)   update.audioBitrate = body.audioBitrate
+
+      const result = await putConfig(id, nvrCreds, channelNo, body.streamType as 'main' | 'sub', update)
+      if (!result.success) {
+        return reply.status(422).send({ message: result.error ?? 'Error al escribir configuración en NVR' })
+      }
+
+      await AuditAction(server.prisma, user.sub, 'NVR_CHANNEL_CONFIG_UPDATED', id, request, { channelNo, streamType: body.streamType, ...update })
+      return reply.send(result.config)
     }
 
     // 3. Reread and return

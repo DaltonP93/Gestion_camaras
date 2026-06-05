@@ -327,10 +327,150 @@ export async function putChannelVideoConfig(
       return { success: false, error: putRes.statusText }
     }
 
-    // 4. Re-read and return the updated config
+    // 4. Re-read and return the updated config to confirm values were applied
     const freshConfig = await getChannelVideoConfig(nvrId, creds, channel)
     return { success: true, config: freshConfig }
   } catch (err: any) {
     return { success: false, error: err.message }
+  }
+}
+
+// ─── Capabilities ─────────────────────────────────────────────────────────────
+
+export interface StreamCapabilities {
+  codecs:       string[]
+  resolutions:  Array<{ width: number; height: number; label: string }>
+  fpsOptions:   number[]
+  bitrateRange: { min: number; max: number }
+  bitrateTypes: string[]
+  exists:       boolean
+  editable:     boolean
+  reason?:      string
+}
+
+export interface ChannelCapabilities {
+  nvrId:     string
+  channel:   number
+  fetchedAt: string
+  main:      StreamCapabilities
+  sub:       StreamCapabilities
+}
+
+/** Known safe defaults when the NVR doesn't expose a /capabilities endpoint */
+function defaultCapabilities(streamType: 'main' | 'sub', currentCodec?: string): StreamCapabilities {
+  const isMain = streamType === 'main'
+  const codecs = isMain
+    ? ['H.264', 'H.265', 'H.264+', 'H.265+']
+    : ['H.264', 'H.265']
+
+  const resolutions = isMain
+    ? [
+        { width: 3840, height: 2160, label: '4K (3840×2160)' },
+        { width: 2688, height: 1520, label: '5MP (2688×1520)' },
+        { width: 2560, height: 1440, label: '4MP (2560×1440)' },
+        { width: 1920, height: 1080, label: '2MP (1920×1080)' },
+        { width: 1280, height: 720,  label: 'HD (1280×720)' },
+        { width: 704,  height: 576,  label: 'D1 (704×576)' },
+        { width: 352,  height: 288,  label: 'CIF (352×288)' },
+      ]
+    : [
+        { width: 1280, height: 720,  label: 'HD (1280×720)' },
+        { width: 704,  height: 576,  label: 'D1 (704×576)' },
+        { width: 640,  height: 360,  label: '360p (640×360)' },
+        { width: 352,  height: 288,  label: 'CIF (352×288)' },
+        { width: 320,  height: 240,  label: 'QCIF (320×240)' },
+      ]
+
+  const fpsOptions = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 20, 25, 30]
+
+  return {
+    codecs,
+    resolutions,
+    fpsOptions,
+    bitrateRange:  { min: 32, max: 16384 },
+    bitrateTypes:  ['CBR', 'VBR'],
+    exists:   true,
+    editable: true,
+  }
+}
+
+/** Parse capabilities XML from Hikvision (StreamingChannelCapabilities or similar) */
+function parseCapabilitiesXml(xml: string, streamType: 'main' | 'sub'): StreamCapabilities {
+  const base = defaultCapabilities(streamType)
+
+  // Try to extract supported codecs from capability XML
+  const codecMatches = xml.match(/<videoCodecType[^>]*>([^<]+)<\/videoCodecType>/gi)
+  if (codecMatches && codecMatches.length > 0) {
+    const codecs = codecMatches.map(m => m.replace(/<[^>]+>/g, '').trim()).filter(Boolean)
+    if (codecs.length > 0) base.codecs = codecs
+  }
+
+  // Try resolution list from capabilities
+  const resBlocks = xml.match(/<Resolution>[^]*?<\/Resolution>/gi)
+  if (resBlocks && resBlocks.length > 0) {
+    const parsed = resBlocks.map(b => ({
+      width:  parseInt(xmlGet(b, 'videoResolutionWidth')  || xmlGet(b, 'width')  || '0'),
+      height: parseInt(xmlGet(b, 'videoResolutionHeight') || xmlGet(b, 'height') || '0'),
+    })).filter(r => r.width > 0 && r.height > 0)
+    if (parsed.length > 0) {
+      base.resolutions = parsed.map(r => ({ ...r, label: `${r.width}×${r.height}` }))
+    }
+  }
+
+  // Bitrate limits
+  const bitrateMin = parseInt(xmlGet(xml, 'minBitrate') || xmlGet(xml, 'MinVideoBitRate') || '0')
+  const bitrateMax = parseInt(xmlGet(xml, 'maxBitrate') || xmlGet(xml, 'MaxVideoBitRate') || '0')
+  if (bitrateMin > 0 && bitrateMax > bitrateMin) {
+    base.bitrateRange = { min: bitrateMin, max: bitrateMax }
+  }
+
+  return base
+}
+
+/**
+ * Query NVR for channel stream capabilities.
+ * Falls back to safe defaults when the firmware doesn't expose the capabilities endpoint.
+ */
+export async function getChannelCapabilities(
+  nvrId: string,
+  creds: NvrCredentials,
+  channel: number,
+): Promise<ChannelCapabilities> {
+  const client = makeClient(creds)
+  const ch = String(channel).padStart(2, '0')
+
+  // Read current config to know what exists and current codec
+  const current = await getChannelVideoConfig(nvrId, creds, channel)
+
+  const mainCaps = await (async (): Promise<StreamCapabilities> => {
+    try {
+      const res = await client.get<string>(`/ISAPI/Streaming/channels/${ch}01/capabilities`)
+      const xml = typeof res.data === 'string' ? res.data : JSON.stringify(res.data)
+      return parseCapabilitiesXml(xml, 'main')
+    } catch {
+      // Firmware doesn't expose capabilities — return safe defaults based on current config
+      return defaultCapabilities('main', current.main?.videoCodecType)
+    }
+  })()
+
+  const subCaps = await (async (): Promise<StreamCapabilities> => {
+    if (!current.sub) {
+      return { ...defaultCapabilities('sub'), exists: false, editable: false, reason: 'Sub-stream no disponible en este canal' }
+    }
+    try {
+      const res = await client.get<string>(`/ISAPI/Streaming/channels/${ch}02/capabilities`)
+      const xml = typeof res.data === 'string' ? res.data : JSON.stringify(res.data)
+      return parseCapabilitiesXml(xml, 'sub')
+    } catch {
+      return defaultCapabilities('sub', current.sub?.videoCodecType)
+    }
+  })()
+
+  return {
+    nvrId,
+    channel,
+    fetchedAt: new Date().toISOString(),
+    main: mainCaps,
+    sub:  subCaps,
   }
 }

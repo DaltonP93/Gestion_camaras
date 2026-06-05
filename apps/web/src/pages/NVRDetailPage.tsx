@@ -1327,6 +1327,34 @@ function CamerasTab({
 
 // ─── Video / Audio Tab ────────────────────────────────────────
 
+interface StreamCapabilities {
+  codecs:       string[]
+  resolutions:  Array<{ width: number; height: number; label: string }>
+  fpsOptions:   number[]
+  bitrateRange: { min: number; max: number }
+  bitrateTypes: string[]
+  exists:       boolean
+  editable:     boolean
+  reason?:      string
+}
+
+interface ChannelCaps {
+  main: StreamCapabilities
+  sub:  StreamCapabilities
+}
+
+interface StreamEditForm {
+  videoCodecType: string
+  width:          number
+  height:         number
+  fps:            number
+  bitrateMax:     number
+  bitrateType:    string
+  audioEnabled:   boolean
+  audioCodecType: string
+  audioBitrate:   number
+}
+
 function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
   nvrId: string
   configs: ChannelVideoConfig[]
@@ -1338,8 +1366,12 @@ function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
   const [filterCodec, setFilterCodec] = useState<'all' | 'h264' | 'h265' | 'nodata'>('all')
   const [selectedChannel, setSelectedChannel] = useState<number | null>(null)
   const [editMode, setEditMode] = useState(false)
-  const [editForm, setEditForm] = useState<Partial<{ mainFps: number; mainBitrate: number; subFps: number; subBitrate: number }>>({})
+  const [caps, setCaps] = useState<ChannelCaps | null>(null)
+  const [loadingCaps, setLoadingCaps] = useState(false)
+  const [mainForm, setMainForm] = useState<Partial<StreamEditForm>>({})
+  const [subForm, setSubForm] = useState<Partial<StreamEditForm>>({})
   const [saving, setSaving] = useState(false)
+  const [editForm, setEditForm] = useState<Partial<{ mainFps: number; mainBitrate: number; subFps: number; subBitrate: number }>>({})
 
   const filtered = configs.filter(c => {
     const nameMatch = !search || c.cameraName.toLowerCase().includes(search.toLowerCase()) || String(c.channel).includes(search)
@@ -1352,12 +1384,64 @@ function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
 
   const selected = configs.find(c => c.channel === selectedChannel)
 
-  const handleSave = async () => {
+  const loadCaps = async (channel: number) => {
+    setLoadingCaps(true)
+    try {
+      const data = await apiGet<ChannelCaps>(`/nvrs/${nvrId}/video-audio/${channel}/capabilities`)
+      setCaps(data)
+    } catch {
+      setCaps(null)
+    } finally {
+      setLoadingCaps(false)
+    }
+  }
+
+  const enterEditMode = () => {
     if (!selected) return
+    // Populate form from current config
+    setMainForm({
+      videoCodecType: selected.main?.codec ?? '',
+      width:    parseInt((selected.main?.resolution ?? '0x0').split('x')[0]) || 0,
+      height:   parseInt((selected.main?.resolution ?? '0x0').split('x')[1]) || 0,
+      fps:      (selected.main?.fps ?? 0) > 0 ? selected.main!.fps : 25,
+      bitrateMax: (selected.main?.bitrate ?? 0) > 0 ? selected.main!.bitrate : 4096,
+      bitrateType: 'CBR',
+      audioEnabled: false,
+      audioCodecType: '',
+      audioBitrate: 64,
+    })
+    setSubForm({
+      videoCodecType: selected.sub?.codec ?? '',
+      width:    parseInt((selected.sub?.resolution ?? '0x0').split('x')[0]) || 0,
+      height:   parseInt((selected.sub?.resolution ?? '0x0').split('x')[1]) || 0,
+      fps:      (selected.sub?.fps ?? 0) > 0 ? selected.sub!.fps : 10,
+      bitrateMax: (selected.sub?.bitrate ?? 0) > 0 ? selected.sub!.bitrate : 1024,
+      bitrateType: 'CBR',
+      audioEnabled: false,
+      audioCodecType: '',
+      audioBitrate: 64,
+    })
+    loadCaps(selected.channel)
+    setEditMode(true)
+  }
+
+  const isFormValid = () => {
+    if (mainForm.fps === 0 || mainForm.bitrateMax === 0) return false
+    if (caps?.sub.exists && (subForm.fps === 0 || subForm.bitrateMax === 0)) return false
+    return true
+  }
+
+  const handleSave = async () => {
+    if (!selected || !isFormValid()) return
     setSaving(true)
     try {
-      await apiPut(`/nvrs/${nvrId}/video-audio/${selected.channel}`, editForm)
-      toast.success('Configuración guardada')
+      const mainPayload = { streamType: 'main', ...mainForm }
+      const subPayload  = { streamType: 'sub',  ...subForm }
+      await apiPut(`/nvrs/${nvrId}/video-audio/${selected.channel}`, mainPayload)
+      if (caps?.sub.exists && selected.sub) {
+        await apiPut(`/nvrs/${nvrId}/video-audio/${selected.channel}`, subPayload)
+      }
+      toast.success('Configuración guardada y verificada en el NVR')
       setEditMode(false)
       onRefresh()
     } catch (e: any) {
@@ -1459,17 +1543,7 @@ function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
                 </div>
                 {isAdmin && !selected.error && (
                   <button
-                    onClick={() => {
-                      setEditMode(!editMode)
-                      if (!editMode) {
-                        setEditForm({
-                          mainFps: selected.main?.fps,
-                          mainBitrate: selected.main?.bitrate,
-                          subFps: selected.sub?.fps,
-                          subBitrate: selected.sub?.bitrate,
-                        })
-                      }
-                    }}
+                    onClick={() => { if (editMode) { setEditMode(false) } else { enterEditMode() } }}
                     className="btn-secondary text-xs"
                   >
                     <Pencil size={11} /> {editMode ? 'Cancelar' : 'Editar'}
@@ -1492,82 +1566,139 @@ function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
                     </div>
                   )}
 
-                  {/* Main stream */}
-                  <div className="space-y-2">
-                    <div className="text-xs font-medium text-surface-400 uppercase tracking-wide">Stream Principal</div>
-                    {selected.main ? (
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                        {[
-                          ['Codec', selected.main.codec],
-                          ['Resolución', selected.main.resolution],
-                          ['FPS', editMode ? null : String(selected.main.fps)],
-                          ['Bitrate', editMode ? null : `${selected.main.bitrate} kbps`],
-                        ].map(([k, v]) => v !== null ? (
-                          <div key={k as string}>
-                            <div className="text-[10px] text-surface-500">{k}</div>
-                            <div className="text-xs text-surface-200">{v}</div>
-                          </div>
-                        ) : null)}
-                        {editMode && (
-                          <>
-                            <div>
-                              <label className="text-[10px] text-surface-500">FPS</label>
-                              <input className="input text-xs mt-0.5" type="number" min="1" max="30"
-                                value={editForm.mainFps ?? ''} onChange={e => setEditForm(f => ({ ...f, mainFps: Number(e.target.value) }))} />
-                            </div>
-                            <div>
-                              <label className="text-[10px] text-surface-500">Bitrate (kbps)</label>
-                              <input className="input text-xs mt-0.5" type="number" min="128" max="16384"
-                                value={editForm.mainBitrate ?? ''} onChange={e => setEditForm(f => ({ ...f, mainBitrate: Number(e.target.value) }))} />
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="text-xs text-surface-500">Sin datos de stream principal</div>
-                    )}
-                  </div>
+                  {loadingCaps && editMode && (
+                    <div className="flex items-center gap-2 text-xs text-surface-400">
+                      <Loader2 size={11} className="animate-spin" /> Cargando capacidades del NVR...
+                    </div>
+                  )}
 
-                  {/* Sub stream */}
-                  <div className="space-y-2">
-                    <div className="text-xs font-medium text-surface-400 uppercase tracking-wide">Sub-stream</div>
-                    {selected.sub ? (
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                        {[
-                          ['Codec', selected.sub.codec],
-                          ['Resolución', selected.sub.resolution],
-                          ['FPS', editMode ? null : String(selected.sub.fps)],
-                          ['Bitrate', editMode ? null : `${selected.sub.bitrate} kbps`],
-                        ].map(([k, v]) => v !== null ? (
-                          <div key={k as string}>
-                            <div className="text-[10px] text-surface-500">{k}</div>
-                            <div className="text-xs text-surface-200">{v}</div>
-                          </div>
-                        ) : null)}
-                        {editMode && (
-                          <>
-                            <div>
-                              <label className="text-[10px] text-surface-500">FPS</label>
-                              <input className="input text-xs mt-0.5" type="number" min="1" max="15"
-                                value={editForm.subFps ?? ''} onChange={e => setEditForm(f => ({ ...f, subFps: Number(e.target.value) }))} />
+                  {/* Helper: editable stream section */}
+                  {(['main', 'sub'] as const).map((st) => {
+                    const stream  = selected[st]
+                    const form    = st === 'main' ? mainForm : subForm
+                    const setForm = st === 'main'
+                      ? (fn: (f: Partial<StreamEditForm>) => Partial<StreamEditForm>) => setMainForm(fn)
+                      : (fn: (f: Partial<StreamEditForm>) => Partial<StreamEditForm>) => setSubForm(fn)
+                    const streamCaps = caps?.[st]
+                    const label = st === 'main' ? 'Stream Principal' : 'Sub-stream'
+
+                    if (!stream && st === 'sub' && streamCaps && !streamCaps.exists) return (
+                      <div key={st} className="space-y-2">
+                        <div className="text-xs font-medium text-surface-400 uppercase tracking-wide">{label}</div>
+                        <div className="text-xs text-surface-500">{streamCaps.reason ?? 'Sub-stream no disponible'}</div>
+                      </div>
+                    )
+
+                    return (
+                      <div key={st} className="space-y-2">
+                        <div className="text-xs font-medium text-surface-400 uppercase tracking-wide">{label}</div>
+                        {stream ? (
+                          editMode ? (
+                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                              {/* Codec */}
+                              <div>
+                                <label className="text-[10px] text-surface-500">Codec</label>
+                                <select
+                                  className="input text-xs mt-0.5 w-full"
+                                  value={form.videoCodecType ?? ''}
+                                  onChange={e => setForm(f => ({ ...f, videoCodecType: e.target.value }))}
+                                >
+                                  {(streamCaps?.codecs ?? [form.videoCodecType ?? 'H.264']).map(c => (
+                                    <option key={c} value={c}>{c}</option>
+                                  ))}
+                                </select>
+                              </div>
+                              {/* Resolution */}
+                              <div>
+                                <label className="text-[10px] text-surface-500">Resolución</label>
+                                <select
+                                  className="input text-xs mt-0.5 w-full"
+                                  value={`${form.width ?? 0}x${form.height ?? 0}`}
+                                  onChange={e => {
+                                    const [w, h] = e.target.value.split('x').map(Number)
+                                    setForm(f => ({ ...f, width: w, height: h }))
+                                  }}
+                                >
+                                  {(streamCaps?.resolutions ?? [{ width: form.width ?? 0, height: form.height ?? 0, label: `${form.width ?? 0}×${form.height ?? 0}` }]).map(r => (
+                                    <option key={`${r.width}x${r.height}`} value={`${r.width}x${r.height}`}>{r.label}</option>
+                                  ))}
+                                </select>
+                              </div>
+                              {/* FPS */}
+                              <div>
+                                <label className="text-[10px] text-surface-500">FPS {form.fps === 0 && <span className="text-red-400">— inválido</span>}</label>
+                                <select
+                                  className="input text-xs mt-0.5 w-full"
+                                  value={form.fps ?? ''}
+                                  onChange={e => setForm(f => ({ ...f, fps: Number(e.target.value) }))}
+                                >
+                                  {(streamCaps?.fpsOptions ?? [1,2,3,5,8,10,12,15,20,25,30]).map(f => (
+                                    <option key={f} value={f}>{f}</option>
+                                  ))}
+                                </select>
+                              </div>
+                              {/* Bitrate type */}
+                              <div>
+                                <label className="text-[10px] text-surface-500">Tipo bitrate</label>
+                                <select
+                                  className="input text-xs mt-0.5 w-full"
+                                  value={form.bitrateType ?? 'CBR'}
+                                  onChange={e => setForm(f => ({ ...f, bitrateType: e.target.value }))}
+                                >
+                                  {(streamCaps?.bitrateTypes ?? ['CBR', 'VBR']).map(t => (
+                                    <option key={t} value={t}>{t}</option>
+                                  ))}
+                                </select>
+                              </div>
+                              {/* Bitrate */}
+                              <div>
+                                <label className="text-[10px] text-surface-500">
+                                  Bitrate (kbps) {form.bitrateMax === 0 && <span className="text-red-400">— inválido</span>}
+                                </label>
+                                <input
+                                  className="input text-xs mt-0.5"
+                                  type="number"
+                                  min={streamCaps?.bitrateRange.min ?? 32}
+                                  max={streamCaps?.bitrateRange.max ?? 16384}
+                                  value={form.bitrateMax ?? ''}
+                                  onChange={e => setForm(f => ({ ...f, bitrateMax: Number(e.target.value) }))}
+                                />
+                              </div>
+                              {/* Audio */}
+                              <div>
+                                <label className="text-[10px] text-surface-500">Audio</label>
+                                <div className="flex items-center gap-2 mt-1">
+                                  <input
+                                    type="checkbox"
+                                    checked={form.audioEnabled ?? false}
+                                    onChange={e => setForm(f => ({ ...f, audioEnabled: e.target.checked }))}
+                                    className="accent-brand-500"
+                                  />
+                                  <span className="text-xs text-surface-300">{form.audioEnabled ? 'Habilitado' : 'Deshabilitado'}</span>
+                                </div>
+                              </div>
                             </div>
-                            <div>
-                              <label className="text-[10px] text-surface-500">Bitrate (kbps)</label>
-                              <input className="input text-xs mt-0.5" type="number" min="64" max="4096"
-                                value={editForm.subBitrate ?? ''} onChange={e => setEditForm(f => ({ ...f, subBitrate: Number(e.target.value) }))} />
+                          ) : (
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                              {[['Codec', stream.codec], ['Resolución', stream.resolution], ['FPS', String(stream.fps)], ['Bitrate', `${stream.bitrate} kbps`]].map(([k, v]) => (
+                                <div key={k as string}>
+                                  <div className="text-[10px] text-surface-500">{k}</div>
+                                  <div className="text-xs text-surface-200">{v}</div>
+                                </div>
+                              ))}
                             </div>
-                          </>
+                          )
+                        ) : (
+                          <div className="text-xs text-surface-500">Sin datos de {label.toLowerCase()}</div>
                         )}
                       </div>
-                    ) : (
-                      <div className="text-xs text-surface-500">Sin datos de sub-stream</div>
-                    )}
-                  </div>
+                    )
+                  })}
 
                   {editMode && (
                     <div className="flex gap-2 justify-end">
                       <button onClick={() => setEditMode(false)} className="btn-secondary text-xs">Cancelar</button>
-                      <button onClick={handleSave} disabled={saving} className="btn-primary text-xs">
+                      <button onClick={handleSave} disabled={saving || !isFormValid()} className="btn-primary text-xs" title={!isFormValid() ? 'FPS o bitrate no pueden ser 0' : undefined}>
                         {saving ? <Loader2 size={11} className="animate-spin" /> : null}
                         {saving ? 'Guardando...' : 'Guardar cambios'}
                       </button>
