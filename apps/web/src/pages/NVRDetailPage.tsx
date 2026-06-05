@@ -41,6 +41,8 @@ export function NVRDetailPage() {
   const [isapDebugModal, setIsapDebugModal] = useState(false)
   const [isapDebugData, setIsapDebugData] = useState<any>(null)
   const [loadingIsapDebug, setLoadingIsapDebug] = useState(false)
+  const [bgSyncing, setBgSyncing] = useState(false)
+  const [bgSyncResult, setBgSyncResult] = useState<{ sourceUsed?: string; syncedAt?: string } | null>(null)
 
   // Tabs data
   const [cameras, setCameras] = useState<{ fromNvr: IpCamera[]; fromDb: CameraType[] } | null>(null)
@@ -81,6 +83,24 @@ export function NVRDetailPage() {
     if (tab === 'users') loadUsers()
     if (tab === 'recordings') loadRecordingCaps()
   }, [tab, nvr])
+
+  // Auto-sync camera metadata in background when NVR detail loads
+  // and lastSyncAt is older than 2 minutes. Does not block the UI.
+  useEffect(() => {
+    if (!nvr || !id || !isSupervisor) return
+    const lastSync = (nvr as any).lastSyncAt ? new Date((nvr as any).lastSyncAt).getTime() : 0
+    const ageMs = Date.now() - lastSync
+    if (ageMs < 2 * 60 * 1000) return  // fresh enough
+    setBgSyncing(true)
+    apiPost<any>(`/nvrs/${id}/sync-cameras`, {})
+      .then((res) => setBgSyncResult({ sourceUsed: res.sourceUsed, syncedAt: res.syncedAt }))
+      .catch(() => {})
+      .finally(() => {
+        setBgSyncing(false)
+        // Reload cameras list if the tab is open
+        if (tab === 'cameras') loadCameras()
+      })
+  }, [nvr?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadNvr = async () => {
     try {
@@ -493,6 +513,8 @@ export function NVRDetailPage() {
           lastSyncResult={lastSyncResult}
           onValidateHealth={handleValidateHealth}
           validatingHealth={validatingHealth}
+          bgSyncing={bgSyncing}
+          bgSyncResult={bgSyncResult}
         />
       )}
       {tab === 'video' && (
@@ -943,7 +965,7 @@ function Highlight({ text, query }: { text: string; query: string }) {
 }
 
 function CamerasTab({
-  cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus, lastSyncResult, onValidateHealth, validatingHealth,
+  cameras, loading, onRefresh, onSyncCameras, onForceSyncNames, syncingCameras, onRestartStream, onDiagnostics, isAdmin, nvrId, isapIStatus, lastSyncResult, onValidateHealth, validatingHealth, bgSyncing, bgSyncResult,
 }: {
   cameras: { fromNvr: IpCamera[]; fromDb: CameraType[] } | null
   loading: boolean
@@ -959,6 +981,8 @@ function CamerasTab({
   lastSyncResult?: { nameSource?: 'real' | 'none'; nameReason?: string; sourceUsed?: string; nameCandidates?: number; nameUpdated?: number; warning?: string } | null
   onValidateHealth: () => void
   validatingHealth?: boolean
+  bgSyncing?: boolean
+  bgSyncResult?: { sourceUsed?: string; syncedAt?: string } | null
 }) {
   const [showAdopt, setShowAdopt] = useState(false)
   const [isapDebug, setIsapDebug] = useState<any[] | null>(null)
@@ -1079,6 +1103,16 @@ function CamerasTab({
             ? <><span className="text-brand-400 font-medium">{list.length}</span> de {allCameras.length}</>
             : <>{allCameras.length} cámaras en BD · {cameras?.fromNvr.length || 0} en NVR</>}
         </span>
+        {bgSyncing && (
+          <span className="flex items-center gap-1 text-[10px] text-brand-400 ml-2">
+            <Loader2 size={10} className="animate-spin" /> Sincronizando en segundo plano...
+          </span>
+        )}
+        {!bgSyncing && bgSyncResult && (
+          <span className="text-[10px] text-surface-500 ml-2">
+            Auto-sync: {bgSyncResult.sourceUsed ?? '?'}
+          </span>
+        )}
         <div className="flex-1" />
         <div className="flex gap-2">
           {isAdmin && (

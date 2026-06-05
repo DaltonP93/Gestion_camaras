@@ -26,6 +26,7 @@ import { liveViewRoutes } from './routes/liveView'
 import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
 import { startHealthWorker } from './jobs/healthWorker'
+import { startSyncWorker } from './jobs/syncWorker'
 import { publishStream } from './services/stream'
 import CryptoJS from 'crypto-js'
 
@@ -188,6 +189,7 @@ async function main() {
 
   // ─── Jobs en background ───────────────────────────────────
   startHealthWorker(server)
+  startSyncWorker(server)
 
   // ─── Iniciar servidor ─────────────────────────────────────
   const host = process.env.API_HOST || '0.0.0.0'
