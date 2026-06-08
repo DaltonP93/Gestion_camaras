@@ -1,15 +1,16 @@
 // src/pages/RecordingsPage.tsx
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useState, useMemo, useRef } from 'react'
 import {
   Search, Play, Download, Calendar, Clock, ChevronDown, CheckSquare, Square,
   AlertTriangle, RefreshCw, ExternalLink, XCircle, Loader2, Info,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
-import { apiPost, apiGet } from '@/lib/api'
+import { apiPost, apiGet, apiDelete } from '@/lib/api'
 import { format, subDays, subHours, startOfDay, endOfDay } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
 import toast from 'react-hot-toast'
+import Hls from 'hls.js'
 
 interface RecordingWithCamera extends Recording {
   cameraId: string
@@ -56,7 +57,11 @@ export function RecordingsPage() {
   const [recordings, setRecordings] = useState<RecordingWithCamera[]>([])
   const [isSearching, setIsSearching] = useState(false)
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
+  const [playbackSessionId, setPlaybackSessionId] = useState<string | null>(null)
+  const [playbackLoading, setPlaybackLoading] = useState(false)
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const hlsRef   = useRef<Hls | null>(null)
   const [showCameraList, setShowCameraList] = useState(false)
   const [nvrErrors, setNvrErrors] = useState<NvrSearchError[]>([])
   const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
@@ -212,17 +217,54 @@ export function RecordingsPage() {
     }
   }
 
+  // Stop any active HLS instance and release the MediaMTX recording path
+  const stopPlayback = () => {
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+    if (playbackSessionId) {
+      apiDelete(`/recordings/playback/${playbackSessionId}`).catch(() => {})
+      setPlaybackSessionId(null)
+    }
+    setPlaybackUrl(null)
+  }
+
+  // Clean up HLS + session on unmount
+  useEffect(() => stopPlayback, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Attach HLS.js whenever playbackUrl changes
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !playbackUrl) return
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: false })
+      hlsRef.current = hls
+      hls.loadSource(playbackUrl)
+      hls.attachMedia(video)
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari native HLS
+      video.src = playbackUrl
+      video.play().catch(() => {})
+    }
+  }, [playbackUrl])
+
   const handlePlay = async (rec: RecordingWithCamera) => {
+    stopPlayback()
     setSelectedRec(rec)
+    setPlaybackLoading(true)
     try {
-      const result = await apiPost<{ url: string }>('/recordings/playback', {
+      const result = await apiPost<{ url: string; sessionId?: string }>('/recordings/playback', {
         cameraId:  rec.cameraId,
         startTime: rec.startTime,
         endTime:   rec.endTime,
       })
       setPlaybackUrl(result.url)
+      if (result.sessionId) setPlaybackSessionId(result.sessionId)
     } catch {
       toast.error('No se pudo cargar la grabación')
+    } finally {
+      setPlaybackLoading(false)
     }
   }
 
@@ -505,15 +547,30 @@ export function RecordingsPage() {
                 : 'Reproductor'}
             </h3>
           </div>
-          <div className="aspect-video bg-surface-900 flex items-center justify-center">
-            {playbackUrl ? (
-              <video key={playbackUrl} src={playbackUrl} controls autoPlay className="w-full h-full" />
-            ) : (
-              <div className="text-center">
-                <Play size={32} className="text-surface-700 mx-auto mb-2" />
-                <p className="text-xs text-surface-500">
-                  {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
-                </p>
+          <div className="aspect-video bg-surface-900 flex items-center justify-center relative">
+            {/* HLS video player — always rendered so ref is stable */}
+            <video
+              ref={videoRef}
+              controls
+              className={clsx('w-full h-full', !playbackUrl && 'hidden')}
+              style={{ background: '#000' }}
+            />
+            {/* Placeholder when no playback active */}
+            {!playbackUrl && (
+              <div className="text-center absolute inset-0 flex flex-col items-center justify-center">
+                {playbackLoading ? (
+                  <>
+                    <Loader2 size={24} className="text-brand-400 mx-auto mb-2 animate-spin" />
+                    <p className="text-xs text-surface-500">Iniciando reproducción...</p>
+                  </>
+                ) : (
+                  <>
+                    <Play size={32} className="text-surface-700 mx-auto mb-2" />
+                    <p className="text-xs text-surface-500">
+                      {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
+                    </p>
+                  </>
+                )}
               </div>
             )}
           </div>

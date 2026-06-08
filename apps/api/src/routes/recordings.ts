@@ -1,12 +1,66 @@
 // apps/api/src/routes/recordings.ts
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { searchRecordings, getPlaybackUrl } from '../services/hikvision'
+import { searchRecordings } from '../services/hikvision'
 import { AuditAction } from '../services/audit'
 import CryptoJS from 'crypto-js'
+import axios from 'axios'
+import crypto from 'crypto'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+
+// ─── MediaMTX client (same pattern as stream.ts) ─────────────────
+const mediamtxApi = axios.create({
+  baseURL: process.env.MEDIAMTX_URL || 'http://mediamtx:9997',
+  timeout: 8000,
+})
+
+// ─── In-memory recording playback sessions ────────────────────────
+// key: sessionId — auto-cleanup after RECORDING_SESSION_TTL_MS of inactivity
+const RECORDING_SESSION_TTL_MS = 30 * 60 * 1000  // 30 minutes
+interface RecordingSession {
+  streamPath: string
+  expiresAt:  number
+  userId:     string
+}
+const recordingSessions = new Map<string, RecordingSession>()
+
+// Periodic cleanup of expired recording paths
+setInterval(async () => {
+  const now = Date.now()
+  for (const [sid, session] of recordingSessions.entries()) {
+    if (now > session.expiresAt) {
+      recordingSessions.delete(sid)
+      mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
+    }
+  }
+}, 5 * 60 * 1000)
+
+async function createRecordingHlsPath(
+  rtspUrl: string,
+  sessionId: string,
+): Promise<string> {
+  const streamPath = `rec_${sessionId}`
+  const config = {
+    source:          rtspUrl,
+    sourceOnDemand:  false,    // pull immediately — recording is finite, not on-demand
+    rtspTransport:   'tcp',
+    record:          false,
+    overridePublisher: true,
+  }
+  try {
+    await mediamtxApi.post(`/v3/config/paths/add/${streamPath}`, config)
+  } catch (err: any) {
+    if (err.response?.status === 400) {
+      // Path already exists — patch it
+      await mediamtxApi.patch(`/v3/config/paths/patch/${streamPath}`, config)
+    } else {
+      throw err
+    }
+  }
+  return streamPath
+}
 
 // In-memory capability cache: nvrId → 'isapi' | 'unsupported' | 'auth_error'
 const nvrCapabilityCache = new Map<string, { result: string; expiresAt: number }>()
@@ -190,7 +244,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     })
   })
 
-  // POST /api/recordings/playback — Obtener URL de reproducción
+  // POST /api/recordings/playback — Start recording playback via MediaMTX HLS proxy
+  // Returns an HLS URL (/hls/rec_<sessionId>/index.m3u8) — no RTSP or credentials sent to browser.
   server.post('/playback', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user = request.user
     const body = playbackSchema.parse(request.body)
@@ -209,14 +264,56 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       if (!perm) return reply.status(403).send({ message: 'Sin permiso de reproducción' })
     }
 
-    const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
-    const playback = await getPlaybackUrl(nvr as any, camera.channel, new Date(body.startTime), new Date(body.endTime))
+    const plainPass = decryptPass(camera.nvr.password)
+    if (!plainPass) {
+      return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
+    }
 
-    await AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
-      startTime: body.startTime, endTime: body.endTime,
-    })
+    // Build Hikvision RTSP playback URL with time range — stays server-side
+    const ch       = String(camera.channel).padStart(2, '0')
+    const start    = new Date(body.startTime)
+    const end      = new Date(body.endTime)
+    const fmtTs    = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+    const rtspUrl  = `rtsp://${camera.nvr.username}:${plainPass}@${camera.nvr.ipAddress}:${camera.nvr.rtspPort}/Streaming/tracks/${ch}00?starttime=${fmtTs(start)}&endtime=${fmtTs(end)}`
 
-    return reply.send(playback)
+    const sessionId = crypto.randomBytes(8).toString('hex')
+
+    try {
+      const streamPath = await createRecordingHlsPath(rtspUrl, sessionId)
+      const hlsUrl     = `/hls/${streamPath}/index.m3u8`
+      const expiresAt  = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
+
+      recordingSessions.set(sessionId, {
+        streamPath,
+        expiresAt: Date.now() + RECORDING_SESSION_TTL_MS,
+        userId:    user.sub,
+      })
+
+      server.log.info(`[recordings] playback_started sessionId=${sessionId} path=${streamPath} cameraId=${body.cameraId} ch=${camera.channel}`)
+
+      await AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
+        startTime: body.startTime, endTime: body.endTime, sessionId,
+      })
+
+      return reply.send({ url: hlsUrl, sessionId, expiresAt })
+    } catch (err: any) {
+      server.log.error(`[recordings] playback_failed sessionId=${sessionId} cameraId=${body.cameraId} err=${err.message}`)
+      return reply.status(502).send({ message: 'No se pudo iniciar la reproducción en el servidor de medios' })
+    }
+  })
+
+  // DELETE /api/recordings/playback/:sessionId — Stop recording playback and release MediaMTX path
+  server.delete('/playback/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string }
+    const session = recordingSessions.get(sessionId)
+    if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
+    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
+    recordingSessions.delete(sessionId)
+    await mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
+    server.log.info(`[recordings] playback_stopped sessionId=${sessionId} path=${session.streamPath}`)
+    return reply.send({ ok: true })
   })
 
   // GET /api/recordings/audit — Log de accesos a grabaciones (solo ADMIN)
