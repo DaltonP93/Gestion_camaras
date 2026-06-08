@@ -184,15 +184,18 @@ export function ViewPlayerPage() {
 
   // ─── Enter fullscreen (must be called inside user gesture) ───────────────
   const enterFullscreen = useCallback((cameraId: string) => {
-    // If already in CSS overlay fullscreen — exit first
-    if (fsState.phase !== 'idle' && fsState.phase !== 'exiting') {
-      const prev = fsState.cameraId
+    // Toggle off: same camera clicked while already in fullscreen
+    if (fsState.cameraId === cameraId && fsState.phase !== 'idle' && fsState.phase !== 'exiting') {
       setFsState(FS_IDLE)
       fsCamIdRef.current = null
-      if (prev) stopHdStream(prev)
-      // Exit native FS if active
+      stopHdStream(cameraId)
       if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
       return
+    }
+
+    // Switch camera: different camera clicked while in fullscreen — stop previous HD
+    if (fsState.cameraId && fsState.cameraId !== cameraId && fsState.phase !== 'idle') {
+      stopHdStream(fsState.cameraId)
     }
 
     // Choose HD stream type based on codec
@@ -204,10 +207,12 @@ export function ViewPlayerPage() {
     fsCamIdRef.current = cameraId
 
     // Request OS-level fullscreen on document root so overlay stays mounted
-    if (document.documentElement.requestFullscreen) {
-      document.documentElement.requestFullscreen().catch(() => {})
-    } else if ((document.documentElement as any).webkitRequestFullscreen) {
-      ;(document.documentElement as any).webkitRequestFullscreen()
+    if (!document.fullscreenElement) {
+      if (document.documentElement.requestFullscreen) {
+        document.documentElement.requestFullscreen().catch(() => {})
+      } else if ((document.documentElement as any).webkitRequestFullscreen) {
+        ;(document.documentElement as any).webkitRequestFullscreen()
+      }
     }
 
     // Start HD stream
@@ -623,7 +628,7 @@ export function ViewPlayerPage() {
 
       {/* ── Camera grid ──────────────────────────────────────────────────────── */}
       <div className={clsx('flex-1 min-h-0 p-0.5', objectFit === 'adapt' && 'overflow-y-auto')}>
-        {isFeatured ? (
+        {isFeatured && objectFit !== 'adapt' ? (
           <div className="h-full grid gap-1" style={{ gridTemplateColumns: '2fr 1fr', gridTemplateRows: '2fr 1fr' }}>
             <div className="row-span-1">{renderCell(pageSlots[0])}</div>
             <div className="grid gap-1" style={{ gridTemplateRows: '1fr 1fr' }}>

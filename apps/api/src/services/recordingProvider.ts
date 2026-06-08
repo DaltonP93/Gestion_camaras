@@ -62,10 +62,13 @@ export function buildIsapiSearchXml(opts: {
 </CMSearchDescription>`
 }
 
-function buildBody(): string {
+// Track IDs to probe in order — covers channels D1..D4; stops at first non-400 response.
+const PROBE_TRACK_IDS = [101, 201, 301, 401]
+
+function buildBody(trackId = 101): string {
   const now   = new Date()
-  const start = new Date(now.getTime() - 5000)
-  return buildIsapiSearchXml({ trackId: 101, startTime: start, endTime: now, maxResults: 1 })
+  const start = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) // 7 days — maximises hit chance
+  return buildIsapiSearchXml({ trackId, startTime: start, endTime: now, maxResults: 1 })
 }
 
 function buildDigestHeader(wwwAuth: string, username: string, password: string, method: string, uri: string): string {
@@ -156,38 +159,61 @@ function extractResponseStatus(body: string): string {
   return parts.join(' — ')
 }
 
-export async function checkIsapiRecordingSupport(creds: NvrCreds): Promise<CheckResult> {
-  const xml   = buildBody()
+/** Send one probed request (with Basic or resolved-Digest auth) and return the result. */
+async function probeOnce(
+  creds: NvrCreds,
+  trackId: number,
+): Promise<RequestResult & { requestXml: string; trackId: number; resolvedAuth: string }> {
+  const xml   = buildBody(trackId)
   const basic = `Basic ${Buffer.from(`${creds.username}:${creds.password}`).toString('base64')}`
-  const requestXml = xml // safe — no credentials in XML body
 
+  const r1 = await doRequest(creds, basic, xml)
+  if (r1.code === 401 && r1.wwwAuth?.toLowerCase().includes('digest')) {
+    const digestHeader = buildDigestHeader(r1.wwwAuth!, creds.username, creds.password, 'POST', ISAPI_PATH)
+    const r2 = await doRequest(creds, digestHeader, xml)
+    return { ...r2, requestXml: xml, trackId, resolvedAuth: 'digest' }
+  }
+  return { ...r1, requestXml: xml, trackId, resolvedAuth: 'basic' }
+}
+
+export async function checkIsapiRecordingSupport(creds: NvrCreds): Promise<CheckResult> {
   try {
-    // Attempt 1: Basic auth
-    const r1 = await doRequest(creds, basic, xml)
+    // Probe multiple channels so a single empty channel (400) doesn't block detection.
+    // Stop as soon as a non-400 response is received.
+    let lastResult: RequestResult & { requestXml: string; trackId: number } | null = null
 
-    if (r1.code >= 200 && r1.code < 400) {
-      return { supported: true, httpStatus: r1.code, responseBody: r1.body, requestXml, trackId: 101 }
-    }
+    for (const tid of PROBE_TRACK_IDS) {
+      const r = await probeOnce(creds, tid)
+      lastResult = r
 
-    // Hikvision returns 401 + Digest challenge — retry with Digest
-    if (r1.code === 401 && r1.wwwAuth?.toLowerCase().includes('digest')) {
-      const digestHeader = buildDigestHeader(r1.wwwAuth!, creds.username, creds.password, 'POST', ISAPI_PATH)
-      const r2 = await doRequest(creds, digestHeader, xml)
-
-      if (r2.code >= 200 && r2.code < 400) {
-        return { supported: true, httpStatus: r2.code, responseBody: r2.body, requestXml, trackId: 101 }
+      if (r.code >= 200 && r.code < 300) {
+        return { supported: true, httpStatus: r.code, responseBody: r.body, requestXml: r.requestXml, trackId: tid }
       }
-      const classified = classifyHttpError(r2.code, r2.body)
-      return { supported: false, ...classified, httpStatus: r2.code, responseBody: r2.body, requestXml, trackId: 101 }
+      // Auth errors and real "unsupported" — stop immediately, no point probing more channels
+      if (r.code === 401 || r.code === 403 || r.code === 404 || r.code === 405 || r.code === 501) {
+        break
+      }
+      // 400 — this channel may not exist; continue to next channel
     }
 
-    const classified = classifyHttpError(r1.code, r1.body)
-    return { supported: false, ...classified, httpStatus: r1.code, responseBody: r1.body, requestXml, trackId: 101 }
+    if (!lastResult) {
+      return { supported: false, error: 'Sin respuesta del NVR', errorCode: 'NETWORK_ERROR' }
+    }
+
+    const classified = classifyHttpError(lastResult.code, lastResult.body)
+    return {
+      supported: false,
+      ...classified,
+      httpStatus: lastResult.code,
+      responseBody: lastResult.body,
+      requestXml: lastResult.requestXml,
+      trackId: lastResult.trackId,
+    }
   } catch (e: any) {
     if (e.message === 'timeout') {
-      return { supported: false, error: 'Timeout al conectar con el NVR', errorCode: 'NETWORK_TIMEOUT', requestXml, trackId: 101 }
+      return { supported: false, error: 'Timeout al conectar con el NVR', errorCode: 'NETWORK_TIMEOUT' }
     }
-    return { supported: false, error: e.message ?? 'Error de red', errorCode: 'NETWORK_ERROR', requestXml, trackId: 101 }
+    return { supported: false, error: e.message ?? 'Error de red', errorCode: 'NETWORK_ERROR' }
   }
 }
 
