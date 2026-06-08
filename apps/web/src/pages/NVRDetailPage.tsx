@@ -86,6 +86,8 @@ export function NVRDetailPage() {
 
   // Auto-sync camera metadata in background when NVR detail loads
   // and lastSyncAt is older than 2 minutes. Does not block the UI.
+  // loadCameras and loadNvr are always called on completion regardless of current tab
+  // so the user sees up-to-date data without a manual refresh.
   useEffect(() => {
     if (!nvr || !id || !isSupervisor) return
     const lastSync = (nvr as any).lastSyncAt ? new Date((nvr as any).lastSyncAt).getTime() : 0
@@ -97,8 +99,9 @@ export function NVRDetailPage() {
       .catch(() => {})
       .finally(() => {
         setBgSyncing(false)
-        // Reload cameras list if the tab is open
-        if (tab === 'cameras') loadCameras()
+        loadCameras()  // always reload — user may not be on cameras tab yet
+        // Refresh NVR object so lastSyncAt and online counts update in the header
+        apiGet<NVR>(`/nvrs/${id}`).then(setNvr).catch(() => {})
       })
   }, [nvr?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
