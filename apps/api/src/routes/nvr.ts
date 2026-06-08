@@ -1281,10 +1281,12 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const creds = { ipAddress: nvr.ipAddress, port: nvr.port, username: nvr.username, password: plain }
     const { supported, error, errorCode, httpStatus, responseBody } = await checkIsapiRecordingSupport(creds)
 
-    // INVALID_REQUEST (HTTP 400 from bad XML) does NOT mean the device is unsupported.
-    // Only set provider to MANUAL_NVR if the device truly doesn't support ISAPI search.
+    // INVALID_REQUEST (HTTP 400) means the endpoint EXISTS — the NVR parsed our XML but rejected
+    // the channel query (e.g. channel D1..D4 has no recordings or isn't provisioned).
+    // This is categorically different from 404/405/501 (endpoint missing = truly unsupported).
+    // So on 400, record provider=ISAPI and supportsIsapiRecording=null (unknown pending retry).
     const provider = (errorCode === 'INVALID_REQUEST')
-      ? ((nvr as any).recordingProvider ?? 'ISAPI')  // preserve existing value
+      ? 'ISAPI'
       : detectProviderFromCapabilities(supported)
 
     const updated = await server.prisma.nVR.update({
