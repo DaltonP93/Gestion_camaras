@@ -478,8 +478,10 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     for (const cam of ipCams) {
       try {
         // onlineInNvr: lo que reporta el NVR vía ISAPI (puede ser unreliable)
-        // online: solo se fuerza a true desde ISAPI; a false lo gestiona la validación RTSP
-        const onlineInNvr = cam.status?.toLowerCase().includes('online') || cam.status?.toLowerCase().includes('en línea')
+        // null = NVR no reportó estado; false = NVR reportó explícitamente offline
+        const onlineInNvr: boolean | null = cam.status
+          ? (cam.status.toLowerCase().includes('online') || cam.status.toLowerCase().includes('en línea'))
+          : null
         await server.prisma.camera.upsert({
           where:  { nvrId_channel: { nvrId: id, channel: cam.channel } },
           create: {
@@ -491,7 +493,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             protocol:       cam.protocol,
             managementPort: cam.managementPort,
             securityStatus: cam.securityStatus,
-            online:         onlineInNvr,
+            online:         onlineInNvr ?? false,
             onlineInNvr:    onlineInNvr,
             lastSyncAt:     new Date(),
           },
@@ -505,7 +507,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             onlineInNvr:    onlineInNvr,
             // Only force online=true if NVR confirms; never force to false here —
             // validateAndUpdateCameraHealth sets online=true when RTSP works.
-            ...(onlineInNvr ? { online: true } : {}),
+            ...(onlineInNvr === true ? { online: true } : {}),
             lastSyncAt:     new Date(),
           },
         })

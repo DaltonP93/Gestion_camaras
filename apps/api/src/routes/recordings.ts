@@ -3,6 +3,7 @@ import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { searchRecordings } from '../services/hikvision'
 import { AuditAction } from '../services/audit'
+import { waitForHlsReady } from '../services/stream'
 import CryptoJS from 'crypto-js'
 import axios from 'axios'
 import crypto from 'crypto'
@@ -289,7 +290,17 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         userId:    user.sub,
       })
 
-      server.log.info(`[recordings] playback_started sessionId=${sessionId} path=${streamPath} cameraId=${body.cameraId} ch=${camera.channel}`)
+      // Wait for MediaMTX to connect to the NVR RTSP before returning the URL.
+      // Without this the frontend immediately gets a 404 on the manifest.
+      const ready = await waitForHlsReady(streamPath, 20_000, 800)
+      if (!ready.ready) {
+        recordingSessions.delete(sessionId)
+        mediamtxApi.delete(`/v3/config/paths/delete/${streamPath}`).catch(() => {})
+        server.log.warn(`[recordings] hls_not_ready sessionId=${sessionId} lastStatus=${ready.lastStatus} elapsed=${ready.elapsedMs}ms`)
+        return reply.status(504).send({ message: 'El servidor de medios no pudo conectar con el NVR a tiempo' })
+      }
+
+      server.log.info(`[recordings] playback_started sessionId=${sessionId} path=${streamPath} cameraId=${body.cameraId} ch=${camera.channel} hlsReady=${ready.elapsedMs}ms`)
 
       await AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
         startTime: body.startTime, endTime: body.endTime, sessionId,

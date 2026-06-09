@@ -75,27 +75,32 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
     return found ?? { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false, canHighQuality: false }
   }, [perms])
 
-  // Checking a camera grants both view + playback (single-checkbox model)
-  const toggleCamera = (nvrId: string, cameraId: string, checked: boolean) => {
+  // Set a specific permission field for a camera
+  const setPermField = (nvrId: string, cameraId: string, field: 'canView' | 'canPlayback' | 'canPtz', checked: boolean) => {
     setPerms(prev => {
       const idx = prev.findIndex(p => p.nvrId === nvrId && p.cameraId === cameraId)
-      if (!checked) {
-        return prev.filter((_, i) => i !== idx)
-      }
-      const entry: PermMatrix = { nvrId, cameraId, canView: true, canPlayback: true, canPtz: false, canHighQuality: false }
-      if (idx >= 0) { const copy = [...prev]; copy[idx] = entry; return copy }
-      return [...prev, entry]
+      const base = idx >= 0 ? prev[idx] : { nvrId, cameraId, canView: false, canPlayback: false, canPtz: false, canHighQuality: false }
+      const updated = { ...base, [field]: checked }
+      const hasAny = updated.canView || updated.canPlayback || updated.canPtz
+      if (!hasAny) return prev.filter((_, i) => i !== idx)
+      if (idx >= 0) { const copy = [...prev]; copy[idx] = updated; return copy }
+      return [...prev, updated]
     })
   }
 
-  const toggleNvrAll = (nvrId: string, checked: boolean) => {
+  const toggleNvrColumn = (nvrId: string, field: 'canView' | 'canPlayback' | 'canPtz', checked: boolean) => {
     const nvCams = cameras.filter(c => c.nvrId === nvrId)
     setPerms(prev => {
-      const next = prev.filter(p => p.nvrId !== nvrId)
-      if (checked) {
-        next.push({ nvrId, cameraId: undefined, canView: true, canPlayback: true, canPtz: false, canHighQuality: false })
-        nvCams.forEach(cam => next.push({ nvrId, cameraId: cam.id, canView: true, canPlayback: true, canPtz: false, canHighQuality: false }))
-      }
+      const next = [...prev]
+      nvCams.forEach(cam => {
+        const idx = next.findIndex(p => p.nvrId === nvrId && p.cameraId === cam.id)
+        const base = idx >= 0 ? next[idx] : { nvrId, cameraId: cam.id, canView: false, canPlayback: false, canPtz: false, canHighQuality: false }
+        const updated = { ...base, [field]: checked }
+        const hasAny = updated.canView || updated.canPlayback || updated.canPtz
+        if (!hasAny && idx >= 0) next.splice(idx, 1)
+        else if (hasAny && idx >= 0) next[idx] = updated
+        else if (hasAny) next.push(updated)
+      })
       return next
     })
   }
@@ -103,7 +108,6 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
   const selectAllCameras = () => {
     const all: PermMatrix[] = []
     nvrs.forEach(nvr => {
-      all.push({ nvrId: nvr.id, cameraId: undefined, canView: true, canPlayback: true, canPtz: false, canHighQuality: false })
       cameras.filter(c => c.nvrId === nvr.id).forEach(cam =>
         all.push({ nvrId: nvr.id, cameraId: cam.id, canView: true, canPlayback: true, canPtz: false, canHighQuality: false })
       )
@@ -161,7 +165,7 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
           </div>
         )}
 
-        {/* Body — single camera list, one checkbox per camera */}
+        {/* Body — 3-column permission matrix per camera */}
         <div className="flex-1 overflow-y-auto">
           {isLoading ? (
             <div className="text-center py-16 text-surface-500 text-sm">Cargando...</div>
@@ -176,31 +180,52 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
                 <button onClick={clearAllCameras} className="text-xs text-surface-400 hover:text-surface-200 whitespace-nowrap">Limpiar</button>
               </div>
 
+              {/* Column headers */}
+              <div className="flex items-center gap-2 px-3 py-1.5 text-[10px] text-surface-500 uppercase tracking-wide">
+                <span className="flex-1 pl-6">Cámara</span>
+                <span className="w-20 text-center flex items-center justify-center gap-1"><Eye size={10} /> Ver</span>
+                <span className="w-20 text-center flex items-center justify-center gap-1"><Monitor size={10} /> Grabaciones</span>
+                <span className="w-20 text-center flex items-center justify-center gap-1"><Settings size={10} /> Gestionar</span>
+              </div>
+
               {filteredNvrs.length === 0 ? (
                 <div className="text-center py-8 text-surface-500 text-xs">Sin NVRs configurados</div>
               ) : filteredNvrs.map(nvr => {
                 const nvrCams = cameras.filter(c => c.nvrId === nvr.id && (!search || c.name.toLowerCase().includes(search.toLowerCase()) || nvr.name.toLowerCase().includes(search.toLowerCase())))
                 if (nvrCams.length === 0) return null
                 const isOpen = expandedNvrs.has(nvr.id)
-                const allChecked = nvrCams.length > 0 && nvrCams.every(c => getPerm(nvr.id, c.id).canView)
-                const someChecked = nvrCams.some(c => getPerm(nvr.id, c.id).canView)
-                const checkedCount = nvrCams.filter(c => getPerm(nvr.id, c.id).canView).length
+
+                const colState = (field: 'canView' | 'canPlayback' | 'canPtz') => {
+                  const count = nvrCams.filter(c => getPerm(nvr.id, c.id)[field]).length
+                  return { all: count === nvrCams.length && nvrCams.length > 0, some: count > 0 && count < nvrCams.length, count }
+                }
+                const viewSt = colState('canView')
+                const playSt = colState('canPlayback')
+                const ptzSt  = colState('canPtz')
 
                 return (
                   <div key={nvr.id} className="border border-surface-700 rounded-lg overflow-hidden">
-                    {/* NVR header row */}
-                    <div className="flex items-center gap-2.5 px-3 py-2.5 bg-surface-750 hover:bg-surface-700/70 transition-colors">
-                      <input
-                        type="checkbox"
-                        checked={allChecked}
-                        ref={el => { if (el) el.indeterminate = someChecked && !allChecked }}
-                        onChange={e => toggleNvrAll(nvr.id, e.target.checked)}
-                        className="accent-brand-500 w-3.5 h-3.5"
-                        onClick={e => e.stopPropagation()}
-                      />
+                    {/* NVR header row — one checkbox per column */}
+                    <div className="flex items-center gap-2 px-3 py-2.5 bg-surface-750">
                       <Server size={12} className="text-surface-400 flex-shrink-0" />
                       <span className="flex-1 text-xs font-medium text-surface-200">{nvr.name}</span>
-                      <span className="text-[10px] text-surface-500">{checkedCount}/{nvrCams.length}</span>
+                      <span className="text-[10px] text-surface-500 mr-1">{viewSt.count}/{nvrCams.length}</span>
+                      {/* Column toggle checkboxes */}
+                      {(['canView', 'canPlayback', 'canPtz'] as const).map((field, fi) => {
+                        const st = [viewSt, playSt, ptzSt][fi]
+                        return (
+                          <div key={field} className="w-20 flex justify-center">
+                            <input
+                              type="checkbox"
+                              checked={st.all}
+                              ref={el => { if (el) el.indeterminate = st.some }}
+                              onChange={e => toggleNvrColumn(nvr.id, field, e.target.checked)}
+                              className="accent-brand-500 w-3.5 h-3.5"
+                              title={`Alternar ${field === 'canView' ? 'Ver' : field === 'canPlayback' ? 'Grabaciones' : 'Gestionar'} para todas las cámaras de ${nvr.name}`}
+                            />
+                          </div>
+                        )
+                      })}
                       <button
                         onClick={() => setExpandedNvrs(prev => { const n = new Set(prev); n.has(nvr.id) ? n.delete(nvr.id) : n.add(nvr.id); return n })}
                         className="p-1 text-surface-500 hover:text-surface-200"
@@ -209,25 +234,25 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
                       </button>
                     </div>
 
-                    {/* Camera rows — visible when expanded */}
+                    {/* Camera rows with 3 columns */}
                     {isOpen && nvrCams.map(cam => {
-                      const checked = getPerm(nvr.id, cam.id).canView
+                      const p = getPerm(nvr.id, cam.id)
                       return (
-                        <div
-                          key={cam.id}
-                          className="flex items-center gap-2.5 px-3 py-2 pl-9 border-t border-surface-700/50 bg-surface-800/50 hover:bg-surface-800 transition-colors cursor-pointer"
-                          onClick={() => toggleCamera(nvr.id, cam.id, !checked)}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={e => toggleCamera(nvr.id, cam.id, e.target.checked)}
-                            onClick={e => e.stopPropagation()}
-                            className="accent-brand-500 w-3.5 h-3.5"
-                          />
+                        <div key={cam.id} className="flex items-center gap-2 px-3 py-2 pl-8 border-t border-surface-700/50 bg-surface-800/50 hover:bg-surface-800 transition-colors">
                           <Monitor size={10} className={clsx('flex-shrink-0', cam.online ? 'text-green-400' : 'text-surface-600')} />
                           <span className="flex-1 text-xs text-surface-300 truncate">{cam.name}</span>
-                          <span className="text-[10px] text-surface-600 font-mono">D{cam.channel}</span>
+                          <span className="text-[10px] text-surface-600 font-mono mr-1">D{cam.channel}</span>
+                          {(['canView', 'canPlayback', 'canPtz'] as const).map(field => (
+                            <div key={field} className="w-20 flex justify-center">
+                              <input
+                                type="checkbox"
+                                checked={p[field]}
+                                onChange={e => setPermField(nvr.id, cam.id, field, e.target.checked)}
+                                className="accent-brand-500 w-3.5 h-3.5"
+                              />
+                            </div>
+                          ))}
+                          <div className="w-5" /> {/* align with NVR expand button */}
                         </div>
                       )
                     })}
@@ -241,7 +266,7 @@ function PermissionsPanel({ user, onClose }: { user: User; onClose: () => void }
         {/* Footer */}
         <div className="px-5 py-3 border-t border-surface-700 flex items-center justify-between gap-2 flex-shrink-0">
           <span className="text-xs text-surface-500">
-            {allowedCams}/{totalCams} cámaras con acceso
+            Ver: {allowedCams} · Grab: {[...new Set(perms.filter(p => p.cameraId && p.canPlayback).map(p => p.cameraId))].length} · Gest: {[...new Set(perms.filter(p => p.cameraId && p.canPtz).map(p => p.cameraId))].length} / {totalCams}
           </span>
           <div className="flex gap-2">
             <button onClick={onClose} className="btn-secondary text-xs">Cancelar</button>
