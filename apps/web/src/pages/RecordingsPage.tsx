@@ -263,8 +263,20 @@ export function RecordingsPage() {
       })
       setPlaybackUrl(result.url)
       if (result.sessionId) setPlaybackSessionId(result.sessionId)
-    } catch {
-      toast.error('No se pudo cargar la grabación')
+    } catch (err: any) {
+      const data   = err?.response?.data ?? {}
+      const code   = data.code ?? ''
+      const detail = data.detail ?? data.message ?? ''
+      if (code === 'HLS_TIMEOUT') {
+        toast.error(
+          `MediaMTX no publicó la grabación (timeout 25s)\n${detail}`,
+          { duration: 8000 }
+        )
+      } else if (code === 'MEDIAMTX_ERROR') {
+        toast.error(`Error registrando path en MediaMTX: ${detail}`, { duration: 6000 })
+      } else {
+        toast.error(detail || 'No se pudo cargar la grabación')
+      }
     } finally {
       setPlaybackLoading(false)
     }

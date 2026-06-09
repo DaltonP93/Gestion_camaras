@@ -1717,10 +1717,13 @@ function parseSearchMatchItem(block: string, nvrId: string, channel: number, ind
 export async function getPlaybackUrl(
   nvr: NVR, channel: number, startTime: Date, endTime: Date
 ): Promise<HikPlaybackUrl> {
-  const channelStr = String(channel).padStart(2, '0')
-  const startIso   = startTime.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
-  const endIso     = endTime.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
-  const url = `rtsp://${nvr.username}:${nvr.password}@${nvr.ipAddress}:${nvr.rtspPort}/Streaming/tracks/${channelStr}00?starttime=${startIso}&endtime=${endIso}`
+  // Track ID = channel * 100 + 1 (main stream) — same formula as searchRecordings.
+  // Password must be URL-encoded to handle special chars (@, #, :, etc.).
+  const trackId     = channel * 100 + 1
+  const encodedPass = encodeURIComponent((nvr as any).password ?? nvr.password)
+  const startIso    = startTime.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const endIso      = endTime.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const url = `rtsp://${nvr.username}:${encodedPass}@${nvr.ipAddress}:${nvr.rtspPort}/Streaming/tracks/${trackId}?starttime=${startIso}&endtime=${endIso}`
   return { url, expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() }
 }
 
