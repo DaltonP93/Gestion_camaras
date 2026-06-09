@@ -370,6 +370,35 @@ export function ViewPlayerPage() {
   const prevPage = useCallback(() => setCurrentPage((p) => (p - 1 + totalPages) % totalPages), [totalPages])
   const nextPage = useCallback(() => setCurrentPage((p) => (p + 1) % totalPages), [totalPages])
 
+  // ─── Heartbeat — keeps stream sessions alive (prevents 90s idle expiry) ──
+  const viewIdRef = useRef<string>(`vp_${Math.random().toString(36).slice(2)}`)
+  useEffect(() => {
+    if (!view || filledSlots.length === 0) return
+    const perPage     = getSlotsPerPage(view.layout)
+    const pageSlots   = filledSlots.slice(currentPage * perPage, (currentPage + 1) * perPage)
+    const visibleIds  = pageSlots.map((s) => s.cameraId!).filter(Boolean)
+    if (visibleIds.length === 0) return
+
+    const sendBeat = () =>
+      apiPost('/live-view/heartbeat', {
+        viewId:           viewIdRef.current,
+        visibleCameraIds: visibleIds,
+        layout:           perPage,
+        page:             currentPage,
+      }).then((result: any) => {
+        if (!result?.streams) return
+        setSlots((prev) => prev.map((s) => {
+          if (!s.cameraId) return s
+          const info = result.streams[s.cameraId]
+          return info ? { ...s, stream: info } : s
+        }))
+      }).catch(() => {})
+
+    sendBeat()
+    const id = setInterval(sendBeat, 30_000)
+    return () => clearInterval(id)
+  }, [view, currentPage, filledSlots.map((s) => s.cameraId).join(',')]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ─── Loading / error UI ───────────────────────────────────────────────────
   if (isLoading) {
     return (
