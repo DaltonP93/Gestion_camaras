@@ -243,9 +243,44 @@ export function RecordingsPage() {
       hlsRef.current = hls
       hls.loadSource(playbackUrl)
       hls.attachMedia(video)
-      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+      hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
+        // Detect HEVC early via codec string in the manifest levels
+        const codecs = data.levels?.map((l: any) => l.videoCodec ?? l.codecs ?? '').join(' ').toLowerCase()
+        if (codecs.includes('hvc1') || codecs.includes('hev1') || codecs.includes('h265')) {
+          toast.error(
+            'La grabación usa H.265 (HEVC). Este navegador no puede reproducirlo. ' +
+            'Usa Safari, o activa HEVC en tu navegador.',
+            { duration: 10000 }
+          )
+        }
+        video.play().catch(() => {})
+      })
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (!data.fatal) return
+        // Detect HEVC/H.265 codec rejection — Chrome/Firefox don't support HEVC in HLS
+        const isCodecError =
+          data.type === Hls.ErrorTypes.MEDIA_ERROR ||
+          (data.details as string)?.includes('codec') ||
+          (data.details as string)?.includes('levelParsed')
+        const videoErr = (data.error as any)?.message ?? ''
+        const isHevc   = videoErr.toLowerCase().includes('h265') ||
+                         videoErr.toLowerCase().includes('hevc') ||
+                         videoErr.toLowerCase().includes('hvc1') ||
+                         data.details === 'bufferStalledError'
+        if (isCodecError || isHevc) {
+          toast.error(
+            'La grabación usa H.265 (HEVC), que este navegador no puede decodificar. ' +
+            'Usa Safari, o un navegador con soporte HEVC habilitado.',
+            { duration: 10000 }
+          )
+        } else {
+          toast.error('Error de reproducción. Intenta de nuevo.', { duration: 5000 })
+        }
+        hls.destroy()
+        hlsRef.current = null
+      })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari native HLS
+      // Safari native HLS (supports HEVC natively)
       video.src = playbackUrl
       video.play().catch(() => {})
     }
