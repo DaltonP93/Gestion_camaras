@@ -1688,6 +1688,7 @@ export async function searchRecordings(
         const parsed = itemsPascal.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
         const withUri = parsed.filter(r => r.playbackURI).length
         if (itemsPascal.length > 0 && withUri === 0) {
+          // Log first block snippet to confirm whether playbackURI tag is present in the XML
           console.warn(`[hikvision] search ch=${channel} total=${itemsPascal.length} withPlaybackUri=0 first_block_snippet=${itemsPascal[0].slice(0, 400).replace(/\s+/g, ' ')}`)
         }
         return parsed
@@ -1697,6 +1698,7 @@ export async function searchRecordings(
     const parsed = items.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
     const withUri = parsed.filter(r => r.playbackURI).length
     if (items.length > 0 && withUri === 0) {
+      // Log first block snippet to confirm whether playbackURI tag is present in the XML
       console.warn(`[hikvision] search ch=${channel} total=${items.length} withPlaybackUri=0 first_block_snippet=${items[0].slice(0, 400).replace(/\s+/g, ' ')}`)
     }
     return parsed

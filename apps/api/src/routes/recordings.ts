@@ -96,10 +96,10 @@ async function createRecordingHlsPath(
   log: (msg: string) => void,
 ): Promise<void> {
   const config = {
-    source:          rtspUrl,
-    sourceOnDemand:  false,    // pull immediately — recording is finite, not on-demand
-    rtspTransport:   'tcp',
-    record:          false,
+    source:            rtspUrl,
+    sourceOnDemand:    false,   // pull immediately — recording is finite, not on-demand
+    rtspTransport:     'tcp',
+    record:            false,
     overridePublisher: true,
   }
 

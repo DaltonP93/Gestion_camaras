@@ -248,7 +248,8 @@ export function RecordingsPage() {
         const codecs = (data.levels ?? []).map((l: any) => l.videoCodec ?? l.codecs ?? '').join(' ').toLowerCase()
         if (codecs.includes('hvc1') || codecs.includes('hev1') || codecs.includes('h265')) {
           toast.error(
-            'La grabación usa H.265 (HEVC). Este navegador no puede reproducirlo. Usa Safari o un navegador con soporte HEVC.',
+            'La grabación usa H.265 (HEVC). Este navegador no puede reproducirlo. ' +
+            'Usa Safari, o activa HEVC en tu navegador.',
             { duration: 10000 }
           )
         }
@@ -256,11 +257,24 @@ export function RecordingsPage() {
       })
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         if (!data.fatal) return
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        // Detect HEVC/H.265 codec rejection — Chrome/Firefox don't support HEVC in HLS
+        const isCodecError =
+          data.type === Hls.ErrorTypes.MEDIA_ERROR ||
+          (data.details as string)?.includes('codec') ||
+          (data.details as string)?.includes('levelParsed')
+        const videoErr = (data.error as any)?.message ?? ''
+        const isHevc   = videoErr.toLowerCase().includes('h265') ||
+                         videoErr.toLowerCase().includes('hevc') ||
+                         videoErr.toLowerCase().includes('hvc1') ||
+                         data.details === 'bufferStalledError'
+        if (isCodecError || isHevc) {
           toast.error(
-            'Error de codec. Si la grabación es H.265 (HEVC), este navegador no puede reproducirla. Usa Safari.',
-            { duration: 8000 }
+            'La grabación usa H.265 (HEVC), que este navegador no puede decodificar. ' +
+            'Usa Safari, o un navegador con soporte HEVC habilitado.',
+            { duration: 10000 }
           )
+        } else {
+          toast.error('Error de reproducción. Intenta de nuevo.', { duration: 5000 })
         }
         hls.destroy()
         hlsRef.current = null
