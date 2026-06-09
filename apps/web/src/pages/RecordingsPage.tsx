@@ -243,9 +243,30 @@ export function RecordingsPage() {
       hlsRef.current = hls
       hls.loadSource(playbackUrl)
       hls.attachMedia(video)
-      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+      hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
+        // Detect H.265 early via codec strings in the manifest (hvc1/hev1)
+        const codecs = (data.levels ?? []).map((l: any) => l.videoCodec ?? l.codecs ?? '').join(' ').toLowerCase()
+        if (codecs.includes('hvc1') || codecs.includes('hev1') || codecs.includes('h265')) {
+          toast.error(
+            'La grabación usa H.265 (HEVC). Este navegador no puede reproducirlo. Usa Safari o un navegador con soporte HEVC.',
+            { duration: 10000 }
+          )
+        }
+        video.play().catch(() => {})
+      })
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (!data.fatal) return
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          toast.error(
+            'Error de codec. Si la grabación es H.265 (HEVC), este navegador no puede reproducirla. Usa Safari.',
+            { duration: 8000 }
+          )
+        }
+        hls.destroy()
+        hlsRef.current = null
+      })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari native HLS
+      // Safari native HLS — soporta HEVC nativamente
       video.src = playbackUrl
       video.play().catch(() => {})
     }

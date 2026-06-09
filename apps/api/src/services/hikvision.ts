@@ -1685,11 +1685,21 @@ export async function searchRecordings(
       // Some firmware uses PascalCase
       const itemsPascal = xmlGetAll(responseData, 'SearchMatchItem')
       if (itemsPascal.length > 0) {
-        return itemsPascal.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+        const parsed = itemsPascal.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+        const withUri = parsed.filter(r => r.playbackURI).length
+        if (itemsPascal.length > 0 && withUri === 0) {
+          console.warn(`[hikvision] search ch=${channel} total=${itemsPascal.length} withPlaybackUri=0 first_block_snippet=${itemsPascal[0].slice(0, 400).replace(/\s+/g, ' ')}`)
+        }
+        return parsed
       }
       return []
     }
-    return items.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+    const parsed = items.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+    const withUri = parsed.filter(r => r.playbackURI).length
+    if (items.length > 0 && withUri === 0) {
+      console.warn(`[hikvision] search ch=${channel} total=${items.length} withPlaybackUri=0 first_block_snippet=${items[0].slice(0, 400).replace(/\s+/g, ' ')}`)
+    }
+    return parsed
   }
 
   // JSON fallback (unlikely for ISAPI search but handle gracefully)

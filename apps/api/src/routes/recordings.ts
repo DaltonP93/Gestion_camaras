@@ -217,6 +217,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(502).send({ code: 'NVR_ERROR', message: 'No se pudo contactar el NVR' })
     }
 
+    const withUri = recordings.filter(r => r.playbackURI).length
+    server.log.info(
+      `[recordings] search_complete nvrId=${camera.nvr.id} ch=${camera.channel}` +
+      ` total=${recordings.length} withPlaybackUri=${withUri}` +
+      (recordings.length > 0 && withUri === 0 ? ' WARN:no_playbackURI_in_results' : '')
+    )
+
     await AuditAction(server.prisma, user.sub, 'SEARCH_RECORDINGS', query.cameraId, request, {
       startTime: query.startTime, endTime: query.endTime, resultsCount: recordings.length,
     })
@@ -293,6 +300,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       if (unsupportedNvr) break
       try {
         const recs = await searchRecordings(nvrWithPass as any, camera.channel, from, to)
+        const withUri = recs.filter(r => r.playbackURI).length
+        server.log.info(
+          `[recordings] batch_search nvrId=${nvr.id} ch=${camera.channel}` +
+          ` total=${recs.length} withPlaybackUri=${withUri}` +
+          (recs.length > 0 && withUri === 0 ? ' WARN:no_playbackURI_in_results' : '')
+        )
         results.push({ cameraId: camera.id, cameraName: camera.name, channel: camera.channel, recordings: recs })
         setCachedCapability(nvr.id, 'isapi')  // at least one success
       } catch (err: any) {
