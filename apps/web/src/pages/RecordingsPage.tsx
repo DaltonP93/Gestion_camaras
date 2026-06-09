@@ -254,17 +254,35 @@ export function RecordingsPage() {
   const handlePlay = async (rec: RecordingWithCamera) => {
     stopPlayback()
     setSelectedRec(rec)
+    // Sync the date pickers to the recording's exact range
+    setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
+    setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
     setPlaybackLoading(true)
     try {
       const result = await apiPost<{ url: string; sessionId?: string }>('/recordings/playback', {
-        cameraId:  rec.cameraId,
-        startTime: rec.startTime,
-        endTime:   rec.endTime,
+        cameraId:    rec.cameraId,
+        startTime:   rec.startTime,
+        endTime:     rec.endTime,
+        // Pass the NVR's exact playback path so the backend doesn't have to reconstruct it.
+        // Avoids the NVR-404 that occurs when name/size params are missing.
+        playbackURI: rec.playbackURI,
       })
       setPlaybackUrl(result.url)
       if (result.sessionId) setPlaybackSessionId(result.sessionId)
-    } catch {
-      toast.error('No se pudo cargar la grabación')
+    } catch (err: any) {
+      const data   = err?.response?.data ?? {}
+      const code   = data.code ?? ''
+      const detail = data.detail ?? data.message ?? ''
+      if (code === 'HLS_TIMEOUT') {
+        toast.error(
+          `MediaMTX no conectó al NVR (timeout)\n${detail}`,
+          { duration: 8000 }
+        )
+      } else if (code === 'MEDIAMTX_ERROR') {
+        toast.error(`Error en MediaMTX: ${detail}`, { duration: 6000 })
+      } else {
+        toast.error(detail || 'No se pudo cargar la grabación')
+      }
     } finally {
       setPlaybackLoading(false)
     }
