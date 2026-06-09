@@ -38,12 +38,37 @@ setInterval(async () => {
   }
 }, 5 * 60 * 1000)
 
-// ─── Build Hikvision RTSP playback URL ───────────────────────────
-// Track ID: channel * 100 + 1 = main stream (same formula as searchRecordings).
-// Password must be URL-encoded to handle special chars (@, #, :, etc.).
-function buildRecordingRtspUrl(opts: {
-  username: string
-  password: string
+// ─── RTSP URL helpers ─────────────────────────────────────────────
+
+/** Inject credentials+host into a path-only playbackURI from the NVR.
+ *  The NVR's playbackURI contains the exact path+query needed to locate the recording
+ *  (including name, size, and other NVR-internal params the NVR requires).
+ *  We always use the DB-configured ipAddress:rtspPort — the NVR sometimes returns
+ *  0.0.0.0 or an internal LAN IP that isn't reachable from MediaMTX.
+ */
+function injectCredentialsIntoPlaybackUri(opts: {
+  playbackURI: string   // path+query only, e.g. /Streaming/tracks/101?starttime=...&name=...
+  username:    string
+  password:    string
+  ipAddress:   string
+  rtspPort:    number
+}): { url: string; masked: string } {
+  const { playbackURI, username, password, ipAddress, rtspPort } = opts
+  const encodedPass = encodeURIComponent(password)
+  const pathQuery   = playbackURI.startsWith('/') ? playbackURI : `/${playbackURI}`
+  return {
+    url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
+    masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
+  }
+}
+
+/** Fallback: construct RTSP URL from timestamps when playbackURI is not in search results.
+ *  Uses track channel * 100 + 1 (same formula as searchRecordings / ISAPI trackID).
+ *  NOTE: some NVRs reject this URL because it lacks the 'name' and 'size' params that
+ *  uniquely identify the recording segment. Use the NVR's playbackURI when available. */
+function buildFallbackRecordingRtspUrl(opts: {
+  username:  string
+  password:  string
   ipAddress: string
   rtspPort:  number
   channel:   number
@@ -54,10 +79,12 @@ function buildRecordingRtspUrl(opts: {
   const trackId     = channel * 100 + 1
   const encodedPass = encodeURIComponent(password)
   const fmtTs       = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
-  const query       = `starttime=${fmtTs(start)}&endtime=${fmtTs(end)}`
-  const url         = `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}/Streaming/tracks/${trackId}?${query}`
-  const masked      = `rtsp://${username}:***@${ipAddress}:${rtspPort}/Streaming/tracks/${trackId}?${query}`
-  return { url, masked, trackId }
+  const pathQuery   = `/Streaming/tracks/${trackId}?starttime=${fmtTs(start)}&endtime=${fmtTs(end)}`
+  return {
+    url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
+    masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
+    trackId,
+  }
 }
 
 // ─── Register a recording path in MediaMTX ───────────────────────
@@ -150,9 +177,13 @@ const batchSearchSchema = z.object({
 })
 
 const playbackSchema = z.object({
-  cameraId:  z.string().min(1),
-  startTime: z.string().datetime(),
-  endTime:   z.string().datetime(),
+  cameraId:    z.string().min(1),
+  startTime:   z.string().datetime(),
+  endTime:     z.string().datetime(),
+  /** Path+query from the NVR's searchRecordings result — used directly for MediaMTX source-pull.
+   *  Must start with / (e.g. /Streaming/tracks/101?starttime=...&name=...&size=...).
+   *  When provided, avoids the NVR-404 caused by constructing the URL from timestamps alone. */
+  playbackURI: z.string().startsWith('/').optional(),
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
@@ -329,24 +360,50 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
     }
 
-    // Build RTSP playback URL — track ID = channel * 100 + 1 (main stream, same as searchRecordings)
-    const { url: rtspUrl, masked: rtspMasked, trackId } = buildRecordingRtspUrl({
-      username:  camera.nvr.username,
-      password:  plainPass,
-      ipAddress: camera.nvr.ipAddress,
-      rtspPort:  camera.nvr.rtspPort,
-      channel:   camera.channel,
-      start:     new Date(body.startTime),
-      end:       new Date(body.endTime),
-    })
+    // Build RTSP source URL for MediaMTX.
+    // Strategy A (preferred): use playbackURI from search results — the NVR includes 'name',
+    // 'size' and other params it needs to locate the exact segment. Without them → 404.
+    // Strategy B (fallback): construct from timestamps — may still fail on some NVR models.
+    let rtspUrl: string
+    let rtspMasked: string
+    let trackId: number | undefined
+    let urlStrategy: string
+
+    if (body.playbackURI) {
+      const injected = injectCredentialsIntoPlaybackUri({
+        playbackURI: body.playbackURI,
+        username:    camera.nvr.username,
+        password:    plainPass,
+        ipAddress:   camera.nvr.ipAddress,
+        rtspPort:    camera.nvr.rtspPort,
+      })
+      rtspUrl    = injected.url
+      rtspMasked = injected.masked
+      urlStrategy = 'nvr_playbackURI'
+    } else {
+      const built = buildFallbackRecordingRtspUrl({
+        username:  camera.nvr.username,
+        password:  plainPass,
+        ipAddress: camera.nvr.ipAddress,
+        rtspPort:  camera.nvr.rtspPort,
+        channel:   camera.channel,
+        start:     new Date(body.startTime),
+        end:       new Date(body.endTime),
+      })
+      rtspUrl    = built.url
+      rtspMasked = built.masked
+      trackId    = built.trackId
+      urlStrategy = 'fallback_timestamps'
+    }
 
     const sessionId  = crypto.randomBytes(8).toString('hex')
     const streamPath = `rec_${sessionId}`
 
     server.log.info(
       `[recordings] playback_init sessionId=${sessionId} path=${streamPath}` +
-      ` cameraId=${body.cameraId} ch=${camera.channel} trackId=${trackId}` +
-      ` source=${rtspMasked}`
+      ` cameraId=${body.cameraId} ch=${camera.channel}` +
+      (trackId ? ` trackId=${trackId}` : '') +
+      ` strategy=${urlStrategy} source=${rtspMasked}`
     )
 
     try {
@@ -391,7 +448,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         `[recordings] hls_not_ready sessionId=${sessionId} lastStatus=${ready.lastStatus}` +
         ` elapsedMs=${ready.elapsedMs}ms pathExists=${pathStatus.exists}` +
         ` pathReady=${pathStatus.ready} pathTracks=${pathStatus.tracks}` +
-        ` sourceState=${pathStatus.sourceState} trackId=${trackId} source=${rtspMasked}`
+        ` sourceState=${pathStatus.sourceState} strategy=${urlStrategy}` +
+        (trackId ? ` trackId=${trackId}` : '') +
+        ` source=${rtspMasked}`
       )
 
       return reply.status(504).send({
