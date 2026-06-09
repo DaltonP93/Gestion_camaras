@@ -101,10 +101,6 @@ async function createRecordingHlsPath(
     rtspTransport:     'tcp',
     record:            false,
     overridePublisher: true,
-    // Override global 10s timeouts — NVR RTSP playback can have bursts followed by pauses
-    // longer than the default readTimeout without dropping the connection.
-    readTimeout:       '30s',
-    writeTimeout:      '30s',
   }
 
   log(`[recordings] mediamtx_path_add path=${streamPath} source=${maskedUrl}`)
