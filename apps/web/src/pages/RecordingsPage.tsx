@@ -60,8 +60,10 @@ export function RecordingsPage() {
   const [playbackSessionId, setPlaybackSessionId] = useState<string | null>(null)
   const [playbackLoading, setPlaybackLoading] = useState(false)
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const hlsRef   = useRef<Hls | null>(null)
+  const videoRef      = useRef<HTMLVideoElement>(null)
+  const hlsRef        = useRef<Hls | null>(null)
+  const startDateRef  = useRef<HTMLInputElement>(null)
+  const endDateRef    = useRef<HTMLInputElement>(null)
   const [showCameraList, setShowCameraList] = useState(false)
   const [nvrErrors, setNvrErrors] = useState<NvrSearchError[]>([])
   const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
@@ -288,7 +290,7 @@ export function RecordingsPage() {
   const triggerDatePicker = (ref: React.RefObject<HTMLInputElement | null>) => {
     const el = ref.current
     if (!el) return
-    try { (el as any).showPicker?.() } catch { el.focus() }
+    try { ;(el as any).showPicker?.() } catch { el.focus() }
   }
 
   return (
@@ -383,12 +385,44 @@ export function RecordingsPage() {
 
           <div>
             <label className="label">Desde</label>
-            <input type="datetime-local" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="input" />
+            <div className="relative">
+              <input
+                ref={startDateRef}
+                type="datetime-local"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                className="input pr-8"
+              />
+              <button
+                type="button"
+                onClick={() => triggerDatePicker(startDateRef)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200 transition-colors"
+                tabIndex={-1}
+              >
+                <Calendar size={14} />
+              </button>
+            </div>
           </div>
 
           <div>
             <label className="label">Hasta</label>
-            <input type="datetime-local" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="input" />
+            <div className="relative">
+              <input
+                ref={endDateRef}
+                type="datetime-local"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                className="input pr-8"
+              />
+              <button
+                type="button"
+                onClick={() => triggerDatePicker(endDateRef)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200 transition-colors"
+                tabIndex={-1}
+              >
+                <Calendar size={14} />
+              </button>
+            </div>
           </div>
         </div>
 
