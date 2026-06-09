@@ -939,8 +939,8 @@ function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolea
   if (isapIStatus === 'available') {
     if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online NVR</span>
     if (camOnlineInNvr === false) {
-      // Distinguish: if the RTSP health check says online, show "No verificado" rather than "Offline NVR"
-      if (camOnline) return <span className="text-surface-500 text-[11px]">No sincronizado</span>
+      // NVR ISAPI says offline, but RTSP health says online — trust RTSP (NVR status can lag)
+      if (camOnline) return <span className="text-green-400/70 text-[11px]">Online (RTSP)</span>
       return <span className="text-surface-500 text-[11px]">Offline NVR</span>
     }
     // null = unknown — use RTSP health as proxy
