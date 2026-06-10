@@ -104,6 +104,10 @@ export interface HikRecording {
   endTime: string
   size: number
   type: string
+  /** RTSP playback URL returned by the NVR — path+query only, credentials stripped.
+   *  Use this to reconstruct the full authenticated URL for MediaMTX source-pull.
+   *  Undefined on older firmware that doesn't include playbackURI in search results. */
+  playbackURI?: string
 }
 
 export interface HikPlaybackUrl {
@@ -1614,21 +1618,21 @@ export async function searchRecordings(
 ): Promise<HikRecording[]> {
   const client = createHikClient(nvr)
   const trackID = channel * 100 + 1
-  const fmt = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const now = new Date()
   const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
-<CMSearchDescription>
-  <searchID>search_${Date.now()}</searchID>
+<CMSearchDescription xmlns="http://www.hikvision.com/ver20/XMLSchema">
+  <searchID>${crypto.randomUUID()}</searchID>
   <trackList>
     <trackID>${trackID}</trackID>
   </trackList>
   <timeSpanList>
     <timeSpan>
-      <startTime>${fmt(startTime)}</startTime>
-      <endTime>${fmt(endTime)}</endTime>
+      <startTime>${startTime.toISOString().replace(/\.\d{3}Z$/, 'Z')}</startTime>
+      <endTime>${endTime.toISOString().replace(/\.\d{3}Z$/, 'Z')}</endTime>
     </timeSpan>
   </timeSpanList>
   <maxResults>200</maxResults>
-  <searchResultPostion>0</searchResultPostion>
+  <searchResultPosition>0</searchResultPosition>
   <metadataList>
     <metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>
   </metadataList>
@@ -1647,9 +1651,17 @@ export async function searchRecordings(
       e.authError = true
       throw e
     }
-    if (status === 404 || status === 400) {
+    // 400 = bad XML or unsupported parameters — NOT "not supported by device"
+    // 404/405/501 = endpoint truly not implemented
+    if (status === 404 || status === 405 || status === 501) {
       const e: any = new Error('ISAPI search not supported')
       e.unsupported = true
+      throw e
+    }
+    if (status === 400) {
+      const body = err?.response?.data ? String(err.response.data) : ''
+      const e: any = new Error(`ISAPI search returned 400 — XML rejected by NVR: ${body.slice(0, 300)}`)
+      e.invalidRequest = true
       throw e
     }
     throw err
@@ -1673,11 +1685,23 @@ export async function searchRecordings(
       // Some firmware uses PascalCase
       const itemsPascal = xmlGetAll(responseData, 'SearchMatchItem')
       if (itemsPascal.length > 0) {
-        return itemsPascal.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+        const parsed = itemsPascal.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+        const withUri = parsed.filter(r => r.playbackURI).length
+        if (itemsPascal.length > 0 && withUri === 0) {
+          // Log first block snippet to confirm whether playbackURI tag is present in the XML
+          console.warn(`[hikvision] search ch=${channel} total=${itemsPascal.length} withPlaybackUri=0 first_block_snippet=${itemsPascal[0].slice(0, 400).replace(/\s+/g, ' ')}`)
+        }
+        return parsed
       }
       return []
     }
-    return items.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+    const parsed = items.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+    const withUri = parsed.filter(r => r.playbackURI).length
+    if (items.length > 0 && withUri === 0) {
+      // Log first block snippet to confirm whether playbackURI tag is present in the XML
+      console.warn(`[hikvision] search ch=${channel} total=${items.length} withPlaybackUri=0 first_block_snippet=${items[0].slice(0, 400).replace(/\s+/g, ' ')}`)
+    }
+    return parsed
   }
 
   // JSON fallback (unlikely for ISAPI search but handle gracefully)
@@ -1687,13 +1711,45 @@ export async function searchRecordings(
   if (!items) return []
   const list = Array.isArray(items) ? items : [items]
   return list.map((item: any, index: number) => ({
-    id:        `${nvr.id}_${channel}_${index}`,
+    id:          `${nvr.id}_${channel}_${index}`,
     channel,
-    startTime: item.timeSpan?.startTime || '',
-    endTime:   item.timeSpan?.endTime || '',
-    size:      Number(item.mediaSegmentDescriptor?.contentLength || 0),
-    type:      item.mediaSegmentDescriptor?.contentType || 'video/mp4',
+    startTime:   item.timeSpan?.startTime || '',
+    endTime:     item.timeSpan?.endTime || '',
+    size:        Number(item.mediaSegmentDescriptor?.contentLength || 0),
+    type:        item.mediaSegmentDescriptor?.contentType || 'video/mp4',
+    playbackURI: extractPlaybackPathQuery(item.mediaSegmentDescriptor?.playbackURI) || undefined,
   }))
+}
+
+function unescapeXml(s: string): string {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+}
+
+/** Extract path+query from a Hikvision RTSP playbackURI, stripping any embedded credentials.
+ *  The NVR sometimes returns rtsp://0.0.0.0/... or rtsp://nvr-ip/... which we can't use
+ *  directly — we'll inject the real IP+port+creds from the DB at call time.
+ *  Returns undefined if the URI is missing or unparseable.
+ */
+function extractPlaybackPathQuery(rawUri: string | undefined): string | undefined {
+  if (!rawUri) return undefined
+  const uri = unescapeXml(rawUri.trim())
+  if (!uri.startsWith('rtsp://')) return undefined
+  try {
+    // URL constructor handles rtsp:// if we swap to https:// for parsing only
+    const u = new URL(uri.replace(/^rtsp:\/\//, 'https://'))
+    return u.pathname + u.search  // e.g. /Streaming/tracks/101?starttime=...&name=...&size=...
+  } catch {
+    // Fallback: strip authority manually (everything after the 3rd slash-group)
+    const afterProto = uri.slice('rtsp://'.length)
+    const slashIdx   = afterProto.indexOf('/')
+    if (slashIdx < 0) return undefined
+    return afterProto.slice(slashIdx)  // /Streaming/...
+  }
 }
 
 function parseSearchMatchItem(block: string, nvrId: string, channel: number, index: number): HikRecording {
@@ -1701,7 +1757,13 @@ function parseSearchMatchItem(block: string, nvrId: string, channel: number, ind
   const endTime   = xmlGet(block, 'endTime')
   const size      = parseInt(xmlGet(block, 'contentLength') || xmlGet(block, 'fileSize') || '0')
   const type      = xmlGet(block, 'contentType') || xmlGet(block, 'recordType') || 'video/mp4'
-  return { id: `${nvrId}_${channel}_${index}_${startTime}`, channel, startTime, endTime, size, type }
+
+  // playbackURI is in <mediaSegmentDescriptor><playbackURI>...
+  // Extract path+query only — credentials will be injected server-side at playback time.
+  const rawUri    = xmlGet(block, 'playbackURI') || xmlGet(block, 'rtspPlaybackURI')
+  const playbackURI = extractPlaybackPathQuery(rawUri) || undefined
+
+  return { id: `${nvrId}_${channel}_${index}_${startTime}`, channel, startTime, endTime, size, type, playbackURI }
 }
 
 // ─── URL de playback de grabación ─────────────────────────────
@@ -1709,10 +1771,13 @@ function parseSearchMatchItem(block: string, nvrId: string, channel: number, ind
 export async function getPlaybackUrl(
   nvr: NVR, channel: number, startTime: Date, endTime: Date
 ): Promise<HikPlaybackUrl> {
-  const channelStr = String(channel).padStart(2, '0')
-  const startIso   = startTime.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
-  const endIso     = endTime.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
-  const url = `rtsp://${nvr.username}:${nvr.password}@${nvr.ipAddress}:${nvr.rtspPort}/Streaming/tracks/${channelStr}00?starttime=${startIso}&endtime=${endIso}`
+  // Track ID = channel * 100 + 1 (main stream) — same formula as searchRecordings.
+  // Password must be URL-encoded to handle special chars (@, #, :, etc.).
+  const trackId     = channel * 100 + 1
+  const encodedPass = encodeURIComponent((nvr as any).password ?? nvr.password)
+  const startIso    = startTime.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const endIso      = endTime.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const url = `rtsp://${nvr.username}:${encodedPass}@${nvr.ipAddress}:${nvr.rtspPort}/Streaming/tracks/${trackId}?starttime=${startIso}&endtime=${endIso}`
   return { url, expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() }
 }
 
