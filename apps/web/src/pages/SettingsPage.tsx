@@ -123,8 +123,20 @@ export function SettingsPage() {
     try {
       const res = await apiPost<{ success: boolean; message: string }>('/alerts/settings/test-email', { testEmail: testEmail || undefined })
       toast.success(res.message)
-    } catch {
-      // error toast shown by interceptor
+    } catch (err: any) {
+      const code = err?.response?.data?.code as string | undefined
+      const serverMsg = err?.response?.data?.message as string | undefined
+      if (code === 'DNS_FAIL') {
+        toast.error('No se pudo resolver el nombre del servidor SMTP. Verifica el host o la conectividad de red.', { duration: 8000 })
+      } else if (code === 'AUTH_FAIL') {
+        toast.error('Autenticación SMTP rechazada. Verifica el usuario y contraseña.', { duration: 8000 })
+      } else if (code === 'CONNECT_TIMEOUT') {
+        toast.error('No se pudo conectar al servidor SMTP. Verifica el host, puerto y firewall.', { duration: 8000 })
+      } else if (code === 'TLS_FAIL') {
+        toast.error('Error de TLS/SSL con el servidor SMTP. Revisa el puerto y la configuración de seguridad.', { duration: 8000 })
+      } else {
+        toast.error(serverMsg || 'Error al enviar el correo de prueba.', { duration: 8000 })
+      }
     } finally {
       setSendingTest(false)
     }
