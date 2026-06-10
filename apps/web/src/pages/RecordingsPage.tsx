@@ -40,6 +40,12 @@ function toLocalDatetimeString(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+function isHevcCodec(codec: string | null | undefined): boolean {
+  if (!codec) return false
+  const c = codec.toLowerCase()
+  return c.includes('265') || c.includes('hevc') || c === 'hvc1' || c === 'hev1'
+}
+
 function classifyError(err: any): 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFFLINE' | 'UNKNOWN' {
   const msg = (err?.response?.data?.message || err?.message || '').toLowerCase()
   if (msg.includes('isapi') || msg.includes('no soporta') || msg.includes('unsupported')) return 'ISAPI_UNSUPPORTED'
@@ -59,6 +65,7 @@ export function RecordingsPage() {
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
   const [playbackSessionId, setPlaybackSessionId] = useState<string | null>(null)
   const [playbackLoading, setPlaybackLoading] = useState(false)
+  const [playbackTranscoding, setPlaybackTranscoding] = useState(false)
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
   const videoRef      = useRef<HTMLVideoElement>(null)
   const hlsRef        = useRef<Hls | null>(null)
@@ -243,39 +250,10 @@ export function RecordingsPage() {
       hlsRef.current = hls
       hls.loadSource(playbackUrl)
       hls.attachMedia(video)
-      hls.on(Hls.Events.MANIFEST_PARSED, (_evt, data) => {
-        // Detect H.265 early via codec strings in the manifest (hvc1/hev1)
-        const codecs = (data.levels ?? []).map((l: any) => l.videoCodec ?? l.codecs ?? '').join(' ').toLowerCase()
-        if (codecs.includes('hvc1') || codecs.includes('hev1') || codecs.includes('h265')) {
-          toast.error(
-            'La grabación usa H.265 (HEVC). Este navegador no puede reproducirlo. ' +
-            'Usa Safari, o activa HEVC en tu navegador.',
-            { duration: 10000 }
-          )
-        }
-        video.play().catch(() => {})
-      })
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         if (!data.fatal) return
-        // Detect HEVC/H.265 codec rejection — Chrome/Firefox don't support HEVC in HLS
-        const isCodecError =
-          data.type === Hls.ErrorTypes.MEDIA_ERROR ||
-          (data.details as string)?.includes('codec') ||
-          (data.details as string)?.includes('levelParsed')
-        const videoErr = (data.error as any)?.message ?? ''
-        const isHevc   = videoErr.toLowerCase().includes('h265') ||
-                         videoErr.toLowerCase().includes('hevc') ||
-                         videoErr.toLowerCase().includes('hvc1') ||
-                         data.details === 'bufferStalledError'
-        if (isCodecError || isHevc) {
-          toast.error(
-            'La grabación usa H.265 (HEVC), que este navegador no puede decodificar. ' +
-            'Usa Safari, o un navegador con soporte HEVC habilitado.',
-            { duration: 10000 }
-          )
-        } else {
-          toast.error('Error de reproducción. Intenta de nuevo.', { duration: 5000 })
-        }
+        toast.error('Error de reproducción. Intenta de nuevo.', { duration: 5000 })
         hls.destroy()
         hlsRef.current = null
       })
@@ -289,19 +267,25 @@ export function RecordingsPage() {
   const handlePlay = async (rec: RecordingWithCamera) => {
     stopPlayback()
     setSelectedRec(rec)
-    // Sync the date pickers to the recording's exact range
     setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
     setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
+
+    // Check if this camera's stream is HEVC so we can show "Transcodificando..." early
+    const cam = cameras.find(c => c.id === rec.cameraId)
+    const willTranscode = isHevcCodec(cam?.mainCodec)
     setPlaybackLoading(true)
+    setPlaybackTranscoding(willTranscode)
+
     try {
-      const result = await apiPost<{ url: string; sessionId?: string }>('/recordings/playback', {
-        cameraId:    rec.cameraId,
-        startTime:   rec.startTime,
-        endTime:     rec.endTime,
-        // Pass the NVR's exact playback path so the backend doesn't have to reconstruct it.
-        // Avoids the NVR-404 that occurs when name/size params are missing.
-        playbackURI: rec.playbackURI,
-      })
+      const result = await apiPost<{ url: string; sessionId?: string; transcoded?: boolean }>(
+        '/recordings/playback',
+        {
+          cameraId:    rec.cameraId,
+          startTime:   rec.startTime,
+          endTime:     rec.endTime,
+          playbackURI: rec.playbackURI,
+        }
+      )
       setPlaybackUrl(result.url)
       if (result.sessionId) setPlaybackSessionId(result.sessionId)
     } catch (err: any) {
@@ -309,17 +293,17 @@ export function RecordingsPage() {
       const code   = data.code ?? ''
       const detail = data.detail ?? data.message ?? ''
       if (code === 'HLS_TIMEOUT') {
-        toast.error(
-          `MediaMTX no conectó al NVR (timeout)\n${detail}`,
-          { duration: 8000 }
-        )
+        toast.error(`Timeout al iniciar reproducción: ${detail}`, { duration: 8000 })
       } else if (code === 'MEDIAMTX_ERROR') {
         toast.error(`Error en MediaMTX: ${detail}`, { duration: 6000 })
+      } else if (code === 'FFMPEG_SPAWN_FAILED') {
+        toast.error('No se pudo iniciar la transcodificación H.265 en el servidor.', { duration: 8000 })
       } else {
         toast.error(detail || 'No se pudo cargar la grabación')
       }
     } finally {
       setPlaybackLoading(false)
+      setPlaybackTranscoding(false)
     }
   }
 
@@ -648,7 +632,14 @@ export function RecordingsPage() {
                 {playbackLoading ? (
                   <>
                     <Loader2 size={24} className="text-brand-400 mx-auto mb-2 animate-spin" />
-                    <p className="text-xs text-surface-500">Iniciando reproducción...</p>
+                    <p className="text-xs text-surface-500">
+                      {playbackTranscoding
+                        ? 'Transcodificando H.265 → H.264…'
+                        : 'Iniciando reproducción...'}
+                    </p>
+                    {playbackTranscoding && (
+                      <p className="text-xs text-surface-600 mt-1">Puede tardar unos segundos</p>
+                    )}
                   </>
                 ) : (
                   <>
