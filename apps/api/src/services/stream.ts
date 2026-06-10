@@ -281,16 +281,28 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   return proc
 }
 
-/** Like spawnTranscodeProcess but takes an explicit RTSP input URL — used for recording playback
- *  where the source URL comes from the ISAPI playbackURI rather than a live stream path.
- *  Shares the same process maps as spawnTranscodeProcess so stopTranscodeProcess,
- *  isTranscodeProcessAlive, and getTranscodeStderr all work transparently.
- */
+export function stopTranscodeProcess(streamPath: string): void {
+  const proc = transcodeProcesses.get(streamPath)
+  if (!proc) return
+  try { proc.kill('SIGTERM') } catch {}
+  transcodeProcesses.delete(streamPath)
+  transcodeRtspMasked.delete(streamPath)
+  console.info(`[transcode] ffmpeg_killed path=${streamPath}`)
+}
+
+// ─── Spawn FFmpeg transcode from an explicit RTSP URL ────────
+// Used for recording playback: takes the full RTSP playbackURI from the NVR
+// rather than deriving it from NVR/Camera objects (as spawnTranscodeProcess does).
+// mode='recording': adds -re to process at native framerate so HLS segments are
+// generated before FFmpeg finishes the clip. Without -re, FFmpeg transcodes a
+// 15s clip in ~1s and exits before MediaMTX creates any HLS segments.
 export function spawnTranscodeFromRtsp(
-  rtspInputUrl:   string,  // full RTSP URL with credentials — NEVER log this
-  maskedInputUrl: string,  // same URL with password replaced by ***
-  streamPath:     string,
+  rtspUrl:   string,
+  maskedUrl: string,
+  streamPath: string,
+  opts?: { mode?: 'live' | 'recording' },
 ): ChildProcess | null {
+  const mode = opts?.mode ?? 'live'
   const rtspOutput = `rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${streamPath}`
 
   const fps         = Number(HEVC_TRANSCODE_FPS) || 15
@@ -299,16 +311,22 @@ export function spawnTranscodeFromRtsp(
   const bitrateUnit = HEVC_TRANSCODE_BITRATE.replace(/^\d+/, '') || 'k'
   const bufsize     = TRANSCODE_BUFSIZE_ENV || `${bitrateNum * 2}${bitrateUnit}`
   const rtspTimeoutOpt = getRtspTimeoutOption()
+  // Recording RTSP sessions may take longer to initialize (NVR seek + segment locate).
+  const rtspTimeoutUs  = mode === 'recording' ? 60_000_000 : 15_000_000
 
-  const args: string[] = [
+  const args: string[] = []
+
+  if (mode === 'recording') args.push('-re')   // real-time rate for short clips
+
+  args.push(
     '-rtsp_transport', 'tcp',
     '-fflags', '+genpts+discardcorrupt',
     '-use_wallclock_as_timestamps', '1',
-    ...(rtspTimeoutOpt ? [rtspTimeoutOpt, '60000000'] : []),  // 60s timeout for recording segments
+    ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
     '-reorder_queue_size', '0',
-    '-i', rtspInputUrl,
-    '-an',   // skip audio track — browser compat (Hikvision audio codec not supported)
-  ]
+    '-i', rtspUrl,
+    '-an',
+  )
 
   if (HEVC_TRANSCODE_WIDTH !== 'source') {
     args.push('-vf', `scale=${HEVC_TRANSCODE_WIDTH}:-2`)
@@ -341,30 +359,25 @@ export function spawnTranscodeFromRtsp(
     rtspOutput,
   )
 
-  // Kill any stale process on this path before spawning
   stopTranscodeProcess(streamPath)
 
-  const maskedArgs = args.map(a => a === rtspInputUrl ? maskedInputUrl : a)
-  console.info(`[transcode] spawn_recording path=${streamPath} source=${maskedInputUrl}`)
+  console.info(`[transcode] spawn_recording path=${streamPath} mode=${mode} source=${maskedUrl}`)
+  const maskedArgs = args.map(a => a === rtspUrl ? maskedUrl : a)
   console.info(`[transcode] spawn_ffmpeg_cmd path=${streamPath} cmd=ffmpeg ${maskedArgs.join(' ')}`)
 
   const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
   transcodeProcesses.set(streamPath, proc)
   transcodeStderr.set(streamPath, '')
   transcodeStderrStart.set(streamPath, '')
-  transcodeRtspMasked.set(streamPath, maskedInputUrl)
+  transcodeRtspMasked.set(streamPath, maskedUrl)
   transcodeSpawnTime.set(streamPath, Date.now())
 
   proc.on('spawn', () => {
-    console.info(`[transcode] ffmpeg_started path=${streamPath} pid=${proc.pid}`)
-    setTimeout(() => {
-      const alive = proc.exitCode === null && !proc.killed
-      console.info(`[transcode] ffmpeg_alive_check path=${streamPath} pid=${proc.pid} alive=${alive} exitCode=${proc.exitCode ?? 'null'}`)
-    }, 2000)
+    console.info(`[transcode] ffmpeg_started path=${streamPath} pid=${proc.pid} mode=${mode}`)
   })
 
   proc.stderr?.on('data', (data: Buffer) => {
-    const chunk = data.toString()
+    const chunk   = data.toString()
     const startBuf = transcodeStderrStart.get(streamPath) || ''
     if (startBuf.length < 1200) {
       transcodeStderrStart.set(streamPath, (startBuf + chunk).slice(0, 1200))
@@ -382,44 +395,45 @@ export function spawnTranscodeFromRtsp(
     const isEarlyExit = uptime < 3_000
     const exitLabel   = code !== null ? `code=${code}` : `signal=${signal}`
     const isEof       = fullStderr.includes('End of file') || fullStderr.includes('Failed reading RTSP data')
-    const exitReason  = isEof ? 'RTSP_RECORDING_EOF' : isEarlyExit ? 'EARLY_EXIT' : `exit_${code ?? signal}`
-    console.warn(`[transcode] ffmpeg_exit path=${streamPath} ${exitLabel} reason=${exitReason} uptime=${uptime}ms`)
+    const exitReason  = isEof && mode === 'recording' ? 'RECORDING_EOF'
+      : isEof                                         ? 'RTSP_INPUT_EOF'
+      : (code === 8 && isEarlyExit)                  ? 'FFMPEG_INVALID_OPTION'
+      : code !== null                                 ? `exit_${code}`
+      : `sig_${signal}`
+
+    console.warn(
+      `[transcode] ffmpeg_exit path=${streamPath} mode=${mode} ${exitLabel}` +
+      ` reason=${exitReason} uptime=${uptime}ms stderrBytes=${fullStderr.length}`
+    )
 
     if (isEarlyExit) {
       const combined  = startBuf + '\n' + fullStderr
       const optErrors = combined.split('\n')
-        .filter(l => /unrecognized option|option .* not found|invalid argument|unknown encoder|no such (file|codec)/i.test(l))
+        .filter(l => /unrecognized option|option .* not found|invalid argument|error splitting|unknown encoder|no such (file|codec)/i.test(l))
         .slice(0, 5).join(' | ')
-      if (optErrors) {
-        console.error(`[transcode] ffmpeg_option_error path=${streamPath} | ${optErrors}`)
-      }
+      if (optErrors) console.error(`[transcode] ffmpeg_option_error path=${streamPath} | ${optErrors}`)
       const startLog = startBuf.slice(0, 1200).replace(/\n/g, ' | ')
-      console.error(`[transcode] ffmpeg_early_exit path=${streamPath} code=${code} | ${startLog || '(empty stderr)'}`)
+      console.error(`[transcode] ffmpeg_early_exit path=${streamPath} mode=${mode} uptime=${uptime}ms | ${startLog || '(empty)'}`)
+    } else if (fullStderr.length > 0) {
+      // Always log stderr for recordings — essential for diagnosing RTSP/codec errors
+      const endLog = fullStderr.slice(-1500).replace(/\n/g, ' | ')
+      console.info(`[transcode] ffmpeg_stderr_end path=${streamPath} mode=${mode} | ${endLog}`)
     }
+
     transcodeProcesses.delete(streamPath)
     transcodeSpawnTime.delete(streamPath)
     transcodeStderrStart.delete(streamPath)
+    // transcodeStderr is kept for post-exit diagnostic access by getTranscodeStderr
   })
 
   proc.on('error', (err: NodeJS.ErrnoException) => {
-    console.error(`[transcode] ffmpeg_spawn_error path=${streamPath} err=${err.message} code=${err.code ?? 'n/a'}`)
-    if (err.code === 'ENOENT') {
-      console.error(`[transcode] ffmpeg_not_found — 'ffmpeg' binary not in PATH inside API container. Check Dockerfile.`)
-    }
+    console.error(`[transcode] ffmpeg_spawn_error path=${streamPath} err=${err.message}`)
+    if (err.code === 'ENOENT') console.error('[transcode] ffmpeg_not_found — check Dockerfile')
     transcodeProcesses.delete(streamPath)
     transcodeStderrStart.delete(streamPath)
   })
 
   return proc
-}
-
-export function stopTranscodeProcess(streamPath: string): void {
-  const proc = transcodeProcesses.get(streamPath)
-  if (!proc) return
-  try { proc.kill('SIGTERM') } catch {}
-  transcodeProcesses.delete(streamPath)
-  transcodeRtspMasked.delete(streamPath)
-  console.info(`[transcode] ffmpeg_killed path=${streamPath}`)
 }
 
 export function isTranscodeProcessAlive(streamPath: string): boolean {

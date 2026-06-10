@@ -59,22 +59,18 @@ export function RecordingsPage() {
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
   const [playbackSessionId, setPlaybackSessionId] = useState<string | null>(null)
   const [playbackLoading, setPlaybackLoading] = useState(false)
-  const [playbackTranscoding, setPlaybackTranscoding] = useState(false)
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
-  const videoRef           = useRef<HTMLVideoElement>(null)
-  const hlsRef             = useRef<Hls | null>(null)
-  const startDateRef       = useRef<HTMLInputElement>(null)
-  const endDateRef         = useRef<HTMLInputElement>(null)
-  // Unique key per playback attempt — used to detect stale async completions and
-  // old HLS error events that fire after the user has already switched recordings.
-  const playbackKeyRef     = useRef<string | null>(null)
-  // Mirrors playbackSessionId as a ref so the cleanup in stopPlayback always sees
-  // the latest value regardless of React's async state batching.
+  const videoRef             = useRef<HTMLVideoElement>(null)
+  const hlsRef               = useRef<Hls | null>(null)
+  const startDateRef         = useRef<HTMLInputElement>(null)
+  const endDateRef           = useRef<HTMLInputElement>(null)
+  const playbackKeyRef       = useRef<string | null>(null)
   const playbackSessionIdRef = useRef<string | null>(null)
   const [showCameraList, setShowCameraList] = useState(false)
   const [nvrErrors, setNvrErrors] = useState<NvrSearchError[]>([])
   const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
   const [nvrCaps, setNvrCaps] = useState<Map<string, RecordingCapabilities>>(new Map())
+  const [playbackTranscoding, setPlaybackTranscoding] = useState(false)
 
   useEffect(() => {
     loadNVRs()
@@ -226,8 +222,6 @@ export function RecordingsPage() {
     }
   }
 
-  // Stop any active HLS instance and release the MediaMTX recording path.
-  // Uses refs (not state) so it always reads the latest values even in async closures.
   const stopPlayback = () => {
     toast.dismiss()
     playbackKeyRef.current = null   // invalidate any in-progress handlePlay
@@ -246,127 +240,72 @@ export function RecordingsPage() {
   useEffect(() => stopPlayback, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Attach HLS.js whenever playbackUrl changes.
-  // Captures the playback key at attachment time so the error handler can detect
-  // whether an error belongs to the current session or a stale one.
+  // Captures playbackKeyRef at attachment time to detect stale errors from previous sessions.
   useEffect(() => {
     const video = videoRef.current
     if (!video || !playbackUrl) return
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
 
-    console.log('[recordings] hls_attach url=', playbackUrl)
-
-    // Snapshot the key at attachment time — used to ignore errors from old sessions
-    const attachedKey = playbackKeyRef.current
+    const attachedKey = playbackKeyRef.current  // snapshot — identifies this specific playback
 
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: false,
-        xhrSetup: (xhr) => { xhr.withCredentials = true },  // send cookies on same-origin HLS requests
+        xhrSetup: (xhr) => { xhr.withCredentials = true },  // send MediaMTX hlsSession cookie
       })
       hlsRef.current = hls
       hls.loadSource(playbackUrl)
       hls.attachMedia(video)
-
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        console.log('[recordings] hls_manifest_parsed url=', playbackUrl)
-        video.play().catch(() => {})
-      })
-
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         const resp       = (data as any).response
         const httpStatus = resp?.code ?? resp?.status ?? null
         const isStale    = attachedKey !== playbackKeyRef.current
-
-        console.error(
-          `[recordings] hls_error url=${playbackUrl}` +
-          ` type=${data.type} details=${data.details} fatal=${data.fatal}` +
-          ` httpStatus=${httpStatus ?? 'n/a'} stale=${isStale}`,
-          data
-        )
-
-        // Ignore errors from a session the user has already abandoned
-        if (isStale) {
-          console.info('[recordings] hls_error_ignored stale session')
-          return
-        }
+        console.error(`[recordings] hls_error key=${attachedKey} currentKey=${playbackKeyRef.current} stale=${isStale} status=${httpStatus}`, data)
+        if (isStale) return  // ignore errors from a previous recording session
         if (!data.fatal) return
-
         if (httpStatus === 401) {
-          toast.error(
-            'La sesión de reproducción expiró. Haz clic en la grabación para volver a reproducir.',
-            { duration: 8000 }
-          )
+          toast.error('La sesión de reproducción expiró. Haz clic en la grabación para volver a reproducir.', { duration: 8000 })
         } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          toast.error(
-            `Error de red en HLS${httpStatus ? ` (HTTP ${httpStatus})` : ''}.\nVerifica la conexión o intenta de nuevo.`,
-            { duration: 8000 }
-          )
+          toast.error(`Error de red en HLS${httpStatus ? ` (HTTP ${httpStatus})` : ''}.`, { duration: 8000 })
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          toast.error('Error de decodificación de video. El codec puede no ser compatible.', { duration: 8000 })
+          toast.error('Error de decodificación de video. El clip puede estar dañado.', { duration: 8000 })
         } else {
           toast.error(`Error HLS: ${data.details}`, { duration: 6000 })
         }
-        hls.destroy()
-        hlsRef.current = null
-        setPlaybackUrl(null)
+        hls.destroy(); hlsRef.current = null; setPlaybackUrl(null)
       })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari native HLS
       video.src = playbackUrl
       video.play().catch(() => {})
     }
   }, [playbackUrl])
 
   const handlePlay = async (rec: RecordingWithCamera) => {
-    // Stop old playback and generate a unique key for this attempt.
-    // The key is checked after every async op — if the user selects another recording
-    // while ffprobe/FFmpeg is running, the in-progress attempt bails cleanly.
     stopPlayback()  // sets playbackKeyRef.current = null
+    setSelectedRec(rec)
+    setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
+    setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
 
     const myKey = `${Date.now()}-${Math.random()}`
     playbackKeyRef.current = myKey
 
-    setSelectedRec(rec)
-    setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
-    setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
     setPlaybackLoading(true)
     setPlaybackTranscoding(false)
 
-    console.log('[recordings] handlePlay start', {
-      cameraId:    rec.cameraId,
-      cameraName:  rec.cameraName,
-      startTime:   rec.startTime,
-      endTime:     rec.endTime,
-      playbackURI: rec.playbackURI ? 'present' : 'absent',
-      key:         myKey,
-    })
-
     try {
-      const result = await apiPost<{
-        url:        string
-        sessionId?: string
-        expiresAt?: string
-        transcoded?: boolean
-      }>('/recordings/playback', {
+      const result = await apiPost<{ url: string; sessionId?: string; expiresAt?: string; transcoded?: boolean }>('/recordings/playback', {
         cameraId:    rec.cameraId,
         startTime:   rec.startTime,
         endTime:     rec.endTime,
         playbackURI: rec.playbackURI,
       })
 
-      // Abort if the user already switched to a different recording
       if (playbackKeyRef.current !== myKey) {
-        console.info('[recordings] handlePlay_abandoned key=', myKey, 'sessionId=', result.sessionId)
+        // User changed recording while this request was in flight — discard and clean up
         if (result.sessionId) apiDelete(`/recordings/playback/${result.sessionId}`).catch(() => {})
         return
       }
-
-      console.log('[recordings] playback_response', {
-        url:       result.url,
-        sessionId: result.sessionId,
-        transcoded: result.transcoded,
-        key:       myKey,
-      })
 
       if (result.sessionId) {
         playbackSessionIdRef.current = result.sessionId
@@ -374,26 +313,25 @@ export function RecordingsPage() {
       }
       if (result.transcoded) setPlaybackTranscoding(true)
       setPlaybackUrl(result.url)
+
     } catch (err: any) {
-      if (playbackKeyRef.current !== myKey) return  // ignore errors from abandoned attempts
+      if (playbackKeyRef.current !== myKey) return  // stale — ignore error
+      const data       = err?.response?.data ?? {}
+      const code       = data.code as string | undefined
+      const detail     = (data.detail ?? data.message ?? '') as string
+      const stderrTail = (data.stderrTail ?? '') as string
 
-      const data   = err?.response?.data ?? {}
-      const code   = data.code ?? ''
-      const detail = data.detail ?? data.message ?? ''
-      const status = err?.response?.status ?? 'network_error'
-
-      console.error('[recordings] playback_api_error', { status, code, detail, key: myKey })
-
-      if (code === 'HLS_TIMEOUT') {
-        toast.error(`Timeout al iniciar reproducción\n${detail}`, { duration: 8000 })
+      if (code === 'FFMPEG_TIMEOUT') {
+        const extra = stderrTail ? `\n\nFFmpeg: ${stderrTail.split('\n').pop() ?? ''}` : ''
+        toast.error(`Timeout al iniciar reproducción: ${detail}${extra}`, { duration: 10000 })
+      } else if (code === 'FFMPEG_SPAWN_FAILED') {
+        toast.error('FFmpeg no está disponible en el servidor. Contacta al administrador.', { duration: 8000 })
+      } else if (code === 'HLS_TIMEOUT') {
+        toast.error(`MediaMTX no conectó al NVR (timeout):\n${detail}`, { duration: 8000 })
       } else if (code === 'MEDIAMTX_ERROR') {
         toast.error(`Error en MediaMTX: ${detail}`, { duration: 6000 })
-      } else if (code === 'FFMPEG_SPAWN_FAILED') {
-        toast.error('No se pudo iniciar la transcodificación H.265→H.264', { duration: 6000 })
-      } else if (!err?.response) {
-        toast.error('Error de red al contactar la API', { duration: 6000 })
       } else {
-        toast.error(detail || `Error ${status} al cargar la grabación`, { duration: 6000 })
+        toast.error(detail || 'No se pudo cargar la grabación')
       }
     } finally {
       if (playbackKeyRef.current === myKey) setPlaybackLoading(false)
