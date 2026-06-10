@@ -40,12 +40,6 @@ function toLocalDatetimeString(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-function isHevcCodec(codec: string | null | undefined): boolean {
-  if (!codec) return false
-  const c = codec.toLowerCase()
-  return c.includes('265') || c.includes('hevc') || c === 'hvc1' || c === 'hev1'
-}
-
 function classifyError(err: any): 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFFLINE' | 'UNKNOWN' {
   const msg = (err?.response?.data?.message || err?.message || '').toLowerCase()
   if (msg.includes('isapi') || msg.includes('no soporta') || msg.includes('unsupported')) return 'ISAPI_UNSUPPORTED'
@@ -228,12 +222,14 @@ export function RecordingsPage() {
 
   // Stop any active HLS instance and release the MediaMTX recording path
   const stopPlayback = () => {
+    toast.dismiss()
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
     if (playbackSessionId) {
       apiDelete(`/recordings/playback/${playbackSessionId}`).catch(() => {})
       setPlaybackSessionId(null)
     }
     setPlaybackUrl(null)
+    setPlaybackTranscoding(false)
   }
 
   // Clean up HLS + session on unmount
@@ -245,20 +241,49 @@ export function RecordingsPage() {
     if (!video || !playbackUrl) return
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
 
+    console.log('[recordings] hls_attach url=', playbackUrl)
+
     if (Hls.isSupported()) {
       const hls = new Hls({ enableWorker: false })
       hlsRef.current = hls
       hls.loadSource(playbackUrl)
       hls.attachMedia(video)
-      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        console.log('[recordings] hls_manifest_parsed url=', playbackUrl)
+        video.play().catch(() => {})
+      })
       hls.on(Hls.Events.ERROR, (_evt, data) => {
+        const resp = (data as any).response
+        const httpStatus = resp?.code ?? resp?.status ?? null
+        console.error(
+          `[recordings] hls_error url=${playbackUrl} type=${data.type}` +
+          ` details=${data.details} fatal=${data.fatal}` +
+          ` httpStatus=${httpStatus ?? 'n/a'}`,
+          data
+        )
         if (!data.fatal) return
-        toast.error('Error de reproducción. Intenta de nuevo.', { duration: 5000 })
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          toast.error(
+            `No se pudo cargar el stream HLS` +
+            (httpStatus ? ` (HTTP ${httpStatus})` : '') +
+            `\nVerifica la URL: ${playbackUrl}`,
+            { duration: 10000 }
+          )
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          toast.error(
+            'Error de decodificación de video.\n' +
+            'El codec puede no ser soportado por este navegador.',
+            { duration: 8000 }
+          )
+        } else {
+          toast.error(`Error HLS: ${data.details}`, { duration: 8000 })
+        }
         hls.destroy()
         hlsRef.current = null
+        setPlaybackUrl(null)
       })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari native HLS — soporta HEVC nativamente
+      // Safari native HLS
       video.src = playbackUrl
       video.play().catch(() => {})
     }
@@ -269,41 +294,59 @@ export function RecordingsPage() {
     setSelectedRec(rec)
     setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
     setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
-
-    // Check if this camera's stream is HEVC so we can show "Transcodificando..." early
-    const cam = cameras.find(c => c.id === rec.cameraId)
-    const willTranscode = isHevcCodec(cam?.mainCodec)
     setPlaybackLoading(true)
-    setPlaybackTranscoding(willTranscode)
+    setPlaybackTranscoding(false)
+
+    console.log('[recordings] handlePlay start', {
+      cameraId: rec.cameraId, cameraName: rec.cameraName,
+      startTime: rec.startTime, endTime: rec.endTime,
+      playbackURI: rec.playbackURI ? 'present' : 'absent',
+    })
 
     try {
-      const result = await apiPost<{ url: string; sessionId?: string; transcoded?: boolean }>(
-        '/recordings/playback',
-        {
-          cameraId:    rec.cameraId,
-          startTime:   rec.startTime,
-          endTime:     rec.endTime,
-          playbackURI: rec.playbackURI,
-        }
-      )
-      setPlaybackUrl(result.url)
+      const result = await apiPost<{
+        url: string
+        sessionId?: string
+        expiresAt?: string
+        transcoded?: boolean
+      }>('/recordings/playback', {
+        cameraId:    rec.cameraId,
+        startTime:   rec.startTime,
+        endTime:     rec.endTime,
+        playbackURI: rec.playbackURI,
+      })
+
+      console.log('[recordings] playback_response', {
+        url:        result.url,
+        sessionId:  result.sessionId,
+        expiresAt:  result.expiresAt,
+        transcoded: result.transcoded,
+      })
+
+      if (result.transcoded) setPlaybackTranscoding(true)
       if (result.sessionId) setPlaybackSessionId(result.sessionId)
+      setPlaybackUrl(result.url)
     } catch (err: any) {
       const data   = err?.response?.data ?? {}
       const code   = data.code ?? ''
       const detail = data.detail ?? data.message ?? ''
+      const status = err?.response?.status ?? 'network_error'
+
+      console.error('[recordings] playback_api_error', { status, code, detail, data })
+
       if (code === 'HLS_TIMEOUT') {
-        toast.error(`Timeout al iniciar reproducción: ${detail}`, { duration: 8000 })
+        toast.error(`Timeout al iniciar reproducción\n${detail}`, { duration: 8000 })
       } else if (code === 'MEDIAMTX_ERROR') {
         toast.error(`Error en MediaMTX: ${detail}`, { duration: 6000 })
       } else if (code === 'FFMPEG_SPAWN_FAILED') {
-        toast.error('No se pudo iniciar la transcodificación H.265 en el servidor.', { duration: 8000 })
+        toast.error('No se pudo iniciar la transcodificación H.265→H.264', { duration: 6000 })
+      } else if (!err?.response) {
+        toast.error('Error de red al contactar la API', { duration: 6000 })
       } else {
-        toast.error(detail || 'No se pudo cargar la grabación')
+        toast.error(detail || `Error ${status} al cargar la grabación`, { duration: 6000 })
       }
     } finally {
       setPlaybackLoading(false)
-      setPlaybackTranscoding(false)
     }
   }
 
@@ -633,9 +676,7 @@ export function RecordingsPage() {
                   <>
                     <Loader2 size={24} className="text-brand-400 mx-auto mb-2 animate-spin" />
                     <p className="text-xs text-surface-500">
-                      {playbackTranscoding
-                        ? 'Transcodificando H.265 → H.264…'
-                        : 'Iniciando reproducción...'}
+                      {playbackTranscoding ? 'Transcodificando H.265 → H.264…' : 'Iniciando reproducción...'}
                     </p>
                     {playbackTranscoding && (
                       <p className="text-xs text-surface-600 mt-1">Puede tardar unos segundos</p>
