@@ -7,6 +7,7 @@ import {
   getChannelVideoConfig,
   getAllChannelsVideoConfig,
   putChannelVideoConfig,
+  getChannelCapabilities,
 } from '../services/nvr-config/hikvision'
 import { AuditAction } from '../services/audit'
 
@@ -262,6 +263,36 @@ export const nvrConfigRoutes: FastifyPluginAsync = async (server) => {
       await AuditAction(server.prisma, (request.user as any).sub, 'NVR_CHANNEL_CONFIG_RESTORED', nvrId, request)
 
       return reply.send(result.config)
+    }
+  )
+
+  // GET /api/nvrs/:nvrId/channels/:channelId/video-config/capabilities
+  // Returns allowed codecs, resolutions, fps, bitrate range for main and sub streams.
+  server.get('/:nvrId/channels/:channelId/video-config/capabilities',
+    { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] },
+    async (request, reply) => {
+      const { nvrId, channelId } = request.params as { nvrId: string; channelId: string }
+      const channel = parseInt(channelId)
+      if (isNaN(channel) || channel < 1 || channel > 64) {
+        return reply.status(400).send({ message: 'channelId inválido (1-64)' })
+      }
+
+      const nvr = await server.prisma.nVR.findUnique({ where: { id: nvrId } })
+      if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
+
+      const plainPass = decryptPass(nvr.password)
+      if (!plainPass) {
+        return reply.status(503).send({ message: 'No se pueden descifrar las credenciales del NVR.' })
+      }
+
+      const caps = await getChannelCapabilities(nvrId, {
+        ipAddress: nvr.ipAddress,
+        port:      nvr.port,
+        username:  nvr.username,
+        password:  plainPass,
+      }, channel)
+
+      return reply.send(caps)
     }
   )
 }
