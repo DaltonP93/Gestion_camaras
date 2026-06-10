@@ -54,7 +54,7 @@ api.interceptors.response.use(
 
     const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh')
     // Estos endpoints manejan sus propios errores — no mostrar toast global
-    const isSilentEndpoint = url.includes('/nvrs/test-connection') || url.includes('/nvrs/detect')
+    const isSilentEndpoint = url.includes('/nvrs/test-connection') || url.includes('/nvrs/detect') || url.includes('/alerts/settings/test-email')
     // /auth/me se llama en cada recarga de página — un 500/error de red no debe mostrar
     // toast porque el usuario ya tiene sesión activa y es un error interno del servidor.
     const isToastSuppressed = isSilentEndpoint || url.includes('/auth/me')

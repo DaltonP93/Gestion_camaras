@@ -343,8 +343,6 @@ export interface Recording {
   endTime: string
   size: number
   type: string
-  /** Path+query from ISAPI search results (e.g. /Streaming/tracks/101?starttime=...&name=...).
-   *  Present when the NVR includes playbackURI in searchMatchItem. */
   playbackURI?: string
 }
 

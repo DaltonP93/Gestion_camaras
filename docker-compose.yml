@@ -104,6 +104,14 @@ services:
       - "4000:4000"
     networks:
       - visioncore_net
+    # Allow the API container to resolve external hostnames (e.g. SMTP servers).
+    # Docker's embedded resolver handles internal service names (postgres, redis, etc.)
+    # regardless of this setting; these DNS servers are only used for external lookups.
+    # If the SMTP server is on an internal network not reachable via public DNS, also
+    # add an extra_hosts entry: "webmail.example.com:<REAL_IP>"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
