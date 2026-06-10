@@ -1,15 +1,16 @@
 // src/pages/RecordingsPage.tsx
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useState, useMemo, useRef } from 'react'
 import {
   Search, Play, Download, Calendar, Clock, ChevronDown, CheckSquare, Square,
   AlertTriangle, RefreshCw, ExternalLink, XCircle, Loader2, Info,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
-import { apiPost, apiGet } from '@/lib/api'
+import { apiPost, apiGet, apiDelete } from '@/lib/api'
 import { format, subDays, subHours, startOfDay, endOfDay } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
 import toast from 'react-hot-toast'
+import Hls from 'hls.js'
 
 interface RecordingWithCamera extends Recording {
   cameraId: string
@@ -56,7 +57,14 @@ export function RecordingsPage() {
   const [recordings, setRecordings] = useState<RecordingWithCamera[]>([])
   const [isSearching, setIsSearching] = useState(false)
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
+  const [playbackSessionId, setPlaybackSessionId] = useState<string | null>(null)
+  const [playbackLoading, setPlaybackLoading] = useState(false)
+  const [playbackTranscoding, setPlaybackTranscoding] = useState(false)
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
+  const videoRef      = useRef<HTMLVideoElement>(null)
+  const hlsRef        = useRef<Hls | null>(null)
+  const startDateRef  = useRef<HTMLInputElement>(null)
+  const endDateRef    = useRef<HTMLInputElement>(null)
   const [showCameraList, setShowCameraList] = useState(false)
   const [nvrErrors, setNvrErrors] = useState<NvrSearchError[]>([])
   const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
@@ -212,17 +220,133 @@ export function RecordingsPage() {
     }
   }
 
-  const handlePlay = async (rec: RecordingWithCamera) => {
-    setSelectedRec(rec)
-    try {
-      const result = await apiPost<{ url: string }>('/recordings/playback', {
-        cameraId:  rec.cameraId,
-        startTime: rec.startTime,
-        endTime:   rec.endTime,
+  // Stop any active HLS instance and release the MediaMTX recording path
+  const stopPlayback = () => {
+    toast.dismiss()
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+    if (playbackSessionId) {
+      apiDelete(`/recordings/playback/${playbackSessionId}`).catch(() => {})
+      setPlaybackSessionId(null)
+    }
+    setPlaybackUrl(null)
+    setPlaybackTranscoding(false)
+  }
+
+  // Clean up HLS + session on unmount
+  useEffect(() => stopPlayback, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Attach HLS.js whenever playbackUrl changes
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !playbackUrl) return
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+
+    console.log('[recordings] hls_attach url=', playbackUrl)
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: false })
+      hlsRef.current = hls
+      hls.loadSource(playbackUrl)
+      hls.attachMedia(video)
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        console.log('[recordings] hls_manifest_parsed url=', playbackUrl)
+        video.play().catch(() => {})
       })
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        const resp = (data as any).response
+        const httpStatus = resp?.code ?? resp?.status ?? null
+        console.error(
+          `[recordings] hls_error url=${playbackUrl} type=${data.type}` +
+          ` details=${data.details} fatal=${data.fatal}` +
+          ` httpStatus=${httpStatus ?? 'n/a'}`,
+          data
+        )
+        if (!data.fatal) return
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          toast.error(
+            `No se pudo cargar el stream HLS` +
+            (httpStatus ? ` (HTTP ${httpStatus})` : '') +
+            `\nVerifica la URL: ${playbackUrl}`,
+            { duration: 10000 }
+          )
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          toast.error(
+            'Error de decodificación de video.\n' +
+            'El codec puede no ser soportado por este navegador.',
+            { duration: 8000 }
+          )
+        } else {
+          toast.error(`Error HLS: ${data.details}`, { duration: 8000 })
+        }
+        hls.destroy()
+        hlsRef.current = null
+        setPlaybackUrl(null)
+      })
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari native HLS
+      video.src = playbackUrl
+      video.play().catch(() => {})
+    }
+  }, [playbackUrl])
+
+  const handlePlay = async (rec: RecordingWithCamera) => {
+    stopPlayback()
+    setSelectedRec(rec)
+    setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
+    setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
+    setPlaybackLoading(true)
+    setPlaybackTranscoding(false)
+
+    console.log('[recordings] handlePlay start', {
+      cameraId: rec.cameraId, cameraName: rec.cameraName,
+      startTime: rec.startTime, endTime: rec.endTime,
+      playbackURI: rec.playbackURI ? 'present' : 'absent',
+    })
+
+    try {
+      const result = await apiPost<{
+        url: string
+        sessionId?: string
+        expiresAt?: string
+        transcoded?: boolean
+      }>('/recordings/playback', {
+        cameraId:    rec.cameraId,
+        startTime:   rec.startTime,
+        endTime:     rec.endTime,
+        playbackURI: rec.playbackURI,
+      })
+
+      console.log('[recordings] playback_response', {
+        url:        result.url,
+        sessionId:  result.sessionId,
+        expiresAt:  result.expiresAt,
+        transcoded: result.transcoded,
+      })
+
+      if (result.transcoded) setPlaybackTranscoding(true)
+      if (result.sessionId) setPlaybackSessionId(result.sessionId)
       setPlaybackUrl(result.url)
-    } catch {
-      toast.error('No se pudo cargar la grabación')
+    } catch (err: any) {
+      const data   = err?.response?.data ?? {}
+      const code   = data.code ?? ''
+      const detail = data.detail ?? data.message ?? ''
+      const status = err?.response?.status ?? 'network_error'
+
+      console.error('[recordings] playback_api_error', { status, code, detail, data })
+
+      if (code === 'HLS_TIMEOUT') {
+        toast.error(`Timeout al iniciar reproducción\n${detail}`, { duration: 8000 })
+      } else if (code === 'MEDIAMTX_ERROR') {
+        toast.error(`Error en MediaMTX: ${detail}`, { duration: 6000 })
+      } else if (code === 'FFMPEG_SPAWN_FAILED') {
+        toast.error('No se pudo iniciar la transcodificación H.265→H.264', { duration: 6000 })
+      } else if (!err?.response) {
+        toast.error('Error de red al contactar la API', { duration: 6000 })
+      } else {
+        toast.error(detail || `Error ${status} al cargar la grabación`, { duration: 6000 })
+      }
+    } finally {
+      setPlaybackLoading(false)
     }
   }
 
@@ -246,7 +370,7 @@ export function RecordingsPage() {
   const triggerDatePicker = (ref: React.RefObject<HTMLInputElement | null>) => {
     const el = ref.current
     if (!el) return
-    try { (el as any).showPicker?.() } catch { el.focus() }
+    try { ;(el as any).showPicker?.() } catch { el.focus() }
   }
 
   return (
@@ -341,12 +465,44 @@ export function RecordingsPage() {
 
           <div>
             <label className="label">Desde</label>
-            <input type="datetime-local" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="input" />
+            <div className="relative">
+              <input
+                ref={startDateRef}
+                type="datetime-local"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                className="input pr-8"
+              />
+              <button
+                type="button"
+                onClick={() => triggerDatePicker(startDateRef)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200 transition-colors"
+                tabIndex={-1}
+              >
+                <Calendar size={14} />
+              </button>
+            </div>
           </div>
 
           <div>
             <label className="label">Hasta</label>
-            <input type="datetime-local" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="input" />
+            <div className="relative">
+              <input
+                ref={endDateRef}
+                type="datetime-local"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                className="input pr-8"
+              />
+              <button
+                type="button"
+                onClick={() => triggerDatePicker(endDateRef)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200 transition-colors"
+                tabIndex={-1}
+              >
+                <Calendar size={14} />
+              </button>
+            </div>
           </div>
         </div>
 
@@ -505,15 +661,35 @@ export function RecordingsPage() {
                 : 'Reproductor'}
             </h3>
           </div>
-          <div className="aspect-video bg-surface-900 flex items-center justify-center">
-            {playbackUrl ? (
-              <video key={playbackUrl} src={playbackUrl} controls autoPlay className="w-full h-full" />
-            ) : (
-              <div className="text-center">
-                <Play size={32} className="text-surface-700 mx-auto mb-2" />
-                <p className="text-xs text-surface-500">
-                  {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
-                </p>
+          <div className="aspect-video bg-surface-900 flex items-center justify-center relative">
+            {/* HLS video player — always rendered so ref is stable */}
+            <video
+              ref={videoRef}
+              controls
+              className={clsx('w-full h-full', !playbackUrl && 'hidden')}
+              style={{ background: '#000' }}
+            />
+            {/* Placeholder when no playback active */}
+            {!playbackUrl && (
+              <div className="text-center absolute inset-0 flex flex-col items-center justify-center">
+                {playbackLoading ? (
+                  <>
+                    <Loader2 size={24} className="text-brand-400 mx-auto mb-2 animate-spin" />
+                    <p className="text-xs text-surface-500">
+                      {playbackTranscoding ? 'Transcodificando H.265 → H.264…' : 'Iniciando reproducción...'}
+                    </p>
+                    {playbackTranscoding && (
+                      <p className="text-xs text-surface-600 mt-1">Puede tardar unos segundos</p>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <Play size={32} className="text-surface-700 mx-auto mb-2" />
+                    <p className="text-xs text-surface-500">
+                      {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
+                    </p>
+                  </>
+                )}
               </div>
             )}
           </div>

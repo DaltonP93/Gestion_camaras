@@ -343,6 +343,7 @@ export interface Recording {
   endTime: string
   size: number
   type: string
+  playbackURI?: string
 }
 
 export interface Alert {
