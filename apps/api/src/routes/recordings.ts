@@ -12,15 +12,20 @@ import {
 import CryptoJS from 'crypto-js'
 import axios from 'axios'
 import crypto from 'crypto'
+import { spawn } from 'child_process'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
-// ─── MediaMTX client (same pattern as stream.ts) ─────────────────
+// ─── MediaMTX clients ─────────────────────────────────────────────
 const mediamtxApi = axios.create({
   baseURL: process.env.MEDIAMTX_URL || 'http://mediamtx:9997',
   timeout: 8000,
 })
+
+// When true, all recordings are forced through FFmpeg/H.264 regardless of detected codec.
+// Use this as a diagnostic override when ffprobe can't reach the RTSP URL.
+const RECORDINGS_FORCE_TRANSCODE = process.env.RECORDINGS_FORCE_TRANSCODE === 'true'
 
 // ─── In-memory recording playback sessions ────────────────────────
 const RECORDING_SESSION_TTL_MS = 30 * 60 * 1000  // 30 minutes
@@ -32,10 +37,73 @@ interface RecordingSession {
 }
 const recordingSessions = new Map<string, RecordingSession>()
 
+/** Detect HEVC from a codec string (mainCodec DB field or CODECS= manifest attribute) */
 function isHevcCodec(codec: string | null | undefined): boolean {
   if (!codec) return false
   const c = codec.toLowerCase()
   return c.includes('265') || c.includes('hevc') || c === 'hvc1' || c === 'hev1'
+}
+
+/** Probe the RTSP URL with ffprobe to detect the video codec BEFORE choosing playback mode.
+ *  Returns the codec_name (e.g. "hevc", "h264") or null on failure/timeout.
+ *  NEVER logs rtspUrl — only maskedUrl is safe for logs. */
+async function probeRtspCodec(rtspUrl: string, maskedUrl: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const args = [
+      '-v', 'quiet',
+      '-print_format', 'json',
+      '-show_streams',
+      '-select_streams', 'v:0',
+      '-rtsp_transport', 'tcp',
+      '-i', rtspUrl,
+    ]
+
+    let stdout = ''
+    let settled = false
+    const settle = (val: string | null) => {
+      if (settled) return
+      settled = true
+      resolve(val)
+    }
+
+    let proc: ReturnType<typeof spawn>
+    try {
+      proc = spawn('ffprobe', args, { stdio: ['ignore', 'pipe', 'ignore'] })
+    } catch (err: any) {
+      console.warn(`[recordings] ffprobe_spawn_error maskedUrl=${maskedUrl} err=${err.message}`)
+      return settle(null)
+    }
+
+    const timer = setTimeout(() => {
+      try { proc.kill('SIGKILL') } catch {}
+      console.warn(`[recordings] ffprobe_timeout maskedUrl=${maskedUrl}`)
+      settle(null)
+    }, 10_000)
+
+    proc.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
+
+    proc.on('close', (code) => {
+      clearTimeout(timer)
+      if (settled) return
+      try {
+        const parsed = JSON.parse(stdout)
+        const streams: any[] = parsed?.streams ?? []
+        const video = streams.find((s: any) => s.codec_type === 'video')
+        const codecName: string | null = video?.codec_name ?? null
+        console.info(`[recordings] ffprobe_result maskedUrl=${maskedUrl} codec_name=${codecName ?? 'null'} code=${code}`)
+        settle(codecName)
+      } catch {
+        console.warn(`[recordings] ffprobe_parse_failed maskedUrl=${maskedUrl} code=${code} stdoutLen=${stdout.length}`)
+        settle(null)
+      }
+    })
+
+    proc.on('error', (err: Error) => {
+      clearTimeout(timer)
+      console.warn(`[recordings] ffprobe_error maskedUrl=${maskedUrl} err=${err.message}`)
+      settle(null)
+    })
+  })
 }
 
 // Periodic cleanup of expired recording sessions
@@ -425,136 +493,163 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       urlStrategy = 'fallback_timestamps'
     }
 
-    // ── Codec detection ───────────────────────────────────────────────────────
-    // Use camera.mainCodec from DB (main stream = what the NVR records by default).
-    // If HEVC, transcode via FFmpeg → H.264 so Chrome/Firefox can play it.
-    const hevc = isHevcCodec(camera.mainCodec)
+    // ── Codec detection: ffprobe over the RTSP playbackURI BEFORE choosing mode ──
+    // ffprobe probes the recording stream directly — more reliable than camera.mainCodec
+    // (which may be null or stale) and avoids starting a MediaMTX path only to tear it
+    // down 25s later after the HLS manifest reveals HEVC.
+    const ffprobeCodec  = await probeRtspCodec(rtspUrl, rtspMasked)
+    // Fallback cascade: ffprobe → DB field → unknown
+    const detectedCodec = ffprobeCodec ?? camera.mainCodec ?? null
+    // RECORDINGS_FORCE_TRANSCODE overrides detection — forces all recordings through FFmpeg
+    const isHevc        = RECORDINGS_FORCE_TRANSCODE || isHevcCodec(detectedCodec)
+    const playbackMode  = isHevc ? 'transcoded_h264' : 'direct_hls'
 
-    const sessionId  = crypto.randomBytes(8).toString('hex')
-    const streamPath = hevc ? `rec_${sessionId}_h264` : `rec_${sessionId}`
-    const playbackMode = hevc ? 'transcoded_h264' : 'direct_hls'
+    const sessionId     = crypto.randomBytes(8).toString('hex')
+    const directPath    = `rec_${sessionId}`
+    const transcodePath = `rec_${sessionId}_h264`
+    const finalPath     = isHevc ? transcodePath : directPath
+    const expiresAt     = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
 
     server.log.info(
-      `[recordings] playback_init sessionId=${sessionId} path=${streamPath}` +
+      `[recordings] playback_init sessionId=${sessionId}` +
       ` cameraId=${body.cameraId} ch=${camera.channel}` +
-      ` codec=${camera.mainCodec ?? 'unknown'} isHevc=${hevc}` +
+      ` camera.mainCodec=${camera.mainCodec ?? 'null'}` +
+      ` camera.subCodec=${(camera as any).subCodec ?? 'null'}` +
+      ` ffprobeCodec=${ffprobeCodec ?? 'null'}` +
+      ` detectedCodec=${detectedCodec ?? 'unknown'}` +
+      ` isHevc=${isHevc}` +
+      ` forceTranscode=${RECORDINGS_FORCE_TRANSCODE}` +
+      ` playbackMode=${playbackMode}` +
+      ` finalPath=${finalPath}` +
       (trackId ? ` trackId=${trackId}` : '') +
-      ` strategy=${urlStrategy} playbackMode=${playbackMode} source=${rtspMasked}`
+      ` strategy=${urlStrategy} source=${rtspMasked}`
     )
 
-    const hlsUrl    = `/hls/${streamPath}/index.m3u8`
-    const expiresAt = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
-
-    if (hevc) {
-      // ── HEVC path: FFmpeg → H.264 → MediaMTX RTSP publish → HLS ──────────
-      // FFmpeg publishes to MediaMTX's RTSP port. MediaMTX accepts it via the
-      // catch-all path wildcard (~.*: source: publisher) and creates the HLS muxer.
+    // ── Helper: spawn FFmpeg transcoding and wait for HLS ─────────────────────
+    const runTranscoded = async (): Promise<{ hlsUrl: string; transcoded: true } | null> => {
       recordingSessions.set(sessionId, {
-        streamPath, expiresAt: Date.now() + RECORDING_SESSION_TTL_MS,
+        streamPath: transcodePath, expiresAt: Date.now() + RECORDING_SESSION_TTL_MS,
         userId: user.sub, isTranscoded: true,
       })
 
-      const proc = spawnTranscodeFromRtsp(rtspUrl, rtspMasked, streamPath)
+      const proc = spawnTranscodeFromRtsp(rtspUrl, rtspMasked, transcodePath)
       if (!proc) {
         recordingSessions.delete(sessionId)
-        return reply.status(502).send({
-          code:    'FFMPEG_SPAWN_FAILED',
-          message: 'No se pudo iniciar FFmpeg para transcodificar la grabación H.265',
-        })
+        return null
       }
 
-      const isAlive = () => isTranscodeProcessAlive(streamPath)
-      const ready   = await waitForHlsReady(streamPath, 40_000, 800, isAlive)
+      const isAlive = () => isTranscodeProcessAlive(transcodePath)
+      const ready   = await waitForHlsReady(transcodePath, 40_000, 800, isAlive)
 
       if (!ready.ready) {
         recordingSessions.delete(sessionId)
-        stopTranscodeProcess(streamPath)
+        stopTranscodeProcess(transcodePath)
+
+        const diagMsg = ready.processExited
+          ? 'FFmpeg terminó antes de generar HLS (RTSP inaccesible o error de codec)'
+          : 'FFmpeg no generó segmentos HLS en tiempo (NVR lento o grabación muy corta)'
 
         server.log.warn(
           `[recordings] hls_not_ready sessionId=${sessionId} mode=transcoded` +
           ` lastStatus=${ready.lastStatus} elapsedMs=${ready.elapsedMs}ms` +
-          ` processExited=${ready.processExited} strategy=${urlStrategy} source=${rtspMasked}`
+          ` processExited=${ready.processExited} source=${rtspMasked}`
         )
 
-        const diagMsg = ready.processExited
-          ? 'FFmpeg terminó antes de generar HLS (RTSP URL inaccesible o codec error)'
-          : 'FFmpeg no generó segmentos HLS en tiempo (NVR lento o grabación muy corta)'
-
-        return reply.status(504).send({
+        await reply.status(504).send({
           code:    'HLS_TIMEOUT',
-          message: 'No se pudo iniciar la transcodificación de la grabación H.265',
+          message: 'No se pudo transcodificar la grabación H.265',
           detail:  diagMsg,
-          diagnostic: { playbackMode, lastHlsStatus: ready.lastStatus, elapsedMs: ready.elapsedMs, rtspSource: rtspMasked },
+          diagnostic: { playbackMode: 'transcoded_h264', lastHlsStatus: ready.lastStatus, elapsedMs: ready.elapsedMs },
         })
+        return null
       }
 
       server.log.info(
-        `[recordings] playback_started sessionId=${sessionId} path=${streamPath}` +
-        ` mode=transcoded_h264 hlsReady=${ready.elapsedMs}ms`
+        `[recordings] playback_started sessionId=${sessionId} path=${transcodePath}` +
+        ` mode=transcoded_h264 hlsReady=${ready.elapsedMs}ms transcoded=true`
       )
-
-    } else {
-      // ── H.264 path: MediaMTX source-pull → HLS (no FFmpeg) ────────────────
-      try {
-        await createRecordingHlsPath(rtspUrl, rtspMasked, streamPath, (msg) => server.log.info(msg))
-      } catch (err: any) {
-        server.log.error(`[recordings] mediamtx_path_create_failed sessionId=${sessionId} err=${err.message}`)
-        return reply.status(502).send({
-          code:    'MEDIAMTX_ERROR',
-          message: 'No se pudo registrar el path en MediaMTX',
-          detail:  err.response?.data?.error || err.message,
-        })
-      }
-
-      recordingSessions.set(sessionId, {
-        streamPath, expiresAt: Date.now() + RECORDING_SESSION_TTL_MS,
-        userId: user.sub,
-      })
-
-      const ready = await waitForHlsReady(streamPath, 25_000, 800)
-
-      if (!ready.ready) {
-        const pathStatus = await getMediaMtxPathStatus(streamPath)
-        recordingSessions.delete(sessionId)
-        mediamtxApi.delete(`/v3/config/paths/delete/${streamPath}`).catch(() => {})
-
-        const diagMsg = !pathStatus.exists
-          ? 'Path no encontrado en MediaMTX'
-          : pathStatus.ready
-            ? 'RTSP conectado pero HLS no generó segmentos en tiempo'
-            : 'MediaMTX no pudo conectar al RTSP del NVR (URL incorrecta o NVR sin soporte playback)'
-
-        server.log.warn(
-          `[recordings] hls_not_ready sessionId=${sessionId} mode=direct` +
-          ` lastStatus=${ready.lastStatus} elapsedMs=${ready.elapsedMs}ms` +
-          ` pathExists=${pathStatus.exists} pathReady=${pathStatus.ready}` +
-          ` sourceState=${pathStatus.sourceState} strategy=${urlStrategy}` +
-          (trackId ? ` trackId=${trackId}` : '') + ` source=${rtspMasked}`
-        )
-
-        return reply.status(504).send({
-          code:    'HLS_TIMEOUT',
-          message: 'MediaMTX no publicó la grabación en tiempo',
-          detail:  diagMsg,
-          diagnostic: {
-            trackId, pathExists: pathStatus.exists, pathReady: pathStatus.ready,
-            sourceState: pathStatus.sourceState, lastHlsStatus: ready.lastStatus,
-            elapsedMs: ready.elapsedMs, rtspSource: rtspMasked,
-          },
-        })
-      }
-
-      server.log.info(
-        `[recordings] playback_started sessionId=${sessionId} path=${streamPath}` +
-        ` mode=direct_hls hlsReady=${ready.elapsedMs}ms`
-      )
+      return { hlsUrl: `/hls/${transcodePath}/index.m3u8`, transcoded: true }
     }
 
-    await AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
-      startTime: body.startTime, endTime: body.endTime, sessionId, playbackMode,
+    // ── Route: HEVC detected → FFmpeg transcoding ─────────────────────────────
+    // ffprobe confirmed HEVC (or RECORDINGS_FORCE_TRANSCODE=true) — go directly to FFmpeg.
+    // NEVER call mediamtx_path_add with a direct RTSP source for HEVC streams.
+    if (isHevc) {
+      const result = await runTranscoded()
+      if (!result) {
+        if (!reply.sent) {
+          return reply.status(502).send({ code: 'FFMPEG_SPAWN_FAILED', message: 'No se pudo iniciar FFmpeg para H.265' })
+        }
+        return
+      }
+      await AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
+        startTime: body.startTime, endTime: body.endTime, sessionId,
+        playbackMode: 'transcoded_h264', transcoded: true, detectedCodec,
+      })
+      return reply.send({ url: result.hlsUrl, sessionId, expiresAt, transcoded: true })
+    }
+
+    // ── Route: H.264 detected → direct MediaMTX source-pull ──────────────────
+    try {
+      await createRecordingHlsPath(rtspUrl, rtspMasked, directPath, (msg) => server.log.info(msg))
+    } catch (err: any) {
+      server.log.error(`[recordings] mediamtx_path_create_failed sessionId=${sessionId} err=${err.message}`)
+      return reply.status(502).send({
+        code:    'MEDIAMTX_ERROR',
+        message: 'No se pudo registrar el path en MediaMTX',
+        detail:  err.response?.data?.error || err.message,
+      })
+    }
+
+    recordingSessions.set(sessionId, {
+      streamPath: directPath, expiresAt: Date.now() + RECORDING_SESSION_TTL_MS,
+      userId: user.sub,
     })
 
-    return reply.send({ url: hlsUrl, sessionId, expiresAt, transcoded: hevc })
+    const directReady = await waitForHlsReady(directPath, 25_000, 800)
+
+    if (!directReady.ready) {
+      const pathStatus = await getMediaMtxPathStatus(directPath)
+      recordingSessions.delete(sessionId)
+      mediamtxApi.delete(`/v3/config/paths/delete/${directPath}`).catch(() => {})
+
+      const diagMsg = !pathStatus.exists
+        ? 'Path no encontrado en MediaMTX'
+        : pathStatus.ready
+          ? 'RTSP conectado pero HLS no generó segmentos en tiempo'
+          : 'MediaMTX no pudo conectar al RTSP del NVR (URL incorrecta o NVR sin soporte playback)'
+
+      server.log.warn(
+        `[recordings] hls_not_ready sessionId=${sessionId} mode=direct` +
+        ` lastStatus=${directReady.lastStatus} elapsedMs=${directReady.elapsedMs}ms` +
+        ` pathExists=${pathStatus.exists} pathReady=${pathStatus.ready}` +
+        ` sourceState=${pathStatus.sourceState} strategy=${urlStrategy}` +
+        (trackId ? ` trackId=${trackId}` : '') + ` source=${rtspMasked}`
+      )
+
+      return reply.status(504).send({
+        code:    'HLS_TIMEOUT',
+        message: 'MediaMTX no publicó la grabación en tiempo',
+        detail:  diagMsg,
+        diagnostic: {
+          trackId, pathExists: pathStatus.exists, pathReady: pathStatus.ready,
+          sourceState: pathStatus.sourceState, lastHlsStatus: directReady.lastStatus,
+          elapsedMs: directReady.elapsedMs, rtspSource: rtspMasked,
+        },
+      })
+    }
+
+    server.log.info(
+      `[recordings] playback_started sessionId=${sessionId} path=${directPath}` +
+      ` mode=direct_hls detectedCodec=${detectedCodec ?? 'null'} hlsReady=${directReady.elapsedMs}ms transcoded=false`
+    )
+
+    await AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
+      startTime: body.startTime, endTime: body.endTime, sessionId,
+      playbackMode: 'direct_hls', transcoded: false, detectedCodec,
+    })
+
+    return reply.send({ url: `/hls/${directPath}/index.m3u8`, sessionId, expiresAt, transcoded: false })
   })
 
   // DELETE /api/recordings/playback/:sessionId — Stop playback and release resources
