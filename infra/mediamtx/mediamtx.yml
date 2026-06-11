@@ -50,7 +50,7 @@ hls: yes
 hlsAddress: :8888
 # fmp4 handles B-frames and reordered DTS natively; mpegts fails with "too many reordered frames"
 hlsVariant: fmp4
-hlsSegmentCount: 4
+hlsSegmentCount: 7
 hlsSegmentDuration: 2s
 hlsSegmentMaxSize: 50MB
 hlsMuxerCloseAfter: 10m

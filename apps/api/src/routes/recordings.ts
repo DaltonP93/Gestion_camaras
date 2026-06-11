@@ -584,11 +584,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).send({ message: 'Sin permiso' })
     }
     recordingSessions.delete(sessionId)
-    if (session.isTranscoded) stopTranscodeProcess(session.streamPath)
     await mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
     server.log.info(
       `[recordings] playback_stopped sessionId=${sessionId} path=${session.streamPath}` +
-      ` transcoded=${session.isTranscoded}`
+      ` transcoded=${session.transcoded}`
     )
     return reply.send({ ok: true })
   })
@@ -600,8 +599,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const session = recordingSessions.get(sessionId)
     if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
     const status  = await getMediaMtxPathStatus(session.streamPath)
-    const ffmpegAlive = session.isTranscoded ? isTranscodeProcessAlive(session.streamPath) : null
-    return reply.send({ sessionId, ...session, pathStatus: status, ffmpegAlive })
+    return reply.send({ sessionId, ...session, pathStatus: status })
   })
 
   // GET /api/recordings/audit

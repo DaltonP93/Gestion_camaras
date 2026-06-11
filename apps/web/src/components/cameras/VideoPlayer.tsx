@@ -145,6 +145,8 @@ export function VideoPlayer({
   const isPlayingRef   = useRef(false)
   // True once the first fragment was loaded in this mount — drives "Reconectando" vs "Preparando"
   const hasPlayedOnce  = useRef(false)
+  // Track previous hlsUrl to detect URL changes for logging
+  const prevHlsUrlRef  = useRef<string>('')
   const [status, setStatus] = useState<Status>('loading')
   const [internalError, setInternalError] = useState<CameraPlaybackError | null>(null)
   // Message shown in the loading overlay during transcoding startup (HLS 500 retry window)
@@ -158,6 +160,7 @@ export function VideoPlayer({
   const initPlayer = useCallback(() => {
     if (!videoRef.current || !hlsUrl) return
 
+    console.info(`[live-ui] hls_attach cameraId=${cameraId || 'unknown'} url=${hlsUrl}`)
     hlsRef.current?.destroy()
     if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
     isPlayingRef.current  = false
@@ -220,6 +223,15 @@ export function VideoPlayer({
             rawCode === 'UNKNOWN' && streamTypeRef.current === 'main_h264'
               ? 'TRANSCODE_NOT_READY'
               : rawCode
+
+          const isStale = hlsRef.current !== hls
+          console.warn(
+            `[live-ui] hls_error cameraId=${cameraId || 'unknown'} status=${data.response?.code ?? 'n/a'}` +
+            ` stale=${isStale} url=${data.url || hlsUrl} details=${data.details}`
+          )
+          // If this HLS instance is no longer current (stale), ignore the error entirely.
+          // This happens when initPlayer was called again before the old HLS.js finished cleanup.
+          if (isStale) return
 
           // 401 — MediaMTX HLS session expired (cookie expired or muxer destroyed)
           if (data.response?.code === 401) {
@@ -288,7 +300,7 @@ export function VideoPlayer({
                 : is404 && isTranscodedStream ? 1000
                 : is404 ? 4000
                 : 3000 * (r + 1)
-              setTimeout(() => hls.startLoad(), delay)
+              setTimeout(() => { if (hlsRef.current === hls) hls.startLoad() }, delay)
               return r + 1
             })
           } else {
@@ -330,8 +342,14 @@ export function VideoPlayer({
   }, [hlsUrl])
 
   useEffect(() => {
+    if (hlsUrl && prevHlsUrlRef.current && prevHlsUrlRef.current !== hlsUrl) {
+      console.info(`[live-ui] stream_url_changed cameraId=${cameraId || 'unknown'} old=${prevHlsUrlRef.current} new=${hlsUrl}`)
+    }
+    prevHlsUrlRef.current = hlsUrl || ''
+
     if (error || externalError) {
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
+      console.info(`[live-ui] hls_destroy cameraId=${cameraId || 'unknown'} reason=external_error`)
       hlsRef.current?.destroy()
       hlsRef.current = null
       setStatus('error')
@@ -340,6 +358,7 @@ export function VideoPlayer({
     if (!hlsUrl) {
       // hlsUrl cleared (session stopped) — destroy HLS so it stops making requests
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
+      console.info(`[live-ui] hls_destroy cameraId=${cameraId || 'unknown'} reason=url_cleared`)
       hlsRef.current?.destroy()
       hlsRef.current = null
       setStatus('loading')
@@ -350,6 +369,7 @@ export function VideoPlayer({
     return () => {
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
       isPlayingRef.current = false
+      console.info(`[live-ui] hls_destroy cameraId=${cameraId || 'unknown'} reason=effect_cleanup`)
       hlsRef.current?.destroy()
       hlsRef.current = null
     }
