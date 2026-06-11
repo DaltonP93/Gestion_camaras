@@ -24,6 +24,7 @@ export type CameraPlaybackErrorCode =
   | 'HLS_SESSION_EXPIRED'
   | 'TRANSCODE_NOT_READY'
   | 'TRANSCODE_PROCESS_EXITED'
+  | 'TRANSCODE_LIMIT_REACHED'
   | 'PLAYER_TIMEOUT'
   | 'UNKNOWN'
 
@@ -48,6 +49,7 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   HLS_SESSION_EXPIRED:        { icon: <Clock size={16} />,        label: 'Sesión HLS expirada',          color: 'text-amber-400' },
   TRANSCODE_NOT_READY:        { icon: <Cpu size={16} />,          label: 'Transcodificación no lista',   color: 'text-purple-400' },
   TRANSCODE_PROCESS_EXITED:   { icon: <Cpu size={16} />,          label: 'FFmpeg finalizó inesperadamente', color: 'text-purple-400' },
+  TRANSCODE_LIMIT_REACHED:    { icon: <Cpu size={16} />,          label: 'Límite de transcodificaciones', color: 'text-amber-400' },
   PLAYER_TIMEOUT:             { icon: <Clock size={16} />,        label: 'Sin frames (timeout)',         color: 'text-surface-400' },
   UNKNOWN:                    { icon: <AlertTriangle size={16} />, label: 'Error desconocido',           color: 'text-surface-400' },
 }
@@ -143,6 +145,8 @@ export function VideoPlayer({
   const isPlayingRef   = useRef(false)
   // True once the first fragment was loaded in this mount — drives "Reconectando" vs "Preparando"
   const hasPlayedOnce  = useRef(false)
+  // Track previous hlsUrl to detect URL changes for logging
+  const prevHlsUrlRef  = useRef<string>('')
   const [status, setStatus] = useState<Status>('loading')
   const [internalError, setInternalError] = useState<CameraPlaybackError | null>(null)
   // Message shown in the loading overlay during transcoding startup (HLS 500 retry window)
@@ -156,6 +160,7 @@ export function VideoPlayer({
   const initPlayer = useCallback(() => {
     if (!videoRef.current || !hlsUrl) return
 
+    console.info(`[live-ui] hls_attach cameraId=${cameraId || 'unknown'} url=${hlsUrl}`)
     hlsRef.current?.destroy()
     if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
     isPlayingRef.current  = false
@@ -218,6 +223,15 @@ export function VideoPlayer({
             rawCode === 'UNKNOWN' && streamTypeRef.current === 'main_h264'
               ? 'TRANSCODE_NOT_READY'
               : rawCode
+
+          const isStale = hlsRef.current !== hls
+          console.warn(
+            `[live-ui] hls_error cameraId=${cameraId || 'unknown'} status=${data.response?.code ?? 'n/a'}` +
+            ` stale=${isStale} url=${data.url || hlsUrl} details=${data.details}`
+          )
+          // If this HLS instance is no longer current (stale), ignore the error entirely.
+          // This happens when initPlayer was called again before the old HLS.js finished cleanup.
+          if (isStale) return
 
           // 401 — MediaMTX HLS session expired (cookie expired or muxer destroyed)
           if (data.response?.code === 401) {
@@ -286,7 +300,7 @@ export function VideoPlayer({
                 : is404 && isTranscodedStream ? 1000
                 : is404 ? 4000
                 : 3000 * (r + 1)
-              setTimeout(() => hls.startLoad(), delay)
+              setTimeout(() => { if (hlsRef.current === hls) hls.startLoad() }, delay)
               return r + 1
             })
           } else {
@@ -328,8 +342,14 @@ export function VideoPlayer({
   }, [hlsUrl])
 
   useEffect(() => {
+    if (hlsUrl && prevHlsUrlRef.current && prevHlsUrlRef.current !== hlsUrl) {
+      console.info(`[live-ui] stream_url_changed cameraId=${cameraId || 'unknown'} old=${prevHlsUrlRef.current} new=${hlsUrl}`)
+    }
+    prevHlsUrlRef.current = hlsUrl || ''
+
     if (error || externalError) {
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
+      console.info(`[live-ui] hls_destroy cameraId=${cameraId || 'unknown'} reason=external_error`)
       hlsRef.current?.destroy()
       hlsRef.current = null
       setStatus('error')
@@ -338,6 +358,7 @@ export function VideoPlayer({
     if (!hlsUrl) {
       // hlsUrl cleared (session stopped) — destroy HLS so it stops making requests
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
+      console.info(`[live-ui] hls_destroy cameraId=${cameraId || 'unknown'} reason=url_cleared`)
       hlsRef.current?.destroy()
       hlsRef.current = null
       setStatus('loading')
@@ -348,6 +369,7 @@ export function VideoPlayer({
     return () => {
       if (firstFrameTimer.current) clearTimeout(firstFrameTimer.current)
       isPlayingRef.current = false
+      console.info(`[live-ui] hls_destroy cameraId=${cameraId || 'unknown'} reason=effect_cleanup`)
       hlsRef.current?.destroy()
       hlsRef.current = null
     }
@@ -407,9 +429,28 @@ export function VideoPlayer({
           (streamCodec || '').toLowerCase().includes('h.265') ||
           (streamCodec || '').toLowerCase().includes('h265')
         )
+        const isLimitReached = activeError?.code === 'TRANSCODE_LIMIT_REACHED'
         return (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-surface-900/95 gap-2 px-3">
-            {isHevcMain ? (
+            {isLimitReached ? (
+              <>
+                <Cpu size={18} className="text-amber-400" />
+                <p className="text-xs font-medium text-amber-300 text-center">Límite de transcodificaciones</p>
+                <p className="text-[10px] text-surface-400 text-center leading-snug max-w-[200px]">
+                  {activeError?.message || 'Cupo máx. alcanzado. Cierra otra cámara HD o usa baja calidad.'}
+                </p>
+                <div className="flex flex-wrap gap-1.5 mt-1 justify-center">
+                  {onRetry && cameraId && (
+                    <button
+                      onClick={() => onRetry!(cameraId!)}
+                      className="btn-ghost text-[10px] px-2 py-1"
+                    >
+                      <RefreshCw size={10} /> Reintentar
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : isHevcMain ? (
               <>
                 <Film size={18} className="text-amber-400" />
                 <p className="text-xs font-medium text-amber-300 text-center">H.265/HEVC no compatible</p>

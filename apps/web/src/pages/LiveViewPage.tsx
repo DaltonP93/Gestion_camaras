@@ -279,7 +279,7 @@ export function LiveViewPage() {
         CAMERA_NOT_FOUND:       'UNKNOWN',
         CAMERA_DISABLED:        'UNKNOWN',
         TRANSCODING_DISABLED:    'CODEC_UNSUPPORTED',
-        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+        TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
         TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
         TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
       }
@@ -367,6 +367,15 @@ export function LiveViewPage() {
     try {
       const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', { viewId, visibleCameraIds: visibleIds })
       applyHeartbeat(result)
+      // Always remount players for cameras that had expired sessions but were NOT freshly
+      // started by the backend (freshly started ones are already bumped in applyHeartbeat).
+      // This forces HLS.js to re-establish its session cookie even when the backend
+      // kept the session alive (session still active → not in startedIds → would stay stuck).
+      const notFreshlyStarted = toRestart.filter(id => !result.startedIds.includes(id))
+      if (notFreshlyStarted.length > 0) {
+        console.info(`[live-ui] hls_reattach_after_expiry ids=[${notFreshlyStarted.join(',')}] reason=session_alive_cookie_expired`)
+        bumpPlayerKeys(notFreshlyStarted)
+      }
     } catch (err: any) {
       if (err?.response?.status === 401) return  // auth expired; interceptor handles redirect
       // Fallback: individual restart per camera (non-auth errors only).
@@ -486,7 +495,7 @@ export function LiveViewPage() {
         CAMERA_NOT_FOUND:        'UNKNOWN',
         CAMERA_DISABLED:         'UNKNOWN',
         TRANSCODING_DISABLED:    'CODEC_UNSUPPORTED',
-        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+        TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
         TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
         TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
       }
@@ -749,7 +758,7 @@ export function LiveViewPage() {
         RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
         TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
         TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
-        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+        TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
       }
       setFocusStreamError({
         code: (errCodeMap[body.error] || 'UNKNOWN') as any,

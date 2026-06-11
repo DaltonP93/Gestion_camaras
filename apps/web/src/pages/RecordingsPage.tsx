@@ -1,7 +1,7 @@
 // src/pages/RecordingsPage.tsx
 import { useEffect, useState, useMemo, useRef } from 'react'
 import {
-  Search, Play, Download, Calendar, Clock, ChevronDown, CheckSquare, Square,
+  Search, Play, Calendar, Clock, ChevronDown, CheckSquare, Square,
   AlertTriangle, RefreshCw, ExternalLink, XCircle, Loader2, Info,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
@@ -697,13 +697,6 @@ export function RecordingsPage() {
                       {rec.size > 0 && <span>{formatSize(rec.size)}</span>}
                     </div>
                   </div>
-                  <button
-                    className="p-1.5 rounded text-surface-500 hover:text-surface-200 hover:bg-surface-600 transition-colors flex-shrink-0"
-                    title="Descargar"
-                    onClick={(e) => { e.stopPropagation(); toast('Descarga no disponible en demo', { icon: 'ℹ️' }) }}
-                  >
-                    <Download size={12} />
-                  </button>
                 </div>
               ))
             )}

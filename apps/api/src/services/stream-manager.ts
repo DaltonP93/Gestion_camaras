@@ -280,6 +280,10 @@ export async function startStream(
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
+  const existingKey = sessionKey(userId, cameraId, streamType)
+  const hasExisting = sessions.has(existingKey)
+  console.info(`[live] start_stream cameraId=${cameraId} streamType=${streamType} existingSession=${hasExisting} userId=${userId}`)
+
   // Buscar cámara en DB con NVR
   const camera = await server.prisma.camera.findUnique({
     where: { id: cameraId },
@@ -649,7 +653,7 @@ export async function stopStream(
   }
 
   console.info(
-    `[stopStream] cameraId=${cameraId} streamType=${streamType} key=${key}` +
+    `[live] stop_stream cameraId=${cameraId} streamType=${streamType}` +
     ` sessionFound=${!!session} path=${session?.streamPath || 'n/a'}` +
     ` killedFfmpeg=${killedFfmpeg} clearedInFlight=${clearedInFlight}` +
     (reason ? ` reason=${reason}` : '')
@@ -682,6 +686,8 @@ export async function reconcileView(
 ): Promise<ReconcileResult> {
   const visibleSet = new Set(visibleCameraIds)
   const vk = vKey(userId, viewId)
+
+  console.info(`[live] heartbeat userId=${userId} viewId=${viewId} cameraIds=[${visibleCameraIds.join(',')}]`)
 
   // Actualizar heartbeat del view
   viewHeartbeat.set(vk, new Date())
@@ -752,6 +758,11 @@ export async function reconcileView(
   // Actualizar viewCameras con el nuevo conjunto visible
   viewCameras.set(vk, new Set(visibleCameraIds.filter(id => streams[id])))
 
+  console.info(
+    `[live] heartbeat_done userId=${userId} viewId=${viewId}` +
+    ` started=[${startedIds.join(',')}] stopped=[${stoppedIds.join(',')}]` +
+    ` active=${visibleCameraIds.filter(id => streams[id]).length} errors=${Object.keys(errors).length}`
+  )
   return { streams, errors, startedIds, stoppedIds }
 }
 
