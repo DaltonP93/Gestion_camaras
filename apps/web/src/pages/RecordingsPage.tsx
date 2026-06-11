@@ -1,15 +1,16 @@
 // src/pages/RecordingsPage.tsx
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useState, useMemo, useRef } from 'react'
 import {
   Search, Play, Download, Calendar, Clock, ChevronDown, CheckSquare, Square,
   AlertTriangle, RefreshCw, ExternalLink, XCircle, Loader2, Info,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
-import { apiPost, apiGet } from '@/lib/api'
+import { apiPost, apiGet, apiDelete } from '@/lib/api'
 import { format, subDays, subHours, startOfDay, endOfDay } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
 import toast from 'react-hot-toast'
+import Hls from 'hls.js'
 
 interface RecordingWithCamera extends Recording {
   cameraId: string
@@ -34,6 +35,16 @@ interface RecordingCapabilities {
   recordingCapabilityError: string | null
 }
 
+interface PlaybackStatusResponse {
+  status:     'starting' | 'ready' | 'error'
+  url:        string
+  hlsReady:   boolean
+  transcoded: boolean
+  errorCode?: string
+  error?:     string
+  stderrTail?: string
+}
+
 function toLocalDatetimeString(date: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
@@ -47,6 +58,9 @@ function classifyError(err: any): 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFF
   return 'UNKNOWN'
 }
 
+const POLL_INTERVAL_MS  = 1_000
+const POLL_MAX_MS       = 65_000
+
 export function RecordingsPage() {
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
   const [selectedNVR, setSelectedNVR] = useState<string>('all')
@@ -56,7 +70,19 @@ export function RecordingsPage() {
   const [recordings, setRecordings] = useState<RecordingWithCamera[]>([])
   const [isSearching, setIsSearching] = useState(false)
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
+  const [playbackSessionId, setPlaybackSessionId] = useState<string | null>(null)
+  const [playbackLoading, setPlaybackLoading] = useState(false)
+  const [playbackStatus, setPlaybackStatus] = useState<'idle' | 'starting' | 'transcoding' | 'ready'>('idle')
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
+  const videoRef             = useRef<HTMLVideoElement>(null)
+  const hlsRef               = useRef<Hls | null>(null)
+  // Stale-session guard: each handlePlay call gets a unique key.
+  // HLS attachment and error toasts only fire if key still matches.
+  const playbackKeyRef       = useRef<string | null>(null)
+  // Mirror of playbackSessionId in a ref so stopPlayback can read it in async closures.
+  const playbackSessionIdRef = useRef<string | null>(null)
+  const startDateRef  = useRef<HTMLInputElement>(null)
+  const endDateRef    = useRef<HTMLInputElement>(null)
   const [showCameraList, setShowCameraList] = useState(false)
   const [nvrErrors, setNvrErrors] = useState<NvrSearchError[]>([])
   const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
@@ -127,7 +153,6 @@ export function RecordingsPage() {
 
     const cameraIds = [...selectedCameras]
 
-    // Group cameras by NVR for error attribution
     const camToNvr = new Map<string, { nvrId: string; nvrName: string }>()
     cameras.forEach(c => {
       if (cameraIds.includes(c.id)) {
@@ -196,11 +221,9 @@ export function RecordingsPage() {
 
       if (caps.supportsIsapiRecording) {
         toast.success('NVR ahora soporta ISAPI. Vuelve a buscar para obtener resultados.')
-        // Remove error for this NVR
         setNvrErrors(prev => prev.filter(e => e.nvrId !== nvrId))
       } else {
         toast('NVR no soporta búsqueda ISAPI', { icon: 'ℹ️' })
-        // Update error with new capabilities (playbackWebUrl, etc.)
         setNvrErrors(prev => prev.map(e =>
           e.nvrId === nvrId ? { ...e, playbackWebUrl: caps.playbackWebUrl ?? null } : e
         ))
@@ -212,17 +235,171 @@ export function RecordingsPage() {
     }
   }
 
-  const handlePlay = async (rec: RecordingWithCamera) => {
-    setSelectedRec(rec)
-    try {
-      const result = await apiPost<{ url: string }>('/recordings/playback', {
-        cameraId:  rec.cameraId,
-        startTime: rec.startTime,
-        endTime:   rec.endTime,
+  // Stop any active HLS instance and release the MediaMTX recording path
+  const stopPlayback = () => {
+    toast.dismiss()
+    playbackKeyRef.current = null
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+    const sid = playbackSessionIdRef.current
+    if (sid) {
+      apiDelete(`/recordings/playback/${sid}`).catch(() => {})
+      playbackSessionIdRef.current = null
+      setPlaybackSessionId(null)
+    }
+    setPlaybackUrl(null)
+    setPlaybackStatus('idle')
+  }
+
+  // Sync ref whenever state changes
+  useEffect(() => { playbackSessionIdRef.current = playbackSessionId }, [playbackSessionId])
+
+  // Clean up HLS + session on unmount
+  useEffect(() => stopPlayback, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Attach HLS.js whenever playbackUrl changes
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !playbackUrl) return
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+
+    // Capture key at attachment time — stale checks compare against this
+    const attachedKey = playbackKeyRef.current
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: false,
+        xhrSetup: (xhr) => { xhr.withCredentials = true },
       })
-      setPlaybackUrl(result.url)
-    } catch {
-      toast.error('No se pudo cargar la grabación')
+      hlsRef.current = hls
+      hls.loadSource(playbackUrl)
+      hls.attachMedia(video)
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (!data.fatal) return
+        if (attachedKey !== playbackKeyRef.current) return  // stale session
+        const status = (data.response as any)?.code ?? 0
+        if (status === 401) {
+          toast.error('Sesión expirada — vuelve a seleccionar la grabación', { duration: 6000 })
+        } else {
+          toast.error('Error al reproducir la grabación', { duration: 5000 })
+        }
+      })
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari native HLS
+      video.src = playbackUrl
+      video.play().catch(() => {})
+    }
+  }, [playbackUrl])
+
+  const handlePlay = async (rec: RecordingWithCamera) => {
+    stopPlayback()
+    setSelectedRec(rec)
+    setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
+    setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
+
+    const myKey = `${Date.now()}-${Math.random()}`
+    playbackKeyRef.current = myKey
+    setPlaybackLoading(true)
+    setPlaybackStatus('starting')
+
+    let sessionId: string | null = null
+
+    try {
+      // POST returns immediately — backend starts background job
+      const result = await apiPost<{
+        status: string
+        sessionId: string
+        url: string
+        pollUrl: string
+        transcoded: boolean
+        expiresAt: string
+      }>('/recordings/playback', {
+        cameraId:    rec.cameraId,
+        startTime:   rec.startTime,
+        endTime:     rec.endTime,
+        playbackURI: rec.playbackURI,
+      })
+
+      // Stale check: user may have clicked a different recording before POST returned
+      if (playbackKeyRef.current !== myKey) return
+
+      sessionId = result.sessionId
+      setPlaybackSessionId(sessionId)
+      playbackSessionIdRef.current = sessionId
+
+      if (result.transcoded) setPlaybackStatus('transcoding')
+
+      // Poll /status until ready or error (max 65s, 1s interval)
+      const pollStart = Date.now()
+      while (Date.now() - pollStart < POLL_MAX_MS) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
+
+        if (playbackKeyRef.current !== myKey) return  // user cancelled
+
+        let statusRes: PlaybackStatusResponse
+        try {
+          statusRes = await apiGet<PlaybackStatusResponse>(
+            `/recordings/playback/${sessionId}/status`, {}
+          )
+        } catch (pollErr: any) {
+          if (playbackKeyRef.current !== myKey) return
+          const code = pollErr?.response?.data?.status
+          if (code === 'error' || pollErr?.response?.status === 404) {
+            toast.error('Sesión de reproducción no encontrada', { duration: 6000 })
+          } else {
+            toast.error('Error al consultar estado de reproducción', { duration: 5000 })
+          }
+          setPlaybackLoading(false)
+          setPlaybackStatus('idle')
+          return
+        }
+
+        if (playbackKeyRef.current !== myKey) return
+
+        if (statusRes.status === 'ready') {
+          setPlaybackUrl(statusRes.url)
+          setPlaybackStatus('ready')
+          setPlaybackLoading(false)
+          return
+        }
+
+        if (statusRes.status === 'error') {
+          const code = statusRes.errorCode ?? ''
+          const msg  = statusRes.error ?? 'Error desconocido'
+          if (code === 'HLS_TIMEOUT') {
+            toast.error(`MediaMTX no conectó al NVR (timeout)\n${msg}`, { duration: 8000 })
+          } else if (code === 'MEDIAMTX_ERROR') {
+            toast.error(`Error en MediaMTX: ${msg}`, { duration: 6000 })
+          } else {
+            toast.error(msg || 'No se pudo cargar la grabación', { duration: 6000 })
+          }
+          setPlaybackLoading(false)
+          setPlaybackStatus('idle')
+          return
+        }
+
+        // Still 'starting' — update transcoding status from response
+        if (statusRes.transcoded) setPlaybackStatus('transcoding')
+      }
+
+      // Poll timeout (client-side safety net — backend has its own 60s timeout)
+      if (playbackKeyRef.current !== myKey) return
+      toast.error('Tiempo de espera agotado. Intenta de nuevo.', { duration: 7000 })
+      setPlaybackLoading(false)
+      setPlaybackStatus('idle')
+
+    } catch (err: any) {
+      if (playbackKeyRef.current !== myKey) return
+      const data   = err?.response?.data ?? {}
+      const code   = data.code ?? ''
+      const detail = data.detail ?? data.message ?? ''
+      if (code === 'MEDIAMTX_ERROR') {
+        toast.error(`Error en MediaMTX: ${detail}`, { duration: 6000 })
+      } else {
+        toast.error(detail || 'No se pudo iniciar la reproducción', { duration: 5000 })
+      }
+      setPlaybackLoading(false)
+      setPlaybackStatus('idle')
     }
   }
 
@@ -246,8 +423,12 @@ export function RecordingsPage() {
   const triggerDatePicker = (ref: React.RefObject<HTMLInputElement | null>) => {
     const el = ref.current
     if (!el) return
-    try { (el as any).showPicker?.() } catch { el.focus() }
+    try { ;(el as any).showPicker?.() } catch { el.focus() }
   }
+
+  const loadingLabel = playbackStatus === 'transcoding'
+    ? 'Transcodificando H.265 → H.264…'
+    : 'Preparando grabación…'
 
   return (
     <div className="p-5 space-y-4 animate-fade-in">
@@ -341,12 +522,44 @@ export function RecordingsPage() {
 
           <div>
             <label className="label">Desde</label>
-            <input type="datetime-local" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="input" />
+            <div className="relative">
+              <input
+                ref={startDateRef}
+                type="datetime-local"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                className="input pr-8"
+              />
+              <button
+                type="button"
+                onClick={() => triggerDatePicker(startDateRef)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200 transition-colors"
+                tabIndex={-1}
+              >
+                <Calendar size={14} />
+              </button>
+            </div>
           </div>
 
           <div>
             <label className="label">Hasta</label>
-            <input type="datetime-local" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="input" />
+            <div className="relative">
+              <input
+                ref={endDateRef}
+                type="datetime-local"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                className="input pr-8"
+              />
+              <button
+                type="button"
+                onClick={() => triggerDatePicker(endDateRef)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200 transition-colors"
+                tabIndex={-1}
+              >
+                <Calendar size={14} />
+              </button>
+            </div>
           </div>
         </div>
 
@@ -505,15 +718,33 @@ export function RecordingsPage() {
                 : 'Reproductor'}
             </h3>
           </div>
-          <div className="aspect-video bg-surface-900 flex items-center justify-center">
-            {playbackUrl ? (
-              <video key={playbackUrl} src={playbackUrl} controls autoPlay className="w-full h-full" />
-            ) : (
-              <div className="text-center">
-                <Play size={32} className="text-surface-700 mx-auto mb-2" />
-                <p className="text-xs text-surface-500">
-                  {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
-                </p>
+          <div className="aspect-video bg-surface-900 flex items-center justify-center relative">
+            {/* HLS video player — always rendered so ref is stable */}
+            <video
+              ref={videoRef}
+              controls
+              className={clsx('w-full h-full', !playbackUrl && 'hidden')}
+              style={{ background: '#000' }}
+            />
+            {/* Placeholder when no playback active */}
+            {!playbackUrl && (
+              <div className="text-center absolute inset-0 flex flex-col items-center justify-center">
+                {playbackLoading ? (
+                  <>
+                    <Loader2 size={24} className="text-brand-400 mx-auto mb-2 animate-spin" />
+                    <p className="text-sm text-surface-300">{loadingLabel}</p>
+                    {playbackStatus === 'transcoding' && (
+                      <p className="text-xs text-surface-500 mt-1">Puede tardar unos segundos</p>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <Play size={32} className="text-surface-700 mx-auto mb-2" />
+                    <p className="text-xs text-surface-500">
+                      {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
+                    </p>
+                  </>
+                )}
               </div>
             )}
           </div>

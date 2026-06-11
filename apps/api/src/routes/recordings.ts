@@ -1,12 +1,220 @@
 // apps/api/src/routes/recordings.ts
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { searchRecordings, getPlaybackUrl } from '../services/hikvision'
+import { searchRecordings } from '../services/hikvision'
 import { AuditAction } from '../services/audit'
+import { waitForHlsReady } from '../services/stream'
 import CryptoJS from 'crypto-js'
+import axios from 'axios'
+import crypto from 'crypto'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+
+// ─── MediaMTX client (same pattern as stream.ts) ─────────────────
+const mediamtxApi = axios.create({
+  baseURL: process.env.MEDIAMTX_URL || 'http://mediamtx:9997',
+  timeout: 8000,
+})
+
+// ─── In-memory recording playback sessions ────────────────────────
+const RECORDING_SESSION_TTL_MS = 30 * 60 * 1000  // 30 minutes
+
+interface RecordingSession {
+  streamPath:   string
+  expiresAt:    number
+  userId:       string
+  // async playback status
+  status:       'starting' | 'ready' | 'error'
+  hlsUrl:       string
+  transcoded:   boolean
+  errorCode?:   string
+  errorMsg?:    string
+  stderrTail?:  string
+}
+
+const recordingSessions = new Map<string, RecordingSession>()
+
+// Periodic cleanup of expired recording paths
+setInterval(async () => {
+  const now = Date.now()
+  for (const [sid, session] of recordingSessions.entries()) {
+    if (now > session.expiresAt) {
+      recordingSessions.delete(sid)
+      mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
+    }
+  }
+}, 5 * 60 * 1000)
+
+// ─── RTSP URL helpers ─────────────────────────────────────────────
+
+/** Inject credentials+host into a path-only playbackURI from the NVR. */
+function injectCredentialsIntoPlaybackUri(opts: {
+  playbackURI: string
+  username:    string
+  password:    string
+  ipAddress:   string
+  rtspPort:    number
+}): { url: string; masked: string } {
+  const { playbackURI, username, password, ipAddress, rtspPort } = opts
+  const encodedPass = encodeURIComponent(password)
+  const pathQuery   = playbackURI.startsWith('/') ? playbackURI : `/${playbackURI}`
+  return {
+    url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
+    masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
+  }
+}
+
+/** Fallback: construct RTSP URL from timestamps. */
+function buildFallbackRecordingRtspUrl(opts: {
+  username:  string
+  password:  string
+  ipAddress: string
+  rtspPort:  number
+  channel:   number
+  start:     Date
+  end:       Date
+}): { url: string; masked: string; trackId: number } {
+  const { username, password, ipAddress, rtspPort, channel, start, end } = opts
+  const trackId     = channel * 100 + 1
+  const encodedPass = encodeURIComponent(password)
+  const fmtTs       = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const pathQuery   = `/Streaming/tracks/${trackId}?starttime=${fmtTs(start)}&endtime=${fmtTs(end)}`
+  return {
+    url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
+    masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
+    trackId,
+  }
+}
+
+// ─── Register a recording path in MediaMTX (source-pull, H264) ───
+async function createRecordingHlsPath(
+  rtspUrl: string,
+  maskedUrl: string,
+  streamPath: string,
+  log: (msg: string) => void,
+): Promise<void> {
+  const config = {
+    source:          rtspUrl,
+    sourceOnDemand:  false,
+    rtspTransport:   'tcp',
+    record:          false,
+    overridePublisher: true,
+  }
+
+  log(`[recordings] mediamtx_path_add path=${streamPath} source=${maskedUrl}`)
+  try {
+    await mediamtxApi.post(`/v3/config/paths/add/${streamPath}`, config)
+    log(`[recordings] mediamtx_path_add ok path=${streamPath}`)
+  } catch (err: any) {
+    const status = err.response?.status
+    if (status === 400) {
+      log(`[recordings] mediamtx_path_patch path=${streamPath} (was 400 — already existed)`)
+      await mediamtxApi.patch(`/v3/config/paths/patch/${streamPath}`, config)
+      log(`[recordings] mediamtx_path_patch ok path=${streamPath}`)
+    } else {
+      const body = JSON.stringify(err.response?.data ?? {}).slice(0, 200)
+      log(`[recordings] mediamtx_path_add FAILED path=${streamPath} status=${status} body=${body}`)
+      throw err
+    }
+  }
+}
+
+// ─── Query live path status in MediaMTX ──────────────────────────
+async function getMediaMtxPathStatus(streamPath: string): Promise<{
+  exists: boolean
+  ready:  boolean
+  tracks: number
+  sourceState: string
+}> {
+  try {
+    const res = await mediamtxApi.get(`/v3/paths/get/${streamPath}`, {
+      timeout: 3000,
+      validateStatus: () => true,
+    })
+    if (res.status === 404) {
+      return { exists: false, ready: false, tracks: 0, sourceState: 'not_found' }
+    }
+    const d = res.data ?? {}
+    return {
+      exists:      true,
+      ready:       d.ready === true,
+      tracks:      (d.tracks ?? []).length,
+      sourceState: d.ready === true ? 'connected' : 'connecting_or_failed',
+    }
+  } catch (err: any) {
+    return { exists: false, ready: false, tracks: 0, sourceState: `error:${err.message}` }
+  }
+}
+
+// ─── Background job: wait for HLS ready, update session status ───
+// Runs fire-and-forget after POST /playback returns immediately.
+async function runPlaybackBackground(opts: {
+  sessionId:   string
+  streamPath:  string
+  rtspUrl:     string
+  rtspMasked:  string
+  trackId?:    number
+  urlStrategy: string
+  log:         (msg: string) => void
+}): Promise<void> {
+  const { sessionId, streamPath, rtspUrl, rtspMasked, trackId, urlStrategy, log } = opts
+  const session = recordingSessions.get(sessionId)
+  if (!session) return
+
+  try {
+    await createRecordingHlsPath(rtspUrl, rtspMasked, streamPath, log)
+  } catch (err: any) {
+    log(`[recordings] bg_path_create_failed sessionId=${sessionId} err=${err.message}`)
+    const s = recordingSessions.get(sessionId)
+    if (s) {
+      s.status   = 'error'
+      s.errorCode = 'MEDIAMTX_ERROR'
+      s.errorMsg  = 'No se pudo registrar el path en MediaMTX'
+    }
+    return
+  }
+
+  // Poll HLS — no isAlive check so FFmpeg finishing short clips doesn't abort us
+  const ready = await waitForHlsReady(streamPath, 60_000, 800)
+
+  const s = recordingSessions.get(sessionId)
+  if (!s) return  // session was deleted while we waited (user cancelled)
+
+  if (ready.ready) {
+    log(
+      `[recordings] bg_hls_ready sessionId=${sessionId} path=${streamPath}` +
+      ` elapsedMs=${ready.elapsedMs}ms`
+    )
+    s.status = 'ready'
+    return
+  }
+
+  // HLS timed out — diagnose and mark error
+  const pathStatus = await getMediaMtxPathStatus(streamPath)
+
+  const diagMsg = !pathStatus.exists
+    ? 'Path no encontrado en MediaMTX'
+    : pathStatus.ready
+      ? 'RTSP conectado pero HLS no generó segmentos en tiempo'
+      : 'MediaMTX no pudo conectar al RTSP del NVR'
+
+  log(
+    `[recordings] bg_hls_timeout sessionId=${sessionId} lastStatus=${ready.lastStatus}` +
+    ` elapsedMs=${ready.elapsedMs}ms pathExists=${pathStatus.exists}` +
+    ` pathReady=${pathStatus.ready} sourceState=${pathStatus.sourceState}` +
+    ` strategy=${urlStrategy}` + (trackId ? ` trackId=${trackId}` : '') +
+    ` source=${rtspMasked}`
+  )
+
+  // Clean up useless path
+  recordingSessions.delete(sessionId)
+  mediamtxApi.delete(`/v3/config/paths/delete/${streamPath}`).catch(() => {})
+
+  s.status    = 'error'
+  s.errorCode = 'HLS_TIMEOUT'
+  s.errorMsg  = diagMsg
+}
 
 // In-memory capability cache: nvrId → 'isapi' | 'unsupported' | 'auth_error'
 const nvrCapabilityCache = new Map<string, { result: string; expiresAt: number }>()
@@ -35,9 +243,12 @@ const batchSearchSchema = z.object({
 })
 
 const playbackSchema = z.object({
-  cameraId:  z.string().min(1),
-  startTime: z.string().datetime(),
-  endTime:   z.string().datetime(),
+  cameraId:    z.string().min(1),
+  startTime:   z.string().datetime(),
+  endTime:     z.string().datetime(),
+  /** Path+query from the NVR's searchRecordings result.
+   *  Must start with / (e.g. /Streaming/tracks/101?starttime=...&name=...&size=...). */
+  playbackURI: z.string().startsWith('/').optional(),
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
@@ -79,7 +290,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // POST /api/recordings/batch-search — Buscar grabaciones para múltiples cámaras de un NVR
-  // Evita N requests al frontend y comparte el check de capacidad del NVR
   server.post('/batch-search', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user = request.user
     if (user.role === 'OPERATOR') return reply.status(403).send({ message: 'Sin acceso a grabaciones' })
@@ -90,17 +300,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     if (from >= to) return reply.status(400).send({ message: 'La fecha "from" debe ser anterior a "to"' })
 
-    // Load NVR
     const nvr = await server.prisma.nVR.findUnique({ where: { id: body.nvrId } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
-    // Load cameras filtering to those in the requested list
     const cameras = await server.prisma.camera.findMany({
       where: { id: { in: body.cameraIds }, nvrId: body.nvrId },
     })
     if (cameras.length === 0) return reply.status(404).send({ message: 'No se encontraron cámaras para este NVR' })
 
-    // AUDITOR: filter to cameras they have canPlayback permission on
     let allowedIds = cameras.map(c => c.id)
     if (user.role === 'AUDITOR') {
       const perms = await server.prisma.userPermission.findMany({
@@ -113,7 +320,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     const nvrWithPass = { ...nvr, password: decryptPass(nvr.password) }
 
-    // Check capability cache before making any ISAPI calls
     const cachedCap = getCachedCapability(nvr.id)
     if (cachedCap === 'unsupported') {
       return reply.send({
@@ -142,18 +348,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const results: Array<{ cameraId: string; cameraName: string; channel: number; recordings: any[] }> = []
     let unsupportedNvr = false
 
-    // Search camera by camera — first failure for unsupported/auth short-circuits the rest
     for (const camera of allowedCameras) {
       if (unsupportedNvr) break
       try {
         const recs = await searchRecordings(nvrWithPass as any, camera.channel, from, to)
         results.push({ cameraId: camera.id, cameraName: camera.name, channel: camera.channel, recordings: recs })
-        setCachedCapability(nvr.id, 'isapi')  // at least one success
+        setCachedCapability(nvr.id, 'isapi')
       } catch (err: any) {
         if (err?.unsupported) {
           setCachedCapability(nvr.id, 'unsupported')
           unsupportedNvr = true
-          // persist supportsIsapiRecording=false to DB (fire and forget)
           break
         }
         if (err?.authError) {
@@ -190,7 +394,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     })
   })
 
-  // POST /api/recordings/playback — Obtener URL de reproducción
+  // POST /api/recordings/playback — Start recording playback (async).
+  // Returns immediately with status='starting'. Client polls GET /playback/:sessionId/status.
   server.post('/playback', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user = request.user
     const body = playbackSchema.parse(request.body)
@@ -209,14 +414,151 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       if (!perm) return reply.status(403).send({ message: 'Sin permiso de reproducción' })
     }
 
-    const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
-    const playback = await getPlaybackUrl(nvr as any, camera.channel, new Date(body.startTime), new Date(body.endTime))
+    const plainPass = decryptPass(camera.nvr.password)
+    if (!plainPass) {
+      return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
+    }
 
-    await AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
-      startTime: body.startTime, endTime: body.endTime,
+    let rtspUrl: string
+    let rtspMasked: string
+    let trackId: number | undefined
+    let urlStrategy: string
+
+    if (body.playbackURI) {
+      const injected = injectCredentialsIntoPlaybackUri({
+        playbackURI: body.playbackURI,
+        username:    camera.nvr.username,
+        password:    plainPass,
+        ipAddress:   camera.nvr.ipAddress,
+        rtspPort:    camera.nvr.rtspPort,
+      })
+      rtspUrl     = injected.url
+      rtspMasked  = injected.masked
+      urlStrategy = 'nvr_playbackURI'
+    } else {
+      const built = buildFallbackRecordingRtspUrl({
+        username:  camera.nvr.username,
+        password:  plainPass,
+        ipAddress: camera.nvr.ipAddress,
+        rtspPort:  camera.nvr.rtspPort,
+        channel:   camera.channel,
+        start:     new Date(body.startTime),
+        end:       new Date(body.endTime),
+      })
+      rtspUrl     = built.url
+      rtspMasked  = built.masked
+      trackId     = built.trackId
+      urlStrategy = 'fallback_timestamps'
+    }
+
+    const sessionId  = crypto.randomBytes(8).toString('hex')
+    const streamPath = `rec_${sessionId}`
+    const hlsUrl     = `/hls/${streamPath}/index.m3u8`
+    const expiresAt  = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
+
+    server.log.info(
+      `[recordings] playback_init sessionId=${sessionId} path=${streamPath}` +
+      ` cameraId=${body.cameraId} ch=${camera.channel}` +
+      (trackId ? ` trackId=${trackId}` : '') +
+      ` strategy=${urlStrategy} source=${rtspMasked}`
+    )
+
+    // Register session immediately so status polls can find it
+    recordingSessions.set(sessionId, {
+      streamPath,
+      expiresAt:  Date.now() + RECORDING_SESSION_TTL_MS,
+      userId:     user.sub,
+      status:     'starting',
+      hlsUrl,
+      transcoded: false,
     })
 
-    return reply.send(playback)
+    // Fire-and-forget background job
+    runPlaybackBackground({
+      sessionId,
+      streamPath,
+      rtspUrl,
+      rtspMasked,
+      trackId,
+      urlStrategy,
+      log: (msg) => server.log.info(msg),
+    }).catch((err) => {
+      server.log.error(`[recordings] bg_unhandled_error sessionId=${sessionId} err=${err?.message}`)
+      const s = recordingSessions.get(sessionId)
+      if (s && s.status === 'starting') {
+        s.status   = 'error'
+        s.errorCode = 'INTERNAL'
+        s.errorMsg  = 'Error interno en el proceso de reproducción'
+      }
+    })
+
+    // Audit asynchronously — don't wait
+    AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
+      startTime: body.startTime, endTime: body.endTime, sessionId,
+    }).catch(() => {})
+
+    return reply.send({
+      status:    'starting',
+      sessionId,
+      url:       hlsUrl,
+      pollUrl:   `/api/recordings/playback/${sessionId}/status`,
+      transcoded: false,
+      expiresAt,
+    })
+  })
+
+  // GET /api/recordings/playback/:sessionId/status — Poll playback readiness
+  server.get('/playback/:sessionId/status', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string }
+    const session = recordingSessions.get(sessionId)
+
+    if (!session) {
+      // Session was cleaned up (error path cleans up before setting error status in some cases)
+      // Return error so client stops polling
+      return reply.status(404).send({
+        status:    'error',
+        errorCode: 'SESSION_NOT_FOUND',
+        error:     'Sesión de reproducción no encontrada o expirada',
+      })
+    }
+
+    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
+
+    return reply.send({
+      status:     session.status,
+      url:        session.hlsUrl,
+      hlsReady:   session.status === 'ready',
+      transcoded: session.transcoded,
+      errorCode:  session.errorCode,
+      error:      session.errorMsg,
+      stderrTail: session.stderrTail,
+    })
+  })
+
+  // DELETE /api/recordings/playback/:sessionId — Stop recording playback
+  server.delete('/playback/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string }
+    const session = recordingSessions.get(sessionId)
+    if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
+    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
+    recordingSessions.delete(sessionId)
+    await mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
+    server.log.info(`[recordings] playback_stopped sessionId=${sessionId} path=${session.streamPath}`)
+    return reply.send({ ok: true })
+  })
+
+  // GET /api/recordings/debug/path/:sessionId — Diagnóstico del path MediaMTX
+  server.get('/debug/path/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
+    if (request.user.role !== 'ADMIN') return reply.status(403).send({ message: 'Solo ADMIN' })
+    const { sessionId } = request.params as { sessionId: string }
+    const session = recordingSessions.get(sessionId)
+    if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
+    const status = await getMediaMtxPathStatus(session.streamPath)
+    return reply.send({ sessionId, ...session, pathStatus: status })
   })
 
   // GET /api/recordings/audit — Log de accesos a grabaciones (solo ADMIN)
