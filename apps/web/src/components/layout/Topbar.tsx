@@ -330,7 +330,7 @@ function NotificationPanel({ onClose }: { onClose: () => void }) {
 }
 
 // ─── Topbar ───────────────────────────────────────────────────────────────────
-export function Topbar() {
+export function Topbar({ hamburger }: { hamburger?: React.ReactNode }) {
   const location = useLocation()
   const { alerts, setAlerts, unreadCount, setUnreadCount } = useAlertStore()
   const { nvrs, loadNVRs, loadCameras } = useCameraStore()
@@ -394,6 +394,7 @@ export function Topbar() {
   return (
     <>
       <header className="h-12 flex-shrink-0 bg-surface-800 border-b border-surface-600 flex items-center px-4 gap-3">
+        {hamburger}
         <h1 className="text-sm font-medium text-surface-100 mr-2">{title}</h1>
 
         {/* Status pills */}

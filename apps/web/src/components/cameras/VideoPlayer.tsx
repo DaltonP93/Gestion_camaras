@@ -24,6 +24,7 @@ export type CameraPlaybackErrorCode =
   | 'HLS_SESSION_EXPIRED'
   | 'TRANSCODE_NOT_READY'
   | 'TRANSCODE_PROCESS_EXITED'
+  | 'TRANSCODE_LIMIT_REACHED'
   | 'PLAYER_TIMEOUT'
   | 'UNKNOWN'
 
@@ -48,6 +49,7 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   HLS_SESSION_EXPIRED:        { icon: <Clock size={16} />,        label: 'Sesión HLS expirada',          color: 'text-amber-400' },
   TRANSCODE_NOT_READY:        { icon: <Cpu size={16} />,          label: 'Transcodificación no lista',   color: 'text-purple-400' },
   TRANSCODE_PROCESS_EXITED:   { icon: <Cpu size={16} />,          label: 'FFmpeg finalizó inesperadamente', color: 'text-purple-400' },
+  TRANSCODE_LIMIT_REACHED:    { icon: <Cpu size={16} />,          label: 'Límite de transcodificaciones', color: 'text-amber-400' },
   PLAYER_TIMEOUT:             { icon: <Clock size={16} />,        label: 'Sin frames (timeout)',         color: 'text-surface-400' },
   UNKNOWN:                    { icon: <AlertTriangle size={16} />, label: 'Error desconocido',           color: 'text-surface-400' },
 }
@@ -407,9 +409,28 @@ export function VideoPlayer({
           (streamCodec || '').toLowerCase().includes('h.265') ||
           (streamCodec || '').toLowerCase().includes('h265')
         )
+        const isLimitReached = activeError?.code === 'TRANSCODE_LIMIT_REACHED'
         return (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-surface-900/95 gap-2 px-3">
-            {isHevcMain ? (
+            {isLimitReached ? (
+              <>
+                <Cpu size={18} className="text-amber-400" />
+                <p className="text-xs font-medium text-amber-300 text-center">Límite de transcodificaciones</p>
+                <p className="text-[10px] text-surface-400 text-center leading-snug max-w-[200px]">
+                  {activeError?.message || 'Cupo máx. alcanzado. Cierra otra cámara HD o usa baja calidad.'}
+                </p>
+                <div className="flex flex-wrap gap-1.5 mt-1 justify-center">
+                  {onRetry && cameraId && (
+                    <button
+                      onClick={() => onRetry!(cameraId!)}
+                      className="btn-ghost text-[10px] px-2 py-1"
+                    >
+                      <RefreshCw size={10} /> Reintentar
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : isHevcMain ? (
               <>
                 <Film size={18} className="text-amber-400" />
                 <p className="text-xs font-medium text-amber-300 text-center">H.265/HEVC no compatible</p>
