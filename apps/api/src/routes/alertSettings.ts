@@ -85,17 +85,38 @@ const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(400).send({ message: 'Ingresa un email de destino' })
     }
 
+    // Derive the correct TLS mode from the configured port.
+    // Port 465 → implicit TLS (secure:true).
+    // Port 587 → STARTTLS (secure:false, requireTLS:true) — smtpSecure=true is often
+    //   set by users expecting "TLS" but this is the STARTTLS variant, not SSL-wrap.
+    // Other ports → follow smtpSecure as set.
+    const port = settings.smtpPort || 587
+    const useImplicitTLS = port === 465 || (port !== 587 && settings.smtpSecure)
+    const transportOptions: any = {
+      host:    settings.smtpHost,
+      port,
+      secure:  useImplicitTLS,
+      auth:    settings.smtpUser ? { user: settings.smtpUser, pass: settings.smtpPassword } : undefined,
+      connectionTimeout: 10_000,
+      greetingTimeout:   8_000,
+      socketTimeout:     15_000,
+    }
+    if (!useImplicitTLS && port === 587) {
+      transportOptions.requireTLS = true   // force STARTTLS upgrade on port 587
+    }
+
+    server.log.info(
+      `[smtp] test_email host=${settings.smtpHost} port=${port}` +
+      ` secure=${useImplicitTLS} requireTLS=${transportOptions.requireTLS ?? false}` +
+      ` user=${settings.smtpUser || '(none)'} to=${recipients}`
+    )
+
     try {
-      const transporter = nodemailer.createTransport({
-        host: settings.smtpHost,
-        port: settings.smtpPort,
-        secure: settings.smtpSecure,
-        auth: settings.smtpUser ? { user: settings.smtpUser, pass: settings.smtpPassword } : undefined,
-      })
+      const transporter = nodemailer.createTransport(transportOptions)
 
       await transporter.sendMail({
-        from: `"${settings.smtpFromName}" <${settings.smtpFromEmail}>`,
-        to: recipients,
+        from:    `"${settings.smtpFromName}" <${settings.smtpFromEmail}>`,
+        to:      recipients,
         subject: '✅ VisionCore — Prueba de configuración de correo',
         html: `
           <div style="font-family:sans-serif;max-width:480px;margin:0 auto">
@@ -110,7 +131,20 @@ const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
 
       return reply.send({ success: true, message: `Email enviado a ${recipients}` })
     } catch (err: any) {
-      return reply.status(500).send({ message: `Error al enviar: ${err.message}` })
+      const msg  = (err.message || '') as string
+      const code: string =
+        (msg.includes('getaddrinfo') || msg.includes('ENOTFOUND') || msg.includes('EAI_AGAIN') || msg.includes('EAI_NONAME'))
+          ? 'DNS_FAIL'
+        : (msg.includes('EAUTH') || msg.includes('535') || msg.includes('534') || msg.includes('Invalid login') || msg.includes('Username and Password'))
+          ? 'AUTH_FAIL'
+        : (msg.includes('ECONNREFUSED') || msg.includes('connect ETIMEDOUT') || msg.includes('ESOCKETTIMEDOUT'))
+          ? 'CONNECT_TIMEOUT'
+        : (msg.includes('TLS') || msg.includes('SSL') || msg.includes('wrong version') || msg.includes('certificate'))
+          ? 'TLS_FAIL'
+        : 'UNKNOWN'
+
+      server.log.error(`[smtp] test_email_failed host=${settings.smtpHost} port=${port} code=${code} err=${msg}`)
+      return reply.status(500).send({ message: `Error al enviar: ${msg}`, code })
     }
   })
 }

@@ -218,7 +218,7 @@ async function runPlaybackBackground(opts: {
 
 // In-memory capability cache: nvrId → 'isapi' | 'unsupported' | 'auth_error'
 const nvrCapabilityCache = new Map<string, { result: string; expiresAt: number }>()
-const CAPABILITY_TTL_MS = 15 * 60 * 1000  // 15 minutes
+const CAPABILITY_TTL_MS = 15 * 60 * 1000
 
 function getCachedCapability(nvrId: string): string | null {
   const entry = nvrCapabilityCache.get(nvrId)
@@ -229,6 +229,7 @@ function setCachedCapability(nvrId: string, result: string) {
   nvrCapabilityCache.set(nvrId, { result, expiresAt: Date.now() + CAPABILITY_TTL_MS })
 }
 
+// ─── Schemas ──────────────────────────────────────────────────────
 const searchSchema = z.object({
   cameraId:  z.string().min(1),
   startTime: z.string().datetime(),
@@ -252,7 +253,7 @@ const playbackSchema = z.object({
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
-  // GET /api/recordings/search — Buscar grabaciones (single camera, legacy)
+  // GET /api/recordings/search
   server.get('/search', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user  = request.user
     const query = searchSchema.parse(request.query)
@@ -281,6 +282,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       if (err?.authError)   return reply.status(502).send({ code: 'NVR_AUTH_ERROR', message: 'Error de autenticación con el NVR' })
       return reply.status(502).send({ code: 'NVR_ERROR', message: 'No se pudo contactar el NVR' })
     }
+
+    const withUri = recordings.filter(r => r.playbackURI).length
+    server.log.info(
+      `[recordings] search_complete nvrId=${camera.nvr.id} ch=${camera.channel}` +
+      ` total=${recordings.length} withPlaybackUri=${withUri}` +
+      (recordings.length > 0 && withUri === 0 ? ' WARN:no_playbackURI_in_results' : '')
+    )
 
     await AuditAction(server.prisma, user.sub, 'SEARCH_RECORDINGS', query.cameraId, request, {
       startTime: query.startTime, endTime: query.endTime, resultsCount: recordings.length,
@@ -352,6 +360,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       if (unsupportedNvr) break
       try {
         const recs = await searchRecordings(nvrWithPass as any, camera.channel, from, to)
+        const withUri = recs.filter(r => r.playbackURI).length
+        server.log.info(
+          `[recordings] batch_search nvrId=${nvr.id} ch=${camera.channel}` +
+          ` total=${recs.length} withPlaybackUri=${withUri}` +
+          (recs.length > 0 && withUri === 0 ? ' WARN:no_playbackURI_in_results' : '')
+        )
         results.push({ cameraId: camera.id, cameraName: camera.name, channel: camera.channel, recordings: recs })
         setCachedCapability(nvr.id, 'isapi')
       } catch (err: any) {
@@ -561,7 +575,36 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({ sessionId, ...session, pathStatus: status })
   })
 
-  // GET /api/recordings/audit — Log de accesos a grabaciones (solo ADMIN)
+  // DELETE /api/recordings/playback/:sessionId
+  server.delete('/playback/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string }
+    const session = recordingSessions.get(sessionId)
+    if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
+    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
+    recordingSessions.delete(sessionId)
+    if (session.isTranscoded) stopTranscodeProcess(session.streamPath)
+    await mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
+    server.log.info(
+      `[recordings] playback_stopped sessionId=${sessionId} path=${session.streamPath}` +
+      ` transcoded=${session.isTranscoded}`
+    )
+    return reply.send({ ok: true })
+  })
+
+  // GET /api/recordings/debug/path/:sessionId
+  server.get('/debug/path/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
+    if (request.user.role !== 'ADMIN') return reply.status(403).send({ message: 'Solo ADMIN' })
+    const { sessionId } = request.params as { sessionId: string }
+    const session = recordingSessions.get(sessionId)
+    if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
+    const status  = await getMediaMtxPathStatus(session.streamPath)
+    const ffmpegAlive = session.isTranscoded ? isTranscodeProcessAlive(session.streamPath) : null
+    return reply.send({ sessionId, ...session, pathStatus: status, ffmpegAlive })
+  })
+
+  // GET /api/recordings/audit
   server.get('/audit', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const { page = '1', limit = '50' } = request.query as { page?: string; limit?: string }
 

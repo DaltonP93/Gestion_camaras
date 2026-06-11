@@ -156,7 +156,7 @@ export interface RecordingCapabilities {
   supportsSdkRecording:         boolean
   recordingCapabilityAt:        string | null
   recordingCapabilityError:     string | null
-  recordingCapabilityErrorCode: 'AUTH_FAILED' | 'UNSUPPORTED_MODEL' | 'NETWORK_TIMEOUT' | 'NETWORK_ERROR' | 'PARSE_ERROR' | null
+  recordingCapabilityErrorCode: 'AUTH_FAILED' | 'UNSUPPORTED_MODEL' | 'INVALID_REQUEST' | 'NETWORK_TIMEOUT' | 'NETWORK_ERROR' | 'PARSE_ERROR' | null
   playbackWebUrl:               string | null
   sdkEnabled:                   boolean
 }
@@ -343,6 +343,7 @@ export interface Recording {
   endTime: string
   size: number
   type: string
+  playbackURI?: string
 }
 
 export interface Alert {

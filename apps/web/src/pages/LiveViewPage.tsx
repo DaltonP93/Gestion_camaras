@@ -608,6 +608,7 @@ export function LiveViewPage() {
   const handleLayoutChange = useCallback(async (layout: GridLayout) => {
     await stopAllSessions('layout_change')
     prevVisibleIds.current = []
+    appliedCameraQuery.current = null  // allow re-navigation to selected camera with new layout
     setGridLayout(layout)
     setPage(0)
   }, [stopAllSessions])

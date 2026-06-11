@@ -87,6 +87,7 @@ export function RecordingsPage() {
   const [nvrErrors, setNvrErrors] = useState<NvrSearchError[]>([])
   const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
   const [nvrCaps, setNvrCaps] = useState<Map<string, RecordingCapabilities>>(new Map())
+  const [playbackTranscoding, setPlaybackTranscoding] = useState(false)
 
   useEffect(() => {
     loadNVRs()
