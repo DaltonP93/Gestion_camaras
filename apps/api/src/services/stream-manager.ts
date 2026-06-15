@@ -637,19 +637,28 @@ export async function stopStream(
       // Non-kill reasons (retry, hls_error, etc.) keep FFmpeg alive so the next
       // startStream call can detect the live process and reuse it without re-spawning.
       const shouldKill = !reason || TRANSCODE_KILL_REASONS.has(reason)
-      if (shouldKill) {
+      // Even if shouldKill, don't kill FFmpeg when other sessions are still watching
+      const otherWatchers = Array.from(sessions.values()).filter(
+        s => s.streamPath === session.streamPath && s.streamType === 'main_h264'
+      ).length
+      if (shouldKill && otherWatchers > 0) {
+        console.info(`[live] stop_deferred_active_viewers path=${session.streamPath} watchers=${otherWatchers} reason=${reason || 'unspecified'}`)
+      } else if (shouldKill) {
         stopTranscodeProcess(session.streamPath)
         transcodeRestarts.delete(session.streamPath)
         transcodeSourceInfo.delete(session.streamPath)
         transcodeLastActivity.delete(session.streamPath)
         killedFfmpeg = true
+        console.info(`[live] transcode_killed path=${session.streamPath} reason=refcount_zero`)
       } else {
-        console.info(`[stopStream] skip_kill_active_main_h264 path=${session.streamPath} reason=${reason}`)
+        console.info(`[live] stop_stream_keep_ffmpeg path=${session.streamPath} reason=${reason}`)
       }
       // Always clear inFlight — next startStream will re-register via isTranscodeProcessAlive check
       transcodeInFlight.delete(session.streamPath)
       clearedInFlight = true
     }
+  } else {
+    console.info(`[live] stop_ignored_stale cameraId=${cameraId} streamType=${streamType} reason=${reason || 'unspecified'}`)
   }
 
   console.info(
@@ -766,25 +775,49 @@ export async function reconcileView(
   return { streams, errors, startedIds, stoppedIds }
 }
 
-// Limpiar todas las sesiones de un usuario y liberar streams sin otros viewers
+// Limpiar sesiones de un usuario.
+// viewId provided → only clean that view's sessions (safe for unmount, won't kill newly started sessions).
+// no viewId → only clean orphaned sessions from views with expired heartbeats (stale tabs).
 export async function cleanupUserSessions(
   server: FastifyInstance,
   userId: string,
+  viewId?: string,
 ): Promise<number> {
-  const userSessions = getSessionsForUser(userId)
+  let targetSessions: StreamSession[]
+
+  if (viewId) {
+    targetSessions = getSessionsForUser(userId).filter(s => s.viewId === viewId)
+    console.info(`[live] cleanup_view userId=${userId} viewId=${viewId} sessions=${targetSessions.length}`)
+  } else {
+    const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
+    targetSessions = getSessionsForUser(userId).filter(s => {
+      const hb = viewHeartbeat.get(vKey(userId, s.viewId))
+      return !hb || hb < cutoff
+    })
+    console.info(`[live] cleanup_stale userId=${userId} orphaned=${targetSessions.length}`)
+  }
+
   let removed = 0
 
-  for (const session of userSessions) {
+  for (const session of targetSessions) {
     const key = sessionKey(userId, session.cameraId, session.streamType)
     sessions.delete(key)
     removed++
 
     if (session.streamType === 'main_h264') {
-      stopTranscodeProcess(session.streamPath)
-      transcodeInFlight.delete(session.streamPath)
-      transcodeRestarts.delete(session.streamPath)
-      transcodeSourceInfo.delete(session.streamPath)
-      transcodeLastActivity.delete(session.streamPath)
+      const otherWatchers = Array.from(sessions.values()).filter(
+        s => s.streamPath === session.streamPath && s.streamType === 'main_h264'
+      ).length
+      if (otherWatchers > 0) {
+        console.info(`[live] transcode_keepalive path=${session.streamPath} reason=other_active_session viewers=${otherWatchers}`)
+      } else {
+        stopTranscodeProcess(session.streamPath)
+        transcodeInFlight.delete(session.streamPath)
+        transcodeRestarts.delete(session.streamPath)
+        transcodeSourceInfo.delete(session.streamPath)
+        transcodeLastActivity.delete(session.streamPath)
+        console.info(`[live] transcode_killed path=${session.streamPath} reason=refcount_zero`)
+      }
     }
 
     const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === session.cameraId)
@@ -799,11 +832,18 @@ export async function cleanupUserSessions(
     }
   }
 
-  // Limpiar view maps para este usuario
-  for (const key of viewCameras.keys()) {
-    if (key.startsWith(`${userId}:`)) {
-      viewCameras.delete(key)
-      viewHeartbeat.delete(key)
+  // Clean view maps
+  if (viewId) {
+    const vk = vKey(userId, viewId)
+    viewCameras.delete(vk)
+    viewHeartbeat.delete(vk)
+  } else {
+    const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
+    for (const [vk, hb] of viewHeartbeat.entries()) {
+      if (vk.startsWith(`${userId}:`) && hb < cutoff) {
+        viewCameras.delete(vk)
+        viewHeartbeat.delete(vk)
+      }
     }
   }
 

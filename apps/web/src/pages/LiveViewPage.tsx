@@ -95,7 +95,9 @@ export function LiveViewPage() {
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
   const { user } = useAuthStore()
 
-  const [gridLayout, setGridLayout]   = useState<GridLayout>(9)
+  const [gridLayout, setGridLayout]   = useState<GridLayout>(() =>
+    typeof window !== 'undefined' && window.innerWidth < 768 ? 4 : 9
+  )
   const [selectedNVR, setSelectedNVR] = useState<string>(nvrFilter || 'all')
   const [page, setPage]               = useState(0)
   const [highlightCamera, setHighlightCamera] = useState<string | null>(null)
@@ -157,8 +159,10 @@ export function LiveViewPage() {
   useEffect(() => {
     loadNVRs()
     loadCameras()
-    // Clear any stale sessions from a previous page visit
-    apiPost('/cameras/cleanup-my-sessions', {}).catch(() => {})
+    // Note: no cleanup-my-sessions on mount — orphaned sessions from crashed tabs
+    // expire via the server-side idle cleanup (90s). Calling cleanup here would race
+    // with any streams started during this mount cycle if a previous unmount cleanup
+    // request arrives late (async HTTP race condition → immediate FFmpeg kill).
   }, [])
   useEffect(() => { if (nvrFilter) setSelectedNVR(nvrFilter) }, [nvrFilter])
 
@@ -433,18 +437,20 @@ export function LiveViewPage() {
   }, [stopSessions, clearStaggerTimers])
 
   // ─── Cleanup on unmount ─────────────────────────────────────
+  // Pass viewId so the server only cleans THIS view's sessions.
+  // Without viewId, the server would kill ALL user sessions — including sessions
+  // the next LiveViewPage mount just started (async HTTP race condition).
   useEffect(() => {
     return () => {
       clearStaggerTimers()
-      // cleanup-my-sessions is more efficient than N individual stop-stream calls
-      apiPost('/cameras/cleanup-my-sessions', {}).catch(() => {
-        // Fallback: individual stops
+      apiPost('/cameras/cleanup-my-sessions', { viewId }).catch(() => {
+        // Fallback: individual stops scoped to active sessions in this view
         activeSessions.current.forEach(id => {
           apiPost(`/cameras/${id}/stop-stream`, {}).catch(() => {})
         })
       })
     }
-  }, [clearStaggerTimers])
+  }, [clearStaggerTimers, viewId])
 
   // ─── Load a single stream ────────────────────────────────────
   // NOTE: intentionally does NOT depend on `streams` state — using it would create
@@ -709,7 +715,18 @@ export function LiveViewPage() {
       apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: st, reason: 'hls_fatal_error' }).catch(() => {})
       activeSessions.current.delete(cameraId)
     }
-    setStreamErrors(prev => ({ ...prev, [cameraId]: err }))
+    // HLS manifest 404 on a grid (sub) camera = RTSP source returned 404 from NVR.
+    // Reclassify to RTSP_CHANNEL_NOT_FOUND so the tile shows a meaningful message.
+    let displayErr = err
+    if (err.code === 'HLS_MANIFEST_NOT_FOUND' && !isFocusStream) {
+      displayErr = {
+        code: 'RTSP_CHANNEL_NOT_FOUND',
+        message: 'Canal no disponible en NVR (substream no encontrado)',
+        technicalDetail: err.technicalDetail,
+      }
+      console.info(`[live-ui] rtsp_404_reclassified cameraId=${cameraId}`)
+    }
+    setStreamErrors(prev => ({ ...prev, [cameraId]: displayErr }))
   }, [flushHlsExpiry, focusCamera, focusStreamType])
 
   // ─── Enter focus/fullscreen — start main stream ─────────────
