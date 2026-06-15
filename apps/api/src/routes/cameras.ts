@@ -378,9 +378,13 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // POST /api/cameras/cleanup-my-sessions — Limpiar sesiones del usuario actual
+  // viewId provided → only clean that view (safe unmount cleanup, won't kill newly started sessions).
+  // no viewId → clean only orphaned sessions from stale/crashed tabs.
   server.post('/cleanup-my-sessions', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user = request.user
-    const cleaned = await cleanupUserSessions(server, user.sub)
+    const body = request.body as any
+    const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+    const cleaned = await cleanupUserSessions(server, user.sub, viewId)
     return reply.send({ cleaned })
   })
 
