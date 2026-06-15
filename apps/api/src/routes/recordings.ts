@@ -561,7 +561,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }
     recordingSessions.delete(sessionId)
     await mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
-    server.log.info(`[recordings] playback_stopped sessionId=${sessionId} path=${session.streamPath}`)
+    server.log.info(
+      `[recordings] playback_stopped sessionId=${sessionId} path=${session.streamPath}` +
+      ` transcoded=${session.transcoded}`
+    )
     return reply.send({ ok: true })
   })
 
@@ -572,33 +575,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const session = recordingSessions.get(sessionId)
     if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
     const status = await getMediaMtxPathStatus(session.streamPath)
-    return reply.send({ sessionId, ...session, pathStatus: status })
-  })
-
-  // DELETE /api/recordings/playback/:sessionId
-  server.delete('/playback/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
-    const { sessionId } = request.params as { sessionId: string }
-    const session = recordingSessions.get(sessionId)
-    if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
-    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
-      return reply.status(403).send({ message: 'Sin permiso' })
-    }
-    recordingSessions.delete(sessionId)
-    await mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
-    server.log.info(
-      `[recordings] playback_stopped sessionId=${sessionId} path=${session.streamPath}` +
-      ` transcoded=${session.transcoded}`
-    )
-    return reply.send({ ok: true })
-  })
-
-  // GET /api/recordings/debug/path/:sessionId
-  server.get('/debug/path/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
-    if (request.user.role !== 'ADMIN') return reply.status(403).send({ message: 'Solo ADMIN' })
-    const { sessionId } = request.params as { sessionId: string }
-    const session = recordingSessions.get(sessionId)
-    if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
-    const status  = await getMediaMtxPathStatus(session.streamPath)
     return reply.send({ sessionId, ...session, pathStatus: status })
   })
 
