@@ -49,6 +49,9 @@ interface PlaybackStatusResponse {
   fps?:                 number
   speed?:               string
   expectedDurationSec?: number
+  progressPercent?:     number
+  lastProgressAt?:      number
+  elapsedMs?:           number
 }
 
 function toLocalDatetimeString(date: Date): string {
@@ -64,8 +67,11 @@ function classifyError(err: any): 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFF
   return 'UNKNOWN'
 }
 
-const POLL_INTERVAL_MS  = 1_000
-const POLL_MAX_MS       = 65_000
+const POLL_INTERVAL_MS    = 1_000
+// Safety cap: 15 minutes. Real timeout is dynamic (see handlePlay) and stall-based.
+const POLL_ABSOLUTE_MAX_MS = 15 * 60 * 1_000
+// Abort if FFmpeg shows no out_time progress for this long after first progress was seen
+const POLL_STALL_MS       = 45_000
 
 export function RecordingsPage() {
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
@@ -336,6 +342,14 @@ export function RecordingsPage() {
   }, [playbackUrl, playbackMimeType])
 
   const handlePlay = async (rec: RecordingWithCamera) => {
+    const isSameRec = selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId
+
+    // Already playing this recording — do nothing
+    if (isSameRec && playbackStatus === 'ready') return
+    // Already generating this recording — let the existing poll finish
+    if (isSameRec && playbackStatus === 'starting') return
+
+    // Different recording or error/idle: stop current and start fresh
     stopPlayback()
     setSelectedRec(rec)
     setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
@@ -353,13 +367,15 @@ export function RecordingsPage() {
     let sessionId: string | null = null
 
     try {
-      // POST returns immediately — backend starts background job
+      // POST returns immediately — backend starts background job (or reuses existing session)
       const result = await apiPost<{
         status: string
         sessionId: string
         pollUrl: string
         expiresAt: string
-        expectedDurationSec: number
+        expectedDurationSec?: number
+        url?: string
+        mimeType?: string
       }>('/recordings/playback', {
         cameraId:    rec.cameraId,
         startTime:   rec.startTime,
@@ -374,9 +390,25 @@ export function RecordingsPage() {
       setPlaybackSessionId(sessionId)
       playbackSessionIdRef.current = sessionId
 
-      // Poll /status until ready or error (max 65s, 1s interval)
+      // Backend may return immediately-ready (session reuse)
+      if (result.status === 'ready' && result.url) {
+        setPlaybackMimeType(result.mimeType ?? null)
+        setPlaybackUrl(result.url)
+        setPlaybackStatus('ready')
+        setPlaybackLoading(false)
+        return
+      }
+
+      // Dynamic timeout: at least 3 minutes, or 2.5× recording length + 60s, capped at 15min.
+      const expectedSec   = result.expectedDurationSec ?? 60
+      const dynamicPollMs = Math.min(POLL_ABSOLUTE_MAX_MS, Math.max(180_000, expectedSec * 2500 + 60_000))
+
+      // Stall detection: track when out_time last advanced (client-side complement to backend watchdog)
+      let lastSeenOutTimeSec = -1
+      let lastProgressTick   = Date.now()
+
       const pollStart = Date.now()
-      while (Date.now() - pollStart < POLL_MAX_MS) {
+      while (Date.now() - pollStart < dynamicPollMs) {
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
 
         if (playbackKeyRef.current !== myKey) return  // user cancelled
@@ -388,9 +420,9 @@ export function RecordingsPage() {
           )
         } catch (pollErr: any) {
           if (playbackKeyRef.current !== myKey) return
-          const code = pollErr?.response?.data?.status
-          if (code === 'error' || pollErr?.response?.status === 404) {
-            toast.error('Sesión de reproducción no encontrada', { duration: 6000 })
+          const httpStatus = pollErr?.response?.status
+          if (httpStatus === 404) {
+            toast.error('Sesión de reproducción no encontrada o expirada', { duration: 6000 })
           } else {
             toast.error('Error al consultar estado de reproducción', { duration: 5000 })
           }
@@ -415,8 +447,8 @@ export function RecordingsPage() {
           const msg  = statusRes.error ?? 'Error desconocido'
           if (code === 'RECORDING_STREAM_STALLED') {
             toast.error(msg, { duration: 8000 })
-          } else if (code === 'HLS_TIMEOUT' || code === 'MEDIAMTX_ERROR') {
-            toast.error(`Error de conexión al NVR: ${msg}`, { duration: 8000 })
+          } else if (code === 'TRANSCODE_FAILED') {
+            toast.error(`Error al generar video: ${msg}`, { duration: 8000 })
           } else {
             toast.error(msg || 'No se pudo cargar la grabación', { duration: 6000 })
           }
@@ -426,29 +458,43 @@ export function RecordingsPage() {
           return
         }
 
-        // Still 'starting' — update VOD generation progress
-        if (statusRes.outTimeSec !== undefined && statusRes.expectedDurationSec) {
-          setVodProgress({ outTimeSec: statusRes.outTimeSec, expectedDurationSec: statusRes.expectedDurationSec })
+        // Still 'starting' — update progress display
+        const outSec = statusRes.outTimeSec ?? 0
+        const expSec = statusRes.expectedDurationSec ?? expectedSec
+        if (outSec > 0) {
+          setVodProgress({ outTimeSec: outSec, expectedDurationSec: expSec })
+          // Update stall tracker when progress actually advances
+          if (outSec > lastSeenOutTimeSec) {
+            lastSeenOutTimeSec = outSec
+            lastProgressTick   = Date.now()
+          }
         }
-        if (statusRes.transcoded) setPlaybackStatus('transcoding')
+
+        // Client-side stall guard: no progress for POLL_STALL_MS after first frame seen
+        if (lastSeenOutTimeSec >= 0 && Date.now() - lastProgressTick > POLL_STALL_MS) {
+          toast.error(
+            `Sin progreso de video durante ${POLL_STALL_MS / 1000}s — el NVR puede haber cortado el stream`,
+            { duration: 8000 },
+          )
+          setPlaybackLoading(false)
+          setPlaybackStatus('idle')
+          setVodProgress(null)
+          return
+        }
       }
 
-      // Poll timeout (client-side safety net — backend has its own 60s timeout)
+      // Safety-cap timeout (should rarely happen if stall detection and backend watchdog work)
       if (playbackKeyRef.current !== myKey) return
-      toast.error('Tiempo de espera agotado. Intenta de nuevo.', { duration: 7000 })
+      toast.error('Tiempo de generación superado (>15 min). Intenta de nuevo.', { duration: 8000 })
       setPlaybackLoading(false)
       setPlaybackStatus('idle')
+      setVodProgress(null)
 
     } catch (err: any) {
       if (playbackKeyRef.current !== myKey) return
       const data   = err?.response?.data ?? {}
-      const code   = data.code ?? ''
       const detail = data.detail ?? data.message ?? ''
-      if (code === 'MEDIAMTX_ERROR') {
-        toast.error(`Error en MediaMTX: ${detail}`, { duration: 6000 })
-      } else {
-        toast.error(detail || 'No se pudo iniciar la reproducción', { duration: 5000 })
-      }
+      toast.error(detail || 'No se pudo iniciar la reproducción', { duration: 5000 })
       setPlaybackLoading(false)
       setPlaybackStatus('idle')
     }

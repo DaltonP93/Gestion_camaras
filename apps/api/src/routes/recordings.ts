@@ -20,15 +20,19 @@ const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000  // 30 minutes
 const RECORDINGS_FORCE_TRANSCODE = process.env.RECORDINGS_FORCE_TRANSCODE === 'true'
 const TRANSCODE_ENCODER          = process.env.TRANSCODE_ENCODER || 'libx264'
 const VOD_TEMP_DIR               = process.env.VOD_TEMP_DIR || '/tmp/visioncore-recordings'
-const STALL_TIMEOUT_MS           = 12_000  // kill FFmpeg if no progress for 12s
+// Kill FFmpeg if out_time hasn't advanced for this long.
+// 30s gives headroom for NVR segment gaps without false-positives.
+const STALL_TIMEOUT_MS           = 30_000
 
 // ─── In-memory recording playback sessions ────────────────────────
 interface RecordingSession {
   expiresAt:   number
   userId:      string
+  startedAt:   number          // Date.now() when session was created
   status:      'starting' | 'ready' | 'error'
   errorCode?:  string
   errorMsg?:   string
+  jobKey?:     string          // cameraId|startTime|endTime|playbackURI — for dedup cleanup
   // VOD fields
   vodFile?:    string         // /tmp path to generated MP4
   vodUrl?:     string         // served URL: /api/recordings/playback/:sessionId/file.mp4
@@ -45,6 +49,8 @@ interface RecordingSession {
 }
 
 const recordingSessions = new Map<string, RecordingSession>()
+// jobKey → sessionId: prevents spawning duplicate FFmpeg for the same recording
+const recordingJobKeys  = new Map<string, string>()
 
 // Ensure temp directory exists
 if (!fs.existsSync(VOD_TEMP_DIR)) {
@@ -57,6 +63,7 @@ setInterval(() => {
   for (const [sid, session] of recordingSessions.entries()) {
     if (now > session.expiresAt) {
       recordingSessions.delete(sid)
+      if (session.jobKey) recordingJobKeys.delete(session.jobKey)
       if (session.vodProcess) {
         try { session.vodProcess.kill('SIGTERM') } catch {}
       }
@@ -192,7 +199,10 @@ async function spawnVodFfmpeg(opts: {
         if (sess) {
           sess.progress = { outTimeSec, frame, fps, speed, lastProgressAt: Date.now() }
         }
-        log(`[recordings] ffmpeg_progress sessionId=${sessionId} out_time=${formatOutTime(outTimeSec)} frame=${frame} fps=${fps.toFixed(1)} speed=${speed}`)
+        const pct = sess?.expectedDurationSec
+          ? Math.min(99, Math.round(outTimeSec / sess.expectedDurationSec * 100))
+          : 0
+        log(`[recordings] ffmpeg_progress sessionId=${sessionId} out_time=${formatOutTime(outTimeSec)} frame=${frame} fps=${fps.toFixed(1)} speed=${speed} progress=${pct}%`)
 
         if (!progressSeen) {
           progressSeen = true
@@ -220,8 +230,8 @@ async function spawnVodFfmpeg(opts: {
 
     proc.on('exit', (code) => {
       const sess = recordingSessions.get(sessionId)
-      // If stall already resolved, don't double-resolve
-      if (!sess || sess.errorCode === 'RECORDING_STREAM_STALLED') {
+      // Stall watchdog already resolved this — let it propagate
+      if (sess?.errorCode === 'RECORDING_STREAM_STALLED') {
         finish('stall')
         return
       }
@@ -301,7 +311,8 @@ async function runVodBackground(opts: {
       try {
         const stat = fs.statSync(vodFile)
         if (stat.size > 512) {  // valid file
-          log(`[recordings] vod_ready sessionId=${sessionId} attempt=copy actualDurationSec=${Math.round(expectedDurationSec)} file=${vodFile} size=${stat.size}`)
+          const elapsedMs = Date.now() - (finalSession.startedAt ?? Date.now())
+          log(`[recordings] vod_ready sessionId=${sessionId} attempt=copy sizeBytes=${stat.size} elapsedMs=${elapsedMs} expectedDurationSec=${expectedDurationSec}`)
           finalSession.vodFile  = vodFile
           finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4`
           finalSession.mimeType = 'video/mp4'
@@ -347,8 +358,9 @@ async function runVodBackground(opts: {
 
   if (result === 'success') {
     try {
-      const stat = fs.statSync(vodFile)
-      log(`[recordings] vod_ready sessionId=${sessionId} attempt=transcode file=${vodFile} size=${stat.size}`)
+      const stat      = fs.statSync(vodFile)
+      const elapsedMs = Date.now() - (finalSession.startedAt ?? Date.now())
+      log(`[recordings] vod_ready sessionId=${sessionId} attempt=transcode sizeBytes=${stat.size} elapsedMs=${elapsedMs} expectedDurationSec=${expectedDurationSec}`)
       finalSession.vodFile  = vodFile
       finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4`
       finalSession.mimeType = 'video/mp4'
@@ -359,6 +371,8 @@ async function runVodBackground(opts: {
       finalSession.errorMsg  = 'El archivo generado no se pudo leer'
     }
   } else {
+    const stderrTail = ''  // could be wired to FFmpeg stderr if needed
+    log(`[recordings] vod_error sessionId=${sessionId} attempt=transcode result=${result} stderrTail=${stderrTail}`)
     finalSession.status   = 'error'
     finalSession.errorCode = 'TRANSCODE_FAILED'
     finalSession.errorMsg  = 'No se pudo generar el video. Verifica la conexión al NVR.'
@@ -615,11 +629,37 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       (new Date(body.endTime).getTime() - new Date(body.startTime).getTime()) / 1000
     )
 
+    // ── Job deduplication: reuse in-progress or ready session ────────
+    const jobKey = `${body.cameraId}|${body.startTime}|${body.endTime}|${body.playbackURI ?? ''}`
+    const existingSid = recordingJobKeys.get(jobKey)
+    if (existingSid) {
+      const existing = recordingSessions.get(existingSid)
+      if (existing && existing.userId === user.sub && existing.status !== 'error') {
+        server.log.info(
+          `[recordings] vod_reuse_session sessionId=${existingSid} jobKey=${jobKey}` +
+          ` status=${existing.status}`
+        )
+        // Extend TTL so polling doesn't race with expiry
+        existing.expiresAt = Date.now() + RECORDING_SESSION_TTL_MS
+        return reply.send({
+          status:              existing.status,
+          sessionId:           existingSid,
+          pollUrl:             `/api/recordings/playback/${existingSid}/status`,
+          expiresAt:           new Date(existing.expiresAt).toISOString(),
+          expectedDurationSec: existing.expectedDurationSec,
+          url:                 existing.vodUrl,
+          mimeType:            existing.mimeType,
+        })
+      }
+      // Stale/errored entry — clean it up
+      recordingJobKeys.delete(jobKey)
+    }
+
     const sessionId  = crypto.randomBytes(8).toString('hex')
     const expiresAt  = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
 
     server.log.info(
-      `[recordings] playback_init sessionId=${sessionId}` +
+      `[recordings] playback_init sessionId=${sessionId} jobKey=${jobKey}` +
       ` cameraId=${body.cameraId} ch=${camera.channel}` +
       (trackId ? ` trackId=${trackId}` : '') +
       ` strategy=${urlStrategy} expectedDurationSec=${expectedDurationSec} source=${rtspMasked}`
@@ -627,10 +667,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     recordingSessions.set(sessionId, {
       expiresAt:  Date.now() + RECORDING_SESSION_TTL_MS,
+      startedAt:  Date.now(),
       userId:     user.sub,
       status:     'starting',
+      jobKey,
       expectedDurationSec,
     })
+    recordingJobKeys.set(jobKey, sessionId)
 
     runVodBackground({
       sessionId,
@@ -680,6 +723,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).send({ message: 'Sin permiso' })
     }
 
+    const outTimeSec    = session.progress?.outTimeSec ?? 0
+    const progressPercent = session.expectedDurationSec && outTimeSec > 0
+      ? Math.min(99, Math.round(outTimeSec / session.expectedDurationSec * 100))
+      : 0
+    const elapsedMs = Date.now() - (session.startedAt ?? Date.now())
+
     return reply.send({
       status:               session.status,
       url:                  session.vodUrl,
@@ -687,10 +736,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       errorCode:            session.errorCode,
       error:                session.errorMsg,
       expectedDurationSec:  session.expectedDurationSec,
-      outTimeSec:           session.progress?.outTimeSec,
+      outTimeSec,
       frame:                session.progress?.frame,
       fps:                  session.progress?.fps,
       speed:                session.progress?.speed,
+      progressPercent,
+      lastProgressAt:       session.progress?.lastProgressAt,
+      elapsedMs,
     })
   })
 
@@ -750,6 +802,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).send({ message: 'Sin permiso' })
     }
     recordingSessions.delete(sessionId)
+    if (session.jobKey) recordingJobKeys.delete(session.jobKey)
     if (session.vodProcess) {
       try { session.vodProcess.kill('SIGTERM') } catch {}
     }
