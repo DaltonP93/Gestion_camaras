@@ -84,7 +84,7 @@ function sanitizeRtsp(s: string): string {
 type RtspTimeoutOpt = '-rw_timeout' | '-timeout' | null
 let _rtspTimeoutOpt: RtspTimeoutOpt | undefined = undefined  // undefined = not yet detected
 
-function getRtspTimeoutOption(): RtspTimeoutOpt {
+export function getRtspTimeoutOption(): RtspTimeoutOpt {
   if (_rtspTimeoutOpt !== undefined) return _rtspTimeoutOpt
   try {
     const out = execSync('ffmpeg -hide_banner -h demuxer=rtsp 2>&1', { timeout: 5000, stdio: 'pipe' }).toString()

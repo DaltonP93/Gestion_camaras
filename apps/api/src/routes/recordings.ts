@@ -3,59 +3,72 @@ import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { searchRecordings } from '../services/hikvision'
 import { AuditAction } from '../services/audit'
-import { waitForHlsReady, spawnTranscodeFromRtsp, stopTranscodeProcess } from '../services/stream'
 import { probeRtspStream } from '../services/rtsp-probe'
+import { getRtspTimeoutOption } from '../services/stream'
 import CryptoJS from 'crypto-js'
-import axios from 'axios'
 import crypto from 'crypto'
+import { spawn } from 'child_process'
+import type { ChildProcess } from 'child_process'
+import fs from 'fs'
+import path from 'path'
 
 const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
-// ─── MediaMTX client (same pattern as stream.ts) ─────────────────
-const mediamtxApi = axios.create({
-  baseURL: process.env.MEDIAMTX_URL || 'http://mediamtx:9997',
-  timeout: 8000,
-})
+// ─── VOD configuration ────────────────────────────────────────────
+const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000  // 30 minutes
+const RECORDINGS_FORCE_TRANSCODE = process.env.RECORDINGS_FORCE_TRANSCODE === 'true'
+const TRANSCODE_ENCODER          = process.env.TRANSCODE_ENCODER || 'libx264'
+const VOD_TEMP_DIR               = process.env.VOD_TEMP_DIR || '/tmp/visioncore-recordings'
+const STALL_TIMEOUT_MS           = 12_000  // kill FFmpeg if no progress for 12s
 
 // ─── In-memory recording playback sessions ────────────────────────
-const RECORDING_SESSION_TTL_MS = 30 * 60 * 1000  // 30 minutes
-// Force FFmpeg transcode for all recordings (use when NVR sends H265 without ffprobe detectable codec)
-const RECORDINGS_FORCE_TRANSCODE = process.env.RECORDINGS_FORCE_TRANSCODE === 'true'
-
 interface RecordingSession {
-  streamPath:   string
-  expiresAt:    number
-  userId:       string
-  // async playback status
-  status:       'starting' | 'ready' | 'error'
-  hlsUrl:       string
-  transcoded:   boolean
-  errorCode?:   string
-  errorMsg?:    string
-  stderrTail?:  string
+  expiresAt:   number
+  userId:      string
+  status:      'starting' | 'ready' | 'error'
+  errorCode?:  string
+  errorMsg?:   string
+  // VOD fields
+  vodFile?:    string         // /tmp path to generated MP4
+  vodUrl?:     string         // served URL: /api/recordings/playback/:sessionId/file.mp4
+  mimeType?:   string         // 'video/mp4'
+  vodProcess?: ChildProcess   // FFmpeg process — killed on DELETE
+  expectedDurationSec?: number
+  progress?: {
+    outTimeSec:     number
+    frame:          number
+    fps:            number
+    speed:          string
+    lastProgressAt: number
+  }
 }
 
 const recordingSessions = new Map<string, RecordingSession>()
 
-// Periodic cleanup of expired recording paths
-setInterval(async () => {
+// Ensure temp directory exists
+if (!fs.existsSync(VOD_TEMP_DIR)) {
+  try { fs.mkdirSync(VOD_TEMP_DIR, { recursive: true }) } catch {}
+}
+
+// Periodic cleanup of expired sessions and their temp files
+setInterval(() => {
   const now = Date.now()
   for (const [sid, session] of recordingSessions.entries()) {
     if (now > session.expiresAt) {
       recordingSessions.delete(sid)
-      // Kill FFmpeg for transcoded recording sessions
-      if (session.transcoded) {
-        stopTranscodeProcess(session.streamPath)
+      if (session.vodProcess) {
+        try { session.vodProcess.kill('SIGTERM') } catch {}
       }
-      mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
+      if (session.vodFile) {
+        fs.unlink(session.vodFile, () => {})
+      }
     }
   }
 }, 5 * 60 * 1000)
 
 // ─── RTSP URL helpers ─────────────────────────────────────────────
 
-/** Inject credentials+host into a path-only playbackURI from the NVR. */
 function injectCredentialsIntoPlaybackUri(opts: {
   playbackURI: string
   username:    string
@@ -72,7 +85,6 @@ function injectCredentialsIntoPlaybackUri(opts: {
   }
 }
 
-/** Fallback: construct RTSP URL from timestamps. */
 function buildFallbackRecordingRtspUrl(opts: {
   username:  string
   password:  string
@@ -94,84 +106,158 @@ function buildFallbackRecordingRtspUrl(opts: {
   }
 }
 
-// ─── Register a recording path in MediaMTX (source-pull, H264) ───
-async function createRecordingHlsPath(
-  rtspUrl: string,
-  maskedUrl: string,
-  streamPath: string,
-  log: (msg: string) => void,
-): Promise<void> {
-  const config = {
-    source:          rtspUrl,
-    sourceOnDemand:  false,
-    rtspTransport:   'tcp',
-    record:          false,
-    overridePublisher: true,
-  }
+// ─── VOD generation ───────────────────────────────────────────────
 
-  log(`[recordings] mediamtx_path_add path=${streamPath} source=${maskedUrl}`)
-  try {
-    await mediamtxApi.post(`/v3/config/paths/add/${streamPath}`, config)
-    log(`[recordings] mediamtx_path_add ok path=${streamPath}`)
-  } catch (err: any) {
-    const status = err.response?.status
-    if (status === 400) {
-      log(`[recordings] mediamtx_path_patch path=${streamPath} (was 400 — already existed)`)
-      await mediamtxApi.patch(`/v3/config/paths/patch/${streamPath}`, config)
-      log(`[recordings] mediamtx_path_patch ok path=${streamPath}`)
-    } else {
-      const body = JSON.stringify(err.response?.data ?? {}).slice(0, 200)
-      log(`[recordings] mediamtx_path_add FAILED path=${streamPath} status=${status} body=${body}`)
-      throw err
-    }
-  }
+function formatOutTime(sec: number): string {
+  const h = Math.floor(sec / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  const s = (sec % 60).toFixed(3).padStart(6, '0')
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s}`
 }
 
-// ─── Query live path status in MediaMTX ──────────────────────────
-async function getMediaMtxPathStatus(streamPath: string): Promise<{
-  exists: boolean
-  ready:  boolean
-  tracks: number
-  sourceState: string
-}> {
-  try {
-    const res = await mediamtxApi.get(`/v3/paths/get/${streamPath}`, {
-      timeout: 3000,
-      validateStatus: () => true,
+type VodResult = 'success' | 'failure' | 'stall' | 'cancelled'
+
+async function spawnVodFfmpeg(opts: {
+  sessionId:           string
+  vodFile:             string
+  rtspUrl:             string
+  rtspMasked:          string
+  codecArgs:           string[]
+  attempt:             'copy' | 'transcode'
+  expectedDurationSec: number
+  log:                 (msg: string) => void
+}): Promise<VodResult> {
+  const { sessionId, vodFile, rtspUrl, rtspMasked, codecArgs, attempt, expectedDurationSec, log } = opts
+
+  const rtspTimeoutOpt = getRtspTimeoutOption()
+  const rtspTimeoutUs  = 60_000_000  // 60s for recordings (NVR seek + locate)
+
+  const args = [
+    '-rtsp_transport', 'tcp',
+    '-fflags', '+genpts+discardcorrupt',
+    '-use_wallclock_as_timestamps', '1',
+    ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
+    '-reorder_queue_size', '0',
+    '-i', rtspUrl,
+    ...codecArgs,
+    '-movflags', '+faststart',
+    '-progress', 'pipe:2',
+    '-stats_period', '1',
+    '-y',
+    vodFile,
+  ]
+
+  const maskedArgs = args.map(a => a === rtspUrl ? rtspMasked : a)
+  log(`[recordings] vod_spawn sessionId=${sessionId} attempt=${attempt} cmd=ffmpeg ${maskedArgs.join(' ')}`)
+
+  return new Promise<VodResult>((resolve) => {
+    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+
+    const s = recordingSessions.get(sessionId)
+    if (s) s.vodProcess = proc
+
+    let stallTimer: ReturnType<typeof setInterval> | null = null
+    let progressSeen = false
+    let resolved = false
+
+    const finish = (result: VodResult) => {
+      if (resolved) return
+      resolved = true
+      if (stallTimer) { clearInterval(stallTimer); stallTimer = null }
+      const sess = recordingSessions.get(sessionId)
+      if (sess && sess.vodProcess === proc) sess.vodProcess = undefined
+      resolve(result)
+    }
+
+    proc.stderr?.on('data', (data: Buffer) => {
+      const text = data.toString()
+      // Parse FFmpeg -progress key=value output
+      const lines = text.split('\n')
+      let frame = 0, fps = 0, outTimeSec = 0, speed = '', hasProgressLine = false
+
+      for (const line of lines) {
+        const eqIdx = line.indexOf('=')
+        if (eqIdx < 0) continue
+        const k = line.slice(0, eqIdx).trim()
+        const v = line.slice(eqIdx + 1).trim()
+        if (k === 'frame')        frame      = parseInt(v)  || 0
+        else if (k === 'fps')     fps        = parseFloat(v) || 0
+        else if (k === 'out_time_ms') outTimeSec = (parseInt(v) || 0) / 1_000_000
+        else if (k === 'speed')   speed      = v
+        else if (k === 'progress') hasProgressLine = true
+      }
+
+      if (hasProgressLine && frame > 0) {
+        const sess = recordingSessions.get(sessionId)
+        if (sess) {
+          sess.progress = { outTimeSec, frame, fps, speed, lastProgressAt: Date.now() }
+        }
+        log(`[recordings] ffmpeg_progress sessionId=${sessionId} out_time=${formatOutTime(outTimeSec)} frame=${frame} fps=${fps.toFixed(1)} speed=${speed}`)
+
+        if (!progressSeen) {
+          progressSeen = true
+          // Start stall watchdog once first real progress is seen
+          stallTimer = setInterval(() => {
+            const sess2 = recordingSessions.get(sessionId)
+            if (!sess2 || sess2.status !== 'starting') {
+              if (stallTimer) clearInterval(stallTimer)
+              return
+            }
+            const sinceMs = Date.now() - (sess2.progress?.lastProgressAt ?? 0)
+            if (sinceMs > STALL_TIMEOUT_MS) {
+              const stallSec = Math.round(sess2.progress?.outTimeSec ?? 0)
+              log(`[recordings] ffmpeg_stall_detected sessionId=${sessionId} sinceMs=${sinceMs} outTimeSec=${stallSec}`)
+              try { proc.kill('SIGTERM') } catch {}
+              sess2.status    = 'error'
+              sess2.errorCode = 'RECORDING_STREAM_STALLED'
+              sess2.errorMsg  = `El NVR dejó de entregar video después de ${stallSec} segundos`
+              finish('stall')
+            }
+          }, 3_000)
+        }
+      }
     })
-    if (res.status === 404) {
-      return { exists: false, ready: false, tracks: 0, sourceState: 'not_found' }
-    }
-    const d = res.data ?? {}
-    return {
-      exists:      true,
-      ready:       d.ready === true,
-      tracks:      (d.tracks ?? []).length,
-      sourceState: d.ready === true ? 'connected' : 'connecting_or_failed',
-    }
-  } catch (err: any) {
-    return { exists: false, ready: false, tracks: 0, sourceState: `error:${err.message}` }
-  }
+
+    proc.on('exit', (code) => {
+      const sess = recordingSessions.get(sessionId)
+      // If stall already resolved, don't double-resolve
+      if (!sess || sess.errorCode === 'RECORDING_STREAM_STALLED') {
+        finish('stall')
+        return
+      }
+      // Session deleted by user (DELETE while generating)
+      if (!sess) {
+        finish('cancelled')
+        return
+      }
+      finish(code === 0 ? 'success' : 'failure')
+    })
+
+    proc.on('error', (err: NodeJS.ErrnoException) => {
+      log(`[recordings] vod_ffmpeg_error sessionId=${sessionId} err=${err.message}`)
+      finish('failure')
+    })
+  })
 }
 
-// ─── Background job: detect codec, optionally transcode, wait for HLS ───
-// Runs fire-and-forget after POST /playback returns immediately.
-// If codec is HEVC (or RECORDINGS_FORCE_TRANSCODE=true): creates an H264 transcode path.
-// Otherwise: creates a direct RTSP-pull path in MediaMTX.
-async function runPlaybackBackground(opts: {
-  sessionId:   string
-  streamPath:  string
-  rtspUrl:     string
-  rtspMasked:  string
-  trackId?:    number
-  urlStrategy: string
-  log:         (msg: string) => void
+// ─── Background VOD generation ────────────────────────────────────
+async function runVodBackground(opts: {
+  sessionId:           string
+  rtspUrl:             string
+  rtspMasked:          string
+  trackId?:            number
+  urlStrategy:         string
+  expectedDurationSec: number
+  log:                 (msg: string) => void
 }): Promise<void> {
-  const { sessionId, streamPath, rtspUrl, rtspMasked, trackId, urlStrategy, log } = opts
+  const { sessionId, rtspUrl, rtspMasked, expectedDurationSec, log } = opts
+
   const session = recordingSessions.get(sessionId)
   if (!session) return
 
-  // ── Step 1: Detect codec via ffprobe ────────────────────────────────
+  const vodFile = path.join(VOD_TEMP_DIR, `rec_${sessionId}.mp4`)
+
+  // ── Step 1: Detect codec ─────────────────────────────────────────
   let useTranscode = RECORDINGS_FORCE_TRANSCODE
   let detectedCodec = 'unknown'
 
@@ -184,138 +270,102 @@ async function runPlaybackBackground(opts: {
         useTranscode = true
       }
     } catch (err: any) {
-      log(`[recordings] ffprobe_error sessionId=${sessionId} err=${err?.message} — using direct path`)
+      log(`[recordings] ffprobe_error sessionId=${sessionId} err=${err?.message} — assuming H264, trying copy`)
     }
   }
-
-  // ── Step 2a: Transcoded path (HEVC → H264 via FFmpeg) ───────────────
-  if (useTranscode) {
-    const transcodePath   = `${streamPath}_h264`
-    const transcodedHlsUrl = `/hls/${transcodePath}/index.m3u8`
-
-    log(
-      `[recordings] playback_init_transcoded sessionId=${sessionId} codec=${detectedCodec}` +
-      ` path=${transcodePath} source=${rtspMasked}`
-    )
-
-    // Register publisher path in MediaMTX (FFmpeg pushes RTSP → MediaMTX → HLS)
-    try {
-      await mediamtxApi.post(`/v3/config/paths/add/${transcodePath}`, {
-        source: 'publisher', record: false, overridePublisher: true,
-      })
-    } catch (err: any) {
-      if (err?.response?.status === 400) {
-        // Already exists — patch it
-        await mediamtxApi.patch(`/v3/config/paths/patch/${transcodePath}`, {
-          source: 'publisher', record: false, overridePublisher: true,
-        }).catch(() => {})
-      } else {
-        log(`[recordings] mediamtx_transcode_path_failed sessionId=${sessionId} err=${err?.message}`)
-        const s = recordingSessions.get(sessionId)
-        if (s) { s.status = 'error'; s.errorCode = 'MEDIAMTX_ERROR'; s.errorMsg = 'No se pudo registrar path transcodificado' }
-        return
-      }
-    }
-
-    // Spawn FFmpeg (mode: 'recording' adds -re flag for real-time playback speed)
-    const proc = spawnTranscodeFromRtsp(rtspUrl, rtspMasked, transcodePath, { mode: 'recording' })
-    if (!proc) {
-      log(`[recordings] ffmpeg_spawn_null sessionId=${sessionId} path=${transcodePath}`)
-      const s = recordingSessions.get(sessionId)
-      if (s) { s.status = 'error'; s.errorCode = 'TRANSCODE_PROCESS_EXITED'; s.errorMsg = 'FFmpeg no pudo iniciarse' }
-      await mediamtxApi.delete(`/v3/config/paths/delete/${transcodePath}`).catch(() => {})
-      return
-    }
-    log(`[transcode] spawn_recording path=${transcodePath} pid=${proc.pid ?? 'pending'}`)
-
-    // Wait for HLS ready (no isAlive check so short clips don't abort)
-    const ready = await waitForHlsReady(transcodePath, 60_000, 800)
-
-    const s = recordingSessions.get(sessionId)
-    if (!s) {
-      // Session deleted while waiting (user cancelled)
-      try { proc.kill('SIGTERM') } catch {}
-      await mediamtxApi.delete(`/v3/config/paths/delete/${transcodePath}`).catch(() => {})
-      return
-    }
-
-    if (ready.ready) {
-      log(`[transcode] hls_ready path=${transcodePath} elapsedMs=${ready.elapsedMs}ms`)
-      log(`[recordings] playback_started sessionId=${sessionId} url=${transcodedHlsUrl} transcoded=true`)
-      s.streamPath = transcodePath
-      s.hlsUrl     = transcodedHlsUrl
-      s.transcoded = true
-      s.status     = 'ready'
-      return
-    }
-
-    // Timeout — kill FFmpeg and mark error
-    try { proc.kill('SIGTERM') } catch {}
-    await mediamtxApi.delete(`/v3/config/paths/delete/${transcodePath}`).catch(() => {})
-    log(`[recordings] bg_transcode_timeout sessionId=${sessionId} path=${transcodePath} lastStatus=${ready.lastStatus} elapsedMs=${ready.elapsedMs}ms`)
-    s.status   = 'error'
-    s.errorCode = 'TRANSCODE_NOT_READY'
-    s.errorMsg  = `Transcodificación no lista en 60s. Verifica conexión RTSP al NVR.`
-    return
-  }
-
-  // ── Step 2b: Direct RTSP-pull path (H264 or unknown codec) ──────────
-  try {
-    await createRecordingHlsPath(rtspUrl, rtspMasked, streamPath, log)
-  } catch (err: any) {
-    log(`[recordings] bg_path_create_failed sessionId=${sessionId} err=${err.message}`)
-    const s = recordingSessions.get(sessionId)
-    if (s) {
-      s.status   = 'error'
-      s.errorCode = 'MEDIAMTX_ERROR'
-      s.errorMsg  = 'No se pudo registrar el path en MediaMTX'
-    }
-    return
-  }
-
-  // Poll HLS — no isAlive check so short clips don't abort us
-  const ready = await waitForHlsReady(streamPath, 60_000, 800)
-
-  const s = recordingSessions.get(sessionId)
-  if (!s) return  // session was deleted while we waited (user cancelled)
-
-  if (ready.ready) {
-    log(
-      `[recordings] bg_hls_ready sessionId=${sessionId} path=${streamPath}` +
-      ` elapsedMs=${ready.elapsedMs}ms`
-    )
-    s.hlsUrl = `/hls/${streamPath}/index.m3u8`
-    s.status = 'ready'
-    return
-  }
-
-  // HLS timed out — diagnose and mark error
-  const pathStatus = await getMediaMtxPathStatus(streamPath)
-
-  const diagMsg = !pathStatus.exists
-    ? 'Path no encontrado en MediaMTX'
-    : pathStatus.ready
-      ? 'RTSP conectado pero HLS no generó segmentos en tiempo'
-      : 'MediaMTX no pudo conectar al RTSP del NVR'
 
   log(
-    `[recordings] bg_hls_timeout sessionId=${sessionId} lastStatus=${ready.lastStatus}` +
-    ` elapsedMs=${ready.elapsedMs}ms pathExists=${pathStatus.exists}` +
-    ` pathReady=${pathStatus.ready} sourceState=${pathStatus.sourceState}` +
-    ` strategy=${urlStrategy}` + (trackId ? ` trackId=${trackId}` : '') +
+    `[recordings] vod_prepare sessionId=${sessionId} codec=${detectedCodec}` +
+    ` useTranscode=${useTranscode} expectedDurationSec=${expectedDurationSec}` +
     ` source=${rtspMasked}`
   )
 
-  // Clean up useless path
-  recordingSessions.delete(sessionId)
-  mediamtxApi.delete(`/v3/config/paths/delete/${streamPath}`).catch(() => {})
+  // ── Step 2a: H264 — try copy first ───────────────────────────────
+  if (!useTranscode) {
+    const result = await spawnVodFfmpeg({
+      sessionId,
+      vodFile,
+      rtspUrl,
+      rtspMasked,
+      codecArgs: ['-an', '-c:v', 'copy'],
+      attempt: 'copy',
+      expectedDurationSec,
+      log,
+    })
 
-  s.status    = 'error'
-  s.errorCode = 'HLS_TIMEOUT'
-  s.errorMsg  = diagMsg
+    if (result === 'stall' || result === 'cancelled') return  // session already marked
+
+    if (result === 'success') {
+      const finalSession = recordingSessions.get(sessionId)
+      if (!finalSession) { fs.unlink(vodFile, () => {}); return }
+      try {
+        const stat = fs.statSync(vodFile)
+        if (stat.size > 512) {  // valid file
+          log(`[recordings] vod_ready sessionId=${sessionId} attempt=copy actualDurationSec=${Math.round(expectedDurationSec)} file=${vodFile} size=${stat.size}`)
+          finalSession.vodFile  = vodFile
+          finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4`
+          finalSession.mimeType = 'video/mp4'
+          finalSession.status   = 'ready'
+          return
+        }
+        log(`[recordings] vod_copy_empty sessionId=${sessionId} size=${stat.size} — falling back to transcode`)
+      } catch {
+        log(`[recordings] vod_copy_stat_failed sessionId=${sessionId} — falling back to transcode`)
+      }
+    }
+
+    // Copy failed or produced empty file — delete partial and transcode
+    log(`[recordings] vod_copy_fallback sessionId=${sessionId} — retrying with ${TRANSCODE_ENCODER}`)
+    try { fs.unlinkSync(vodFile) } catch {}
+  }
+
+  // ── Step 2b: Transcode (HEVC → H264, or copy fallback) ───────────
+  const transcodeCodecArgs = [
+    '-an',
+    '-c:v', TRANSCODE_ENCODER,
+    '-preset', 'veryfast',
+    '-pix_fmt', 'yuv420p',
+    '-profile:v', 'main',
+    '-level', '4.1',
+  ]
+
+  const result = await spawnVodFfmpeg({
+    sessionId,
+    vodFile,
+    rtspUrl,
+    rtspMasked,
+    codecArgs: transcodeCodecArgs,
+    attempt: 'transcode',
+    expectedDurationSec,
+    log,
+  })
+
+  if (result === 'stall' || result === 'cancelled') return
+
+  const finalSession = recordingSessions.get(sessionId)
+  if (!finalSession) { fs.unlink(vodFile, () => {}); return }
+
+  if (result === 'success') {
+    try {
+      const stat = fs.statSync(vodFile)
+      log(`[recordings] vod_ready sessionId=${sessionId} attempt=transcode file=${vodFile} size=${stat.size}`)
+      finalSession.vodFile  = vodFile
+      finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4`
+      finalSession.mimeType = 'video/mp4'
+      finalSession.status   = 'ready'
+    } catch {
+      finalSession.status   = 'error'
+      finalSession.errorCode = 'VOD_FILE_MISSING'
+      finalSession.errorMsg  = 'El archivo generado no se pudo leer'
+    }
+  } else {
+    finalSession.status   = 'error'
+    finalSession.errorCode = 'TRANSCODE_FAILED'
+    finalSession.errorMsg  = 'No se pudo generar el video. Verifica la conexión al NVR.'
+  }
 }
 
-// In-memory capability cache: nvrId → 'isapi' | 'unsupported' | 'auth_error'
+// ─── Capability cache ─────────────────────────────────────────────
 const nvrCapabilityCache = new Map<string, { result: string; expiresAt: number }>()
 const CAPABILITY_TTL_MS = 15 * 60 * 1000
 
@@ -346,8 +396,6 @@ const playbackSchema = z.object({
   cameraId:    z.string().min(1),
   startTime:   z.string().datetime(),
   endTime:     z.string().datetime(),
-  /** Path+query from the NVR's searchRecordings result.
-   *  Must start with / (e.g. /Streaming/tracks/101?starttime=...&name=...&size=...). */
   playbackURI: z.string().startsWith('/').optional(),
 })
 
@@ -396,7 +444,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({ recordings, source: 'nvr_isapi', camera: { id: camera.id, name: camera.name, channel: camera.channel }, nvrModel: camera.nvr.model })
   })
 
-  // POST /api/recordings/batch-search — Buscar grabaciones para múltiples cámaras de un NVR
+  // POST /api/recordings/batch-search
   server.post('/batch-search', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user = request.user
     if (user.role === 'OPERATOR') return reply.status(403).send({ message: 'Sin acceso a grabaciones' })
@@ -508,7 +556,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // POST /api/recordings/playback — Start recording playback (async).
-  // Returns immediately with status='starting'. Client polls GET /playback/:sessionId/status.
   server.post('/playback', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user = request.user
     const body = playbackSchema.parse(request.body)
@@ -564,36 +611,34 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       urlStrategy = 'fallback_timestamps'
     }
 
+    const expectedDurationSec = Math.round(
+      (new Date(body.endTime).getTime() - new Date(body.startTime).getTime()) / 1000
+    )
+
     const sessionId  = crypto.randomBytes(8).toString('hex')
-    const streamPath = `rec_${sessionId}`
-    const hlsUrl     = `/hls/${streamPath}/index.m3u8`
     const expiresAt  = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
 
     server.log.info(
-      `[recordings] playback_init sessionId=${sessionId} path=${streamPath}` +
+      `[recordings] playback_init sessionId=${sessionId}` +
       ` cameraId=${body.cameraId} ch=${camera.channel}` +
       (trackId ? ` trackId=${trackId}` : '') +
-      ` strategy=${urlStrategy} source=${rtspMasked}`
+      ` strategy=${urlStrategy} expectedDurationSec=${expectedDurationSec} source=${rtspMasked}`
     )
 
-    // Register session immediately so status polls can find it
     recordingSessions.set(sessionId, {
-      streamPath,
       expiresAt:  Date.now() + RECORDING_SESSION_TTL_MS,
       userId:     user.sub,
       status:     'starting',
-      hlsUrl,
-      transcoded: false,
+      expectedDurationSec,
     })
 
-    // Fire-and-forget background job
-    runPlaybackBackground({
+    runVodBackground({
       sessionId,
-      streamPath,
       rtspUrl,
       rtspMasked,
       trackId,
       urlStrategy,
+      expectedDurationSec,
       log: (msg) => server.log.info(msg),
     }).catch((err) => {
       server.log.error(`[recordings] bg_unhandled_error sessionId=${sessionId} err=${err?.message}`)
@@ -605,7 +650,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       }
     })
 
-    // Audit asynchronously — don't wait
     AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
       startTime: body.startTime, endTime: body.endTime, sessionId,
     }).catch(() => {})
@@ -613,10 +657,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({
       status:    'starting',
       sessionId,
-      url:       hlsUrl,
       pollUrl:   `/api/recordings/playback/${sessionId}/status`,
-      transcoded: false,
       expiresAt,
+      expectedDurationSec,
     })
   })
 
@@ -626,8 +669,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const session = recordingSessions.get(sessionId)
 
     if (!session) {
-      // Session was cleaned up (error path cleans up before setting error status in some cases)
-      // Return error so client stops polling
       return reply.status(404).send({
         status:    'error',
         errorCode: 'SESSION_NOT_FOUND',
@@ -640,17 +681,67 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }
 
     return reply.send({
-      status:     session.status,
-      url:        session.hlsUrl,
-      hlsReady:   session.status === 'ready',
-      transcoded: session.transcoded,
-      errorCode:  session.errorCode,
-      error:      session.errorMsg,
-      stderrTail: session.stderrTail,
+      status:               session.status,
+      url:                  session.vodUrl,
+      mimeType:             session.mimeType,
+      errorCode:            session.errorCode,
+      error:                session.errorMsg,
+      expectedDurationSec:  session.expectedDurationSec,
+      outTimeSec:           session.progress?.outTimeSec,
+      frame:                session.progress?.frame,
+      fps:                  session.progress?.fps,
+      speed:                session.progress?.speed,
     })
   })
 
-  // DELETE /api/recordings/playback/:sessionId — Stop recording playback
+  // GET /api/recordings/playback/:sessionId/file.mp4 — Serve VOD file with Range support
+  server.get('/playback/:sessionId/file.mp4', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string }
+    const session = recordingSessions.get(sessionId)
+
+    if (!session || session.status !== 'ready' || !session.vodFile) {
+      return reply.status(404).send({ message: 'Archivo no disponible' })
+    }
+    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
+
+    let fileSize: number
+    try {
+      fileSize = fs.statSync(session.vodFile).size
+    } catch {
+      return reply.status(404).send({ message: 'Archivo no encontrado en disco' })
+    }
+
+    const rangeHeader = request.headers.range as string | undefined
+
+    if (rangeHeader) {
+      const match = rangeHeader.match(/bytes=(\d*)-(\d*)/)
+      if (!match) return reply.status(416).send({ message: 'Invalid Range header' })
+      const start = match[1] ? parseInt(match[1], 10) : 0
+      const end   = match[2] ? parseInt(match[2], 10) : fileSize - 1
+      if (start > end || end >= fileSize) {
+        reply.header('Content-Range', `bytes */${fileSize}`)
+        return reply.status(416).send({ message: 'Range Not Satisfiable' })
+      }
+      const chunkSize = end - start + 1
+      reply
+        .status(206)
+        .header('Content-Range',  `bytes ${start}-${end}/${fileSize}`)
+        .header('Accept-Ranges',  'bytes')
+        .header('Content-Length', String(chunkSize))
+        .header('Content-Type',   'video/mp4')
+      return reply.send(fs.createReadStream(session.vodFile, { start, end }))
+    }
+
+    reply
+      .header('Content-Type',   'video/mp4')
+      .header('Content-Length', String(fileSize))
+      .header('Accept-Ranges',  'bytes')
+    return reply.send(fs.createReadStream(session.vodFile))
+  })
+
+  // DELETE /api/recordings/playback/:sessionId — Stop/cancel playback
   server.delete('/playback/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string }
     const session = recordingSessions.get(sessionId)
@@ -659,25 +750,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).send({ message: 'Sin permiso' })
     }
     recordingSessions.delete(sessionId)
-    if (session.transcoded) {
-      stopTranscodeProcess(session.streamPath)
+    if (session.vodProcess) {
+      try { session.vodProcess.kill('SIGTERM') } catch {}
     }
-    await mediamtxApi.delete(`/v3/config/paths/delete/${session.streamPath}`).catch(() => {})
-    server.log.info(
-      `[recordings] playback_stopped sessionId=${sessionId} path=${session.streamPath}` +
-      ` transcoded=${session.transcoded}`
-    )
+    if (session.vodFile) {
+      fs.unlink(session.vodFile, () => {})
+    }
+    server.log.info(`[recordings] playback_stopped sessionId=${sessionId}`)
     return reply.send({ ok: true })
-  })
-
-  // GET /api/recordings/debug/path/:sessionId — Diagnóstico del path MediaMTX
-  server.get('/debug/path/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
-    if (request.user.role !== 'ADMIN') return reply.status(403).send({ message: 'Solo ADMIN' })
-    const { sessionId } = request.params as { sessionId: string }
-    const session = recordingSessions.get(sessionId)
-    if (!session) return reply.status(404).send({ message: 'Sesión no encontrada' })
-    const status = await getMediaMtxPathStatus(session.streamPath)
-    return reply.send({ sessionId, ...session, pathStatus: status })
   })
 
   // GET /api/recordings/audit
