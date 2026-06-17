@@ -81,6 +81,10 @@ export function RecordingsPage() {
   const playbackKeyRef       = useRef<string | null>(null)
   // Mirror of playbackSessionId in a ref so stopPlayback can read it in async closures.
   const playbackSessionIdRef = useRef<string | null>(null)
+  // True after video.ended fires — suppresses post-end HLS error toasts (401/404 are expected)
+  const playbackEndedRef     = useRef(false)
+  // True while stopPlayback is executing — suppresses cleanup-induced HLS errors
+  const playbackCleaningRef  = useRef(false)
   const startDateRef  = useRef<HTMLInputElement>(null)
   const endDateRef    = useRef<HTMLInputElement>(null)
   const [showCameraList, setShowCameraList] = useState(false)
@@ -238,6 +242,7 @@ export function RecordingsPage() {
 
   // Stop any active HLS instance and release the MediaMTX recording path
   const stopPlayback = () => {
+    playbackCleaningRef.current = true
     toast.dismiss()
     playbackKeyRef.current = null
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
@@ -263,8 +268,27 @@ export function RecordingsPage() {
     if (!video || !playbackUrl) return
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
 
+    playbackEndedRef.current  = false
+    playbackCleaningRef.current = false
+
     // Capture key at attachment time — stale checks compare against this
     const attachedKey = playbackKeyRef.current
+
+    const handleVideoEnded = () => {
+      playbackEndedRef.current = true
+      // Destroy HLS silently — segments will 401 after MediaMTX path closes
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+      // Release server session without showing any toast
+      const sid = playbackSessionIdRef.current
+      if (sid) {
+        apiDelete(`/recordings/playback/${sid}`).catch(() => {})
+        playbackSessionIdRef.current = null
+        setPlaybackSessionId(null)
+      }
+      setPlaybackStatus('idle')
+    }
+
+    video.addEventListener('ended', handleVideoEnded)
 
     if (Hls.isSupported()) {
       const hls = new Hls({
@@ -277,6 +301,8 @@ export function RecordingsPage() {
       hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (!data.fatal) return
+        if (playbackEndedRef.current) return   // post-end 401/404 are expected
+        if (playbackCleaningRef.current) return // stopPlayback in progress
         if (attachedKey !== playbackKeyRef.current) return  // stale session
         const status = (data.response as any)?.code ?? 0
         if (status === 401) {
@@ -290,6 +316,8 @@ export function RecordingsPage() {
       video.src = playbackUrl
       video.play().catch(() => {})
     }
+
+    return () => { video.removeEventListener('ended', handleVideoEnded) }
   }, [playbackUrl])
 
   const handlePlay = async (rec: RecordingWithCamera) => {
@@ -299,7 +327,9 @@ export function RecordingsPage() {
     setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
 
     const myKey = `${Date.now()}-${Math.random()}`
-    playbackKeyRef.current = myKey
+    playbackKeyRef.current    = myKey
+    playbackEndedRef.current  = false
+    playbackCleaningRef.current = false
     setPlaybackLoading(true)
     setPlaybackStatus('starting')
 

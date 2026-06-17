@@ -126,6 +126,9 @@ export function LiveViewPage() {
 
   // playerKeys forces VideoPlayer remount (new HLS instance) when incremented for a camera
   const [playerKeys, setPlayerKeys] = useState<Record<string, number>>({})
+  // Mirrors which cameras are using the main_h264 fallback — drives the "Trans H.264" badge.
+  // Separate from gridStreamOverride (a ref) so the badge re-renders when fallback is activated.
+  const [gridFallbackIds, setGridFallbackIds] = useState<Set<string>>(new Set())
 
   // Stable ID for this browser tab — used by backend to track sessions per view
   const [viewId] = useState<string>(makeViewId)
@@ -155,6 +158,13 @@ export function LiveViewPage() {
   // Ref to loadStream so flushHlsExpiry (declared before loadStream) can call it
   // without a forward-reference compile error.
   const loadStreamRef = useRef<((camera: Camera) => Promise<void>) | null>(null)
+  // When a grid camera's sub stream fails (MEDIAMTX_NOT_READY / RTSP not found), we
+  // auto-fallback to main_h264 transcode. This ref tracks per-camera overrides so the
+  // heartbeat and applyHeartbeat don't revert the camera back to a broken sub stream.
+  const gridStreamOverride = useRef<Record<string, 'main_h264'>>({})
+  // Tracks the HLS URL currently loaded by each camera's VideoPlayer.
+  // applyHeartbeat uses this to skip playerKey bumps when the URL hasn't changed.
+  const currentStreamUrls = useRef<Record<string, string>>({})
 
   useEffect(() => {
     loadNVRs()
@@ -232,11 +242,15 @@ export function LiveViewPage() {
   // Updates streams state, bumps keys for newly started cameras, sets errors.
   // Called from both the periodic heartbeat and visibility-restore handler.
   const applyHeartbeat = useCallback((result: HeartbeatResponse) => {
-    // Merge stream URLs into state (started + already-running)
+    // Merge stream URLs into state (started + already-running).
+    // Skip cameras with a gridStreamOverride — the heartbeat returns sub-stream URLs
+    // but these cameras are intentionally running main_h264; overwriting would cause
+    // VideoPlayer to load the broken sub URL and restart the fallback loop.
     if (Object.keys(result.streams).length > 0) {
       setStreams(prev => {
         const next = { ...prev }
         for (const [cameraId, info] of Object.entries(result.streams)) {
+          if (gridStreamOverride.current[cameraId]) continue  // keep fallback URL intact
           next[cameraId] = {
             cameraId,
             streamPath: info.streamPath,
@@ -251,9 +265,17 @@ export function LiveViewPage() {
         return next
       })
     }
-    // Cameras that the backend newly started need fresh HLS.js instances
+    // Cameras that the backend newly started need fresh HLS.js instances.
+    // Skip cameras with a gridStreamOverride AND whose URL hasn't changed —
+    // bumping would remount VideoPlayer and break the working fallback session.
     if (result.startedIds.length > 0) {
-      bumpPlayerKeys(result.startedIds)
+      const toReallyBump = result.startedIds.filter(id => {
+        if (!gridStreamOverride.current[id]) return true
+        // Override active: only bump if the URL actually changed
+        const incoming = result.streams[id]?.hls
+        return incoming && incoming !== currentStreamUrls.current[id]
+      })
+      if (toReallyBump.length > 0) bumpPlayerKeys(toReallyBump)
       // Clear any previous errors for restarted cameras
       setStreamErrors(prev => {
         const n = { ...prev }
@@ -434,6 +456,9 @@ export function LiveViewPage() {
     setStreams({})
     setStreamErrors({})
     setLoadingStreams({})
+    gridStreamOverride.current = {}
+    currentStreamUrls.current  = {}
+    setGridFallbackIds(new Set())
   }, [stopSessions, clearStaggerTimers])
 
   // ─── Cleanup on unmount ─────────────────────────────────────
@@ -472,8 +497,11 @@ export function LiveViewPage() {
     setLoadingStreams(prev => ({ ...prev, [camera.id]: true }))
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, {})
+      const overrideType = gridStreamOverride.current[camera.id]
+      const body = overrideType ? { streamType: overrideType } : {}
+      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, body)
       activeSessions.current.add(camera.id)
+      if (info.hls) currentStreamUrls.current[camera.id] = info.hls
       setStreams(prev => ({ ...prev, [camera.id]: info }))
       setStreamErrors(prev => {
         const next = { ...prev }
@@ -613,6 +641,15 @@ export function LiveViewPage() {
         setStreams(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
         setStreamErrors(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
         setLoadingStreams(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
+        leaving.forEach(id => {
+          delete gridStreamOverride.current[id]
+          delete currentStreamUrls.current[id]
+        })
+        setGridFallbackIds(prev => {
+          const n = new Set(prev)
+          leaving.forEach(id => n.delete(id))
+          return n
+        })
       }
       startVisibleStreams(arriving)
       isTransitioning.current = false
@@ -709,16 +746,19 @@ export function LiveViewPage() {
     // For all other fatal errors, stop the backend stream using the correct type.
     // Focus camera non-transcode: use focusStreamType. Grid camera: always sub.
     // Pass reason=hls_fatal_error so backend does NOT kill FFmpeg (transient error).
+    const isGridCamera = cameraId !== focusCameraRef.current
+    const currentStreamType = isGridCamera
+      ? (gridStreamOverride.current[cameraId] ?? 'sub')
+      : (cameraId === focusCamera ? focusStreamType : 'sub')
     if (activeSessions.current.has(cameraId)) {
-      const st = cameraId === focusCamera ? focusStreamType : 'sub'
-      console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${st} reason=hls_fatal_error code=${err.code}`)
-      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: st, reason: 'hls_fatal_error' }).catch(() => {})
+      console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${currentStreamType} reason=hls_fatal_error code=${err.code}`)
+      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: currentStreamType, reason: 'hls_fatal_error' }).catch(() => {})
       activeSessions.current.delete(cameraId)
     }
     // HLS manifest 404 on a grid (sub) camera = RTSP source returned 404 from NVR.
     // Reclassify to RTSP_CHANNEL_NOT_FOUND so the tile shows a meaningful message.
     let displayErr = err
-    if (err.code === 'HLS_MANIFEST_NOT_FOUND' && !isFocusStream) {
+    if (err.code === 'HLS_MANIFEST_NOT_FOUND' && isGridCamera) {
       displayErr = {
         code: 'RTSP_CHANNEL_NOT_FOUND',
         message: 'Canal no disponible en NVR (substream no encontrado)',
@@ -726,8 +766,35 @@ export function LiveViewPage() {
       }
       console.info(`[live-ui] rtsp_404_reclassified cameraId=${cameraId}`)
     }
+
+    // Auto-fallback: if a grid camera's sub stream fails with a transient or path-not-found
+    // error AND it has no active override, silently retry with main_h264 transcode.
+    // This covers the common case where the sub stream isn't ready in MediaMTX but the
+    // main (transcoded) stream works fine — the user sees a seamless fallback rather than
+    // an error tile.
+    const GRID_FALLBACK_CODES: CameraPlaybackError['code'][] = [
+      'MEDIAMTX_NOT_READY', 'RTSP_CHANNEL_NOT_FOUND',
+    ]
+    if (
+      isGridCamera &&
+      !gridStreamOverride.current[cameraId] &&
+      (GRID_FALLBACK_CODES.includes(displayErr.code) || GRID_FALLBACK_CODES.includes(err.code))
+    ) {
+      console.info(`[live-ui] grid_fallback_to_main_h264 cameraId=${cameraId} originalCode=${err.code}`)
+      gridStreamOverride.current[cameraId] = 'main_h264'
+      delete currentStreamUrls.current[cameraId]
+      pendingStarts.current.delete(cameraId)
+      setGridFallbackIds(prev => new Set([...prev, cameraId]))
+      setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+      setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+      bumpPlayerKeys([cameraId])
+      const cam = filteredCamerasRef.current.find(c => c.id === cameraId)
+      if (cam) setTimeout(() => loadStreamRef.current?.(cam), 300)
+      return
+    }
+
     setStreamErrors(prev => ({ ...prev, [cameraId]: displayErr }))
-  }, [flushHlsExpiry, focusCamera, focusStreamType])
+  }, [flushHlsExpiry, focusCamera, focusStreamType, bumpPlayerKeys])
 
   // ─── Enter focus/fullscreen — start main stream ─────────────
   const handleEnterFocus = useCallback(async (camera: Camera) => {
@@ -1032,9 +1099,13 @@ export function LiveViewPage() {
         ) : (
           <div className={clsx('grid gap-1.5 h-full', currentGrid.cols)}>
             {filteredCameras.map(camera => {
-              const stream    = streams[camera.id]
-              const health    = camera.streamHealthStatus
-              const isHighlit = highlightCamera === camera.id
+              const stream       = streams[camera.id]
+              const health       = camera.streamHealthStatus
+              const isHighlit    = highlightCamera === camera.id
+              const isFallback   = gridFallbackIds.has(camera.id)
+              const gridType     = isFallback ? 'main_h264' : 'sub'
+              const gridCodec    = isFallback ? camera.mainCodec : camera.subCodec
+              const gridRes      = isFallback ? undefined : camera.subResolution
               return (
                 <div
                   key={camera.id}
@@ -1056,6 +1127,13 @@ export function LiveViewPage() {
                       </div>
                     )
                   })()}
+                  {/* Trans H.264 fallback badge */}
+                  {isFallback && (
+                    <div className="absolute top-1.5 right-1.5 z-10 flex items-center gap-1 rounded px-1.5 py-0.5 bg-brand-700/80">
+                      <Film size={9} className="text-brand-200" />
+                      <span className="text-[9px] font-medium text-brand-100">Trans H.264</span>
+                    </div>
+                  )}
                   <VideoPlayer
                     key={`${camera.id}-${playerKeys[camera.id] ?? 0}`}
                     hlsUrl={stream?.hls || ''}
@@ -1073,9 +1151,9 @@ export function LiveViewPage() {
                         ? undefined
                         : streamErrors[camera.id]
                     }
-                    streamType="sub"
-                    streamCodec={camera.subCodec}
-                    streamResolution={camera.subResolution}
+                    streamType={gridType}
+                    streamCodec={gridCodec}
+                    streamResolution={gridRes}
                   />
                 </div>
               )
