@@ -56,3 +56,4 @@ backup_*.dump
 /package.json
 /package-lock.json
 /yarn.lock
+.claude/
