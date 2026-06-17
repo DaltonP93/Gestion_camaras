@@ -36,13 +36,19 @@ interface RecordingCapabilities {
 }
 
 interface PlaybackStatusResponse {
-  status:     'starting' | 'ready' | 'error'
-  url:        string
-  hlsReady:   boolean
-  transcoded: boolean
-  errorCode?: string
-  error?:     string
-  stderrTail?: string
+  status:               'starting' | 'ready' | 'error'
+  url?:                 string
+  mimeType?:            string
+  hlsReady?:            boolean
+  transcoded?:          boolean
+  errorCode?:           string
+  error?:               string
+  // VOD generation progress
+  outTimeSec?:          number
+  frame?:               number
+  fps?:                 number
+  speed?:               string
+  expectedDurationSec?: number
 }
 
 function toLocalDatetimeString(date: Date): string {
@@ -92,6 +98,8 @@ export function RecordingsPage() {
   const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
   const [nvrCaps, setNvrCaps] = useState<Map<string, RecordingCapabilities>>(new Map())
   const [playbackTranscoding, setPlaybackTranscoding] = useState(false)
+  const [playbackMimeType, setPlaybackMimeType] = useState<string | null>(null)
+  const [vodProgress, setVodProgress] = useState<{ outTimeSec: number; expectedDurationSec: number } | null>(null)
 
   useEffect(() => {
     loadNVRs()
@@ -240,7 +248,7 @@ export function RecordingsPage() {
     }
   }
 
-  // Stop any active HLS instance and release the MediaMTX recording path
+  // Stop any active HLS instance and release the recording session
   const stopPlayback = () => {
     playbackCleaningRef.current = true
     toast.dismiss()
@@ -254,6 +262,8 @@ export function RecordingsPage() {
     }
     setPlaybackUrl(null)
     setPlaybackStatus('idle')
+    setPlaybackMimeType(null)
+    setVodProgress(null)
   }
 
   // Sync ref whenever state changes
@@ -262,23 +272,19 @@ export function RecordingsPage() {
   // Clean up HLS + session on unmount
   useEffect(() => stopPlayback, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Attach HLS.js whenever playbackUrl changes
+  // Attach video source whenever playbackUrl or mimeType changes
   useEffect(() => {
     const video = videoRef.current
     if (!video || !playbackUrl) return
-    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
 
-    playbackEndedRef.current  = false
+    playbackEndedRef.current   = false
     playbackCleaningRef.current = false
 
-    // Capture key at attachment time — stale checks compare against this
     const attachedKey = playbackKeyRef.current
 
     const handleVideoEnded = () => {
       playbackEndedRef.current = true
-      // Destroy HLS silently — segments will 401 after MediaMTX path closes
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
-      // Release server session without showing any toast
       const sid = playbackSessionIdRef.current
       if (sid) {
         apiDelete(`/recordings/playback/${sid}`).catch(() => {})
@@ -290,6 +296,16 @@ export function RecordingsPage() {
 
     video.addEventListener('ended', handleVideoEnded)
 
+    // Native HTML5 for MP4 VOD — no HLS.js needed
+    if (playbackMimeType === 'video/mp4') {
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+      video.src = playbackUrl
+      video.play().catch(() => {})
+      return () => { video.removeEventListener('ended', handleVideoEnded) }
+    }
+
+    // HLS.js path (legacy / fallback)
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: false,
@@ -301,9 +317,9 @@ export function RecordingsPage() {
       hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (!data.fatal) return
-        if (playbackEndedRef.current) return   // post-end 401/404 are expected
-        if (playbackCleaningRef.current) return // stopPlayback in progress
-        if (attachedKey !== playbackKeyRef.current) return  // stale session
+        if (playbackEndedRef.current) return
+        if (playbackCleaningRef.current) return
+        if (attachedKey !== playbackKeyRef.current) return
         const status = (data.response as any)?.code ?? 0
         if (status === 401) {
           toast.error('Sesión expirada — vuelve a seleccionar la grabación', { duration: 6000 })
@@ -312,13 +328,12 @@ export function RecordingsPage() {
         }
       })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari native HLS
       video.src = playbackUrl
       video.play().catch(() => {})
     }
 
     return () => { video.removeEventListener('ended', handleVideoEnded) }
-  }, [playbackUrl])
+  }, [playbackUrl, playbackMimeType])
 
   const handlePlay = async (rec: RecordingWithCamera) => {
     stopPlayback()
@@ -330,6 +345,8 @@ export function RecordingsPage() {
     playbackKeyRef.current    = myKey
     playbackEndedRef.current  = false
     playbackCleaningRef.current = false
+    setPlaybackMimeType(null)
+    setVodProgress(null)
     setPlaybackLoading(true)
     setPlaybackStatus('starting')
 
@@ -340,10 +357,9 @@ export function RecordingsPage() {
       const result = await apiPost<{
         status: string
         sessionId: string
-        url: string
         pollUrl: string
-        transcoded: boolean
         expiresAt: string
+        expectedDurationSec: number
       }>('/recordings/playback', {
         cameraId:    rec.cameraId,
         startTime:   rec.startTime,
@@ -357,8 +373,6 @@ export function RecordingsPage() {
       sessionId = result.sessionId
       setPlaybackSessionId(sessionId)
       playbackSessionIdRef.current = sessionId
-
-      if (result.transcoded) setPlaybackStatus('transcoding')
 
       // Poll /status until ready or error (max 65s, 1s interval)
       const pollStart = Date.now()
@@ -388,28 +402,34 @@ export function RecordingsPage() {
         if (playbackKeyRef.current !== myKey) return
 
         if (statusRes.status === 'ready') {
-          setPlaybackUrl(statusRes.url)
+          setPlaybackMimeType(statusRes.mimeType ?? null)
+          setPlaybackUrl(statusRes.url ?? null)
           setPlaybackStatus('ready')
           setPlaybackLoading(false)
+          setVodProgress(null)
           return
         }
 
         if (statusRes.status === 'error') {
           const code = statusRes.errorCode ?? ''
           const msg  = statusRes.error ?? 'Error desconocido'
-          if (code === 'HLS_TIMEOUT') {
-            toast.error(`MediaMTX no conectó al NVR (timeout)\n${msg}`, { duration: 8000 })
-          } else if (code === 'MEDIAMTX_ERROR') {
-            toast.error(`Error en MediaMTX: ${msg}`, { duration: 6000 })
+          if (code === 'RECORDING_STREAM_STALLED') {
+            toast.error(msg, { duration: 8000 })
+          } else if (code === 'HLS_TIMEOUT' || code === 'MEDIAMTX_ERROR') {
+            toast.error(`Error de conexión al NVR: ${msg}`, { duration: 8000 })
           } else {
             toast.error(msg || 'No se pudo cargar la grabación', { duration: 6000 })
           }
           setPlaybackLoading(false)
           setPlaybackStatus('idle')
+          setVodProgress(null)
           return
         }
 
-        // Still 'starting' — update transcoding status from response
+        // Still 'starting' — update VOD generation progress
+        if (statusRes.outTimeSec !== undefined && statusRes.expectedDurationSec) {
+          setVodProgress({ outTimeSec: statusRes.outTimeSec, expectedDurationSec: statusRes.expectedDurationSec })
+        }
         if (statusRes.transcoded) setPlaybackStatus('transcoding')
       }
 
@@ -457,9 +477,14 @@ export function RecordingsPage() {
     try { ;(el as any).showPicker?.() } catch { el.focus() }
   }
 
-  const loadingLabel = playbackStatus === 'transcoding'
-    ? 'Transcodificando H.265 → H.264…'
-    : 'Preparando grabación…'
+  const vodPct = vodProgress && vodProgress.expectedDurationSec > 0
+    ? Math.min(99, Math.round(vodProgress.outTimeSec / vodProgress.expectedDurationSec * 100))
+    : null
+  const loadingLabel = vodPct !== null
+    ? `Generando video… ${vodPct}%`
+    : playbackStatus === 'transcoding'
+      ? 'Transcodificando H.265 → H.264…'
+      : 'Preparando grabación…'
 
   return (
     <div className="p-5 space-y-4 animate-fade-in">
@@ -717,8 +742,9 @@ export function RecordingsPage() {
                         </span>
                       )}
                     </div>
-                    <div className="text-xs text-surface-100">
+                    <div className="text-xs text-surface-100 flex items-center gap-1.5">
                       {format(new Date(rec.startTime), 'dd/MM/yyyy HH:mm:ss')}
+                      <span className="text-[9px] text-surface-600 bg-surface-700/60 px-1 py-0.5 rounded">hora local</span>
                     </div>
                     <div className="text-xs text-surface-400 flex items-center gap-2 mt-0.5">
                       <span className="flex items-center gap-1">
@@ -743,7 +769,7 @@ export function RecordingsPage() {
             </h3>
           </div>
           <div className="aspect-video bg-surface-900 flex items-center justify-center relative">
-            {/* HLS video player — always rendered so ref is stable */}
+            {/* Video player — always rendered so ref is stable */}
             <video
               ref={videoRef}
               controls
@@ -757,7 +783,15 @@ export function RecordingsPage() {
                   <>
                     <Loader2 size={24} className="text-brand-400 mx-auto mb-2 animate-spin" />
                     <p className="text-sm text-surface-300">{loadingLabel}</p>
-                    {playbackStatus === 'transcoding' && (
+                    {vodPct !== null && (
+                      <div className="w-48 mt-2 bg-surface-700 rounded-full h-1.5">
+                        <div
+                          className="bg-brand-500 h-1.5 rounded-full transition-all duration-500"
+                          style={{ width: `${vodPct}%` }}
+                        />
+                      </div>
+                    )}
+                    {playbackStatus === 'transcoding' && vodPct === null && (
                       <p className="text-xs text-surface-500 mt-1">Puede tardar unos segundos</p>
                     )}
                   </>
