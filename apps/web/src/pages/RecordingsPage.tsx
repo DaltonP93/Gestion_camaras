@@ -472,14 +472,20 @@ export function RecordingsPage() {
 
         // Client-side stall guard: no progress for POLL_STALL_MS after first frame seen
         if (lastSeenOutTimeSec >= 0 && Date.now() - lastProgressTick > POLL_STALL_MS) {
-          toast.error(
-            `Sin progreso de video durante ${POLL_STALL_MS / 1000}s — el NVR puede haber cortado el stream`,
-            { duration: 8000 },
-          )
-          setPlaybackLoading(false)
-          setPlaybackStatus('idle')
-          setVodProgress(null)
-          return
+          const pct = statusRes.progressPercent ?? 0
+          if (pct >= 95) {
+            // Backend is finalizando the MP4 (near-complete SIGINT path) — keep polling
+            console.info(`[recordings-ui] vod_client_stall_ignored_near_complete pct=${pct}`)
+          } else {
+            toast.error(
+              `Sin progreso de video durante ${POLL_STALL_MS / 1000}s — el NVR puede haber cortado el stream`,
+              { duration: 8000 },
+            )
+            setPlaybackLoading(false)
+            setPlaybackStatus('idle')
+            setVodProgress(null)
+            return
+          }
         }
       }
 
@@ -526,11 +532,14 @@ export function RecordingsPage() {
   const vodPct = vodProgress && vodProgress.expectedDurationSec > 0
     ? Math.min(99, Math.round(vodProgress.outTimeSec / vodProgress.expectedDurationSec * 100))
     : null
-  const loadingLabel = vodPct !== null
-    ? `Generando video… ${vodPct}%`
-    : playbackStatus === 'transcoding'
-      ? 'Transcodificando H.265 → H.264…'
-      : 'Preparando grabación…'
+  const isNearComplete = (vodPct ?? 0) >= 95
+  const loadingLabel = isNearComplete
+    ? `Finalizando video… ${vodPct}%`
+    : vodPct !== null
+      ? `Generando video… ${vodPct}%`
+      : playbackStatus === 'transcoding'
+        ? 'Transcodificando H.265 → H.264…'
+        : 'Preparando grabación…'
 
   return (
     <div className="p-5 space-y-4 animate-fade-in">

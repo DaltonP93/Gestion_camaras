@@ -23,6 +23,10 @@ const VOD_TEMP_DIR               = process.env.VOD_TEMP_DIR || '/tmp/visioncore-
 // Kill FFmpeg if out_time hasn't advanced for this long.
 // 30s gives headroom for NVR segment gaps without false-positives.
 const STALL_TIMEOUT_MS           = 30_000
+// When FFmpeg is near the end (≥98% or within 5s of expected duration), send
+// SIGINT after this idle period instead of treating it as a stall — lets FFmpeg
+// write the MP4 moov atom cleanly before closing.
+const NEAR_COMPLETE_IDLE_MS      = 20_000
 
 // ─── In-memory recording playback sessions ────────────────────────
 interface RecordingSession {
@@ -166,6 +170,7 @@ async function spawnVodFfmpeg(opts: {
     let stallTimer: ReturnType<typeof setInterval> | null = null
     let progressSeen = false
     let resolved = false
+    let nearCompleteFinalize = false
 
     const finish = (result: VodResult) => {
       if (resolved) return
@@ -213,10 +218,23 @@ async function spawnVodFfmpeg(opts: {
               if (stallTimer) clearInterval(stallTimer)
               return
             }
-            const sinceMs = Date.now() - (sess2.progress?.lastProgressAt ?? 0)
-            if (sinceMs > STALL_TIMEOUT_MS) {
-              const stallSec = Math.round(sess2.progress?.outTimeSec ?? 0)
-              log(`[recordings] ffmpeg_stall_detected sessionId=${sessionId} sinceMs=${sinceMs} outTimeSec=${stallSec}`)
+            const sinceMs    = Date.now() - (sess2.progress?.lastProgressAt ?? 0)
+            const outTimeSec2 = sess2.progress?.outTimeSec ?? 0
+            const pct2       = sess2.expectedDurationSec && sess2.expectedDurationSec > 0
+              ? Math.min(99, Math.round(outTimeSec2 / sess2.expectedDurationSec * 100))
+              : 0
+            const nearComplete = (sess2.expectedDurationSec != null && sess2.expectedDurationSec > 0 &&
+              outTimeSec2 >= sess2.expectedDurationSec - 5) || pct2 >= 98
+
+            if (nearComplete && sinceMs > NEAR_COMPLETE_IDLE_MS) {
+              // FFmpeg captured everything but NVR won't send EOF — send SIGINT for clean MP4 close
+              log(`[recordings] vod_near_complete_finalize sessionId=${sessionId} outTimeSec=${outTimeSec2} expectedDurationSec=${sess2.expectedDurationSec} pct=${pct2}% idleMs=${sinceMs}`)
+              nearCompleteFinalize = true
+              clearInterval(stallTimer!); stallTimer = null
+              try { proc.kill('SIGINT') } catch {}
+            } else if (!nearComplete && sinceMs > STALL_TIMEOUT_MS) {
+              const stallSec = Math.round(outTimeSec2)
+              log(`[recordings] ffmpeg_stall_detected sessionId=${sessionId} sinceMs=${sinceMs} outTimeSec=${stallSec} pct=${pct2}%`)
               try { proc.kill('SIGTERM') } catch {}
               sess2.status    = 'error'
               sess2.errorCode = 'RECORDING_STREAM_STALLED'
@@ -238,6 +256,11 @@ async function spawnVodFfmpeg(opts: {
       // Session deleted by user (DELETE while generating)
       if (!sess) {
         finish('cancelled')
+        return
+      }
+      // SIGINT sent for near-complete finalization — treat as success regardless of exit code
+      if (nearCompleteFinalize) {
+        finish('success')
         return
       }
       finish(code === 0 ? 'success' : 'failure')
