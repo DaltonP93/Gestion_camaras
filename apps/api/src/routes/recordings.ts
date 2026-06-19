@@ -16,33 +16,173 @@ const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET 
 const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
 
 // ─── VOD configuration ────────────────────────────────────────────
-const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000  // 30 minutes
+const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000
 const RECORDINGS_FORCE_TRANSCODE = process.env.RECORDINGS_FORCE_TRANSCODE === 'true'
 const TRANSCODE_ENCODER          = process.env.TRANSCODE_ENCODER || 'libx264'
 const VOD_TEMP_DIR               = process.env.VOD_TEMP_DIR || '/tmp/visioncore-recordings'
 // Kill FFmpeg if out_time hasn't advanced for this long.
-// 30s gives headroom for NVR segment gaps without false-positives.
 const STALL_TIMEOUT_MS           = 30_000
-// When FFmpeg is near the end (≥98% or within 5s of expected duration), send
-// SIGINT after this idle period instead of treating it as a stall — lets FFmpeg
-// write the MP4 moov atom cleanly before closing.
+// Near-complete: send SIGINT instead of SIGTERM so FFmpeg writes the moov atom cleanly.
 const NEAR_COMPLETE_IDLE_MS      = 20_000
+
+// Per-recording transcode quality — env-configurable, no hardcoded high bitrate.
+// Defaults produce ~8-15 MB for a 53s clip vs 48 MB with unthrottled libx264.
+const TRANSCODE_PRESET    = process.env.RECORDINGS_TRANSCODE_PRESET    || 'ultrafast'
+const TRANSCODE_CRF       = process.env.RECORDINGS_TRANSCODE_CRF       || '28'
+const TRANSCODE_MAXRATE   = process.env.RECORDINGS_TRANSCODE_MAXRATE   || '2000k'
+const TRANSCODE_BUFSIZE   = process.env.RECORDINGS_TRANSCODE_BUFSIZE   || '4000k'
+const TRANSCODE_MAX_WIDTH = process.env.RECORDINGS_TRANSCODE_MAX_WIDTH || '1280'
+const TRANSCODE_FPS       = process.env.RECORDINGS_TRANSCODE_FPS       || ''  // '' = keep source FPS
+
+// Persistent MP4 cache — set RECORDINGS_CACHE_DIR to enable.
+// Without it each session writes to VOD_TEMP_DIR and is deleted on session expiry.
+const CACHE_DIR       = process.env.RECORDINGS_CACHE_DIR        || ''
+const CACHE_MAX_GB    = parseFloat(process.env.RECORDINGS_CACHE_MAX_GB    || '20')
+const CACHE_TTL_HOURS = parseFloat(process.env.RECORDINGS_CACHE_TTL_HOURS || '24')
+
+// ─── Strategy ─────────────────────────────────────────────────────
+// copy_h264     – H.264 source → direct remux, < 5 s
+// hevc_copy     – HEVC source + browser supports HEVC → direct remux, < 5 s
+// hevc_transcode – HEVC source + no browser support → libx264 transcode, ~60 s on CPU
+type VodStrategy = 'copy_h264' | 'hevc_copy' | 'hevc_transcode'
+
+function isHevcCodec(codec: string): boolean {
+  return /hevc|h265|h\.265|hvc1|hev1/i.test(codec)
+}
+
+function determineStrategy(opts: {
+  detectedCodec:  string
+  canPlayHevcMp4: boolean
+  forceTranscode: boolean
+}): VodStrategy {
+  const { detectedCodec, canPlayHevcMp4, forceTranscode } = opts
+  if (forceTranscode || RECORDINGS_FORCE_TRANSCODE) return 'hevc_transcode'
+  if (!isHevcCodec(detectedCodec)) return 'copy_h264'
+  return canPlayHevcMp4 ? 'hevc_copy' : 'hevc_transcode'
+}
+
+function buildCodecArgs(strategy: VodStrategy): string[] {
+  if (strategy === 'copy_h264' || strategy === 'hevc_copy') {
+    return ['-an', '-c:v', 'copy']
+  }
+  // hevc_transcode — CRF + maxrate keeps file small; scale keeps browser-compat resolution
+  const vfParts: string[] = []
+  if (TRANSCODE_MAX_WIDTH && TRANSCODE_MAX_WIDTH !== 'source') {
+    vfParts.push(`scale='min(${TRANSCODE_MAX_WIDTH}\\,iw)':-2:flags=lanczos`)
+  }
+  if (TRANSCODE_FPS) {
+    vfParts.push(`fps=${TRANSCODE_FPS}`)
+  }
+  const args: string[] = [
+    '-an',
+    '-c:v',     TRANSCODE_ENCODER,
+    '-preset',  TRANSCODE_PRESET,
+    '-crf',     TRANSCODE_CRF,
+    '-maxrate', TRANSCODE_MAXRATE,
+    '-bufsize',  TRANSCODE_BUFSIZE,
+    '-pix_fmt', 'yuv420p',
+    '-profile:v', 'main',
+    '-level',   '4.1',
+  ]
+  if (vfParts.length > 0) {
+    args.push('-vf', vfParts.join(','))
+  }
+  return args
+}
+
+// ─── Cache helpers ────────────────────────────────────────────────
+
+function computeCacheKey(opts: {
+  cameraId:       string
+  startTime:      string
+  endTime:        string
+  playbackURI:    string
+  canPlayHevcMp4: boolean
+  forceTranscode: boolean
+}): string {
+  const raw = [
+    opts.cameraId, opts.startTime, opts.endTime, opts.playbackURI,
+    String(opts.canPlayHevcMp4), String(opts.forceTranscode),
+    TRANSCODE_CRF, TRANSCODE_MAXRATE, TRANSCODE_MAX_WIDTH, TRANSCODE_FPS,
+  ].join('|')
+  return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 40)
+}
+
+function runCacheCleanup(log: (msg: string) => void): void {
+  if (!CACHE_DIR) return
+  try {
+    const files = fs.readdirSync(CACHE_DIR).filter(f => f.endsWith('.mp4'))
+    const now   = Date.now()
+    const ttlMs = CACHE_TTL_HOURS * 3600 * 1000
+    const maxBytes = CACHE_MAX_GB * 1024 * 1024 * 1024
+
+    const stats = files
+      .map(f => {
+        const fp = path.join(CACHE_DIR, f)
+        try { const s = fs.statSync(fp); return { path: fp, size: s.size, mtime: s.mtimeMs } }
+        catch { return null }
+      })
+      .filter(Boolean) as Array<{ path: string; size: number; mtime: number }>
+
+    let totalBytes    = stats.reduce((s, f) => s + f.size, 0)
+    let deletedFiles  = 0
+    let freedBytes    = 0
+
+    // TTL sweep
+    for (const f of stats) {
+      if (now - f.mtime > ttlMs) {
+        try { fs.unlinkSync(f.path); deletedFiles++; freedBytes += f.size; totalBytes -= f.size } catch {}
+      }
+    }
+
+    // Size cap (LRU by mtime)
+    if (totalBytes > maxBytes) {
+      const remaining = stats
+        .filter(f => { try { fs.statSync(f.path); return true } catch { return false } })
+        .sort((a, b) => a.mtime - b.mtime)
+      for (const f of remaining) {
+        if (totalBytes <= maxBytes) break
+        try { fs.unlinkSync(f.path); deletedFiles++; freedBytes += f.size; totalBytes -= f.size } catch {}
+      }
+    }
+
+    if (deletedFiles > 0) {
+      log(`[recordings] vod_cache_cleanup deletedFiles=${deletedFiles} freedBytes=${freedBytes} cacheDir=${CACHE_DIR}`)
+    }
+  } catch (err: any) {
+    log(`[recordings] vod_cache_cleanup_error err=${err?.message}`)
+  }
+}
+
+// ─── Directory setup ──────────────────────────────────────────────
+
+if (!fs.existsSync(VOD_TEMP_DIR)) {
+  try { fs.mkdirSync(VOD_TEMP_DIR, { recursive: true }) } catch {}
+}
+if (CACHE_DIR && !fs.existsSync(CACHE_DIR)) {
+  try { fs.mkdirSync(CACHE_DIR, { recursive: true }) } catch {}
+}
+if (CACHE_DIR) {
+  // Cleanup on startup then hourly
+  runCacheCleanup(console.log)
+  setInterval(() => runCacheCleanup(console.log), 60 * 60 * 1000)
+}
 
 // ─── In-memory recording playback sessions ────────────────────────
 interface RecordingSession {
   expiresAt:   number
   userId:      string
-  startedAt:   number          // Date.now() when session was created
+  startedAt:   number
   status:      'starting' | 'ready' | 'error'
   errorCode?:  string
   errorMsg?:   string
-  jobKey?:     string          // cameraId|startTime|endTime|playbackURI — for dedup cleanup
-  // VOD fields
-  fileToken?:  string         // one-time token for unauthenticated file.mp4 download
-  vodFile?:    string         // /tmp path to generated MP4
-  vodUrl?:     string         // served URL: /api/recordings/playback/:sessionId/file.mp4?token=<fileToken>
-  mimeType?:   string         // 'video/mp4'
-  vodProcess?: ChildProcess   // FFmpeg process — killed on DELETE
+  jobKey?:     string
+  fileToken?:  string     // token for unauthenticated file.mp4 download
+  vodFile?:    string     // absolute path to generated MP4
+  vodFileCached?: boolean // true if vodFile is in CACHE_DIR (do not delete on session cleanup)
+  vodUrl?:     string     // /api/recordings/playback/:sessionId/file.mp4?token=<fileToken>
+  mimeType?:   string
+  vodProcess?: ChildProcess
   expectedDurationSec?: number
   progress?: {
     outTimeSec:     number
@@ -54,15 +194,9 @@ interface RecordingSession {
 }
 
 const recordingSessions = new Map<string, RecordingSession>()
-// jobKey → sessionId: prevents spawning duplicate FFmpeg for the same recording
 const recordingJobKeys  = new Map<string, string>()
 
-// Ensure temp directory exists
-if (!fs.existsSync(VOD_TEMP_DIR)) {
-  try { fs.mkdirSync(VOD_TEMP_DIR, { recursive: true }) } catch {}
-}
-
-// Periodic cleanup of expired sessions and their temp files
+// Periodic cleanup of expired sessions — does NOT delete cached files
 setInterval(() => {
   const now = Date.now()
   for (const [sid, session] of recordingSessions.entries()) {
@@ -72,7 +206,8 @@ setInterval(() => {
       if (session.vodProcess) {
         try { session.vodProcess.kill('SIGTERM') } catch {}
       }
-      if (session.vodFile) {
+      // Only delete session-scoped temp files, not cache files
+      if (session.vodFile && !session.vodFileCached) {
         fs.unlink(session.vodFile, () => {})
       }
     }
@@ -135,14 +270,14 @@ async function spawnVodFfmpeg(opts: {
   rtspUrl:             string
   rtspMasked:          string
   codecArgs:           string[]
-  attempt:             'copy' | 'transcode'
+  attempt:             string   // strategy name for logging
   expectedDurationSec: number
   log:                 (msg: string) => void
 }): Promise<VodResult> {
   const { sessionId, vodFile, rtspUrl, rtspMasked, codecArgs, attempt, expectedDurationSec, log } = opts
 
   const rtspTimeoutOpt = getRtspTimeoutOption()
-  const rtspTimeoutUs  = 60_000_000  // 60s for recordings (NVR seek + locate)
+  const rtspTimeoutUs  = 60_000_000  // 60s for NVR seek + locate
 
   const args = [
     '-rtsp_transport', 'tcp',
@@ -160,7 +295,7 @@ async function spawnVodFfmpeg(opts: {
   ]
 
   const maskedArgs = args.map(a => a === rtspUrl ? rtspMasked : a)
-  log(`[recordings] vod_spawn sessionId=${sessionId} attempt=${attempt} cmd=ffmpeg ${maskedArgs.join(' ')}`)
+  log(`[recordings] ffmpeg_command_sanitized sessionId=${sessionId} attempt=${attempt} cmd=ffmpeg ${maskedArgs.join(' ')}`)
 
   return new Promise<VodResult>((resolve) => {
     const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -183,8 +318,7 @@ async function spawnVodFfmpeg(opts: {
     }
 
     proc.stderr?.on('data', (data: Buffer) => {
-      const text = data.toString()
-      // Parse FFmpeg -progress key=value output
+      const text  = data.toString()
       const lines = text.split('\n')
       let frame = 0, fps = 0, outTimeSec = 0, speed = '', hasProgressLine = false
 
@@ -193,11 +327,11 @@ async function spawnVodFfmpeg(opts: {
         if (eqIdx < 0) continue
         const k = line.slice(0, eqIdx).trim()
         const v = line.slice(eqIdx + 1).trim()
-        if (k === 'frame')        frame      = parseInt(v)  || 0
-        else if (k === 'fps')     fps        = parseFloat(v) || 0
+        if (k === 'frame')           frame      = parseInt(v) || 0
+        else if (k === 'fps')        fps        = parseFloat(v) || 0
         else if (k === 'out_time_ms') outTimeSec = (parseInt(v) || 0) / 1_000_000
-        else if (k === 'speed')   speed      = v
-        else if (k === 'progress') hasProgressLine = true
+        else if (k === 'speed')      speed      = v
+        else if (k === 'progress')   hasProgressLine = true
       }
 
       if (hasProgressLine && frame > 0) {
@@ -212,23 +346,18 @@ async function spawnVodFfmpeg(opts: {
 
         if (!progressSeen) {
           progressSeen = true
-          // Start stall watchdog once first real progress is seen
           stallTimer = setInterval(() => {
             const sess2 = recordingSessions.get(sessionId)
-            if (!sess2 || sess2.status !== 'starting') {
-              if (stallTimer) clearInterval(stallTimer)
-              return
-            }
-            const sinceMs    = Date.now() - (sess2.progress?.lastProgressAt ?? 0)
+            if (!sess2 || sess2.status !== 'starting') { if (stallTimer) clearInterval(stallTimer); return }
+            const sinceMs     = Date.now() - (sess2.progress?.lastProgressAt ?? 0)
             const outTimeSec2 = sess2.progress?.outTimeSec ?? 0
-            const pct2       = sess2.expectedDurationSec && sess2.expectedDurationSec > 0
+            const pct2        = sess2.expectedDurationSec && sess2.expectedDurationSec > 0
               ? Math.min(99, Math.round(outTimeSec2 / sess2.expectedDurationSec * 100))
               : 0
             const nearComplete = (sess2.expectedDurationSec != null && sess2.expectedDurationSec > 0 &&
               outTimeSec2 >= sess2.expectedDurationSec - 5) || pct2 >= 98
 
             if (nearComplete && sinceMs > NEAR_COMPLETE_IDLE_MS) {
-              // FFmpeg captured everything but NVR won't send EOF — send SIGINT for clean MP4 close
               log(`[recordings] vod_near_complete_finalize sessionId=${sessionId} outTimeSec=${outTimeSec2} expectedDurationSec=${sess2.expectedDurationSec} pct=${pct2}% idleMs=${sinceMs}`)
               nearCompleteFinalize = true
               clearInterval(stallTimer!); stallTimer = null
@@ -249,21 +378,9 @@ async function spawnVodFfmpeg(opts: {
 
     proc.on('exit', (code) => {
       const sess = recordingSessions.get(sessionId)
-      // Stall watchdog already resolved this — let it propagate
-      if (sess?.errorCode === 'RECORDING_STREAM_STALLED') {
-        finish('stall')
-        return
-      }
-      // Session deleted by user (DELETE while generating)
-      if (!sess) {
-        finish('cancelled')
-        return
-      }
-      // SIGINT sent for near-complete finalization — treat as success regardless of exit code
-      if (nearCompleteFinalize) {
-        finish('success')
-        return
-      }
+      if (sess?.errorCode === 'RECORDING_STREAM_STALLED') { finish('stall'); return }
+      if (!sess) { finish('cancelled'); return }
+      if (nearCompleteFinalize) { finish('success'); return }
       finish(code === 0 ? 'success' : 'failure')
     })
 
@@ -275,6 +392,7 @@ async function spawnVodFfmpeg(opts: {
 }
 
 // ─── Background VOD generation ────────────────────────────────────
+
 async function runVodBackground(opts: {
   sessionId:           string
   rtspUrl:             string
@@ -282,97 +400,44 @@ async function runVodBackground(opts: {
   trackId?:            number
   urlStrategy:         string
   expectedDurationSec: number
+  canPlayHevcMp4:      boolean
+  forceTranscode:      boolean
+  vodFile:             string   // caller decides cache vs temp path
   log:                 (msg: string) => void
 }): Promise<void> {
-  const { sessionId, rtspUrl, rtspMasked, expectedDurationSec, log } = opts
+  const { sessionId, rtspUrl, rtspMasked, expectedDurationSec, canPlayHevcMp4, forceTranscode, vodFile, log } = opts
 
   const session = recordingSessions.get(sessionId)
   if (!session) return
 
-  const vodFile = path.join(VOD_TEMP_DIR, `rec_${sessionId}.mp4`)
-
   // ── Step 1: Detect codec ─────────────────────────────────────────
-  let useTranscode = RECORDINGS_FORCE_TRANSCODE
   let detectedCodec = 'unknown'
-
-  if (!useTranscode) {
+  if (!RECORDINGS_FORCE_TRANSCODE && !forceTranscode) {
     try {
       const probe = await probeRtspStream(rtspUrl)
       detectedCodec = probe.codec || 'unknown'
       log(`[recordings] ffprobe_result sessionId=${sessionId} codec=${detectedCodec} ok=${probe.ok}`)
-      if (/hevc|h265|h\.265|hvc1|hev1/i.test(detectedCodec)) {
-        useTranscode = true
-      }
     } catch (err: any) {
-      log(`[recordings] ffprobe_error sessionId=${sessionId} err=${err?.message} — assuming H264, trying copy`)
+      log(`[recordings] ffprobe_error sessionId=${sessionId} err=${err?.message} — assuming h264, using copy`)
+      detectedCodec = 'h264'
     }
+  } else {
+    detectedCodec = 'forced_transcode'
   }
 
-  log(
-    `[recordings] vod_prepare sessionId=${sessionId} codec=${detectedCodec}` +
-    ` useTranscode=${useTranscode} expectedDurationSec=${expectedDurationSec}` +
-    ` source=${rtspMasked}`
-  )
+  // ── Step 2: Determine strategy ───────────────────────────────────
+  const strategy = determineStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
+  const encoder  = strategy === 'hevc_transcode' ? TRANSCODE_ENCODER : 'copy'
 
-  // ── Step 2a: H264 — try copy first ───────────────────────────────
-  if (!useTranscode) {
-    const result = await spawnVodFfmpeg({
-      sessionId,
-      vodFile,
-      rtspUrl,
-      rtspMasked,
-      codecArgs: ['-an', '-c:v', 'copy'],
-      attempt: 'copy',
-      expectedDurationSec,
-      log,
-    })
+  log(`[recordings] vod_strategy sessionId=${sessionId} strategy=${strategy} codec=${detectedCodec} canPlayHevcMp4=${canPlayHevcMp4} forceTranscode=${forceTranscode} expectedDurationSec=${expectedDurationSec}`)
+  log(`[recordings] encoder_selected sessionId=${sessionId} encoder=${encoder} reason=${strategy}`)
 
-    if (result === 'stall' || result === 'cancelled') return  // session already marked
+  const codecArgs = buildCodecArgs(strategy)
 
-    if (result === 'success') {
-      const finalSession = recordingSessions.get(sessionId)
-      if (!finalSession) { fs.unlink(vodFile, () => {}); return }
-      try {
-        const stat = fs.statSync(vodFile)
-        if (stat.size > 512) {  // valid file
-          const elapsedMs = Date.now() - (finalSession.startedAt ?? Date.now())
-          log(`[recordings] vod_ready sessionId=${sessionId} attempt=copy sizeBytes=${stat.size} elapsedMs=${elapsedMs} expectedDurationSec=${expectedDurationSec}`)
-          finalSession.vodFile  = vodFile
-          finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${finalSession.fileToken}`
-          finalSession.mimeType = 'video/mp4'
-          finalSession.status   = 'ready'
-          return
-        }
-        log(`[recordings] vod_copy_empty sessionId=${sessionId} size=${stat.size} — falling back to transcode`)
-      } catch {
-        log(`[recordings] vod_copy_stat_failed sessionId=${sessionId} — falling back to transcode`)
-      }
-    }
-
-    // Copy failed or produced empty file — delete partial and transcode
-    log(`[recordings] vod_copy_fallback sessionId=${sessionId} — retrying with ${TRANSCODE_ENCODER}`)
-    try { fs.unlinkSync(vodFile) } catch {}
-  }
-
-  // ── Step 2b: Transcode (HEVC → H264, or copy fallback) ───────────
-  const transcodeCodecArgs = [
-    '-an',
-    '-c:v', TRANSCODE_ENCODER,
-    '-preset', 'ultrafast',   // fastest possible — quality not critical for recordings review
-    '-pix_fmt', 'yuv420p',
-    '-profile:v', 'main',
-    '-level', '4.1',
-  ]
-
+  // ── Step 3: Run FFmpeg ───────────────────────────────────────────
   const result = await spawnVodFfmpeg({
-    sessionId,
-    vodFile,
-    rtspUrl,
-    rtspMasked,
-    codecArgs: transcodeCodecArgs,
-    attempt: 'transcode',
-    expectedDurationSec,
-    log,
+    sessionId, vodFile, rtspUrl, rtspMasked, codecArgs,
+    attempt: strategy, expectedDurationSec, log,
   })
 
   if (result === 'stall' || result === 'cancelled') return
@@ -382,22 +447,68 @@ async function runVodBackground(opts: {
 
   if (result === 'success') {
     try {
-      const stat      = fs.statSync(vodFile)
-      const elapsedMs = Date.now() - (finalSession.startedAt ?? Date.now())
-      log(`[recordings] vod_ready sessionId=${sessionId} attempt=transcode sizeBytes=${stat.size} elapsedMs=${elapsedMs} expectedDurationSec=${expectedDurationSec}`)
-      finalSession.vodFile  = vodFile
-      finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${finalSession.fileToken}`
-      finalSession.mimeType = 'video/mp4'
-      finalSession.status   = 'ready'
+      const stat = fs.statSync(vodFile)
+      if (stat.size > 512) {
+        const elapsedMs = Date.now() - (finalSession.startedAt ?? Date.now())
+        log(
+          `[recordings] vod_ready sessionId=${sessionId} attempt=${strategy} sizeBytes=${stat.size}` +
+          ` elapsedMs=${elapsedMs} expectedDurationSec=${expectedDurationSec}` +
+          ` codec=${detectedCodec} strategy=${strategy} encoder=${encoder}` +
+          ` crf=${strategy === 'hevc_transcode' ? TRANSCODE_CRF : 'n/a'}` +
+          ` maxrate=${strategy === 'hevc_transcode' ? TRANSCODE_MAXRATE : 'n/a'}`
+        )
+        finalSession.vodFile  = vodFile
+        finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${finalSession.fileToken}`
+        finalSession.mimeType = 'video/mp4'
+        finalSession.status   = 'ready'
+        return
+      }
+      // File too small — copy produced a degenerate file
+      log(`[recordings] vod_copy_empty sessionId=${sessionId} strategy=${strategy} size=${stat.size} — falling back to hevc_transcode`)
     } catch {
-      finalSession.status   = 'error'
-      finalSession.errorCode = 'VOD_FILE_MISSING'
-      finalSession.errorMsg  = 'El archivo generado no se pudo leer'
+      log(`[recordings] vod_stat_failed sessionId=${sessionId} strategy=${strategy} — falling back to hevc_transcode`)
+    }
+
+    // Automatic fallback to transcode when copy produced an unusable file
+    if (strategy !== 'hevc_transcode') {
+      log(`[recordings] vod_transcode_fallback sessionId=${sessionId} — retrying with ${TRANSCODE_ENCODER}`)
+      try { fs.unlinkSync(vodFile) } catch {}
+      const fallbackResult = await spawnVodFfmpeg({
+        sessionId, vodFile, rtspUrl, rtspMasked,
+        codecArgs: buildCodecArgs('hevc_transcode'),
+        attempt: 'hevc_transcode_fallback', expectedDurationSec, log,
+      })
+      if (fallbackResult === 'stall' || fallbackResult === 'cancelled') return
+      const sess2 = recordingSessions.get(sessionId)
+      if (!sess2) { fs.unlink(vodFile, () => {}); return }
+      if (fallbackResult === 'success') {
+        try {
+          const stat2     = fs.statSync(vodFile)
+          const elapsedMs = Date.now() - (sess2.startedAt ?? Date.now())
+          log(`[recordings] vod_ready sessionId=${sessionId} attempt=hevc_transcode_fallback sizeBytes=${stat2.size} elapsedMs=${elapsedMs} encoder=${TRANSCODE_ENCODER} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE}`)
+          sess2.vodFile  = vodFile
+          sess2.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${sess2.fileToken}`
+          sess2.mimeType = 'video/mp4'
+          sess2.status   = 'ready'
+        } catch {
+          sess2.status    = 'error'
+          sess2.errorCode = 'VOD_FILE_MISSING'
+          sess2.errorMsg  = 'El archivo generado no se pudo leer'
+        }
+      } else {
+        log(`[recordings] vod_error sessionId=${sessionId} attempt=hevc_transcode_fallback result=${fallbackResult}`)
+        sess2.status    = 'error'
+        sess2.errorCode = 'TRANSCODE_FAILED'
+        sess2.errorMsg  = 'No se pudo generar el video. Verifica la conexión al NVR.'
+      }
+    } else {
+      finalSession.status    = 'error'
+      finalSession.errorCode = 'TRANSCODE_FAILED'
+      finalSession.errorMsg  = 'No se pudo generar el video. Verifica la conexión al NVR.'
     }
   } else {
-    const stderrTail = ''  // could be wired to FFmpeg stderr if needed
-    log(`[recordings] vod_error sessionId=${sessionId} attempt=transcode result=${result} stderrTail=${stderrTail}`)
-    finalSession.status   = 'error'
+    log(`[recordings] vod_error sessionId=${sessionId} strategy=${strategy} result=${result} encoder=${encoder}`)
+    finalSession.status    = 'error'
     finalSession.errorCode = 'TRANSCODE_FAILED'
     finalSession.errorMsg  = 'No se pudo generar el video. Verifica la conexión al NVR.'
   }
@@ -431,10 +542,12 @@ const batchSearchSchema = z.object({
 })
 
 const playbackSchema = z.object({
-  cameraId:    z.string().min(1),
-  startTime:   z.string().datetime(),
-  endTime:     z.string().datetime(),
-  playbackURI: z.string().startsWith('/').optional(),
+  cameraId:       z.string().min(1),
+  startTime:      z.string().datetime(),
+  endTime:        z.string().datetime(),
+  playbackURI:    z.string().startsWith('/').optional(),
+  canPlayHevcMp4: z.boolean().optional(),
+  forceTranscode: z.boolean().optional(),
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
@@ -516,24 +629,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const cachedCap = getCachedCapability(nvr.id)
     if (cachedCap === 'unsupported') {
       return reply.send({
-        results: [],
-        unsupportedNvr: true,
-        nvrModel: nvr.model,
-        nvrName: nvr.name,
-        playbackWebUrl: (nvr as any).playbackWebUrl ?? null,
-        errors: [],
-        cameraCount: allowedIds.length,
+        results: [], unsupportedNvr: true, nvrModel: nvr.model, nvrName: nvr.name,
+        playbackWebUrl: (nvr as any).playbackWebUrl ?? null, errors: [], cameraCount: allowedIds.length,
       })
     }
     if (cachedCap === 'auth_error') {
       return reply.send({
-        results: [],
-        unsupportedNvr: false,
-        authError: true,
-        nvrModel: nvr.model,
-        nvrName: nvr.name,
-        errors: [{ code: 'NVR_AUTH_ERROR', message: 'Error de autenticación con el NVR' }],
-        cameraCount: allowedIds.length,
+        results: [], unsupportedNvr: false, authError: true, nvrModel: nvr.model, nvrName: nvr.name,
+        errors: [{ code: 'NVR_AUTH_ERROR', message: 'Error de autenticación con el NVR' }], cameraCount: allowedIds.length,
       })
     }
 
@@ -562,11 +665,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         if (err?.authError) {
           setCachedCapability(nvr.id, 'auth_error')
           return reply.send({
-            results,
-            unsupportedNvr: false,
-            authError: true,
-            nvrModel: nvr.model,
-            nvrName: nvr.name,
+            results, unsupportedNvr: false, authError: true, nvrModel: nvr.model, nvrName: nvr.name,
             errors: [{ code: 'NVR_AUTH_ERROR', message: 'Error de autenticación con el NVR', cameraId: camera.id }],
             cameraCount: allowedIds.length,
           })
@@ -583,13 +682,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }
 
     return reply.send({
-      results,
-      unsupportedNvr,
-      nvrModel: nvr.model,
-      nvrName:  nvr.name,
+      results, unsupportedNvr, nvrModel: nvr.model, nvrName: nvr.name,
       playbackWebUrl: unsupportedNvr ? ((nvr as any).playbackWebUrl ?? null) : undefined,
-      errors:   [],
-      cameraCount: allowedIds.length,
+      errors: [], cameraCount: allowedIds.length,
     })
   })
 
@@ -617,6 +712,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
     }
 
+    const canPlayHevcMp4 = body.canPlayHevcMp4 ?? false
+    const forceTranscode = body.forceTranscode ?? false
+
     let rtspUrl: string
     let rtspMasked: string
     let trackId: number | undefined
@@ -624,24 +722,17 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     if (body.playbackURI) {
       const injected = injectCredentialsIntoPlaybackUri({
-        playbackURI: body.playbackURI,
-        username:    camera.nvr.username,
-        password:    plainPass,
-        ipAddress:   camera.nvr.ipAddress,
-        rtspPort:    camera.nvr.rtspPort,
+        playbackURI: body.playbackURI, username: camera.nvr.username,
+        password: plainPass, ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort,
       })
       rtspUrl     = injected.url
       rtspMasked  = injected.masked
       urlStrategy = 'nvr_playbackURI'
     } else {
       const built = buildFallbackRecordingRtspUrl({
-        username:  camera.nvr.username,
-        password:  plainPass,
-        ipAddress: camera.nvr.ipAddress,
-        rtspPort:  camera.nvr.rtspPort,
-        channel:   camera.channel,
-        start:     new Date(body.startTime),
-        end:       new Date(body.endTime),
+        username: camera.nvr.username, password: plainPass,
+        ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort,
+        channel: camera.channel, start: new Date(body.startTime), end: new Date(body.endTime),
       })
       rtspUrl     = built.url
       rtspMasked  = built.masked
@@ -653,17 +744,49 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       (new Date(body.endTime).getTime() - new Date(body.startTime).getTime()) / 1000
     )
 
+    // ── Cache check ──────────────────────────────────────────────────
+    const cacheKey  = computeCacheKey({
+      cameraId: body.cameraId, startTime: body.startTime, endTime: body.endTime,
+      playbackURI: body.playbackURI ?? '', canPlayHevcMp4, forceTranscode,
+    })
+    const cacheFile = CACHE_DIR ? path.join(CACHE_DIR, `${cacheKey}.mp4`) : null
+
+    if (cacheFile) {
+      try {
+        const stat = fs.statSync(cacheFile)
+        if (stat.size > 512) {
+          // Cache hit — create a ready session immediately with a fresh fileToken
+          const sessionId  = crypto.randomBytes(8).toString('hex')
+          const fileToken  = crypto.randomBytes(24).toString('hex')
+          const expiresAt  = Date.now() + RECORDING_SESSION_TTL_MS
+          server.log.info(`[recordings] vod_cache_hit sessionId=${sessionId} cacheKey=${cacheKey} sizeBytes=${stat.size} cameraId=${body.cameraId}`)
+          recordingSessions.set(sessionId, {
+            expiresAt, startedAt: Date.now(), userId: user.sub,
+            status: 'ready', fileToken,
+            vodFile: cacheFile, vodFileCached: true,
+            vodUrl: `/api/recordings/playback/${sessionId}/file.mp4?token=${fileToken}`,
+            mimeType: 'video/mp4', expectedDurationSec,
+          })
+          return reply.send({
+            status: 'ready', sessionId,
+            pollUrl:  `/api/recordings/playback/${sessionId}/status`,
+            expiresAt: new Date(expiresAt).toISOString(),
+            expectedDurationSec,
+            url:      `/api/recordings/playback/${sessionId}/file.mp4?token=${fileToken}`,
+            mimeType: 'video/mp4',
+          })
+        }
+      } catch { /* cache miss — file doesn't exist */ }
+      server.log.info(`[recordings] vod_cache_miss cacheKey=${cacheKey} cameraId=${body.cameraId}`)
+    }
+
     // ── Job deduplication: reuse in-progress or ready session ────────
-    const jobKey = `${body.cameraId}|${body.startTime}|${body.endTime}|${body.playbackURI ?? ''}`
+    const jobKey = `${body.cameraId}|${body.startTime}|${body.endTime}|${body.playbackURI ?? ''}|${canPlayHevcMp4}|${forceTranscode}`
     const existingSid = recordingJobKeys.get(jobKey)
     if (existingSid) {
       const existing = recordingSessions.get(existingSid)
       if (existing && existing.userId === user.sub && existing.status !== 'error') {
-        server.log.info(
-          `[recordings] vod_reuse_session sessionId=${existingSid} jobKey=${jobKey}` +
-          ` status=${existing.status}`
-        )
-        // Extend TTL so polling doesn't race with expiry
+        server.log.info(`[recordings] vod_reuse_session sessionId=${existingSid} jobKey=${jobKey} status=${existing.status}`)
         existing.expiresAt = Date.now() + RECORDING_SESSION_TTL_MS
         return reply.send({
           status:              existing.status,
@@ -675,19 +798,24 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           mimeType:            existing.mimeType,
         })
       }
-      // Stale/errored entry — clean it up
       recordingJobKeys.delete(jobKey)
     }
 
-    const sessionId  = crypto.randomBytes(8).toString('hex')
-    const fileToken  = crypto.randomBytes(24).toString('hex')
-    const expiresAt  = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
+    const sessionId = crypto.randomBytes(8).toString('hex')
+    const fileToken = crypto.randomBytes(24).toString('hex')
+    const expiresAt = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
+
+    // Destination: use cache dir if configured, otherwise session-scoped temp file
+    const vodFile       = cacheFile ?? path.join(VOD_TEMP_DIR, `rec_${sessionId}.mp4`)
+    const vodFileCached = !!cacheFile
 
     server.log.info(
       `[recordings] playback_init sessionId=${sessionId} jobKey=${jobKey}` +
       ` cameraId=${body.cameraId} ch=${camera.channel}` +
       (trackId ? ` trackId=${trackId}` : '') +
-      ` strategy=${urlStrategy} expectedDurationSec=${expectedDurationSec} source=${rtspMasked}`
+      ` urlStrategy=${urlStrategy} expectedDurationSec=${expectedDurationSec}` +
+      ` canPlayHevcMp4=${canPlayHevcMp4} forceTranscode=${forceTranscode}` +
+      ` cacheKey=${cacheKey} source=${rtspMasked}`
     )
 
     recordingSessions.set(sessionId, {
@@ -697,23 +825,20 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       status:     'starting',
       fileToken,
       jobKey,
+      vodFileCached,
       expectedDurationSec,
     })
     recordingJobKeys.set(jobKey, sessionId)
 
     runVodBackground({
-      sessionId,
-      rtspUrl,
-      rtspMasked,
-      trackId,
-      urlStrategy,
-      expectedDurationSec,
+      sessionId, rtspUrl, rtspMasked, trackId, urlStrategy,
+      expectedDurationSec, canPlayHevcMp4, forceTranscode, vodFile,
       log: (msg) => server.log.info(msg),
     }).catch((err) => {
       server.log.error(`[recordings] bg_unhandled_error sessionId=${sessionId} err=${err?.message}`)
       const s = recordingSessions.get(sessionId)
       if (s && s.status === 'starting') {
-        s.status   = 'error'
+        s.status    = 'error'
         s.errorCode = 'INTERNAL'
         s.errorMsg  = 'Error interno en el proceso de reproducción'
       }
@@ -724,72 +849,65 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }).catch(() => {})
 
     return reply.send({
-      status:    'starting',
-      sessionId,
-      pollUrl:   `/api/recordings/playback/${sessionId}/status`,
-      expiresAt,
-      expectedDurationSec,
+      status: 'starting', sessionId,
+      pollUrl: `/api/recordings/playback/${sessionId}/status`,
+      expiresAt, expectedDurationSec,
     })
   })
 
-  // GET /api/recordings/playback/:sessionId/status — Poll playback readiness
+  // GET /api/recordings/playback/:sessionId/status
   server.get('/playback/:sessionId/status', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string }
     const session = recordingSessions.get(sessionId)
 
     if (!session) {
       return reply.status(404).send({
-        status:    'error',
-        errorCode: 'SESSION_NOT_FOUND',
-        error:     'Sesión de reproducción no encontrada o expirada',
+        status: 'error', errorCode: 'SESSION_NOT_FOUND',
+        error:  'Sesión de reproducción no encontrada o expirada',
       })
     }
-
     if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
       return reply.status(403).send({ message: 'Sin permiso' })
     }
 
-    const outTimeSec    = session.progress?.outTimeSec ?? 0
+    const outTimeSec      = session.progress?.outTimeSec ?? 0
     const progressPercent = session.expectedDurationSec && outTimeSec > 0
       ? Math.min(99, Math.round(outTimeSec / session.expectedDurationSec * 100))
       : 0
     const elapsedMs = Date.now() - (session.startedAt ?? Date.now())
 
     return reply.send({
-      status:               session.status,
-      url:                  session.vodUrl,
-      mimeType:             session.mimeType,
-      errorCode:            session.errorCode,
-      error:                session.errorMsg,
-      expectedDurationSec:  session.expectedDurationSec,
+      status:              session.status,
+      url:                 session.vodUrl,
+      mimeType:            session.mimeType,
+      errorCode:           session.errorCode,
+      error:               session.errorMsg,
+      expectedDurationSec: session.expectedDurationSec,
       outTimeSec,
-      frame:                session.progress?.frame,
-      fps:                  session.progress?.fps,
-      speed:                session.progress?.speed,
+      frame:               session.progress?.frame,
+      fps:                 session.progress?.fps,
+      speed:               session.progress?.speed,
       progressPercent,
-      lastProgressAt:       session.progress?.lastProgressAt,
+      lastProgressAt:      session.progress?.lastProgressAt,
       elapsedMs,
     })
   })
 
-  // GET /api/recordings/playback/:sessionId/file.mp4 — Serve VOD file with Range support.
-  // Uses a short-lived fileToken in the query string instead of Authorization header
-  // so native <video src> requests work without credentials.
+  // GET /api/recordings/playback/:sessionId/file.mp4 — Serve VOD file (token-authenticated).
+  // Uses a per-session fileToken in the query string so native <video src> requests work
+  // without an Authorization header.
   server.get('/playback/:sessionId/file.mp4', async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string }
     const { token }     = request.query as { token?: string }
     const session       = recordingSessions.get(sessionId)
 
-    // Token validation — guards against unauthenticated access without JWT
     if (!session || !session.fileToken || !token || token !== session.fileToken) {
       server.log.warn(`[recordings] file_token_invalid sessionId=${sessionId} hasSession=${!!session}`)
       return reply.status(401).send({ message: 'Token de archivo inválido o expirado' })
     }
-
     if (session.status !== 'ready' || !session.vodFile) {
       return reply.status(404).send({ message: 'Archivo no disponible' })
     }
-
     if (Date.now() > session.expiresAt) {
       server.log.warn(`[recordings] file_session_expired sessionId=${sessionId}`)
       return reply.status(401).send({ message: 'Sesión expirada' })
@@ -799,7 +917,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     try {
       fileSize = fs.statSync(session.vodFile).size
     } catch {
-      server.log.warn(`[recordings] file_missing sessionId=${sessionId} path=${session.vodFile}`)
+      server.log.warn(`[recordings] file_missing sessionId=${sessionId}`)
       return reply.status(404).send({ message: 'Archivo no encontrado en disco' })
     }
 
@@ -833,7 +951,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     return reply.send(fs.createReadStream(session.vodFile))
   })
 
-  // DELETE /api/recordings/playback/:sessionId — Stop/cancel playback
+  // DELETE /api/recordings/playback/:sessionId
   server.delete('/playback/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string }
     const session = recordingSessions.get(sessionId)
@@ -846,7 +964,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     if (session.vodProcess) {
       try { session.vodProcess.kill('SIGTERM') } catch {}
     }
-    if (session.vodFile) {
+    // Only remove temp files, not cache files (cache is managed by runCacheCleanup)
+    if (session.vodFile && !session.vodFileCached) {
       fs.unlink(session.vodFile, () => {})
     }
     server.log.info(`[recordings] playback_stopped sessionId=${sessionId}`)
@@ -858,11 +977,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const { page = '1', limit = '50' } = request.query as { page?: string; limit?: string }
 
     const logs = await server.prisma.auditLog.findMany({
-      where: { action: { in: ['VIEW_RECORDING', 'SEARCH_RECORDINGS'] } },
+      where:   { action: { in: ['VIEW_RECORDING', 'SEARCH_RECORDINGS'] } },
       include: { user: { select: { username: true, fullName: true, role: true } } },
       orderBy: { createdAt: 'desc' },
-      skip: (parseInt(page) - 1) * parseInt(limit),
-      take: parseInt(limit),
+      skip:    (parseInt(page) - 1) * parseInt(limit),
+      take:    parseInt(limit),
     })
     const total = await server.prisma.auditLog.count({
       where: { action: { in: ['VIEW_RECORDING', 'SEARCH_RECORDINGS'] } },

@@ -88,17 +88,20 @@ export function RecordingsPage() {
   const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
   const videoRef             = useRef<HTMLVideoElement>(null)
   const hlsRef               = useRef<Hls | null>(null)
-  // Stale-session guard: each handlePlay call gets a unique key.
-  // HLS attachment and error toasts only fire if key still matches.
   const playbackKeyRef       = useRef<string | null>(null)
-  // Mirror of playbackSessionId in a ref so stopPlayback can read it in async closures.
   const playbackSessionIdRef = useRef<string | null>(null)
-  // True after video.ended fires — suppresses post-end HLS error toasts (401/404 are expected)
   const playbackEndedRef     = useRef(false)
-  // True while stopPlayback is executing — suppresses cleanup-induced HLS errors
   const playbackCleaningRef  = useRef(false)
   const startDateRef  = useRef<HTMLInputElement>(null)
   const endDateRef    = useRef<HTMLInputElement>(null)
+  // Mirrors selectedRec so error handlers inside useEffect closures can read it
+  const selectedRecRef        = useRef<RecordingWithCamera | null>(null)
+  // True if canPlayHevcMp4=true was sent — drives the one-shot hevc→transcode retry
+  const hevcCopyAttemptedRef  = useRef(false)
+  const hevcRetryDoneRef      = useRef(false)
+  // Always-current reference to handlePlay — used to call it from useEffect closures
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handlePlayFnRef       = useRef<(rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
   const [showCameraList, setShowCameraList] = useState(false)
   const [nvrErrors, setNvrErrors] = useState<NvrSearchError[]>([])
   const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
@@ -272,8 +275,8 @@ export function RecordingsPage() {
     setVodProgress(null)
   }
 
-  // Sync ref whenever state changes
   useEffect(() => { playbackSessionIdRef.current = playbackSessionId }, [playbackSessionId])
+  useEffect(() => { selectedRecRef.current = selectedRec }, [selectedRec])
 
   // Clean up HLS + session on unmount
   useEffect(() => stopPlayback, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -312,16 +315,40 @@ export function RecordingsPage() {
         if (attachedKey !== playbackKeyRef.current) return
         const err = video.error
         console.error(`[recordings-ui] mp4_video_error code=${err?.code} message=${err?.message} currentSrc=${video.currentSrc}`)
+
+        // One-shot retry: if hevc_copy was attempted and browser can't decode it, re-request
+        // with forceTranscode=true so backend produces a libx264 MP4 instead.
+        if (hevcCopyAttemptedRef.current && !hevcRetryDoneRef.current && selectedRecRef.current) {
+          hevcRetryDoneRef.current = true
+          const recToRetry = selectedRecRef.current
+          console.info('[recordings-ui] mp4_hevc_copy_failed retrying with forceTranscode=true')
+          toast('Video HEVC no compatible con este navegador. Reintentando con conversión H.264…', { duration: 6000 })
+          stopPlayback()
+          setTimeout(() => handlePlayFnRef.current(recToRetry, { forceTranscode: true }), 150)
+          return
+        }
+
         toast.error('El video fue generado pero el navegador no pudo abrir el archivo MP4', { duration: 8000 })
       }
 
+      const handleCanPlay = () => {
+        console.info(`[recordings-ui] mp4_canplay sessionId=${playbackSessionIdRef.current} duration=${video.duration?.toFixed(1)}s`)
+      }
+      const handlePlaying = () => {
+        console.info(`[recordings-ui] mp4_playing sessionId=${playbackSessionIdRef.current}`)
+      }
+
       console.info(`[recordings-ui] mp4_attach_url sessionId=${playbackSessionIdRef.current} url=${playbackUrl}`)
-      video.addEventListener('error', handleVideoError)
+      video.addEventListener('error',   handleVideoError)
+      video.addEventListener('canplay', handleCanPlay)
+      video.addEventListener('playing', handlePlaying)
       video.src = playbackUrl
       video.play().catch(() => {})
       return () => {
-        video.removeEventListener('ended', handleVideoEnded)
-        video.removeEventListener('error', handleVideoError)
+        video.removeEventListener('ended',   handleVideoEnded)
+        video.removeEventListener('error',   handleVideoError)
+        video.removeEventListener('canplay', handleCanPlay)
+        video.removeEventListener('playing', handlePlaying)
       }
     }
 
@@ -356,7 +383,9 @@ export function RecordingsPage() {
     return () => { video.removeEventListener('ended', handleVideoEnded) }
   }, [playbackUrl, playbackMimeType])
 
-  const handlePlay = async (rec: RecordingWithCamera) => {
+  const handlePlay = async (rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => {
+    const forceTranscode = opts?.forceTranscode ?? false
+
     const isSameRec = selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId
 
     // Already playing this recording — do nothing
@@ -379,10 +408,23 @@ export function RecordingsPage() {
     setPlaybackLoading(true)
     setPlaybackStatus('starting')
 
+    // Detect HEVC native playback support (canPlayType is synchronous and safe to call here)
+    const videoEl        = videoRef.current ?? document.createElement('video')
+    const canPlayHevcMp4 = !forceTranscode && (
+      videoEl.canPlayType('video/mp4; codecs="hvc1"') !== '' ||
+      videoEl.canPlayType('video/mp4; codecs="hev1"') !== ''
+    )
+
+    // Track for the one-shot hevc→transcode retry in the video error handler
+    hevcCopyAttemptedRef.current = canPlayHevcMp4
+    if (!forceTranscode) hevcRetryDoneRef.current = false
+
+    console.info(`[recordings-ui] playback_start cameraId=${rec.cameraId} canPlayHevcMp4=${canPlayHevcMp4} forceTranscode=${forceTranscode}`)
+
     let sessionId: string | null = null
 
     try {
-      // POST returns immediately — backend starts background job (or reuses existing session)
+      // POST returns immediately — backend starts background job (or returns cache/reuse)
       const result = await apiPost<{
         status: string
         sessionId: string
@@ -392,14 +434,16 @@ export function RecordingsPage() {
         url?: string
         mimeType?: string
       }>('/recordings/playback', {
-        cameraId:    rec.cameraId,
-        startTime:   rec.startTime,
-        endTime:     rec.endTime,
-        playbackURI: rec.playbackURI,
+        cameraId:       rec.cameraId,
+        startTime:      rec.startTime,
+        endTime:        rec.endTime,
+        playbackURI:    rec.playbackURI,
+        canPlayHevcMp4,
+        forceTranscode,
       })
 
-      // Stale check: user may have clicked a different recording before POST returned
       if (playbackKeyRef.current !== myKey) return
+      console.info(`[recordings-ui] playback_post_response sessionId=${result.sessionId} status=${result.status} expectedDurationSec=${result.expectedDurationSec}`)
 
       sessionId = result.sessionId
       setPlaybackSessionId(sessionId)
@@ -520,6 +564,9 @@ export function RecordingsPage() {
       setPlaybackStatus('idle')
     }
   }
+
+  // Keep ref current so useEffect closures can call the latest handlePlay without stale closure issues
+  handlePlayFnRef.current = handlePlay
 
   const formatDuration = (start: string, end: string) => {
     const diff = new Date(end).getTime() - new Date(start).getTime()
