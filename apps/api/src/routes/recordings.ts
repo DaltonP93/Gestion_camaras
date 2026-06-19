@@ -38,8 +38,9 @@ interface RecordingSession {
   errorMsg?:   string
   jobKey?:     string          // cameraId|startTime|endTime|playbackURI — for dedup cleanup
   // VOD fields
+  fileToken?:  string         // one-time token for unauthenticated file.mp4 download
   vodFile?:    string         // /tmp path to generated MP4
-  vodUrl?:     string         // served URL: /api/recordings/playback/:sessionId/file.mp4
+  vodUrl?:     string         // served URL: /api/recordings/playback/:sessionId/file.mp4?token=<fileToken>
   mimeType?:   string         // 'video/mp4'
   vodProcess?: ChildProcess   // FFmpeg process — killed on DELETE
   expectedDurationSec?: number
@@ -337,7 +338,7 @@ async function runVodBackground(opts: {
           const elapsedMs = Date.now() - (finalSession.startedAt ?? Date.now())
           log(`[recordings] vod_ready sessionId=${sessionId} attempt=copy sizeBytes=${stat.size} elapsedMs=${elapsedMs} expectedDurationSec=${expectedDurationSec}`)
           finalSession.vodFile  = vodFile
-          finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4`
+          finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${finalSession.fileToken}`
           finalSession.mimeType = 'video/mp4'
           finalSession.status   = 'ready'
           return
@@ -357,7 +358,7 @@ async function runVodBackground(opts: {
   const transcodeCodecArgs = [
     '-an',
     '-c:v', TRANSCODE_ENCODER,
-    '-preset', 'veryfast',
+    '-preset', 'ultrafast',   // fastest possible — quality not critical for recordings review
     '-pix_fmt', 'yuv420p',
     '-profile:v', 'main',
     '-level', '4.1',
@@ -385,7 +386,7 @@ async function runVodBackground(opts: {
       const elapsedMs = Date.now() - (finalSession.startedAt ?? Date.now())
       log(`[recordings] vod_ready sessionId=${sessionId} attempt=transcode sizeBytes=${stat.size} elapsedMs=${elapsedMs} expectedDurationSec=${expectedDurationSec}`)
       finalSession.vodFile  = vodFile
-      finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4`
+      finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${finalSession.fileToken}`
       finalSession.mimeType = 'video/mp4'
       finalSession.status   = 'ready'
     } catch {
@@ -679,6 +680,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const sessionId  = crypto.randomBytes(8).toString('hex')
+    const fileToken  = crypto.randomBytes(24).toString('hex')
     const expiresAt  = new Date(Date.now() + RECORDING_SESSION_TTL_MS).toISOString()
 
     server.log.info(
@@ -693,6 +695,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       startedAt:  Date.now(),
       userId:     user.sub,
       status:     'starting',
+      fileToken,
       jobKey,
       expectedDurationSec,
     })
@@ -769,22 +772,34 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     })
   })
 
-  // GET /api/recordings/playback/:sessionId/file.mp4 — Serve VOD file with Range support
-  server.get('/playback/:sessionId/file.mp4', { preHandler: [server.authenticate] }, async (request, reply) => {
+  // GET /api/recordings/playback/:sessionId/file.mp4 — Serve VOD file with Range support.
+  // Uses a short-lived fileToken in the query string instead of Authorization header
+  // so native <video src> requests work without credentials.
+  server.get('/playback/:sessionId/file.mp4', async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string }
-    const session = recordingSessions.get(sessionId)
+    const { token }     = request.query as { token?: string }
+    const session       = recordingSessions.get(sessionId)
 
-    if (!session || session.status !== 'ready' || !session.vodFile) {
+    // Token validation — guards against unauthenticated access without JWT
+    if (!session || !session.fileToken || !token || token !== session.fileToken) {
+      server.log.warn(`[recordings] file_token_invalid sessionId=${sessionId} hasSession=${!!session}`)
+      return reply.status(401).send({ message: 'Token de archivo inválido o expirado' })
+    }
+
+    if (session.status !== 'ready' || !session.vodFile) {
       return reply.status(404).send({ message: 'Archivo no disponible' })
     }
-    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
-      return reply.status(403).send({ message: 'Sin permiso' })
+
+    if (Date.now() > session.expiresAt) {
+      server.log.warn(`[recordings] file_session_expired sessionId=${sessionId}`)
+      return reply.status(401).send({ message: 'Sesión expirada' })
     }
 
     let fileSize: number
     try {
       fileSize = fs.statSync(session.vodFile).size
     } catch {
+      server.log.warn(`[recordings] file_missing sessionId=${sessionId} path=${session.vodFile}`)
       return reply.status(404).send({ message: 'Archivo no encontrado en disco' })
     }
 
@@ -806,6 +821,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         .header('Accept-Ranges',  'bytes')
         .header('Content-Length', String(chunkSize))
         .header('Content-Type',   'video/mp4')
+        .header('Cache-Control',  'private, no-store')
       return reply.send(fs.createReadStream(session.vodFile, { start, end }))
     }
 
@@ -813,6 +829,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       .header('Content-Type',   'video/mp4')
       .header('Content-Length', String(fileSize))
       .header('Accept-Ranges',  'bytes')
+      .header('Cache-Control',  'private, no-store')
     return reply.send(fs.createReadStream(session.vodFile))
   })
 

@@ -305,9 +305,24 @@ export function RecordingsPage() {
     // Native HTML5 for MP4 VOD — no HLS.js needed
     if (playbackMimeType === 'video/mp4') {
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+
+      const handleVideoError = () => {
+        if (playbackEndedRef.current) return
+        if (playbackCleaningRef.current) return
+        if (attachedKey !== playbackKeyRef.current) return
+        const err = video.error
+        console.error(`[recordings-ui] mp4_video_error code=${err?.code} message=${err?.message} currentSrc=${video.currentSrc}`)
+        toast.error('El video fue generado pero el navegador no pudo abrir el archivo MP4', { duration: 8000 })
+      }
+
+      console.info(`[recordings-ui] mp4_attach_url sessionId=${playbackSessionIdRef.current} url=${playbackUrl}`)
+      video.addEventListener('error', handleVideoError)
       video.src = playbackUrl
       video.play().catch(() => {})
-      return () => { video.removeEventListener('ended', handleVideoEnded) }
+      return () => {
+        video.removeEventListener('ended', handleVideoEnded)
+        video.removeEventListener('error', handleVideoError)
+      }
     }
 
     // HLS.js path (legacy / fallback)
