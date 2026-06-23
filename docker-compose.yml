@@ -93,8 +93,21 @@ services:
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
       UPLOADS_DIR: /app/uploads
+      # ── Grabaciones VOD ──────────────────────────────────────────
+      # Cache persistente de MP4 generados (segunda apertura < 1 s)
+      RECORDINGS_CACHE_DIR: /var/lib/visioncore/recordings-cache
+      RECORDINGS_CACHE_MAX_GB: "20"
+      RECORDINGS_CACHE_TTL_HOURS: "24"
+      # Parámetros de transcode HEVC → H.264 (CRF 28 + 2 Mbps cap reduce ~48 MB a ~12-15 MB)
+      RECORDINGS_TRANSCODE_PRESET: ultrafast
+      RECORDINGS_TRANSCODE_CRF: "28"
+      RECORDINGS_TRANSCODE_MAXRATE: 2000k
+      RECORDINGS_TRANSCODE_BUFSIZE: 4000k
+      RECORDINGS_TRANSCODE_MAX_WIDTH: "1280"
+      RECORDINGS_FORCE_TRANSCODE: "false"
     volumes:
       - uploads_data:/app/uploads
+      - recordings_cache:/var/lib/visioncore/recordings-cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -162,6 +175,7 @@ volumes:
   certbot_conf:
   certbot_www:
   uploads_data:
+  recordings_cache:
 
 networks:
   visioncore_net:
