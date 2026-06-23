@@ -11,6 +11,7 @@ import { clsx } from 'clsx'
 import type { Recording, Camera } from '@/types'
 import toast from 'react-hot-toast'
 import Hls from 'hls.js'
+import { RecordingPlaybackControls } from '@/components/RecordingPlaybackControls'
 
 interface RecordingWithCamera extends Recording {
   cameraId: string
@@ -940,6 +941,13 @@ export function RecordingsPage() {
               </div>
             )}
           </div>
+          {/* Speed controls — visible only when a recording is actively playing */}
+          {playbackStatus === 'ready' && (
+            <RecordingPlaybackControls
+              key={playbackSessionId ?? 'idle'}
+              videoRef={videoRef}
+            />
+          )}
         </div>
       </div>
     </div>
