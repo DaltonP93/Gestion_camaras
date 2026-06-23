@@ -17,6 +17,7 @@ const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toStr
 
 // ─── VOD configuration ────────────────────────────────────────────
 const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000
+const DOWNLOAD_TOKEN_TTL_MS     = 24 * 60 * 60 * 1000
 const RECORDINGS_FORCE_TRANSCODE = process.env.RECORDINGS_FORCE_TRANSCODE === 'true'
 const TRANSCODE_ENCODER          = process.env.TRANSCODE_ENCODER || 'libx264'
 const VOD_TEMP_DIR               = process.env.VOD_TEMP_DIR || '/tmp/visioncore-recordings'
@@ -168,6 +169,15 @@ if (CACHE_DIR) {
   setInterval(() => runCacheCleanup(console.log), 60 * 60 * 1000)
 }
 
+// ─── Download tokens (long-lived, independent of session lifetime) ────
+interface DownloadToken {
+  token:     string
+  filePath:  string
+  filename:  string
+  expiresAt: number
+}
+const downloadTokens = new Map<string, DownloadToken>()
+
 // ─── In-memory recording playback sessions ────────────────────────
 interface RecordingSession {
   expiresAt:   number
@@ -181,6 +191,8 @@ interface RecordingSession {
   vodFile?:    string     // absolute path to generated MP4
   vodFileCached?: boolean // true if vodFile is in CACHE_DIR (do not delete on session cleanup)
   vodUrl?:     string     // /api/recordings/playback/:sessionId/file.mp4?token=<fileToken>
+  downloadToken?: string  // long-lived token for /api/recordings/download?t=<token>
+  downloadUrl?:  string   // /api/recordings/download?t=<downloadToken>
   mimeType?:   string
   vodProcess?: ChildProcess
   expectedDurationSec?: number
@@ -196,7 +208,27 @@ interface RecordingSession {
 const recordingSessions = new Map<string, RecordingSession>()
 const recordingJobKeys  = new Map<string, string>()
 
-// Periodic cleanup of expired sessions — does NOT delete cached files
+function issueDownloadToken(opts: {
+  sessionId: string
+  filePath:  string
+  filename:  string
+  log:       (msg: string) => void
+}): string {
+  const token = crypto.randomBytes(24).toString('hex')
+  downloadTokens.set(token, {
+    token, filePath: opts.filePath, filename: opts.filename,
+    expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL_MS,
+  })
+  const sess = recordingSessions.get(opts.sessionId)
+  if (sess) {
+    sess.downloadToken = token
+    sess.downloadUrl   = `/api/recordings/download?t=${token}`
+  }
+  opts.log(`[recordings] download_token_issued sessionId=${opts.sessionId} filename=${opts.filename}`)
+  return token
+}
+
+// Periodic cleanup of expired sessions and download tokens — does NOT delete cached files
 setInterval(() => {
   const now = Date.now()
   for (const [sid, session] of recordingSessions.entries()) {
@@ -211,6 +243,9 @@ setInterval(() => {
         fs.unlink(session.vodFile, () => {})
       }
     }
+  }
+  for (const [tok, dt] of downloadTokens.entries()) {
+    if (now > dt.expiresAt) downloadTokens.delete(tok)
   }
 }, 5 * 60 * 1000)
 
@@ -403,9 +438,10 @@ async function runVodBackground(opts: {
   canPlayHevcMp4:      boolean
   forceTranscode:      boolean
   vodFile:             string   // caller decides cache vs temp path
+  filename:            string   // suggested download filename without extension
   log:                 (msg: string) => void
 }): Promise<void> {
-  const { sessionId, rtspUrl, rtspMasked, expectedDurationSec, canPlayHevcMp4, forceTranscode, vodFile, log } = opts
+  const { sessionId, rtspUrl, rtspMasked, expectedDurationSec, canPlayHevcMp4, forceTranscode, vodFile, filename, log } = opts
 
   const session = recordingSessions.get(sessionId)
   if (!session) return
@@ -461,6 +497,7 @@ async function runVodBackground(opts: {
         finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${finalSession.fileToken}`
         finalSession.mimeType = 'video/mp4'
         finalSession.status   = 'ready'
+        issueDownloadToken({ sessionId, filePath: vodFile, filename: `${filename}.mp4`, log })
         return
       }
       // File too small — copy produced a degenerate file
@@ -490,6 +527,7 @@ async function runVodBackground(opts: {
           sess2.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${sess2.fileToken}`
           sess2.mimeType = 'video/mp4'
           sess2.status   = 'ready'
+          issueDownloadToken({ sessionId, filePath: vodFile, filename: `${filename}.mp4`, log })
         } catch {
           sess2.status    = 'error'
           sess2.errorCode = 'VOD_FILE_MISSING'
@@ -751,6 +789,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     })
     const cacheFile = CACHE_DIR ? path.join(CACHE_DIR, `${cacheKey}.mp4`) : null
 
+    // Build suggested download filename from startTime + camera name
+    const startDate    = new Date(body.startTime)
+    const pad          = (n: number) => String(n).padStart(2, '0')
+    const datePart     = `${startDate.getFullYear()}${pad(startDate.getMonth() + 1)}${pad(startDate.getDate())}`
+    const timePart     = `${pad(startDate.getHours())}${pad(startDate.getMinutes())}${pad(startDate.getSeconds())}`
+    const safeCamName  = camera.name.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 32)
+    const downloadFilename = `grabacion-${datePart}-${timePart}-${safeCamName}.mp4`
+
     if (cacheFile) {
       try {
         const stat = fs.statSync(cacheFile)
@@ -767,13 +813,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             vodUrl: `/api/recordings/playback/${sessionId}/file.mp4?token=${fileToken}`,
             mimeType: 'video/mp4', expectedDurationSec,
           })
+          const dlToken = issueDownloadToken({
+            sessionId, filePath: cacheFile, filename: downloadFilename,
+            log: (msg) => server.log.info(msg),
+          })
           return reply.send({
             status: 'ready', sessionId,
-            pollUrl:  `/api/recordings/playback/${sessionId}/status`,
-            expiresAt: new Date(expiresAt).toISOString(),
+            pollUrl:     `/api/recordings/playback/${sessionId}/status`,
+            expiresAt:   new Date(expiresAt).toISOString(),
             expectedDurationSec,
-            url:      `/api/recordings/playback/${sessionId}/file.mp4?token=${fileToken}`,
-            mimeType: 'video/mp4',
+            url:         `/api/recordings/playback/${sessionId}/file.mp4?token=${fileToken}`,
+            mimeType:    'video/mp4',
+            downloadUrl: `/api/recordings/download?t=${dlToken}`,
           })
         }
       } catch { /* cache miss — file doesn't exist */ }
@@ -796,6 +847,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           expectedDurationSec: existing.expectedDurationSec,
           url:                 existing.vodUrl,
           mimeType:            existing.mimeType,
+          downloadUrl:         existing.downloadUrl,
         })
       }
       recordingJobKeys.delete(jobKey)
@@ -833,6 +885,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     runVodBackground({
       sessionId, rtspUrl, rtspMasked, trackId, urlStrategy,
       expectedDurationSec, canPlayHevcMp4, forceTranscode, vodFile,
+      filename: downloadFilename.replace(/\.mp4$/, ''),
       log: (msg) => server.log.info(msg),
     }).catch((err) => {
       server.log.error(`[recordings] bg_unhandled_error sessionId=${sessionId} err=${err?.message}`)
@@ -890,6 +943,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       progressPercent,
       lastProgressAt:      session.progress?.lastProgressAt,
       elapsedMs,
+      downloadUrl:         session.downloadUrl,
     })
   })
 
@@ -970,6 +1024,77 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }
     server.log.info(`[recordings] playback_stopped sessionId=${sessionId}`)
     return reply.send({ ok: true })
+  })
+
+  // GET /api/recordings/download?t=<token> — Long-lived download endpoint.
+  // Token is independent of session lifetime (24h TTL) so Chrome can download
+  // after the playback session expires. No JWT auth — token IS the credential.
+  server.get('/download', async (request, reply) => {
+    const { t } = request.query as { t?: string }
+
+    if (!t) {
+      server.log.warn('[recordings] download_token_invalid reason=missing')
+      return reply.status(403).type('text/plain').send('Acceso denegado')
+    }
+
+    const dt = downloadTokens.get(t)
+    if (!dt) {
+      server.log.warn(`[recordings] download_token_invalid reason=not_found token=${t.slice(0, 8)}…`)
+      return reply.status(403).type('text/plain').send('Acceso denegado')
+    }
+    if (Date.now() > dt.expiresAt) {
+      downloadTokens.delete(t)
+      server.log.warn(`[recordings] download_token_invalid reason=expired filename=${dt.filename}`)
+      return reply.status(403).type('text/plain').send('Token expirado')
+    }
+
+    // Path-traversal guard: filename must be a plain name with no separators
+    if (path.basename(dt.filePath) !== path.basename(dt.filePath) || dt.filePath !== path.resolve(dt.filePath)) {
+      server.log.warn(`[recordings] download_token_invalid reason=path_traversal filePath=${dt.filePath}`)
+      return reply.status(403).type('text/plain').send('Acceso denegado')
+    }
+
+    let fileSize: number
+    try {
+      fileSize = fs.statSync(dt.filePath).size
+    } catch {
+      server.log.warn(`[recordings] download_file_missing filename=${dt.filename} filePath=${dt.filePath}`)
+      return reply.status(404).type('text/plain').send('Archivo no encontrado')
+    }
+
+    const safeFilename = dt.filename.replace(/[^\w\-_.]/g, '_')
+    server.log.info(`[recordings] download_started filename=${safeFilename} sizeBytes=${fileSize}`)
+
+    const rangeHeader = request.headers.range as string | undefined
+
+    if (rangeHeader) {
+      const match = rangeHeader.match(/bytes=(\d*)-(\d*)/)
+      if (!match) return reply.status(416).type('text/plain').send('Invalid Range')
+      const start = match[1] ? parseInt(match[1], 10) : 0
+      const end   = match[2] ? parseInt(match[2], 10) : fileSize - 1
+      if (start > end || end >= fileSize) {
+        reply.header('Content-Range', `bytes */${fileSize}`)
+        return reply.status(416).type('text/plain').send('Range Not Satisfiable')
+      }
+      const chunkSize = end - start + 1
+      reply
+        .status(206)
+        .header('Content-Range',       `bytes ${start}-${end}/${fileSize}`)
+        .header('Accept-Ranges',       'bytes')
+        .header('Content-Length',      String(chunkSize))
+        .header('Content-Type',        'video/mp4')
+        .header('Content-Disposition', `attachment; filename="${safeFilename}"`)
+        .header('Cache-Control',       'private, no-store')
+      return reply.send(fs.createReadStream(dt.filePath, { start, end }))
+    }
+
+    reply
+      .header('Content-Type',        'video/mp4')
+      .header('Content-Length',      String(fileSize))
+      .header('Accept-Ranges',       'bytes')
+      .header('Content-Disposition', `attachment; filename="${safeFilename}"`)
+      .header('Cache-Control',       'private, no-store')
+    return reply.send(fs.createReadStream(dt.filePath))
   })
 
   // GET /api/recordings/audit
