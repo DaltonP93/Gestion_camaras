@@ -2,7 +2,7 @@
 import { useEffect, useState, useMemo, useRef } from 'react'
 import {
   Search, Play, Calendar, Clock, ChevronDown, CheckSquare, Square,
-  AlertTriangle, RefreshCw, ExternalLink, XCircle, Loader2, Info,
+  AlertTriangle, RefreshCw, ExternalLink, XCircle, Loader2, Info, Download,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet, apiDelete } from '@/lib/api'
@@ -43,6 +43,7 @@ interface PlaybackStatusResponse {
   transcoded?:          boolean
   errorCode?:           string
   error?:               string
+  downloadUrl?:         string
   // VOD generation progress
   outTimeSec?:          number
   frame?:               number
@@ -109,6 +110,7 @@ export function RecordingsPage() {
   const [playbackTranscoding, setPlaybackTranscoding] = useState(false)
   const [playbackMimeType, setPlaybackMimeType] = useState<string | null>(null)
   const [vodProgress, setVodProgress] = useState<{ outTimeSec: number; expectedDurationSec: number } | null>(null)
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null)
 
   useEffect(() => {
     loadNVRs()
@@ -273,6 +275,7 @@ export function RecordingsPage() {
     setPlaybackStatus('idle')
     setPlaybackMimeType(null)
     setVodProgress(null)
+    setDownloadUrl(null)
   }
 
   useEffect(() => { playbackSessionIdRef.current = playbackSessionId }, [playbackSessionId])
@@ -433,6 +436,7 @@ export function RecordingsPage() {
         expectedDurationSec?: number
         url?: string
         mimeType?: string
+        downloadUrl?: string
       }>('/recordings/playback', {
         cameraId:       rec.cameraId,
         startTime:      rec.startTime,
@@ -449,12 +453,13 @@ export function RecordingsPage() {
       setPlaybackSessionId(sessionId)
       playbackSessionIdRef.current = sessionId
 
-      // Backend may return immediately-ready (session reuse)
+      // Backend may return immediately-ready (session reuse or cache hit)
       if (result.status === 'ready' && result.url) {
         setPlaybackMimeType(result.mimeType ?? null)
         setPlaybackUrl(result.url)
         setPlaybackStatus('ready')
         setPlaybackLoading(false)
+        if (result.downloadUrl) setDownloadUrl(result.downloadUrl)
         return
       }
 
@@ -498,6 +503,7 @@ export function RecordingsPage() {
           setPlaybackStatus('ready')
           setPlaybackLoading(false)
           setVodProgress(null)
+          if (statusRes.downloadUrl) setDownloadUrl(statusRes.downloadUrl)
           return
         }
 
@@ -878,18 +884,29 @@ export function RecordingsPage() {
 
         {/* Reproductor */}
         <div className="card overflow-hidden">
-          <div className="px-4 py-3 border-b border-surface-600">
+          <div className="px-4 py-3 border-b border-surface-600 flex items-center justify-between gap-3">
             <h3 className="text-sm font-medium text-surface-100 truncate">
               {selectedRec
                 ? `${selectedRec.nvrName} · ${selectedRec.cameraName} — ${format(new Date(selectedRec.startTime), 'dd/MM HH:mm')}`
                 : 'Reproductor'}
             </h3>
+            {playbackStatus === 'ready' && downloadUrl && (
+              <a
+                href={downloadUrl}
+                download
+                className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
+              >
+                <Download size={12} />
+                Descargar MP4
+              </a>
+            )}
           </div>
           <div className="aspect-video bg-surface-900 flex items-center justify-center relative">
             {/* Video player — always rendered so ref is stable */}
             <video
               ref={videoRef}
               controls
+              controlsList="nodownload"
               className={clsx('w-full h-full', !playbackUrl && 'hidden')}
               style={{ background: '#000' }}
             />
