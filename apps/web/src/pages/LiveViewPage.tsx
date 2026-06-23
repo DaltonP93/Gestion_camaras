@@ -798,6 +798,7 @@ export function LiveViewPage() {
 
   // ─── Enter focus/fullscreen — start main stream ─────────────
   const handleEnterFocus = useCallback(async (camera: Camera) => {
+    console.info(`[live-ui] fullscreen_requested cameraId=${camera.id} streamType=main`)
     setFocusCamera(camera.id)
     setFocusStreamInfo(null)
     setFocusStreamError(null)
@@ -844,8 +845,13 @@ export function LiveViewPage() {
         TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
         TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
       }
+      const mappedCode = (errCodeMap[body.error] || 'UNKNOWN') as CameraPlaybackError['code']
+      if (mappedCode === 'TRANSCODE_LIMIT_REACHED') {
+        console.info(`[live-ui] transcode_limit_reached cameraId=${camera.id}`)
+        console.info(`[live-ui] fallback_to_substream cameraId=${camera.id} reason=transcode_limit_reached — user can click 'Usar baja calidad'`)
+      }
       setFocusStreamError({
-        code: (errCodeMap[body.error] || 'UNKNOWN') as any,
+        code: mappedCode,
         message: body.message || 'Error al iniciar stream principal',
         technicalDetail: body.details,
       })
@@ -859,6 +865,7 @@ export function LiveViewPage() {
     if (quality === 'sub') {
       // Explicitly switching back to sub — stop both main streams so FFmpeg is killed.
       console.info(`[LiveView] qualitySwitch cameraId=${focusCamera} from=${focusStreamType} to=sub reason=switch_to_sub`)
+      console.info(`[live-ui] fallback_to_substream cameraId=${focusCamera} reason=user_selected_low_quality prevType=${focusStreamType}`)
       apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main',      reason: 'switch_to_sub' }).catch(() => {})
       apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main_h264', reason: 'switch_to_sub' }).catch(() => {})
       setFocusStreamInfo(null)
@@ -914,7 +921,7 @@ export function LiveViewPage() {
         RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
         TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
         TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
-        TRANSCODE_LIMIT_REACHED: 'UNKNOWN',
+        TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
       }
       setFocusStreamError({
         code: (errCodeMap[body.error] || 'UNKNOWN') as any,
