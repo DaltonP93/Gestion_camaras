@@ -41,6 +41,13 @@ const CACHE_DIR       = process.env.RECORDINGS_CACHE_DIR        || ''
 const CACHE_MAX_GB    = parseFloat(process.env.RECORDINGS_CACHE_MAX_GB    || '20')
 const CACHE_TTL_HOURS = parseFloat(process.env.RECORDINGS_CACHE_TTL_HOURS || '24')
 
+// Progressive / fragmented MP4 — DISABLED by default.
+// When true, uses -movflags frag_keyframe+empty_moov+default_base_moof so the browser
+// can start rendering before the full file is written. May improve first-frame latency
+// for long recordings. Keep OFF unless you verify Range requests + seek work correctly
+// in your target browsers, since fragmented MP4 moov structure differs from regular MP4.
+const PROGRESSIVE_MP4 = process.env.RECORDINGS_PROGRESSIVE_MP4 === 'true'
+
 // ─── Strategy ─────────────────────────────────────────────────────
 // copy_h264              – H.264 source → direct remux, fastest (< 5 s)
 // hevc_copy              – HEVC source + browser supports HEVC → direct remux, fastest (< 5 s)
@@ -193,12 +200,12 @@ if (CACHE_DIR && !fs.existsSync(CACHE_DIR)) {
 }
 if (CACHE_DIR) {
   console.log(`[recordings] vod_cache_configured dir=${CACHE_DIR} maxGb=${CACHE_MAX_GB} ttlHours=${CACHE_TTL_HOURS} forceTranscode=${RECORDINGS_FORCE_TRANSCODE}`)
-  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'}`)
+  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'} progressiveMp4=${PROGRESSIVE_MP4}`)
   runCacheCleanup(console.log)
   setInterval(() => runCacheCleanup(console.log), 60 * 60 * 1000)
 } else {
   console.log('[recordings] vod_cache_disabled — RECORDINGS_CACHE_DIR not set; MP4s deleted on session expiry (set env to enable persistent cache)')
-  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'}`)
+  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'} progressiveMp4=${PROGRESSIVE_MP4}`)
 }
 
 // ─── Download tokens (long-lived, independent of session lifetime) ────
@@ -363,7 +370,9 @@ async function spawnVodFfmpeg(opts: {
     '-reorder_queue_size', '0',
     '-i', rtspUrl,
     ...codecArgs,
-    '-movflags', '+faststart',
+    '-movflags', PROGRESSIVE_MP4
+      ? 'frag_keyframe+empty_moov+default_base_moof'
+      : '+faststart',
     '-progress', 'pipe:2',
     '-stats_period', '1',
     '-y',
