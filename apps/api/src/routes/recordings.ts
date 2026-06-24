@@ -164,9 +164,13 @@ if (CACHE_DIR && !fs.existsSync(CACHE_DIR)) {
   try { fs.mkdirSync(CACHE_DIR, { recursive: true }) } catch {}
 }
 if (CACHE_DIR) {
-  // Cleanup on startup then hourly
+  console.log(`[recordings] vod_cache_configured dir=${CACHE_DIR} maxGb=${CACHE_MAX_GB} ttlHours=${CACHE_TTL_HOURS} forceTranscode=${RECORDINGS_FORCE_TRANSCODE}`)
+  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'}`)
   runCacheCleanup(console.log)
   setInterval(() => runCacheCleanup(console.log), 60 * 60 * 1000)
+} else {
+  console.log('[recordings] vod_cache_disabled — RECORDINGS_CACHE_DIR not set; MP4s deleted on session expiry (set env to enable persistent cache)')
+  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'}`)
 }
 
 // ─── Download tokens (long-lived, independent of session lifetime) ────
@@ -805,7 +809,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           const sessionId  = crypto.randomBytes(8).toString('hex')
           const fileToken  = crypto.randomBytes(24).toString('hex')
           const expiresAt  = Date.now() + RECORDING_SESSION_TTL_MS
-          server.log.info(`[recordings] vod_cache_hit sessionId=${sessionId} cacheKey=${cacheKey} sizeBytes=${stat.size} cameraId=${body.cameraId}`)
+          server.log.info(`[recordings] vod_cache_hit sessionId=${sessionId} cacheKey=${cacheKey} sizeBytes=${stat.size} cameraId=${body.cameraId} cacheFile=${cacheFile}`)
           recordingSessions.set(sessionId, {
             expiresAt, startedAt: Date.now(), userId: user.sub,
             status: 'ready', fileToken,
@@ -828,7 +832,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           })
         }
       } catch { /* cache miss — file doesn't exist */ }
-      server.log.info(`[recordings] vod_cache_miss cacheKey=${cacheKey} cameraId=${body.cameraId}`)
+      server.log.info(`[recordings] vod_cache_miss cacheKey=${cacheKey} cameraId=${body.cameraId} cacheFile=${cacheFile}`)
     }
 
     // ── Job deduplication: reuse in-progress or ready session ────────

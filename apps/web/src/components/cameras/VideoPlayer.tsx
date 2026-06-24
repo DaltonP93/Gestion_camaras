@@ -440,6 +440,14 @@ export function VideoPlayer({
                   {activeError?.message || 'Cupo máx. alcanzado. Cierra otra cámara HD o usa baja calidad.'}
                 </p>
                 <div className="flex flex-wrap gap-1.5 mt-1 justify-center">
+                  {onQualitySwitch && (
+                    <button
+                      onClick={() => onQualitySwitch('sub')}
+                      className="btn-ghost text-[10px] px-2 py-1 text-brand-400 hover:text-brand-300"
+                    >
+                      Usar baja calidad
+                    </button>
+                  )}
                   {onRetry && cameraId && (
                     <button
                       onClick={() => onRetry!(cameraId!)}
