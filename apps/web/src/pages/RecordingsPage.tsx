@@ -395,6 +395,19 @@ export function RecordingsPage() {
       ` forceTranscode=${forceTranscode}`
     )
 
+    // ── Timezone diagnostic ──────────────────────────────────────────────────
+    // Helps identify whether UI displays wrong time vs what the NVR returns.
+    const browserTz   = Intl.DateTimeFormat().resolvedOptions().timeZone
+    const displayedStart = format(new Date(rec.startTime), 'dd/MM/yyyy HH:mm:ss')
+    const displayedEnd   = format(new Date(rec.endTime),   'dd/MM/yyyy HH:mm:ss')
+    console.info(
+      `[recordings-ui] time_mapping slot=${slotIndex}` +
+      ` recStart_raw=${rec.startTime} recEnd_raw=${rec.endTime}` +
+      ` displayedStart=${displayedStart} displayedEnd=${displayedEnd}` +
+      ` browserTz=${browserTz}` +
+      ` playbackURI=${(rec as any).playbackURI ?? 'none'}`
+    )
+
     const myKey = `${Date.now()}-${Math.random()}`
     slotKeysRef.current[slotIndex] = myKey
 
