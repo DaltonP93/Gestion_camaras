@@ -41,11 +41,18 @@ const CACHE_DIR       = process.env.RECORDINGS_CACHE_DIR        || ''
 const CACHE_MAX_GB    = parseFloat(process.env.RECORDINGS_CACHE_MAX_GB    || '20')
 const CACHE_TTL_HOURS = parseFloat(process.env.RECORDINGS_CACHE_TTL_HOURS || '24')
 
+// Progressive / fragmented MP4 — DISABLED by default.
+// When true, uses -movflags frag_keyframe+empty_moov+default_base_moof so the browser
+// can start rendering before the full file is written. May improve first-frame latency
+// for long recordings. Keep OFF unless you verify Range requests + seek work correctly
+// in your target browsers, since fragmented MP4 moov structure differs from regular MP4.
+const PROGRESSIVE_MP4 = process.env.RECORDINGS_PROGRESSIVE_MP4 === 'true'
+
 // ─── Strategy ─────────────────────────────────────────────────────
-// copy_h264     – H.264 source → direct remux, < 5 s
-// hevc_copy     – HEVC source + browser supports HEVC → direct remux, < 5 s
-// hevc_transcode – HEVC source + no browser support → libx264 transcode, ~60 s on CPU
-type VodStrategy = 'copy_h264' | 'hevc_copy' | 'hevc_transcode'
+// copy_h264              – H.264 source → direct remux, fastest (< 5 s)
+// hevc_copy              – HEVC source + browser supports HEVC → direct remux, fastest (< 5 s)
+// hevc_transcode_preview – HEVC source + no browser HEVC support → libx264 transcode (~1 min CPU)
+type VodStrategy = 'copy_h264' | 'hevc_copy' | 'hevc_transcode_preview'
 
 function isHevcCodec(codec: string): boolean {
   return /hevc|h265|h\.265|hvc1|hev1/i.test(codec)
@@ -57,16 +64,16 @@ function determineStrategy(opts: {
   forceTranscode: boolean
 }): VodStrategy {
   const { detectedCodec, canPlayHevcMp4, forceTranscode } = opts
-  if (forceTranscode || RECORDINGS_FORCE_TRANSCODE) return 'hevc_transcode'
+  if (forceTranscode || RECORDINGS_FORCE_TRANSCODE) return 'hevc_transcode_preview'
   if (!isHevcCodec(detectedCodec)) return 'copy_h264'
-  return canPlayHevcMp4 ? 'hevc_copy' : 'hevc_transcode'
+  return canPlayHevcMp4 ? 'hevc_copy' : 'hevc_transcode_preview'
 }
 
 function buildCodecArgs(strategy: VodStrategy): string[] {
   if (strategy === 'copy_h264' || strategy === 'hevc_copy') {
     return ['-an', '-c:v', 'copy']
   }
-  // hevc_transcode — CRF + maxrate keeps file small; scale keeps browser-compat resolution
+  // hevc_transcode_preview — CRF + maxrate keeps file small; scale keeps browser-compat resolution
   const vfParts: string[] = []
   if (TRANSCODE_MAX_WIDTH && TRANSCODE_MAX_WIDTH !== 'source') {
     vfParts.push(`scale='min(${TRANSCODE_MAX_WIDTH}\\,iw)':-2:flags=lanczos`)
@@ -109,6 +116,32 @@ function computeCacheKey(opts: {
   return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 40)
 }
 
+// ─── Cache sidecar helpers ────────────────────────────────────────
+// Alongside each cached .mp4 file we write a tiny .json sidecar so
+// that cache-hit log messages can report the strategy that generated
+// the file, without needing to re-probe the stream.
+interface VodSidecar {
+  strategy:  VodStrategy
+  codec:     string
+  elapsedMs: number
+  sizeBytes: number
+  createdAt: number
+}
+
+function getSidecarPath(vodFile: string): string {
+  return vodFile.replace(/\.mp4$/, '.json')
+}
+
+function writeSidecar(vodFile: string, data: VodSidecar): void {
+  try { fs.writeFileSync(getSidecarPath(vodFile), JSON.stringify(data)) } catch {}
+}
+
+function readSidecar(vodFile: string): VodSidecar | null {
+  try { return JSON.parse(fs.readFileSync(getSidecarPath(vodFile), 'utf-8')) } catch { return null }
+}
+
+// ─────────────────────────────────────────────────────────────────
+
 function runCacheCleanup(log: (msg: string) => void): void {
   if (!CACHE_DIR) return
   try {
@@ -133,6 +166,7 @@ function runCacheCleanup(log: (msg: string) => void): void {
     for (const f of stats) {
       if (now - f.mtime > ttlMs) {
         try { fs.unlinkSync(f.path); deletedFiles++; freedBytes += f.size; totalBytes -= f.size } catch {}
+        try { fs.unlinkSync(getSidecarPath(f.path)) } catch {}
       }
     }
 
@@ -144,6 +178,7 @@ function runCacheCleanup(log: (msg: string) => void): void {
       for (const f of remaining) {
         if (totalBytes <= maxBytes) break
         try { fs.unlinkSync(f.path); deletedFiles++; freedBytes += f.size; totalBytes -= f.size } catch {}
+        try { fs.unlinkSync(getSidecarPath(f.path)) } catch {}
       }
     }
 
@@ -165,12 +200,12 @@ if (CACHE_DIR && !fs.existsSync(CACHE_DIR)) {
 }
 if (CACHE_DIR) {
   console.log(`[recordings] vod_cache_configured dir=${CACHE_DIR} maxGb=${CACHE_MAX_GB} ttlHours=${CACHE_TTL_HOURS} forceTranscode=${RECORDINGS_FORCE_TRANSCODE}`)
-  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'}`)
+  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'} progressiveMp4=${PROGRESSIVE_MP4}`)
   runCacheCleanup(console.log)
   setInterval(() => runCacheCleanup(console.log), 60 * 60 * 1000)
 } else {
   console.log('[recordings] vod_cache_disabled — RECORDINGS_CACHE_DIR not set; MP4s deleted on session expiry (set env to enable persistent cache)')
-  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'}`)
+  console.log(`[recordings] transcode_config preset=${TRANSCODE_PRESET} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE} bufsize=${TRANSCODE_BUFSIZE} maxWidth=${TRANSCODE_MAX_WIDTH || 'source'} fps=${TRANSCODE_FPS || 'source'} progressiveMp4=${PROGRESSIVE_MP4}`)
 }
 
 // ─── Download tokens (long-lived, independent of session lifetime) ────
@@ -179,6 +214,8 @@ interface DownloadToken {
   filePath:  string
   filename:  string
   expiresAt: number
+  sessionId: string
+  issuedAt:  number
 }
 const downloadTokens = new Map<string, DownloadToken>()
 
@@ -199,6 +236,8 @@ interface RecordingSession {
   downloadUrl?:  string   // /api/recordings/download?t=<downloadToken>
   mimeType?:   string
   vodProcess?: ChildProcess
+  strategy?: VodStrategy   // strategy used to generate this session's file
+  codec?: string           // codec detected by ffprobe
   expectedDurationSec?: number
   progress?: {
     outTimeSec:     number
@@ -218,17 +257,22 @@ function issueDownloadToken(opts: {
   filename:  string
   log:       (msg: string) => void
 }): string {
-  const token = crypto.randomBytes(24).toString('hex')
+  const token    = crypto.randomBytes(24).toString('hex')
+  const issuedAt = Date.now()
   downloadTokens.set(token, {
     token, filePath: opts.filePath, filename: opts.filename,
-    expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL_MS,
+    expiresAt: issuedAt + DOWNLOAD_TOKEN_TTL_MS,
+    sessionId: opts.sessionId,
+    issuedAt,
   })
   const sess = recordingSessions.get(opts.sessionId)
   if (sess) {
     sess.downloadToken = token
     sess.downloadUrl   = `/api/recordings/download?t=${token}`
   }
+  const previewStrategy = sess?.strategy ?? 'unknown'
   opts.log(`[recordings] download_token_issued sessionId=${opts.sessionId} filename=${opts.filename}`)
+  opts.log(`[recordings] download_strategy sessionId=${opts.sessionId} strategy=reuse_preview previewStrategy=${previewStrategy} filename=${opts.filename}`)
   return token
 }
 
@@ -326,7 +370,9 @@ async function spawnVodFfmpeg(opts: {
     '-reorder_queue_size', '0',
     '-i', rtspUrl,
     ...codecArgs,
-    '-movflags', '+faststart',
+    '-movflags', PROGRESSIVE_MP4
+      ? 'frag_keyframe+empty_moov+default_base_moof'
+      : '+faststart',
     '-progress', 'pipe:2',
     '-stats_period', '1',
     '-y',
@@ -467,9 +513,16 @@ async function runVodBackground(opts: {
 
   // ── Step 2: Determine strategy ───────────────────────────────────
   const strategy = determineStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
-  const encoder  = strategy === 'hevc_transcode' ? TRANSCODE_ENCODER : 'copy'
+  const encoder  = strategy === 'hevc_transcode_preview' ? TRANSCODE_ENCODER : 'copy'
 
-  log(`[recordings] vod_strategy sessionId=${sessionId} strategy=${strategy} codec=${detectedCodec} canPlayHevcMp4=${canPlayHevcMp4} forceTranscode=${forceTranscode} expectedDurationSec=${expectedDurationSec}`)
+  // Persist strategy + codec on session for download logs and sidecar
+  const sessForStrategy = recordingSessions.get(sessionId)
+  if (sessForStrategy) {
+    sessForStrategy.strategy = strategy
+    sessForStrategy.codec    = detectedCodec
+  }
+
+  log(`[recordings] vod_strategy sessionId=${sessionId} strategy=${strategy} codec=${detectedCodec} canPlayHevc=${canPlayHevcMp4} forceTranscode=${forceTranscode} expectedDurationSec=${expectedDurationSec}`)
   log(`[recordings] encoder_selected sessionId=${sessionId} encoder=${encoder} reason=${strategy}`)
 
   const codecArgs = buildCodecArgs(strategy)
@@ -491,32 +544,39 @@ async function runVodBackground(opts: {
       if (stat.size > 512) {
         const elapsedMs = Date.now() - (finalSession.startedAt ?? Date.now())
         log(
-          `[recordings] vod_ready sessionId=${sessionId} attempt=${strategy} sizeBytes=${stat.size}` +
+          `[recordings] vod_ready sessionId=${sessionId} strategy=${strategy} sizeBytes=${stat.size}` +
           ` elapsedMs=${elapsedMs} expectedDurationSec=${expectedDurationSec}` +
-          ` codec=${detectedCodec} strategy=${strategy} encoder=${encoder}` +
-          ` crf=${strategy === 'hevc_transcode' ? TRANSCODE_CRF : 'n/a'}` +
-          ` maxrate=${strategy === 'hevc_transcode' ? TRANSCODE_MAXRATE : 'n/a'}`
+          ` codec=${detectedCodec} encoder=${encoder}` +
+          ` crf=${strategy === 'hevc_transcode_preview' ? TRANSCODE_CRF : 'n/a'}` +
+          ` maxrate=${strategy === 'hevc_transcode_preview' ? TRANSCODE_MAXRATE : 'n/a'}`
         )
         finalSession.vodFile  = vodFile
         finalSession.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${finalSession.fileToken}`
         finalSession.mimeType = 'video/mp4'
         finalSession.status   = 'ready'
+        // Write sidecar for cache-hit logs (only when file lives in CACHE_DIR)
+        if (finalSession.vodFileCached && CACHE_DIR) {
+          writeSidecar(vodFile, { strategy, codec: detectedCodec, elapsedMs, sizeBytes: stat.size, createdAt: Date.now() })
+        }
         issueDownloadToken({ sessionId, filePath: vodFile, filename: `${filename}.mp4`, log })
         return
       }
       // File too small — copy produced a degenerate file
-      log(`[recordings] vod_copy_empty sessionId=${sessionId} strategy=${strategy} size=${stat.size} — falling back to hevc_transcode`)
+      log(`[recordings] vod_copy_empty sessionId=${sessionId} strategy=${strategy} size=${stat.size} — falling back to hevc_transcode_preview`)
     } catch {
-      log(`[recordings] vod_stat_failed sessionId=${sessionId} strategy=${strategy} — falling back to hevc_transcode`)
+      log(`[recordings] vod_stat_failed sessionId=${sessionId} strategy=${strategy} — falling back to hevc_transcode_preview`)
     }
 
     // Automatic fallback to transcode when copy produced an unusable file
-    if (strategy !== 'hevc_transcode') {
+    if (strategy !== 'hevc_transcode_preview') {
       log(`[recordings] vod_transcode_fallback sessionId=${sessionId} — retrying with ${TRANSCODE_ENCODER}`)
+      // Update session strategy for the fallback attempt
+      const sessForFallback = recordingSessions.get(sessionId)
+      if (sessForFallback) { sessForFallback.strategy = 'hevc_transcode_preview'; sessForFallback.codec = detectedCodec }
       try { fs.unlinkSync(vodFile) } catch {}
       const fallbackResult = await spawnVodFfmpeg({
         sessionId, vodFile, rtspUrl, rtspMasked,
-        codecArgs: buildCodecArgs('hevc_transcode'),
+        codecArgs: buildCodecArgs('hevc_transcode_preview'),
         attempt: 'hevc_transcode_fallback', expectedDurationSec, log,
       })
       if (fallbackResult === 'stall' || fallbackResult === 'cancelled') return
@@ -526,11 +586,14 @@ async function runVodBackground(opts: {
         try {
           const stat2     = fs.statSync(vodFile)
           const elapsedMs = Date.now() - (sess2.startedAt ?? Date.now())
-          log(`[recordings] vod_ready sessionId=${sessionId} attempt=hevc_transcode_fallback sizeBytes=${stat2.size} elapsedMs=${elapsedMs} encoder=${TRANSCODE_ENCODER} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE}`)
+          log(`[recordings] vod_ready sessionId=${sessionId} strategy=hevc_transcode_fallback sizeBytes=${stat2.size} elapsedMs=${elapsedMs} encoder=${TRANSCODE_ENCODER} crf=${TRANSCODE_CRF} maxrate=${TRANSCODE_MAXRATE}`)
           sess2.vodFile  = vodFile
           sess2.vodUrl   = `/api/recordings/playback/${sessionId}/file.mp4?token=${sess2.fileToken}`
           sess2.mimeType = 'video/mp4'
           sess2.status   = 'ready'
+          if (sess2.vodFileCached && CACHE_DIR) {
+            writeSidecar(vodFile, { strategy: 'hevc_transcode_preview', codec: detectedCodec, elapsedMs, sizeBytes: stat2.size, createdAt: Date.now() })
+          }
           issueDownloadToken({ sessionId, filePath: vodFile, filename: `${filename}.mp4`, log })
         } catch {
           sess2.status    = 'error'
@@ -538,7 +601,7 @@ async function runVodBackground(opts: {
           sess2.errorMsg  = 'El archivo generado no se pudo leer'
         }
       } else {
-        log(`[recordings] vod_error sessionId=${sessionId} attempt=hevc_transcode_fallback result=${fallbackResult}`)
+        log(`[recordings] vod_error sessionId=${sessionId} strategy=hevc_transcode_fallback result=${fallbackResult}`)
         sess2.status    = 'error'
         sess2.errorCode = 'TRANSCODE_FAILED'
         sess2.errorMsg  = 'No se pudo generar el video. Verifica la conexión al NVR.'
@@ -809,7 +872,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           const sessionId  = crypto.randomBytes(8).toString('hex')
           const fileToken  = crypto.randomBytes(24).toString('hex')
           const expiresAt  = Date.now() + RECORDING_SESSION_TTL_MS
-          server.log.info(`[recordings] vod_cache_hit sessionId=${sessionId} cacheKey=${cacheKey} sizeBytes=${stat.size} cameraId=${body.cameraId} cacheFile=${cacheFile}`)
+          const sidecar = readSidecar(cacheFile)
+          server.log.info(`[recordings] vod_cache_hit sessionId=${sessionId} cacheKey=${cacheKey} strategy=${sidecar?.strategy ?? 'unknown'} codec=${sidecar?.codec ?? 'unknown'} sizeBytes=${stat.size} cameraId=${body.cameraId} cacheFile=${cacheFile}`)
           recordingSessions.set(sessionId, {
             expiresAt, startedAt: Date.now(), userId: user.sub,
             status: 'ready', fileToken,
@@ -1067,7 +1131,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }
 
     const safeFilename = dt.filename.replace(/[^\w\-_.]/g, '_')
+    const downloadElapsedMs = Date.now() - dt.issuedAt
     server.log.info(`[recordings] download_started filename=${safeFilename} sizeBytes=${fileSize}`)
+    server.log.info(`[recordings] download_ready sessionId=${dt.sessionId} sizeBytes=${fileSize} elapsedMs=${downloadElapsedMs} filename=${safeFilename}`)
 
     const rangeHeader = request.headers.range as string | undefined
 

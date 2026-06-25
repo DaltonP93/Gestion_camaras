@@ -1,40 +1,23 @@
 // src/pages/RecordingsPage.tsx
 import { useEffect, useState, useMemo, useRef } from 'react'
 import {
-  Search, Play, Calendar, Clock, ChevronDown, CheckSquare, Square,
-  AlertTriangle, RefreshCw, ExternalLink, XCircle, Loader2, Info, Download,
+  Play, Clock, AlertTriangle, RefreshCw, ExternalLink,
+  XCircle, Loader2, Info, Download,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet, apiDelete } from '@/lib/api'
-import { format, subDays, subHours, startOfDay, endOfDay } from 'date-fns'
+import { format, subHours } from 'date-fns'
 import { clsx } from 'clsx'
-import type { Recording, Camera } from '@/types'
+import type { Recording } from '@/types'
 import toast from 'react-hot-toast'
 import Hls from 'hls.js'
 import { RecordingPlaybackControls } from '@/components/RecordingPlaybackControls'
+import { RecordingCameraTree }  from '@/components/recordings/RecordingCameraTree'
+import { RecordingSearchBar }   from '@/components/recordings/RecordingSearchBar'
+import { RecordingTimeline }    from '@/components/recordings/RecordingTimeline'
+import type { RecordingWithCamera, NvrSearchError, PlaybackLayout } from '@/components/recordings/types'
 
-interface RecordingWithCamera extends Recording {
-  cameraId: string
-  cameraName: string
-  nvrName: string
-}
-
-interface NvrSearchError {
-  nvrId: string
-  nvrName: string
-  cameraIds: string[]
-  code: 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFFLINE' | 'UNKNOWN'
-  message: string
-  playbackWebUrl?: string | null
-}
-
-interface RecordingCapabilities {
-  nvrId: string
-  recordingProvider: string
-  supportsIsapiRecording: boolean | null
-  playbackWebUrl: string | null
-  recordingCapabilityError: string | null
-}
+// ─── Local interfaces kept for PlaybackStatusResponse ────────────────────────
 
 interface PlaybackStatusResponse {
   status:               'starting' | 'ready' | 'error'
@@ -45,7 +28,6 @@ interface PlaybackStatusResponse {
   errorCode?:           string
   error?:               string
   downloadUrl?:         string
-  // VOD generation progress
   outTimeSec?:          number
   frame?:               number
   fps?:                 number
@@ -56,6 +38,16 @@ interface PlaybackStatusResponse {
   elapsedMs?:           number
 }
 
+interface RecordingCapabilities {
+  nvrId: string
+  recordingProvider: string
+  supportsIsapiRecording: boolean | null
+  playbackWebUrl: string | null
+  recordingCapabilityError: string | null
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 function toLocalDatetimeString(date: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
@@ -64,106 +56,98 @@ function toLocalDatetimeString(date: Date): string {
 function classifyError(err: any): 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFFLINE' | 'UNKNOWN' {
   const msg = (err?.response?.data?.message || err?.message || '').toLowerCase()
   if (msg.includes('isapi') || msg.includes('no soporta') || msg.includes('unsupported')) return 'ISAPI_UNSUPPORTED'
-  if (msg.includes('401') || msg.includes('auth') || msg.includes('credencial')) return 'AUTH_FAILED'
+  if (msg.includes('401') || msg.includes('auth') || msg.includes('credencial'))           return 'AUTH_FAILED'
   if (msg.includes('offline') || msg.includes('unreachable') || msg.includes('econnrefused')) return 'NVR_OFFLINE'
   return 'UNKNOWN'
 }
 
+function formatDuration(start: string, end: string) {
+  const diff = new Date(end).getTime() - new Date(start).getTime()
+  const mins = Math.floor(diff / 60000)
+  const secs = Math.floor((diff % 60000) / 1000)
+  return `${mins}:${String(secs).padStart(2, '0')}`
+}
+
+function formatSize(bytes: number) {
+  if (bytes === 0) return '—'
+  if (bytes > 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`
+  return `${(bytes / 1048576).toFixed(0)} MB`
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
 const POLL_INTERVAL_MS    = 1_000
-// Safety cap: 15 minutes. Real timeout is dynamic (see handlePlay) and stall-based.
 const POLL_ABSOLUTE_MAX_MS = 15 * 60 * 1_000
-// Abort if FFmpeg shows no out_time progress for this long after first progress was seen
 const POLL_STALL_MS       = 45_000
+
+// ─── Component ───────────────────────────────────────────────────────────────
 
 export function RecordingsPage() {
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
-  const [selectedNVR, setSelectedNVR] = useState<string>('all')
+
+  // ── Search / filter state ──────────────────────────────────────────────────
   const [selectedCameras, setSelectedCameras] = useState<Set<string>>(new Set())
   const [startDate, setStartDate] = useState(toLocalDatetimeString(subHours(new Date(), 1)))
-  const [endDate, setEndDate]     = useState(toLocalDatetimeString(new Date()))
+  const [endDate,   setEndDate]   = useState(toLocalDatetimeString(new Date()))
   const [recordings, setRecordings] = useState<RecordingWithCamera[]>([])
   const [isSearching, setIsSearching] = useState(false)
-  const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
+  const [nvrErrors, setNvrErrors]     = useState<NvrSearchError[]>([])
+  const [nvrCaps,   setNvrCaps]       = useState<Map<string, RecordingCapabilities>>(new Map())
+  const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
+
+  // ── Layout ─────────────────────────────────────────────────────────────────
+  const [layout, setLayout] = useState<PlaybackLayout>('1x1')
+
+  // ── Playback state ─────────────────────────────────────────────────────────
+  const [playbackUrl, setPlaybackUrl]         = useState<string | null>(null)
   const [playbackSessionId, setPlaybackSessionId] = useState<string | null>(null)
   const [playbackLoading, setPlaybackLoading] = useState(false)
-  const [playbackStatus, setPlaybackStatus] = useState<'idle' | 'starting' | 'transcoding' | 'ready'>('idle')
-  const [selectedRec, setSelectedRec] = useState<RecordingWithCamera | null>(null)
+  const [playbackStatus, setPlaybackStatus]   = useState<'idle' | 'starting' | 'transcoding' | 'ready'>('idle')
+  const [selectedRec, setSelectedRec]         = useState<RecordingWithCamera | null>(null)
+  const [playbackMimeType, setPlaybackMimeType] = useState<string | null>(null)
+  const [playbackTranscoding, setPlaybackTranscoding] = useState(false) // eslint-disable-line @typescript-eslint/no-unused-vars
+  const [vodProgress, setVodProgress]         = useState<{ outTimeSec: number; expectedDurationSec: number } | null>(null)
+  const [downloadUrl,  setDownloadUrl]         = useState<string | null>(null)
+
+  // ── Refs ───────────────────────────────────────────────────────────────────
   const videoRef             = useRef<HTMLVideoElement>(null)
   const hlsRef               = useRef<Hls | null>(null)
   const playbackKeyRef       = useRef<string | null>(null)
   const playbackSessionIdRef = useRef<string | null>(null)
   const playbackEndedRef     = useRef(false)
   const playbackCleaningRef  = useRef(false)
-  const startDateRef  = useRef<HTMLInputElement>(null)
-  const endDateRef    = useRef<HTMLInputElement>(null)
-  // Mirrors selectedRec so error handlers inside useEffect closures can read it
-  const selectedRecRef        = useRef<RecordingWithCamera | null>(null)
-  // True if canPlayHevcMp4=true was sent — drives the one-shot hevc→transcode retry
-  const hevcCopyAttemptedRef  = useRef(false)
-  const hevcRetryDoneRef      = useRef(false)
-  // Always-current reference to handlePlay — used to call it from useEffect closures
+  const selectedRecRef       = useRef<RecordingWithCamera | null>(null)
+  const hevcCopyAttemptedRef = useRef(false)
+  const hevcRetryDoneRef     = useRef(false)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const handlePlayFnRef       = useRef<(rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
-  const [showCameraList, setShowCameraList] = useState(false)
-  const [nvrErrors, setNvrErrors] = useState<NvrSearchError[]>([])
-  const [revalidating, setRevalidating] = useState<Set<string>>(new Set())
-  const [nvrCaps, setNvrCaps] = useState<Map<string, RecordingCapabilities>>(new Map())
-  const [playbackTranscoding, setPlaybackTranscoding] = useState(false)
-  const [playbackMimeType, setPlaybackMimeType] = useState<string | null>(null)
-  const [vodProgress, setVodProgress] = useState<{ outTimeSec: number; expectedDurationSec: number } | null>(null)
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null)
+  const handlePlayFnRef      = useRef<(rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
 
-  useEffect(() => {
-    loadNVRs()
-    loadCameras()
-  }, [])
+  // ── Bootstrap ──────────────────────────────────────────────────────────────
+  useEffect(() => { loadNVRs(); loadCameras() }, [])
 
-  const filteredCameras = useMemo(() =>
-    cameras.filter(c => selectedNVR === 'all' ? true : c.nvrId === selectedNVR),
-    [cameras, selectedNVR]
-  )
-
-  const camerasByNVR = useMemo(() => {
-    const map = new Map<string, { nvrName: string; cameras: Camera[] }>()
-    filteredCameras.forEach((cam) => {
-      const nvrName = cam.nvr?.name || 'Sin NVR'
-      if (!map.has(cam.nvrId)) map.set(cam.nvrId, { nvrName, cameras: [] })
-      map.get(cam.nvrId)!.cameras.push(cam)
-    })
-    return map
-  }, [filteredCameras])
-
-  useEffect(() => { setSelectedCameras(new Set()) }, [selectedNVR])
-
-  const toggleCamera = (cameraId: string) => {
+  // ── Camera selection helpers ───────────────────────────────────────────────
+  const toggleCamera = (cameraId: string) =>
     setSelectedCameras(prev => {
       const next = new Set(prev)
       next.has(cameraId) ? next.delete(cameraId) : next.add(cameraId)
       return next
     })
-  }
 
-  const toggleAllInNVR = (nvrId: string) => {
-    const group = camerasByNVR.get(nvrId)
-    if (!group) return
-    const allIds = group.cameras.map(c => c.id)
-    const allSelected = allIds.every(id => selectedCameras.has(id))
+  const toggleNVR = (nvrId: string) => {
+    const ids = cameras.filter(c => c.nvrId === nvrId).map(c => c.id)
+    const allSelected = ids.every(id => selectedCameras.has(id))
     setSelectedCameras(prev => {
       const next = new Set(prev)
-      if (allSelected) allIds.forEach(id => next.delete(id))
-      else allIds.forEach(id => next.add(id))
+      if (allSelected) ids.forEach(id => next.delete(id))
+      else             ids.forEach(id => next.add(id))
       return next
     })
   }
 
-  const selectAll = () => setSelectedCameras(new Set(filteredCameras.map(c => c.id)))
+  const selectAll = () => setSelectedCameras(new Set(cameras.map(c => c.id)))
   const clearAll  = () => setSelectedCameras(new Set())
 
-  const setQuick = (from: Date, to: Date) => {
-    setStartDate(toLocalDatetimeString(from))
-    setEndDate(toLocalDatetimeString(to))
-  }
-
+  // ── Search ─────────────────────────────────────────────────────────────────
   const handleSearch = async () => {
     if (selectedCameras.size === 0) { toast.error('Selecciona al menos una cámara'); return }
     const start = new Date(startDate)
@@ -186,18 +170,18 @@ export function RecordingsPage() {
     })
 
     const results = await Promise.allSettled(
-      cameraIds.map((cameraId) =>
+      cameraIds.map(cameraId =>
         apiGet<{ recordings: Recording[] }>('/recordings/search', {
           cameraId,
           startTime: new Date(startDate).toISOString(),
-          endTime: new Date(endDate).toISOString(),
-        }).then((res) => {
+          endTime:   new Date(endDate).toISOString(),
+        }).then(res => {
           const cam = cameras.find(c => c.id === cameraId)
           return (res?.recordings ?? []).map((r): RecordingWithCamera => ({
             ...r,
             cameraId,
             cameraName: cam?.name || 'Desconocida',
-            nvrName: cam?.nvr?.name || '',
+            nvrName:    cam?.nvr?.name || '',
           }))
         })
       )
@@ -211,15 +195,15 @@ export function RecordingsPage() {
         all.push(...r.value)
       } else {
         const cameraId = cameraIds[i]
-        const nvrInfo = camToNvr.get(cameraId)
+        const nvrInfo  = camToNvr.get(cameraId)
         if (nvrInfo) {
           if (!errsByNvr.has(nvrInfo.nvrId)) {
             errsByNvr.set(nvrInfo.nvrId, {
-              nvrId: nvrInfo.nvrId,
-              nvrName: nvrInfo.nvrName,
+              nvrId:    nvrInfo.nvrId,
+              nvrName:  nvrInfo.nvrName,
               cameraIds: [],
-              code: classifyError(r.reason),
-              message: r.reason?.response?.data?.message ?? r.reason?.message ?? 'Error desconocido',
+              code:     classifyError(r.reason),
+              message:  r.reason?.response?.data?.message ?? r.reason?.message ?? 'Error desconocido',
               playbackWebUrl: nvrCaps.get(nvrInfo.nvrId)?.playbackWebUrl ?? null,
             })
           }
@@ -243,7 +227,6 @@ export function RecordingsPage() {
     try {
       const caps = await apiPost<RecordingCapabilities>(`/nvrs/${nvrId}/recording-capabilities/check`, {})
       setNvrCaps(prev => new Map([...prev, [nvrId, caps]]))
-
       if (caps.supportsIsapiRecording) {
         toast.success('NVR ahora soporta ISAPI. Vuelve a buscar para obtener resultados.')
         setNvrErrors(prev => prev.filter(e => e.nvrId !== nvrId))
@@ -260,7 +243,8 @@ export function RecordingsPage() {
     }
   }
 
-  // Stop any active HLS instance and release the recording session
+  // ── Playback control ───────────────────────────────────────────────────────
+
   const stopPlayback = () => {
     playbackCleaningRef.current = true
     toast.dismiss()
@@ -282,17 +266,16 @@ export function RecordingsPage() {
   useEffect(() => { playbackSessionIdRef.current = playbackSessionId }, [playbackSessionId])
   useEffect(() => { selectedRecRef.current = selectedRec }, [selectedRec])
 
-  // Clean up HLS + session on unmount
+  // Clean up on unmount
   useEffect(() => stopPlayback, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Attach video source whenever playbackUrl or mimeType changes
+  // Attach video source when playbackUrl / mimeType changes
   useEffect(() => {
     const video = videoRef.current
     if (!video || !playbackUrl) return
 
-    playbackEndedRef.current   = false
+    playbackEndedRef.current    = false
     playbackCleaningRef.current = false
-
     const attachedKey = playbackKeyRef.current
 
     const handleVideoEnded = () => {
@@ -309,19 +292,16 @@ export function RecordingsPage() {
 
     video.addEventListener('ended', handleVideoEnded)
 
-    // Native HTML5 for MP4 VOD — no HLS.js needed
     if (playbackMimeType === 'video/mp4') {
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
 
       const handleVideoError = () => {
-        if (playbackEndedRef.current) return
-        if (playbackCleaningRef.current) return
+        if (playbackEndedRef.current)             return
+        if (playbackCleaningRef.current)          return
         if (attachedKey !== playbackKeyRef.current) return
         const err = video.error
         console.error(`[recordings-ui] mp4_video_error code=${err?.code} message=${err?.message} currentSrc=${video.currentSrc}`)
 
-        // One-shot retry: if hevc_copy was attempted and browser can't decode it, re-request
-        // with forceTranscode=true so backend produces a libx264 MP4 instead.
         if (hevcCopyAttemptedRef.current && !hevcRetryDoneRef.current && selectedRecRef.current) {
           hevcRetryDoneRef.current = true
           const recToRetry = selectedRecRef.current
@@ -356,7 +336,7 @@ export function RecordingsPage() {
       }
     }
 
-    // HLS.js path (legacy / fallback)
+    // HLS.js path
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
     if (Hls.isSupported()) {
       const hls = new Hls({
@@ -368,9 +348,9 @@ export function RecordingsPage() {
       hls.attachMedia(video)
       hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
       hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (!data.fatal) return
-        if (playbackEndedRef.current) return
-        if (playbackCleaningRef.current) return
+        if (!data.fatal)                           return
+        if (playbackEndedRef.current)              return
+        if (playbackCleaningRef.current)           return
         if (attachedKey !== playbackKeyRef.current) return
         const status = (data.response as any)?.code ?? 0
         if (status === 401) {
@@ -387,39 +367,35 @@ export function RecordingsPage() {
     return () => { video.removeEventListener('ended', handleVideoEnded) }
   }, [playbackUrl, playbackMimeType])
 
+  // ── handlePlay ─────────────────────────────────────────────────────────────
+
   const handlePlay = async (rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => {
     const forceTranscode = opts?.forceTranscode ?? false
-
     const isSameRec = selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId
 
-    // Already playing this recording — do nothing
-    if (isSameRec && playbackStatus === 'ready') return
-    // Already generating this recording — let the existing poll finish
+    if (isSameRec && playbackStatus === 'ready')    return
     if (isSameRec && playbackStatus === 'starting') return
 
-    // Different recording or error/idle: stop current and start fresh
     stopPlayback()
     setSelectedRec(rec)
     setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
     setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
 
     const myKey = `${Date.now()}-${Math.random()}`
-    playbackKeyRef.current    = myKey
-    playbackEndedRef.current  = false
+    playbackKeyRef.current      = myKey
+    playbackEndedRef.current    = false
     playbackCleaningRef.current = false
     setPlaybackMimeType(null)
     setVodProgress(null)
     setPlaybackLoading(true)
     setPlaybackStatus('starting')
 
-    // Detect HEVC native playback support (canPlayType is synchronous and safe to call here)
     const videoEl        = videoRef.current ?? document.createElement('video')
     const canPlayHevcMp4 = !forceTranscode && (
       videoEl.canPlayType('video/mp4; codecs="hvc1"') !== '' ||
       videoEl.canPlayType('video/mp4; codecs="hev1"') !== ''
     )
 
-    // Track for the one-shot hevc→transcode retry in the video error handler
     hevcCopyAttemptedRef.current = canPlayHevcMp4
     if (!forceTranscode) hevcRetryDoneRef.current = false
 
@@ -428,7 +404,6 @@ export function RecordingsPage() {
     let sessionId: string | null = null
 
     try {
-      // POST returns immediately — backend starts background job (or returns cache/reuse)
       const result = await apiPost<{
         status: string
         sessionId: string
@@ -439,10 +414,10 @@ export function RecordingsPage() {
         mimeType?: string
         downloadUrl?: string
       }>('/recordings/playback', {
-        cameraId:       rec.cameraId,
-        startTime:      rec.startTime,
-        endTime:        rec.endTime,
-        playbackURI:    rec.playbackURI,
+        cameraId:    rec.cameraId,
+        startTime:   rec.startTime,
+        endTime:     rec.endTime,
+        playbackURI: rec.playbackURI,
         canPlayHevcMp4,
         forceTranscode,
       })
@@ -454,7 +429,6 @@ export function RecordingsPage() {
       setPlaybackSessionId(sessionId)
       playbackSessionIdRef.current = sessionId
 
-      // Backend may return immediately-ready (session reuse or cache hit)
       if (result.status === 'ready' && result.url) {
         setPlaybackMimeType(result.mimeType ?? null)
         setPlaybackUrl(result.url)
@@ -464,11 +438,9 @@ export function RecordingsPage() {
         return
       }
 
-      // Dynamic timeout: at least 3 minutes, or 2.5× recording length + 60s, capped at 15min.
-      const expectedSec   = result.expectedDurationSec ?? 60
-      const dynamicPollMs = Math.min(POLL_ABSOLUTE_MAX_MS, Math.max(180_000, expectedSec * 2500 + 60_000))
+      const expectedSec    = result.expectedDurationSec ?? 60
+      const dynamicPollMs  = Math.min(POLL_ABSOLUTE_MAX_MS, Math.max(180_000, expectedSec * 2500 + 60_000))
 
-      // Stall detection: track when out_time last advanced (client-side complement to backend watchdog)
       let lastSeenOutTimeSec = -1
       let lastProgressTick   = Date.now()
 
@@ -476,7 +448,7 @@ export function RecordingsPage() {
       while (Date.now() - pollStart < dynamicPollMs) {
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
 
-        if (playbackKeyRef.current !== myKey) return  // user cancelled
+        if (playbackKeyRef.current !== myKey) return
 
         let statusRes: PlaybackStatusResponse
         try {
@@ -524,23 +496,19 @@ export function RecordingsPage() {
           return
         }
 
-        // Still 'starting' — update progress display
         const outSec = statusRes.outTimeSec ?? 0
         const expSec = statusRes.expectedDurationSec ?? expectedSec
         if (outSec > 0) {
           setVodProgress({ outTimeSec: outSec, expectedDurationSec: expSec })
-          // Update stall tracker when progress actually advances
           if (outSec > lastSeenOutTimeSec) {
             lastSeenOutTimeSec = outSec
             lastProgressTick   = Date.now()
           }
         }
 
-        // Client-side stall guard: no progress for POLL_STALL_MS after first frame seen
         if (lastSeenOutTimeSec >= 0 && Date.now() - lastProgressTick > POLL_STALL_MS) {
           const pct = statusRes.progressPercent ?? 0
           if (pct >= 95) {
-            // Backend is finalizando the MP4 (near-complete SIGINT path) — keep polling
             console.info(`[recordings-ui] vod_client_stall_ignored_near_complete pct=${pct}`)
           } else {
             toast.error(
@@ -555,7 +523,6 @@ export function RecordingsPage() {
         }
       }
 
-      // Safety-cap timeout (should rarely happen if stall detection and backend watchdog work)
       if (playbackKeyRef.current !== myKey) return
       toast.error('Tiempo de generación superado (>15 min). Intenta de nuevo.', { duration: 8000 })
       setPlaybackLoading(false)
@@ -572,31 +539,9 @@ export function RecordingsPage() {
     }
   }
 
-  // Keep ref current so useEffect closures can call the latest handlePlay without stale closure issues
   handlePlayFnRef.current = handlePlay
 
-  const formatDuration = (start: string, end: string) => {
-    const diff = new Date(end).getTime() - new Date(start).getTime()
-    const mins = Math.floor(diff / 60000)
-    const secs = Math.floor((diff % 60000) / 1000)
-    return `${mins}:${String(secs).padStart(2, '0')}`
-  }
-
-  const formatSize = (bytes: number) => {
-    if (bytes === 0) return '—'
-    if (bytes > 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`
-    return `${(bytes / 1048576).toFixed(0)} MB`
-  }
-
-  const selectedLabel = selectedCameras.size === 0
-    ? 'Seleccionar cámaras'
-    : `${selectedCameras.size} cámara${selectedCameras.size > 1 ? 's' : ''} seleccionada${selectedCameras.size > 1 ? 's' : ''}`
-
-  const triggerDatePicker = (ref: React.RefObject<HTMLInputElement | null>) => {
-    const el = ref.current
-    if (!el) return
-    try { ;(el as any).showPicker?.() } catch { el.focus() }
-  }
+  // ── Derived UI values ──────────────────────────────────────────────────────
 
   const vodPct = vodProgress && vodProgress.expectedDurationSec > 0
     ? Math.min(99, Math.round(vodProgress.outTimeSec / vodProgress.expectedDurationSec * 100))
@@ -610,345 +555,273 @@ export function RecordingsPage() {
         ? 'Transcodificando H.265 → H.264…'
         : 'Preparando grabación…'
 
+  // ── Grid layout helpers ────────────────────────────────────────────────────
+
+  const gridColsClass: Record<PlaybackLayout, string> = {
+    '1x1': 'grid-cols-1',
+    '2x2': 'grid-cols-2',
+    '3x3': 'grid-cols-3',
+    '4x4': 'grid-cols-4',
+  }
+  const slotCount: Record<PlaybackLayout, number> = { '1x1': 1, '2x2': 4, '3x3': 9, '4x4': 16 }
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+
   return (
-    <div className="p-5 space-y-4 animate-fade-in">
-      <h2 className="text-base font-semibold text-surface-100">Grabaciones</h2>
+    <div className="flex h-full bg-surface-900 overflow-hidden">
 
-      {/* Filtros */}
-      <div className="card p-4 space-y-3">
-        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+      {/* ── Left: camera tree ─────────────────────────────────────────────── */}
+      <aside className="w-56 flex-shrink-0 border-r border-surface-700 flex flex-col overflow-hidden">
+        <RecordingCameraTree
+          nvrs={nvrs}
+          cameras={cameras}
+          selectedCameras={selectedCameras}
+          nvrErrors={nvrErrors}
+          onToggleCamera={toggleCamera}
+          onToggleNVR={toggleNVR}
+          onSelectAll={selectAll}
+          onClearAll={clearAll}
+        />
+      </aside>
 
-          <div>
-            <label className="label">NVR</label>
-            <div className="relative">
-              <select
-                value={selectedNVR}
-                onChange={(e) => setSelectedNVR(e.target.value)}
-                className="input appearance-none pr-8"
-              >
-                <option value="all">Todos los NVRs</option>
-                {nvrs.map((nvr) => (
-                  <option key={nvr.id} value={nvr.id}>{nvr.name}</option>
-                ))}
-              </select>
-              <ChevronDown size={12} className="absolute right-3 top-1/2 -translate-y-1/2 text-surface-400 pointer-events-none" />
-            </div>
-          </div>
+      {/* ── Right: main area ──────────────────────────────────────────────── */}
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
 
-          <div>
-            <label className="label">Cámaras</label>
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setShowCameraList(v => !v)}
-                className="input text-left flex items-center justify-between w-full"
-              >
-                <span className={clsx('truncate', selectedCameras.size === 0 && 'text-surface-500')}>
-                  {selectedLabel}
+        {/* Search bar */}
+        <RecordingSearchBar
+          startDate={startDate}
+          endDate={endDate}
+          onStartDateChange={setStartDate}
+          onEndDateChange={setEndDate}
+          onSearch={handleSearch}
+          isSearching={isSearching}
+          cameraCount={selectedCameras.size}
+          layout={layout}
+          onLayoutChange={setLayout}
+        />
+
+        {/* NVR error banners */}
+        {nvrErrors.length > 0 && (
+          <div className="flex-shrink-0 space-y-1 px-3 py-2 border-b border-surface-700 max-h-32 overflow-y-auto">
+            {nvrErrors.map(err => (
+              <div key={err.nvrId} className={clsx(
+                'flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-xs',
+                err.code === 'ISAPI_UNSUPPORTED' ? 'bg-amber-900/15 border-amber-700/40 text-amber-300'
+                  : err.code === 'NVR_OFFLINE'   ? 'bg-red-900/15 border-red-700/40 text-red-300'
+                  : 'bg-surface-800 border-surface-700 text-surface-400'
+              )}>
+                {err.code === 'ISAPI_UNSUPPORTED' ? <AlertTriangle size={12} className="flex-shrink-0" />
+                  : err.code === 'NVR_OFFLINE'    ? <XCircle size={12} className="flex-shrink-0" />
+                  : <Info size={12} className="flex-shrink-0" />
+                }
+                <span className="font-medium flex-shrink-0">{err.nvrName}</span>
+                <span className="text-[10px] opacity-70 truncate">
+                  {err.code === 'ISAPI_UNSUPPORTED' && 'No soporta ISAPI'}
+                  {err.code === 'AUTH_FAILED' && 'Credenciales inválidas'}
+                  {err.code === 'NVR_OFFLINE' && 'NVR no accesible'}
+                  {err.code === 'UNKNOWN' && err.message}
                 </span>
-                <ChevronDown size={12} className="text-surface-400 flex-shrink-0 ml-2" />
-              </button>
-
-              {showCameraList && (
-                <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-surface-800 border border-surface-600 rounded-lg shadow-xl max-h-72 overflow-y-auto">
-                  <div className="sticky top-0 bg-surface-800 border-b border-surface-700 px-3 py-2 flex items-center gap-2">
-                    <button onClick={selectAll} className="text-xs text-brand-400 hover:text-brand-300">Seleccionar todo</button>
-                    <span className="text-surface-600">·</span>
-                    <button onClick={clearAll} className="text-xs text-surface-400 hover:text-surface-200">Limpiar</button>
-                    <span className="ml-auto text-xs text-surface-500">{selectedCameras.size} sel.</span>
-                  </div>
-
-                  {[...camerasByNVR.entries()].map(([nvrId, { nvrName, cameras: cams }]) => {
-                    const allSel  = cams.every(c => selectedCameras.has(c.id))
-                    const someSel = cams.some(c => selectedCameras.has(c.id))
-                    const isUnsupported = nvrErrors.some(e => e.nvrId === nvrId && e.code === 'ISAPI_UNSUPPORTED')
-                    return (
-                      <div key={nvrId}>
-                        <button
-                          onClick={() => toggleAllInNVR(nvrId)}
-                          className="w-full flex items-center gap-2 px-3 py-2 bg-surface-750 hover:bg-surface-700 transition-colors text-left"
-                        >
-                          {allSel ? <CheckSquare size={13} className="text-brand-400 flex-shrink-0" />
-                            : someSel ? <CheckSquare size={13} className="text-brand-400/50 flex-shrink-0" />
-                            : <Square size={13} className="text-surface-500 flex-shrink-0" />}
-                          <span className="text-xs font-medium text-surface-200 uppercase tracking-wide">{nvrName}</span>
-                          {isUnsupported && (
-                            <span className="text-[9px] px-1 py-0.5 rounded bg-amber-900/40 text-amber-500 ml-1">sin ISAPI</span>
-                          )}
-                          <span className="ml-auto text-xs text-surface-500">{cams.length}ch</span>
-                        </button>
-                        {cams.map((cam) => (
-                          <button
-                            key={cam.id}
-                            onClick={() => toggleCamera(cam.id)}
-                            className="w-full flex items-center gap-2 pl-6 pr-3 py-1.5 hover:bg-surface-700/50 transition-colors text-left"
-                          >
-                            {selectedCameras.has(cam.id)
-                              ? <CheckSquare size={12} className="text-brand-400 flex-shrink-0" />
-                              : <Square size={12} className="text-surface-600 flex-shrink-0" />}
-                            <span className="text-xs text-surface-300 truncate">{cam.name}</span>
-                            <span className={clsx('ml-auto text-xs flex-shrink-0', cam.online ? 'text-green-500' : 'text-surface-600')}>
-                              {cam.online ? '●' : '○'}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    )
-                  })}
+                <div className="ml-auto flex items-center gap-1.5 flex-shrink-0">
+                  {err.playbackWebUrl && (
+                    <a href={err.playbackWebUrl} target="_blank" rel="noopener noreferrer"
+                      className="flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-200 transition-colors">
+                      <ExternalLink size={9} /> Web NVR
+                    </a>
+                  )}
+                  <button
+                    onClick={() => handleRevalidate(err.nvrId)}
+                    disabled={revalidating.has(err.nvrId)}
+                    className="flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-200 transition-colors disabled:opacity-50"
+                  >
+                    {revalidating.has(err.nvrId)
+                      ? <Loader2 size={9} className="animate-spin" />
+                      : <RefreshCw size={9} />
+                    }
+                    Revalidar
+                  </button>
                 </div>
-              )}
-            </div>
-          </div>
-
-          <div>
-            <label className="label">Desde</label>
-            <div className="relative">
-              <input
-                ref={startDateRef}
-                type="datetime-local"
-                value={startDate}
-                onChange={(e) => setStartDate(e.target.value)}
-                className="input pr-8"
-              />
-              <button
-                type="button"
-                onClick={() => triggerDatePicker(startDateRef)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200 transition-colors"
-                tabIndex={-1}
-              >
-                <Calendar size={14} />
-              </button>
-            </div>
-          </div>
-
-          <div>
-            <label className="label">Hasta</label>
-            <div className="relative">
-              <input
-                ref={endDateRef}
-                type="datetime-local"
-                value={endDate}
-                onChange={(e) => setEndDate(e.target.value)}
-                className="input pr-8"
-              />
-              <button
-                type="button"
-                onClick={() => triggerDatePicker(endDateRef)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-surface-200 transition-colors"
-                tabIndex={-1}
-              >
-                <Calendar size={14} />
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-3 flex-wrap">
-          <div className="flex gap-2 flex-wrap flex-1">
-            {[
-              { label: 'Última hora', fn: () => setQuick(subHours(new Date(), 1), new Date()) },
-              { label: 'Hoy',         fn: () => setQuick(startOfDay(new Date()), new Date()) },
-              { label: 'Ayer',        fn: () => setQuick(startOfDay(subDays(new Date(), 1)), endOfDay(subDays(new Date(), 1))) },
-              { label: 'Últimos 7d',  fn: () => setQuick(startOfDay(subDays(new Date(), 7)), new Date()) },
-            ].map(({ label, fn }) => (
-              <button key={label} onClick={fn}
-                className="text-xs px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:text-surface-200 hover:bg-surface-600 transition-colors"
-              >
-                {label}
-              </button>
+              </div>
             ))}
           </div>
-          <button
-            onClick={handleSearch}
-            disabled={isSearching || selectedCameras.size === 0}
-            className="btn-primary justify-center min-w-[120px]"
-          >
-            {isSearching ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}
-            {isSearching ? 'Buscando...' : 'Buscar'}
-          </button>
-        </div>
-      </div>
+        )}
 
-      {/* Click-away for camera dropdown */}
-      {showCameraList && (
-        <div className="fixed inset-0 z-40" onClick={() => setShowCameraList(false)} />
-      )}
+        {/* ── Central: video grid + recordings list ─────────────────────── */}
+        <div className="flex-1 flex min-h-0 overflow-hidden">
 
-      {/* Per-NVR error banners */}
-      {nvrErrors.map((err) => (
-        <div key={err.nvrId} className={clsx(
-          'flex items-start gap-3 p-3 rounded-lg border text-sm',
-          err.code === 'ISAPI_UNSUPPORTED'
-            ? 'bg-amber-900/15 border-amber-700/40 text-amber-300'
-            : err.code === 'NVR_OFFLINE'
-              ? 'bg-red-900/15 border-red-700/40 text-red-300'
-              : 'bg-surface-800 border-surface-700 text-surface-400'
-        )}>
-          {err.code === 'ISAPI_UNSUPPORTED'
-            ? <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
-            : err.code === 'NVR_OFFLINE'
-              ? <XCircle size={16} className="flex-shrink-0 mt-0.5" />
-              : <Info size={16} className="flex-shrink-0 mt-0.5" />
-          }
-          <div className="flex-1 min-w-0">
-            <div className="font-medium">{err.nvrName}</div>
-            <div className="text-xs opacity-80 mt-0.5">
-              {err.code === 'ISAPI_UNSUPPORTED' && 'Este NVR no soporta búsqueda de grabaciones vía ISAPI'}
-              {err.code === 'AUTH_FAILED' && 'Credenciales inválidas para acceder a grabaciones'}
-              {err.code === 'NVR_OFFLINE' && 'NVR no accesible'}
-              {err.code === 'UNKNOWN' && err.message}
-              {' · '}{err.cameraIds.length} cámara{err.cameraIds.length !== 1 ? 's' : ''} omitida{err.cameraIds.length !== 1 ? 's' : ''}
-            </div>
-          </div>
-          <div className="flex items-center gap-2 flex-shrink-0">
-            {err.playbackWebUrl && (
-              <a
-                href={err.playbackWebUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-1 text-xs px-2 py-1 rounded bg-surface-700 hover:bg-surface-600 text-surface-200 transition-colors"
-              >
-                <ExternalLink size={11} /> Abrir web NVR
-              </a>
-            )}
-            <button
-              onClick={() => handleRevalidate(err.nvrId)}
-              disabled={revalidating.has(err.nvrId)}
-              className="flex items-center gap-1 text-xs px-2 py-1 rounded bg-surface-700 hover:bg-surface-600 text-surface-200 transition-colors disabled:opacity-50"
-            >
-              {revalidating.has(err.nvrId) ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-              Revalidar
-            </button>
-          </div>
-        </div>
-      ))}
+          {/* Video grid */}
+          <div className="flex-1 min-w-0 bg-black">
+            <div className={clsx('grid h-full gap-0.5 bg-surface-800', gridColsClass[layout])}>
+              {Array.from({ length: slotCount[layout] }).map((_, idx) => {
+                const isActive = idx === 0
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Lista de grabaciones */}
-        <div className="card overflow-hidden">
-          <div className="px-4 py-3 border-b border-surface-600 flex items-center justify-between">
-            <h3 className="text-sm font-medium text-surface-100">
-              Resultados
-              {recordings.length > 0 && (
-                <span className="ml-2 text-xs text-surface-400">{recordings.length} grabaciones</span>
-              )}
-            </h3>
-          </div>
-          <div className="divide-y divide-surface-700 max-h-[500px] overflow-auto">
-            {recordings.length === 0 ? (
-              <div className="py-12 text-center">
-                <Calendar size={24} className="text-surface-600 mx-auto mb-2" />
-                <p className="text-sm text-surface-500">
-                  {isSearching ? 'Buscando...' : 'Realiza una búsqueda para ver grabaciones'}
-                </p>
-              </div>
-            ) : (
-              recordings.map((rec) => (
-                <div
-                  key={`${rec.cameraId}-${rec.id}`}
-                  className={clsx(
-                    'px-4 py-3 flex items-center gap-3 cursor-pointer hover:bg-surface-700/50 transition-colors',
-                    selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId && 'bg-surface-700/80'
-                  )}
-                  onClick={() => handlePlay(rec)}
-                >
-                  <div className="w-8 h-8 rounded-lg bg-brand-900/50 flex items-center justify-center flex-shrink-0">
-                    <Play size={12} className="text-brand-400 fill-brand-400" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5 mb-0.5">
-                      <span className="text-xs text-surface-300 font-medium truncate">
-                        {rec.nvrName} · {rec.cameraName}
+                return (
+                  <div
+                    key={idx}
+                    className={clsx(
+                      'relative flex flex-col overflow-hidden',
+                      isActive ? 'bg-black' : 'bg-surface-900'
+                    )}
+                  >
+                    {/* Slot label bar */}
+                    <div className="absolute top-0 left-0 right-0 z-10 flex items-center gap-1.5 px-2 py-1 bg-gradient-to-b from-black/70 to-transparent pointer-events-none">
+                      <span className="text-[9px] text-surface-400 font-medium">
+                        {isActive && selectedRec
+                          ? `${selectedRec.nvrName} · ${selectedRec.cameraName}`
+                          : `Canal ${idx + 1}`
+                        }
                       </span>
-                      {rec.type && rec.type !== 'video/mp4' && (
-                        <span className="text-[9px] px-1 py-0.5 rounded bg-surface-700 text-surface-400 uppercase tracking-wide flex-shrink-0">
-                          {rec.type.replace('video/', '').replace('//recordType.meta.std-cgi.com/', '')}
-                        </span>
+                      {isActive && playbackStatus === 'ready' && (
+                        <span className="text-[8px] px-1 py-0.5 rounded bg-green-700/60 text-green-300">●  En vivo</span>
                       )}
                     </div>
-                    <div className="text-xs text-surface-100 flex items-center gap-1.5">
-                      {format(new Date(rec.startTime), 'dd/MM/yyyy HH:mm:ss')}
-                      <span className="text-[9px] text-surface-600 bg-surface-700/60 px-1 py-0.5 rounded">hora local</span>
-                    </div>
-                    <div className="text-xs text-surface-400 flex items-center gap-2 mt-0.5">
-                      <span className="flex items-center gap-1">
-                        <Clock size={10} /> {formatDuration(rec.startTime, rec.endTime)}
-                      </span>
-                      {rec.size > 0 && <span>{formatSize(rec.size)}</span>}
-                    </div>
+
+                    {/* Active slot: real video + loading overlay */}
+                    {isActive ? (
+                      <>
+                        <video
+                          ref={videoRef}
+                          controls
+                          controlsList="nodownload"
+                          className={clsx('absolute inset-0 w-full h-full', !playbackUrl && 'hidden')}
+                          style={{ background: '#000' }}
+                        />
+                        {!playbackUrl && (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center">
+                            {playbackLoading ? (
+                              <>
+                                <Loader2 size={24} className="text-brand-400 mb-2 animate-spin" />
+                                <p className="text-xs text-surface-300">{loadingLabel}</p>
+                                {vodPct !== null && (
+                                  <div className="w-40 mt-2 bg-surface-700 rounded-full h-1.5">
+                                    <div
+                                      className="bg-brand-500 h-1.5 rounded-full transition-all duration-500"
+                                      style={{ width: `${vodPct}%` }}
+                                    />
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <>
+                                <Play size={28} className="text-surface-700 mb-2" />
+                                <p className="text-[11px] text-surface-600">
+                                  {recordings.length > 0
+                                    ? 'Selecciona una grabación'
+                                    : 'Busca grabaciones primero'
+                                  }
+                                </p>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      /* Inactive slot placeholder */
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
+                        <Play size={16} className="text-surface-800" />
+                        <span className="text-[9px] text-surface-700">Vacío</span>
+                      </div>
+                    )}
                   </div>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Recordings list sidebar */}
+          <div className="w-52 flex-shrink-0 border-l border-surface-700 flex flex-col overflow-hidden">
+            <div className="px-3 py-2 border-b border-surface-700 flex items-center gap-1.5 flex-shrink-0">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500">
+                Grabaciones
+              </span>
+              {recordings.length > 0 && (
+                <span className="ml-auto text-[10px] text-surface-600 tabular-nums">
+                  {recordings.length}
+                </span>
+              )}
+            </div>
+            <div className="flex-1 overflow-y-auto divide-y divide-surface-800">
+              {recordings.length === 0 ? (
+                <div className="py-10 flex flex-col items-center gap-1.5">
+                  <Play size={18} className="text-surface-700" />
+                  <p className="text-[10px] text-surface-600 text-center px-3">
+                    {isSearching ? 'Buscando…' : 'Sin resultados'}
+                  </p>
                 </div>
-              ))
-            )}
+              ) : (
+                recordings.map(rec => {
+                  const isSelected = selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId
+                  return (
+                    <button
+                      key={`${rec.cameraId}-${rec.id}`}
+                      onClick={() => handlePlay(rec)}
+                      className={clsx(
+                        'w-full text-left px-3 py-2 transition-colors',
+                        isSelected
+                          ? 'bg-brand-900/30 border-l-2 border-brand-500'
+                          : 'hover:bg-surface-800/60 border-l-2 border-transparent'
+                      )}
+                    >
+                      <div className="text-[10px] text-surface-400 truncate">
+                        {rec.nvrName} · {rec.cameraName}
+                      </div>
+                      <div className="text-xs text-surface-200 mt-0.5">
+                        {format(new Date(rec.startTime), 'HH:mm:ss')}
+                      </div>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <span className="text-[10px] text-surface-500 flex items-center gap-0.5">
+                          <Clock size={9} /> {formatDuration(rec.startTime, rec.endTime)}
+                        </span>
+                        {rec.size > 0 && (
+                          <span className="text-[10px] text-surface-600">{formatSize(rec.size)}</span>
+                        )}
+                      </div>
+                    </button>
+                  )
+                })
+              )}
+            </div>
           </div>
         </div>
 
-        {/* Reproductor */}
-        <div className="card overflow-hidden">
-          <div className="px-4 py-3 border-b border-surface-600 flex items-center justify-between gap-3">
-            <h3 className="text-sm font-medium text-surface-100 truncate">
-              {selectedRec
-                ? `${selectedRec.nvrName} · ${selectedRec.cameraName} — ${format(new Date(selectedRec.startTime), 'dd/MM HH:mm')}`
-                : 'Reproductor'}
-            </h3>
-            {playbackStatus === 'ready' && downloadUrl && (
-              <a
-                href={downloadUrl}
-                download
-                className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
-              >
-                <Download size={12} />
-                Descargar MP4
-              </a>
-            )}
-          </div>
-          <div className="aspect-video bg-surface-900 flex items-center justify-center relative">
-            {/* Video player — always rendered so ref is stable */}
-            <video
-              ref={videoRef}
-              controls
-              controlsList="nodownload"
-              className={clsx('w-full h-full', !playbackUrl && 'hidden')}
-              style={{ background: '#000' }}
-            />
-            {/* Placeholder when no playback active */}
-            {!playbackUrl && (
-              <div className="text-center absolute inset-0 flex flex-col items-center justify-center">
-                {playbackLoading ? (
-                  <>
-                    <Loader2 size={24} className="text-brand-400 mx-auto mb-2 animate-spin" />
-                    <p className="text-sm text-surface-300">{loadingLabel}</p>
-                    {vodPct !== null && (
-                      <div className="w-48 mt-2 bg-surface-700 rounded-full h-1.5">
-                        <div
-                          className="bg-brand-500 h-1.5 rounded-full transition-all duration-500"
-                          style={{ width: `${vodPct}%` }}
-                        />
-                      </div>
-                    )}
-                    {playbackStatus === 'transcoding' && vodPct === null && (
-                      <p className="text-xs text-surface-500 mt-1">Puede tardar unos segundos</p>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <Play size={32} className="text-surface-700 mx-auto mb-2" />
-                    <p className="text-xs text-surface-500">
-                      {recordings.length > 0 ? 'Selecciona una grabación para reproducir' : 'Busca grabaciones primero'}
-                    </p>
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-          {/* Speed controls — visible only when a recording is actively playing */}
-          {playbackStatus === 'ready' && (
+        {/* ── Timeline ──────────────────────────────────────────────────── */}
+        <div className="flex-shrink-0 border-t border-surface-700 bg-surface-900">
+          <RecordingTimeline
+            recordings={recordings}
+            selectedRec={selectedRec}
+            startDate={startDate}
+            endDate={endDate}
+            onSelectRecording={handlePlay}
+          />
+        </div>
+
+        {/* ── Controls toolbar ──────────────────────────────────────────── */}
+        {playbackStatus === 'ready' && (
+          <div className="flex-shrink-0 border-t border-surface-700">
+            {/* Download row */}
+            <div className="flex items-center justify-between px-3 py-1.5 bg-surface-800/30">
+              <span className="text-[10px] text-surface-500 truncate max-w-[50%]">
+                {selectedRec
+                  ? `${selectedRec.nvrName} · ${selectedRec.cameraName} — ${format(new Date(selectedRec.startTime), 'dd/MM HH:mm')}`
+                  : ''
+                }
+              </span>
+              {downloadUrl && (
+                <a
+                  href={downloadUrl}
+                  download
+                  className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
+                >
+                  <Download size={11} />
+                  Descargar MP4
+                </a>
+              )}
+            </div>
             <RecordingPlaybackControls
               key={playbackSessionId ?? 'idle'}
               videoRef={videoRef}
             />
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   )
