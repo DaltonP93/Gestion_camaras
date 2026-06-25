@@ -243,6 +243,8 @@ export function RecordingsPage() {
     const nvrObj = nvrs.find(n => n.id === cam.nvrId)
 
     console.info(`[recordings-ui] slot_camera_assigned slot=${activeSlotIndex} cameraId=${cameraId} cameraName=${cam.name}`)
+    console.info(`[recordings-ui] assigned_camera_added_to_search slot=${activeSlotIndex} cameraId=${cameraId}`)
+    setSelectedCameras(prev => new Set([...prev, cameraId]))
 
     stopSlot(activeSlotIndex)
 
@@ -274,7 +276,15 @@ export function RecordingsPage() {
 
   // ── Search ─────────────────────────────────────────────────────────────────
   const handleSearch = async () => {
-    if (selectedCameras.size === 0) { toast.error('Selecciona al menos una cámara'); return }
+    const assignedCameraIds = new Set(slotsRef.current.filter(s => s.cameraId).map(s => s.cameraId!))
+    const effectiveCameraIds = new Set([...selectedCameras, ...assignedCameraIds])
+
+    console.info(
+      `[recordings-ui] search_effective_cameras selected=${selectedCameras.size}` +
+      ` assigned=${assignedCameraIds.size} effective=${effectiveCameraIds.size}`
+    )
+
+    if (effectiveCameraIds.size === 0) { toast.error('Selecciona o asigna al menos una cámara'); return }
     const start = new Date(startDate)
     const end   = new Date(endDate)
     if (isNaN(start.getTime()) || isNaN(end.getTime())) { toast.error('Fechas inválidas'); return }
@@ -285,7 +295,7 @@ export function RecordingsPage() {
     setRecordings([])
     setNvrErrors([])
 
-    const cameraIds = [...selectedCameras]
+    const cameraIds = [...effectiveCameraIds]
     const camToNvr = new Map<string, { nvrId: string; nvrName: string }>()
     cameras.forEach(c => {
       if (cameraIds.includes(c.id)) {
@@ -340,6 +350,14 @@ export function RecordingsPage() {
     setRecordings(all)
     setNvrErrors([...errsByNvr.values()])
     setIsSearching(false)
+
+    // Initialize playhead to start of earliest recording found
+    if (all.length > 0) {
+      const earliest = all.reduce((min, r) =>
+        new Date(r.startTime).getTime() < new Date(min.startTime).getTime() ? r : min
+      )
+      setGlobalPlaybackTime(new Date(earliest.startTime))
+    }
 
     if (all.length === 0 && errsByNvr.size === 0) {
       toast('Sin grabaciones en ese rango', { icon: 'ℹ️' })
@@ -610,12 +628,55 @@ export function RecordingsPage() {
     if (globalPlayingRef.current) {
       slotsRef.current.forEach((_, i) => videoRefs.current[i]?.pause())
       setGlobalPlaying(false)
-    } else {
-      slotsRef.current.forEach((s, i) => {
-        if (s.status === 'ready') videoRefs.current[i]?.play().catch(() => {})
-      })
-      setGlobalPlaying(true)
+      return
     }
+
+    const currentSlots   = slotsRef.current
+    const readySlots     = currentSlots.filter(s => s.status === 'ready')
+    const assignedSlots  = currentSlots.filter(s => s.cameraId && s.status !== 'loading')
+
+    console.info(
+      `[recordings-ui] global_play_requested` +
+      ` playhead=${globalPlaybackTime?.toISOString() ?? 'null'}` +
+      ` readySlots=${readySlots.length} assignedSlots=${assignedSlots.length}`
+    )
+
+    // Play all slots that are already ready
+    readySlots.forEach(s => videoRefs.current[s.slotIndex]?.play().catch(() => {}))
+
+    // For assigned-but-not-ready slots, auto-load recording covering the playhead
+    const playheadMs = globalPlaybackTime ? globalPlaybackTime.getTime() : null
+    assignedSlots
+      .filter(s => s.status !== 'ready')
+      .forEach(slot => {
+        if (!slot.cameraId) return
+        if (playheadMs === null) return
+
+        const camRecs   = recordingsByCamera.get(slot.cameraId) ?? []
+        const covering  = camRecs.find(r =>
+          new Date(r.startTime).getTime() <= playheadMs && new Date(r.endTime).getTime() > playheadMs
+        )
+
+        if (covering) {
+          console.info(
+            `[recordings-ui] slot_autoload_from_playhead slot=${slot.slotIndex}` +
+            ` cameraId=${slot.cameraId} recId=${covering.id}` +
+            ` recStart=${covering.startTime} recEnd=${covering.endTime}`
+          )
+          loadInSlotRef.current(slot.slotIndex, covering)
+        } else {
+          console.info(
+            `[recordings-ui] slot_no_recording_at_playhead slot=${slot.slotIndex}` +
+            ` cameraId=${slot.cameraId} playhead=${new Date(playheadMs).toISOString()}`
+          )
+          stopSlot(slot.slotIndex)
+          setSlots(prev => prev.map((s, i) => i === slot.slotIndex ? {
+            ...s, status: 'no_recording', recording: null, playbackUrl: null, sessionId: null,
+          } : s))
+        }
+      })
+
+    setGlobalPlaying(true)
   }
 
   const syncedRate = (rate: number) => {
@@ -662,6 +723,7 @@ export function RecordingsPage() {
 
   const handleTimelineSeek = (time: Date) => {
     const timeMs = time.getTime()
+    console.info(`[recordings-ui] timeline_seek playhead=${time.toISOString()}`)
     slotsRef.current.forEach((slot, slotIndex) => {
       if (!slot.cameraId) return
 
@@ -682,7 +744,9 @@ export function RecordingsPage() {
         const vid = videoRefs.current[slotIndex]
         if (vid) {
           const recStartMs = new Date(covering.startTime).getTime()
-          vid.currentTime = Math.max(0, Math.min(vid.duration || 0, (timeMs - recStartMs) / 1000))
+          const newTime = Math.max(0, Math.min(vid.duration || 0, (timeMs - recStartMs) / 1000))
+          vid.currentTime = newTime
+          console.info(`[recordings-ui] slot_seek_within_loaded_recording slot=${slotIndex} currentTime=${newTime.toFixed(2)}`)
         }
         return
       }
@@ -744,7 +808,7 @@ export function RecordingsPage() {
           onEndDateChange={setEndDate}
           onSearch={handleSearch}
           isSearching={isSearching}
-          cameraCount={selectedCameras.size}
+          cameraCount={new Set([...selectedCameras, ...slots.filter(s => s.cameraId).map(s => s.cameraId!)]).size}
           layout={layout}
           onLayoutChange={setLayout}
         />
@@ -861,7 +925,7 @@ export function RecordingsPage() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black">
                         <Play size={20} className="text-surface-700" />
                         <span className="text-[9px] text-surface-500">
-                          {recordings.length > 0 ? 'Selecciona una grabación' : 'Busca grabaciones primero'}
+                          {recordings.length > 0 ? 'Mueve el cabezal y presiona Play' : 'Busca grabaciones y presiona Play'}
                         </span>
                       </div>
                     )}
