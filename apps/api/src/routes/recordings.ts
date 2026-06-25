@@ -849,6 +849,21 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       (new Date(body.endTime).getTime() - new Date(body.startTime).getTime()) / 1000
     )
 
+    // ── Timezone diagnostic ───────────────────────────────────────────
+    // Log raw times from client, server interpretation, and the RTSP URL we'll use.
+    // Compare recStart_client vs rtsp_url to find timezone desfase.
+    server.log.info(
+      `[recordings] playback_time_mapping cameraId=${body.cameraId} ch=${camera.channel}` +
+      ` startTime_client=${body.startTime} endTime_client=${body.endTime}` +
+      ` startTime_local=${new Date(body.startTime).toLocaleString('es-CL', { timeZone: 'America/Santiago' })}` +
+      ` startTime_utc=${new Date(body.startTime).toUTCString()}` +
+      ` urlStrategy=${urlStrategy}` +
+      ` playbackURI=${body.playbackURI ?? 'none'}` +
+      ` rtsp_masked=${rtspMasked.substring(0, 120)}` +
+      ` expectedDurationSec=${expectedDurationSec}` +
+      ` nodeTimezone=${Intl.DateTimeFormat().resolvedOptions().timeZone}`
+    )
+
     // ── Cache check ──────────────────────────────────────────────────
     const cacheKey  = computeCacheKey({
       cameraId: body.cameraId, startTime: body.startTime, endTime: body.endTime,

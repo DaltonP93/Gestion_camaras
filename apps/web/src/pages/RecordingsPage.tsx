@@ -4,6 +4,7 @@ import {
   Play, Clock, AlertTriangle, RefreshCw, ExternalLink,
   XCircle, Loader2, Info, Download, Video,
 } from 'lucide-react'
+// Clock kept for slot overlays
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet, apiDelete } from '@/lib/api'
 import { format, subHours } from 'date-fns'
@@ -241,6 +242,8 @@ export function RecordingsPage() {
     if (!cam) return
     const nvrObj = nvrs.find(n => n.id === cam.nvrId)
 
+    console.info(`[recordings-ui] slot_camera_assigned slot=${activeSlotIndex} cameraId=${cameraId} cameraName=${cam.name}`)
+
     stopSlot(activeSlotIndex)
 
     setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
@@ -258,6 +261,15 @@ export function RecordingsPage() {
       vodProgress: null,
       mimeType: null,
     } : s))
+
+    // If we already have recordings for this camera, auto-load the most recent one
+    const camRecs = recordingsByCamera.get(cameraId)
+    if (camRecs && camRecs.length > 0) {
+      const first = camRecs[0]
+      console.info(`[recordings-ui] slot_camera_assigned_autoload slot=${activeSlotIndex} cameraId=${cameraId} recId=${first.id} recStart=${first.startTime}`)
+      // Slight delay so setSlots above has committed
+      setTimeout(() => loadInSlotRef.current(activeSlotIndex, first), 0)
+    }
   }
 
   // ── Search ─────────────────────────────────────────────────────────────────
@@ -363,6 +375,38 @@ export function RecordingsPage() {
     opts?: { forceTranscode?: boolean },
   ) => {
     const forceTranscode = opts?.forceTranscode ?? false
+
+    // Guard: if slot has an explicit camera assignment, reject recordings from different cameras
+    // (unless this is a forceTranscode retry, which always uses the same rec)
+    const currentSlot = slotsRef.current[slotIndex]
+    if (!forceTranscode && currentSlot?.cameraId && currentSlot.cameraId !== rec.cameraId) {
+      console.info(
+        `[recordings-ui] slot_recording_rejected_camera_mismatch slot=${slotIndex}` +
+        ` slotCameraId=${currentSlot.cameraId} recCameraId=${rec.cameraId}` +
+        ` recId=${rec.id} recStart=${rec.startTime}`
+      )
+      return
+    }
+
+    console.info(
+      `[recordings-ui] slot_recording_load slot=${slotIndex}` +
+      ` slotCameraId=${currentSlot?.cameraId ?? 'none'} recCameraId=${rec.cameraId}` +
+      ` recId=${rec.id} recStart=${rec.startTime} recEnd=${rec.endTime}` +
+      ` forceTranscode=${forceTranscode}`
+    )
+
+    // ── Timezone diagnostic ──────────────────────────────────────────────────
+    // Helps identify whether UI displays wrong time vs what the NVR returns.
+    const browserTz   = Intl.DateTimeFormat().resolvedOptions().timeZone
+    const displayedStart = format(new Date(rec.startTime), 'dd/MM/yyyy HH:mm:ss')
+    const displayedEnd   = format(new Date(rec.endTime),   'dd/MM/yyyy HH:mm:ss')
+    console.info(
+      `[recordings-ui] time_mapping slot=${slotIndex}` +
+      ` recStart_raw=${rec.startTime} recEnd_raw=${rec.endTime}` +
+      ` displayedStart=${displayedStart} displayedEnd=${displayedEnd}` +
+      ` browserTz=${browserTz}` +
+      ` playbackURI=${(rec as any).playbackURI ?? 'none'}`
+    )
 
     const myKey = `${Date.now()}-${Math.random()}`
     slotKeysRef.current[slotIndex] = myKey
@@ -652,12 +696,22 @@ export function RecordingsPage() {
 
   const anySlotReady = slots.some(s => s.status === 'ready')
 
-  // Active slot info for controls / sidebar
+  // Active slot info for controls
   const activeRecording = activeSlot.recording
   const activeDownloadUrl = activeSlot.downloadUrl
 
-  // For sidebar: highlight recording matching active slot's current time
-  const highlightedRecId = activeSlot.recording?.id ?? null
+  // Cameras assigned to slots — passed to timeline to always show their row
+  const assignedCameras = useMemo(() =>
+    slots
+      .filter(s => s.cameraId !== null)
+      .map(s => ({
+        cameraId:   s.cameraId!,
+        cameraName: s.cameraName!,
+        nvrName:    s.nvrName ?? '',
+        slotIndex:  s.slotIndex,
+      })),
+    [slots]
+  )
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -740,12 +794,9 @@ export function RecordingsPage() {
           </div>
         )}
 
-        {/* ── Central: video grid + recordings list ─────────────────────── */}
-        <div className="flex-1 flex min-h-0 overflow-hidden">
-
-          {/* Video grid */}
-          <div className="flex-1 min-w-0 bg-black">
-            <div className={clsx('grid h-full gap-0.5 bg-surface-800', GRID_COLS[layout])}>
+        {/* ── Central: video grid (full width) ─────────────────────────── */}
+        <div className="flex-1 min-h-0 bg-black overflow-hidden">
+          <div className={clsx('grid h-full gap-0.5 bg-surface-800', GRID_COLS[layout])}>
               {Array.from({ length: SLOT_COUNT[layout] }).map((_, idx) => {
                 const slot      = slots[idx] ?? emptySlot(idx)
                 const isActive  = idx === activeSlotIndex
@@ -761,7 +812,10 @@ export function RecordingsPage() {
                 return (
                   <div
                     key={idx}
-                    onClick={() => setActiveSlotIndex(idx)}
+                    onClick={() => {
+                      console.info(`[recordings-ui] slot_selected slot=${idx} cameraId=${slots[idx]?.cameraId ?? 'none'} status=${slots[idx]?.status ?? 'empty'}`)
+                      setActiveSlotIndex(idx)
+                    }}
                     className={clsx(
                       'relative flex flex-col overflow-hidden cursor-pointer',
                       isActive
@@ -853,71 +907,6 @@ export function RecordingsPage() {
                   </div>
                 )
               })}
-            </div>
-          </div>
-
-          {/* Recordings list sidebar */}
-          <div className="w-52 flex-shrink-0 border-l border-surface-700 flex flex-col overflow-hidden">
-            <div className="px-3 py-2 border-b border-surface-700 flex items-center gap-1.5 flex-shrink-0">
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500">
-                Grabaciones
-              </span>
-              {recordings.length > 0 && (
-                <span className="ml-auto text-[10px] text-surface-600 tabular-nums">
-                  {recordings.length}
-                </span>
-              )}
-            </div>
-            {/* Active slot hint */}
-            <div className="px-3 py-1 border-b border-surface-800 flex-shrink-0">
-              <span className="text-[9px] text-surface-600">
-                Cargando en: <span className="text-surface-400 font-medium">Canal {activeSlotIndex + 1}</span>
-                {activeSlot.cameraName && (
-                  <> · <span className="text-brand-500">{activeSlot.cameraName}</span></>
-                )}
-              </span>
-            </div>
-            <div className="flex-1 overflow-y-auto divide-y divide-surface-800">
-              {recordings.length === 0 ? (
-                <div className="py-10 flex flex-col items-center gap-1.5">
-                  <Play size={18} className="text-surface-700" />
-                  <p className="text-[10px] text-surface-600 text-center px-3">
-                    {isSearching ? 'Buscando…' : 'Sin resultados'}
-                  </p>
-                </div>
-              ) : (
-                recordings.map(rec => {
-                  const isHighlighted = highlightedRecId === rec.id && activeSlot.recording?.cameraId === rec.cameraId
-                  return (
-                    <button
-                      key={`${rec.cameraId}-${rec.id}`}
-                      onClick={() => loadRecordingInSlot(activeSlotIndex, rec)}
-                      className={clsx(
-                        'w-full text-left px-3 py-2 transition-colors',
-                        isHighlighted
-                          ? 'bg-brand-900/30 border-l-2 border-brand-500'
-                          : 'hover:bg-surface-800/60 border-l-2 border-transparent'
-                      )}
-                    >
-                      <div className="text-[10px] text-surface-400 truncate">
-                        {rec.nvrName} · {rec.cameraName}
-                      </div>
-                      <div className="text-xs text-surface-200 mt-0.5">
-                        {format(new Date(rec.startTime), 'HH:mm:ss')}
-                      </div>
-                      <div className="flex items-center gap-1.5 mt-0.5">
-                        <span className="text-[10px] text-surface-500 flex items-center gap-0.5">
-                          <Clock size={9} /> {formatDuration(rec.startTime, rec.endTime)}
-                        </span>
-                        {rec.size > 0 && (
-                          <span className="text-[10px] text-surface-600">{formatSize(rec.size)}</span>
-                        )}
-                      </div>
-                    </button>
-                  )
-                })
-              )}
-            </div>
           </div>
         </div>
 
@@ -925,39 +914,55 @@ export function RecordingsPage() {
         <div className="flex-shrink-0 border-t border-surface-700 bg-surface-900">
           <RecordingTimeline
             recordings={recordings}
+            assignedCameras={assignedCameras}
             selectedRec={activeRecording}
             startDate={startDate}
             endDate={endDate}
             onSelectRecording={rec => loadRecordingInSlot(activeSlotIndex, rec)}
             globalTime={globalPlaybackTime}
-            onSeekToTime={recordings.length > 0 ? handleTimelineSeek : undefined}
+            onSeekToTime={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelineSeek : undefined}
           />
         </div>
 
-        {/* ── Controls toolbar ──────────────────────────────────────────── */}
-        {anySlotReady && (
-          <div className="flex-shrink-0 border-t border-surface-700">
-            {/* Download row */}
-            <div className="flex items-center justify-between px-3 py-1.5 bg-surface-800/30">
-              <span className="text-[10px] text-surface-500 truncate max-w-[50%]">
-                {activeRecording
-                  ? `${activeRecording.nvrName} · ${activeRecording.cameraName} — ${format(new Date(activeRecording.startTime), 'dd/MM HH:mm')}`
-                  : activeSlot.cameraName
-                    ? `${activeSlot.nvrName} · ${activeSlot.cameraName}`
-                    : ''
-                }
-              </span>
-              {activeDownloadUrl && (
-                <a
-                  href={activeDownloadUrl}
-                  download
-                  className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
-                >
-                  <Download size={11} />
-                  Descargar MP4
-                </a>
-              )}
-            </div>
+        {/* ── Controls toolbar — always visible ─────────────────────── */}
+        <div className="flex-shrink-0 border-t border-surface-700">
+          {/* Info row: playhead time · slot label · download */}
+          <div className="flex items-center gap-3 px-3 py-1.5 bg-surface-800/50 border-b border-surface-700/60">
+            {/* Playhead time — main clock */}
+            <span className="text-[11px] font-mono text-surface-200 tabular-nums flex-shrink-0">
+              {globalPlaybackTime
+                ? format(globalPlaybackTime, 'dd/MM HH:mm:ss')
+                : activeRecording
+                  ? format(new Date(activeRecording.startTime), 'dd/MM HH:mm:ss')
+                  : '--/-- --:--:--'
+              }
+            </span>
+
+            {/* Slot indicator */}
+            <span className="text-[9px] text-surface-600 flex-shrink-0">
+              {activeSlot.cameraName
+                ? `S${activeSlotIndex + 1} · ${activeSlot.nvrName} · ${activeSlot.cameraName}`
+                : `S${activeSlotIndex + 1} — sin cámara`
+              }
+            </span>
+
+            <div className="flex-1" />
+
+            {/* Download button for active slot */}
+            {activeDownloadUrl && (
+              <a
+                href={activeDownloadUrl}
+                download
+                className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
+              >
+                <Download size={11} />
+                Descargar MP4
+              </a>
+            )}
+          </div>
+
+          {/* Playback controls — grayed when nothing is ready */}
+          <div className={clsx(!anySlotReady && 'opacity-40 pointer-events-none')}>
             <RecordingPlaybackControls
               key={`slot-${activeSlotIndex}-${activeSlot.sessionId ?? 'idle'}`}
               video={videoRefs.current[activeSlotIndex] ?? undefined}
@@ -967,7 +972,7 @@ export function RecordingsPage() {
               onApplyRate={syncedRate}
             />
           </div>
-        )}
+        </div>
       </div>
     </div>
   )

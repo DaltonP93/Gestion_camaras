@@ -1,11 +1,20 @@
 // apps/web/src/components/recordings/RecordingTimeline.tsx
-import { useMemo } from 'react'
+import { useMemo, useRef, useCallback } from 'react'
 import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import type { RecordingWithCamera } from './types'
 
+interface AssignedCamera {
+  cameraId:   string
+  cameraName: string
+  nvrName:    string
+  slotIndex:  number
+}
+
 interface Props {
   recordings: RecordingWithCamera[]
+  /** Cameras assigned to slots — always show a row even with no recordings */
+  assignedCameras: AssignedCamera[]
   selectedRec: RecordingWithCamera | null
   startDate: string
   endDate: string
@@ -15,11 +24,11 @@ interface Props {
 }
 
 function getTickInterval(totalMs: number): number {
-  if (totalMs <= 2 * 3600_000)   return 15 * 60_000   // every 15min
-  if (totalMs <= 6 * 3600_000)   return 30 * 60_000   // every 30min
-  if (totalMs <= 24 * 3600_000)  return 60 * 60_000   // every 1h
-  if (totalMs <= 72 * 3600_000)  return 6 * 3600_000  // every 6h
-  return 24 * 3600_000                                  // every 24h
+  if (totalMs <= 2 * 3600_000)   return 15 * 60_000
+  if (totalMs <= 6 * 3600_000)   return 30 * 60_000
+  if (totalMs <= 24 * 3600_000)  return 60 * 60_000
+  if (totalMs <= 72 * 3600_000)  return 6 * 3600_000
+  return 24 * 3600_000
 }
 
 function generateTicks(rangeStart: number, rangeEnd: number, intervalMs: number) {
@@ -37,75 +46,139 @@ function generateTicks(rangeStart: number, rangeEnd: number, intervalMs: number)
   return ticks
 }
 
-const LABEL_W = 120 // px — left label column width
+const LABEL_W   = 130 // px — camera label column
+const ROW_H     = 28  // px per camera row
 
 export function RecordingTimeline({
-  recordings, selectedRec, startDate, endDate, onSelectRecording,
-  globalTime, onSeekToTime,
+  recordings, assignedCameras, selectedRec, startDate, endDate,
+  onSelectRecording, globalTime, onSeekToTime,
 }: Props) {
   const rangeStart = useMemo(() => new Date(startDate).getTime(), [startDate])
   const rangeEnd   = useMemo(() => new Date(endDate).getTime(),   [endDate])
   const totalMs    = rangeEnd - rangeStart
 
-  const groups = useMemo(() => {
+  // Build ordered rows: assigned slots first (preserve slot order), then extra cameras from recordings
+  const rows = useMemo(() => {
     if (totalMs <= 0) return []
-    const map = new Map<string, { label: string; recs: RecordingWithCamera[] }>()
-    recordings.forEach(rec => {
-      const key = `${rec.nvrName}||${rec.cameraId}`
-      if (!map.has(key)) {
-        map.set(key, { label: `${rec.nvrName} · ${rec.cameraName}`, recs: [] })
-      }
-      map.get(key)!.recs.push(rec)
+
+    // Map cameraId → recordings
+    const recsByCam = new Map<string, RecordingWithCamera[]>()
+    recordings.forEach(r => {
+      if (!recsByCam.has(r.cameraId)) recsByCam.set(r.cameraId, [])
+      recsByCam.get(r.cameraId)!.push(r)
     })
-    return [...map.values()]
-  }, [recordings, totalMs])
+
+    // Rows from assigned cameras first (slot order)
+    const seen = new Set<string>()
+    const result: Array<{
+      cameraId: string; label: string; recs: RecordingWithCamera[]; slotIndex: number | null
+    }> = []
+
+    for (const ac of assignedCameras) {
+      if (seen.has(ac.cameraId)) continue
+      seen.add(ac.cameraId)
+      result.push({
+        cameraId:   ac.cameraId,
+        label:      `${ac.nvrName} · ${ac.cameraName}`,
+        recs:       recsByCam.get(ac.cameraId) ?? [],
+        slotIndex:  ac.slotIndex,
+      })
+    }
+
+    // Then any cameras from recordings not already shown
+    recordings.forEach(r => {
+      if (seen.has(r.cameraId)) return
+      seen.add(r.cameraId)
+      result.push({
+        cameraId:  r.cameraId,
+        label:     `${r.nvrName} · ${r.cameraName}`,
+        recs:      recsByCam.get(r.cameraId)!,
+        slotIndex: null,
+      })
+    })
+
+    return result
+  }, [recordings, assignedCameras, totalMs])
 
   const ticks = useMemo(() => {
     if (totalMs <= 0) return []
     return generateTicks(rangeStart, rangeEnd, getTickInterval(totalMs))
   }, [rangeStart, rangeEnd, totalMs])
 
-  if (totalMs <= 0 || recordings.length === 0) {
+  // ── Drag / click on track ────────────────────────────────────────────────────
+  const isDraggingRef = useRef(false)
+  const trackRef      = useRef<HTMLDivElement>(null)
+
+  const timeFromX = useCallback((clientX: number): Date | null => {
+    const el = trackRef.current
+    if (!el || totalMs <= 0) return null
+    const rect  = el.getBoundingClientRect()
+    const x     = clientX - rect.left
+    const ratio = Math.max(0, Math.min(1, x / rect.width))
+    return new Date(rangeStart + ratio * totalMs)
+  }, [rangeStart, totalMs])
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (!onSeekToTime) return
+    e.preventDefault()
+    isDraggingRef.current = true
+    const t = timeFromX(e.clientX)
+    if (t) onSeekToTime(t)
+
+    const onMove = (ev: MouseEvent) => {
+      if (!isDraggingRef.current) return
+      const t2 = timeFromX(ev.clientX)
+      if (t2) onSeekToTime(t2)
+    }
+    const onUp = () => {
+      isDraggingRef.current = false
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [onSeekToTime, timeFromX])
+
+  const showEmpty = totalMs <= 0 || (rows.length === 0 && recordings.length === 0)
+
+  if (showEmpty) {
     return (
-      <div className="h-24 flex items-center justify-center">
+      <div className="h-20 flex items-center justify-center border-t border-surface-700 bg-surface-900">
         <p className="text-[11px] text-surface-600">
-          {recordings.length === 0 ? 'Sin grabaciones — realiza una búsqueda' : 'Rango de fechas inválido'}
+          {totalMs <= 0 ? 'Rango de fechas inválido' : 'Sin grabaciones — realiza una búsqueda'}
         </p>
       </div>
     )
   }
 
-  const pct = (ms: number) => `${Math.max(0, Math.min(100, (ms - rangeStart) / totalMs * 100)).toFixed(3)}%`
+  const pct = (ms: number) =>
+    `${Math.max(0, Math.min(100, (ms - rangeStart) / totalMs * 100)).toFixed(3)}%`
   const widthPct = (startMs: number, endMs: number) => {
     const clamped = Math.min(endMs, rangeEnd) - Math.max(startMs, rangeStart)
     return `${Math.max(0, clamped / totalMs * 100).toFixed(3)}%`
   }
 
-  const handleTrackClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!onSeekToTime) return
-    const rect = e.currentTarget.getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const ratio = Math.max(0, Math.min(1, x / rect.width))
-    const clickedMs = rangeStart + ratio * totalMs
-    onSeekToTime(new Date(clickedMs))
-  }
-
-  const playheadMs = globalTime ? globalTime.getTime() : null
+  const playheadMs      = globalTime ? globalTime.getTime() : null
   const playheadVisible = playheadMs !== null && playheadMs >= rangeStart && playheadMs <= rangeEnd
+
+  const maxRows = Math.min(rows.length, 6)
+  const maxHeight = maxRows * ROW_H + 4 // +4 for bottom border
 
   return (
     <div className="flex flex-col select-none" style={{ minHeight: 0 }}>
-      {/* Time axis */}
+
+      {/* ── Time axis ────────────────────────────────────────────────── */}
       <div className="flex flex-shrink-0 border-b border-surface-700/60 h-6">
-        <div style={{ width: LABEL_W }} className="flex-shrink-0 border-r border-surface-700/60" />
+        <div style={{ width: LABEL_W }} className="flex-shrink-0 border-r border-surface-700/60 bg-surface-900" />
         <div
-          className={clsx('flex-1 relative overflow-hidden', onSeekToTime && 'cursor-crosshair')}
-          onClick={handleTrackClick}
+          ref={trackRef}
+          className={clsx('flex-1 relative overflow-hidden bg-surface-900', onSeekToTime && 'cursor-crosshair')}
+          onMouseDown={handleMouseDown}
         >
           {ticks.map(tick => (
             <div
               key={tick.time}
-              className="absolute top-0 h-full flex flex-col items-start"
+              className="absolute top-0 h-full flex flex-col items-start pointer-events-none"
               style={{ left: pct(tick.time) }}
             >
               <div className="h-2 w-px bg-surface-700" />
@@ -114,73 +187,90 @@ export function RecordingTimeline({
               </span>
             </div>
           ))}
-          {/* Playhead in tick row */}
+          {/* Tick-row playhead */}
           {playheadVisible && (
             <div
-              className="absolute top-0 bottom-0 w-px bg-red-500/70 z-20 pointer-events-none"
+              className="absolute top-0 bottom-0 w-0.5 bg-red-500 z-20 pointer-events-none"
               style={{ left: pct(playheadMs!) }}
             />
           )}
         </div>
       </div>
 
-      {/* Camera rows */}
-      <div className="overflow-y-auto" style={{ maxHeight: 112 }}>
-        {groups.map(({ label, recs }) => (
-          <div
-            key={label}
-            className="flex border-b border-surface-800/50 h-7"
-          >
-            {/* Label */}
-            <div
-              className="flex-shrink-0 flex items-center px-2 border-r border-surface-700/60 bg-surface-800/30"
-              style={{ width: LABEL_W }}
-            >
-              <span className="text-[9px] text-surface-500 truncate" title={label}>
-                {label}
-              </span>
-            </div>
+      {/* ── Camera rows ──────────────────────────────────────────────── */}
+      <div className="overflow-y-auto" style={{ maxHeight }}>
+        {rows.map(({ cameraId, label, recs, slotIndex }) => {
+          const hasRecs = recs.length > 0
+          return (
+            <div key={cameraId} className="flex border-b border-surface-800/50" style={{ height: ROW_H }}>
 
-            {/* Recording blocks */}
-            <div
-              className={clsx('flex-1 relative bg-surface-900', onSeekToTime && 'cursor-crosshair')}
-              onClick={handleTrackClick}
-            >
-              {recs.map(rec => {
-                const recStart = new Date(rec.startTime).getTime()
-                const recEnd   = new Date(rec.endTime).getTime()
-                const isSelected = selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId
-                const durationMin = Math.round((recEnd - recStart) / 60_000)
+              {/* Camera label */}
+              <div
+                className="flex-shrink-0 flex items-center gap-1.5 px-2 border-r border-surface-700/60 bg-surface-800/40"
+                style={{ width: LABEL_W }}
+                title={label}
+              >
+                {slotIndex !== null && (
+                  <span className="text-[8px] px-1 rounded bg-surface-700 text-surface-500 flex-shrink-0 font-mono">
+                    S{slotIndex + 1}
+                  </span>
+                )}
+                <span className="text-[9px] text-surface-400 truncate">{label}</span>
+              </div>
 
-                return (
-                  <button
-                    key={`${rec.cameraId}-${rec.id}`}
-                    onClick={e => { e.stopPropagation(); onSelectRecording(rec) }}
-                    title={`${format(new Date(rec.startTime), 'HH:mm:ss')} – ${format(new Date(rec.endTime), 'HH:mm:ss')} (${durationMin}min)`}
-                    className={clsx(
-                      'absolute top-1 bottom-1 rounded-sm transition-colors cursor-pointer',
-                      isSelected
-                        ? 'bg-brand-500/90 border border-brand-400 z-10'
-                        : 'bg-brand-800/70 border border-brand-700/50 hover:bg-brand-600/70 hover:border-brand-500/60'
-                    )}
-                    style={{
-                      left: pct(recStart),
-                      width: widthPct(recStart, recEnd),
-                      minWidth: 3,
-                    }}
+              {/* Track */}
+              <div
+                className={clsx(
+                  'flex-1 relative',
+                  hasRecs ? 'bg-surface-900' : 'bg-surface-900/50',
+                  onSeekToTime && 'cursor-crosshair'
+                )}
+                onMouseDown={handleMouseDown}
+              >
+                {!hasRecs && (
+                  <div className="absolute inset-0 flex items-center px-2">
+                    <span className="text-[8px] text-surface-700 italic">sin grabaciones en este rango</span>
+                  </div>
+                )}
+
+                {recs.map(rec => {
+                  const recStart    = new Date(rec.startTime).getTime()
+                  const recEnd      = new Date(rec.endTime).getTime()
+                  const isSelected  = selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId
+                  const durationMin = Math.round((recEnd - recStart) / 60_000)
+
+                  return (
+                    <button
+                      key={`${rec.cameraId}-${rec.id}`}
+                      onMouseDown={e => e.stopPropagation()}
+                      onClick={e => { e.stopPropagation(); onSelectRecording(rec) }}
+                      title={`${format(new Date(rec.startTime), 'HH:mm:ss')} – ${format(new Date(rec.endTime), 'HH:mm:ss')} (${durationMin}min)`}
+                      className={clsx(
+                        'absolute top-1 bottom-1 rounded-sm transition-colors cursor-pointer',
+                        isSelected
+                          ? 'bg-brand-500/90 border border-brand-400 z-10'
+                          : 'bg-brand-700/80 border border-brand-600/60 hover:bg-brand-500/80 hover:border-brand-400/70'
+                      )}
+                      style={{
+                        left:     pct(recStart),
+                        width:    widthPct(recStart, recEnd),
+                        minWidth: 4,
+                      }}
+                    />
+                  )
+                })}
+
+                {/* Per-row playhead */}
+                {playheadVisible && (
+                  <div
+                    className="absolute top-0 bottom-0 w-0.5 bg-red-500 z-20 pointer-events-none"
+                    style={{ left: pct(playheadMs!) }}
                   />
-                )
-              })}
-              {/* Playhead in row */}
-              {playheadVisible && (
-                <div
-                  className="absolute top-0 bottom-0 w-px bg-red-500 z-20 pointer-events-none"
-                  style={{ left: pct(playheadMs!) }}
-                />
-              )}
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )
