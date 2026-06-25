@@ -2,7 +2,7 @@
 import { useEffect, useState, useMemo, useRef } from 'react'
 import {
   Play, Clock, AlertTriangle, RefreshCw, ExternalLink,
-  XCircle, Loader2, Info, Download,
+  XCircle, Loader2, Info, Download, Video,
 } from 'lucide-react'
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet, apiDelete } from '@/lib/api'
@@ -10,32 +10,29 @@ import { format, subHours } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording } from '@/types'
 import toast from 'react-hot-toast'
-import Hls from 'hls.js'
 import { RecordingPlaybackControls } from '@/components/RecordingPlaybackControls'
 import { RecordingCameraTree }  from '@/components/recordings/RecordingCameraTree'
 import { RecordingSearchBar }   from '@/components/recordings/RecordingSearchBar'
 import { RecordingTimeline }    from '@/components/recordings/RecordingTimeline'
-import type { RecordingWithCamera, NvrSearchError, PlaybackLayout } from '@/components/recordings/types'
+import type {
+  RecordingWithCamera, NvrSearchError, PlaybackLayout,
+  PlaybackSlot,
+} from '@/components/recordings/types'
+import { emptySlot } from '@/components/recordings/types'
 
-// ─── Local interfaces kept for PlaybackStatusResponse ────────────────────────
+// ─── Local interfaces ─────────────────────────────────────────────────────────
 
 interface PlaybackStatusResponse {
   status:               'starting' | 'ready' | 'error'
   url?:                 string
   mimeType?:            string
-  hlsReady?:            boolean
   transcoded?:          boolean
   errorCode?:           string
   error?:               string
   downloadUrl?:         string
   outTimeSec?:          number
-  frame?:               number
-  fps?:                 number
-  speed?:               string
   expectedDurationSec?: number
   progressPercent?:     number
-  lastProgressAt?:      number
-  elapsedMs?:           number
 }
 
 interface RecordingCapabilities {
@@ -76,9 +73,17 @@ function formatSize(bytes: number) {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const POLL_INTERVAL_MS    = 1_000
+const POLL_INTERVAL_MS     = 1_000
 const POLL_ABSOLUTE_MAX_MS = 15 * 60 * 1_000
-const POLL_STALL_MS       = 45_000
+const POLL_STALL_MS        = 45_000
+
+const SLOT_COUNT: Record<PlaybackLayout, number> = { '1x1': 1, '2x2': 4, '3x3': 9, '4x4': 16 }
+const GRID_COLS:  Record<PlaybackLayout, string> = {
+  '1x1': 'grid-cols-1',
+  '2x2': 'grid-cols-2',
+  '3x3': 'grid-cols-3',
+  '4x4': 'grid-cols-4',
+}
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
@@ -98,32 +103,81 @@ export function RecordingsPage() {
   // ── Layout ─────────────────────────────────────────────────────────────────
   const [layout, setLayout] = useState<PlaybackLayout>('1x1')
 
-  // ── Playback state ─────────────────────────────────────────────────────────
-  const [playbackUrl, setPlaybackUrl]         = useState<string | null>(null)
-  const [playbackSessionId, setPlaybackSessionId] = useState<string | null>(null)
-  const [playbackLoading, setPlaybackLoading] = useState(false)
-  const [playbackStatus, setPlaybackStatus]   = useState<'idle' | 'starting' | 'transcoding' | 'ready'>('idle')
-  const [selectedRec, setSelectedRec]         = useState<RecordingWithCamera | null>(null)
-  const [playbackMimeType, setPlaybackMimeType] = useState<string | null>(null)
-  const [playbackTranscoding, setPlaybackTranscoding] = useState(false) // eslint-disable-line @typescript-eslint/no-unused-vars
-  const [vodProgress, setVodProgress]         = useState<{ outTimeSec: number; expectedDurationSec: number } | null>(null)
-  const [downloadUrl,  setDownloadUrl]         = useState<string | null>(null)
+  // ── Multi-slot state ───────────────────────────────────────────────────────
+  const [slots, setSlots]                   = useState<PlaybackSlot[]>([emptySlot(0)])
+  const [activeSlotIndex, setActiveSlotIndex] = useState(0)
+
+  // ── Global playback state ──────────────────────────────────────────────────
+  const [globalPlaying, setGlobalPlaying]           = useState(false)
+  const [globalPlaybackRate, setGlobalPlaybackRate] = useState(1)
+  const [globalPlaybackTime, setGlobalPlaybackTime] = useState<Date | null>(null)
 
   // ── Refs ───────────────────────────────────────────────────────────────────
-  const videoRef             = useRef<HTMLVideoElement>(null)
-  const hlsRef               = useRef<Hls | null>(null)
-  const playbackKeyRef       = useRef<string | null>(null)
-  const playbackSessionIdRef = useRef<string | null>(null)
-  const playbackEndedRef     = useRef(false)
-  const playbackCleaningRef  = useRef(false)
-  const selectedRecRef       = useRef<RecordingWithCamera | null>(null)
-  const hevcCopyAttemptedRef = useRef(false)
-  const hevcRetryDoneRef     = useRef(false)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const handlePlayFnRef      = useRef<(rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
+  const videoRefs       = useRef<{ [k: number]: HTMLVideoElement | null }>({})
+  const slotKeysRef     = useRef<{ [k: number]: string | null }>({})
+  const hevcAttemptedRef = useRef<{ [k: number]: boolean }>({})
+  const hevcRetryRef    = useRef<{ [k: number]: boolean }>({})
+  const slotsRef        = useRef<PlaybackSlot[]>([])
+  const globalPlayingRef     = useRef(false)
+  const globalPlaybackRateRef = useRef(1)
+  const videoCleanupRef = useRef<{ [k: number]: (() => void) | null }>({})
+  const loadInSlotRef   = useRef<(si: number, rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
+
+  // Keep refs in sync
+  useEffect(() => { slotsRef.current = slots }, [slots])
+  useEffect(() => { globalPlayingRef.current = globalPlaying }, [globalPlaying])
+  useEffect(() => { globalPlaybackRateRef.current = globalPlaybackRate }, [globalPlaybackRate])
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
   useEffect(() => { loadNVRs(); loadCameras() }, [])
+
+  // ── Resize slots when layout changes ──────────────────────────────────────
+  useEffect(() => {
+    const count = SLOT_COUNT[layout]
+    setSlots(prev => {
+      if (prev.length === count) return prev
+      if (prev.length > count) {
+        // Stop sessions for removed slots
+        prev.slice(count).forEach(s => {
+          slotKeysRef.current[s.slotIndex] = null
+          if (videoCleanupRef.current[s.slotIndex]) {
+            videoCleanupRef.current[s.slotIndex]!()
+            videoCleanupRef.current[s.slotIndex] = null
+          }
+          if (s.sessionId) apiDelete(`/recordings/playback/${s.sessionId}`).catch(() => {})
+        })
+        return prev.slice(0, count)
+      }
+      const extra = Array.from({ length: count - prev.length }, (_, i) => emptySlot(prev.length + i))
+      return [...prev, ...extra]
+    })
+    setActiveSlotIndex(ai => Math.min(ai, count - 1))
+  }, [layout])
+
+  // ── Cleanup on unmount ─────────────────────────────────────────────────────
+  useEffect(() => () => {
+    slotsRef.current.forEach(s => {
+      slotKeysRef.current[s.slotIndex] = null
+      if (videoCleanupRef.current[s.slotIndex]) videoCleanupRef.current[s.slotIndex]!()
+      if (s.sessionId) apiDelete(`/recordings/playback/${s.sessionId}`).catch(() => {})
+    })
+  }, [])
+
+  // ── Track global time from active slot ────────────────────────────────────
+  const activeSlot = slots[activeSlotIndex] ?? emptySlot(activeSlotIndex)
+
+  useEffect(() => {
+    const vid = videoRefs.current[activeSlotIndex]
+    const slot = slotsRef.current[activeSlotIndex]
+    if (!vid || slot?.status !== 'ready' || !slot?.recording) return
+
+    const recStartMs = new Date(slot.recording.startTime).getTime()
+    const handleTimeUpdate = () => {
+      setGlobalPlaybackTime(new Date(recStartMs + vid.currentTime * 1000))
+    }
+    vid.addEventListener('timeupdate', handleTimeUpdate)
+    return () => vid.removeEventListener('timeupdate', handleTimeUpdate)
+  }, [activeSlotIndex, activeSlot.status, activeSlot.recording?.startTime])
 
   // ── Camera selection helpers ───────────────────────────────────────────────
   const toggleCamera = (cameraId: string) =>
@@ -147,6 +201,65 @@ export function RecordingsPage() {
   const selectAll = () => setSelectedCameras(new Set(cameras.map(c => c.id)))
   const clearAll  = () => setSelectedCameras(new Set())
 
+  // ── Slot helpers ───────────────────────────────────────────────────────────
+
+  const stopSlot = (slotIndex: number) => {
+    slotKeysRef.current[slotIndex] = null
+    if (videoCleanupRef.current[slotIndex]) {
+      videoCleanupRef.current[slotIndex]!()
+      videoCleanupRef.current[slotIndex] = null
+    }
+    const vid = videoRefs.current[slotIndex]
+    if (vid) { vid.src = ''; vid.load() }
+    const s = slotsRef.current[slotIndex]
+    if (s?.sessionId) {
+      apiDelete(`/recordings/playback/${s.sessionId}`).catch(() => {})
+    }
+  }
+
+  const clearAllPlayback = () => {
+    const count = slotsRef.current.length
+    for (let i = 0; i < count; i++) stopSlot(i)
+    setSlots(prev => prev.map(s => ({
+      ...s,
+      recording: null,
+      status: s.cameraId ? 'idle' : 'empty',
+      playbackUrl: null,
+      sessionId: null,
+      downloadUrl: null,
+      errorMsg: null,
+      vodProgress: null,
+      mimeType: null,
+    })))
+    setGlobalPlaying(false)
+    setGlobalPlaybackTime(null)
+  }
+
+  // Assign camera from tree double-click to active slot
+  const assignCameraToSlot = (cameraId: string) => {
+    const cam = cameras.find(c => c.id === cameraId)
+    if (!cam) return
+    const nvrObj = nvrs.find(n => n.id === cam.nvrId)
+
+    stopSlot(activeSlotIndex)
+
+    setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
+      ...s,
+      cameraId: cam.id,
+      cameraName: cam.name,
+      nvrId: cam.nvrId,
+      nvrName: nvrObj?.name ?? '',
+      recording: null,
+      status: 'idle',
+      playbackUrl: null,
+      sessionId: null,
+      downloadUrl: null,
+      errorMsg: null,
+      vodProgress: null,
+      mimeType: null,
+    } : s))
+  }
+
   // ── Search ─────────────────────────────────────────────────────────────────
   const handleSearch = async () => {
     if (selectedCameras.size === 0) { toast.error('Selecciona al menos una cámara'); return }
@@ -156,12 +269,11 @@ export function RecordingsPage() {
     if (start >= end) { toast.error('La fecha Desde debe ser anterior a Hasta'); return }
 
     setIsSearching(true)
-    setPlaybackUrl(null)
+    clearAllPlayback()
     setRecordings([])
     setNvrErrors([])
 
     const cameraIds = [...selectedCameras]
-
     const camToNvr = new Map<string, { nvrId: string; nvrName: string }>()
     cameras.forEach(c => {
       if (cameraIds.includes(c.id)) {
@@ -243,172 +355,108 @@ export function RecordingsPage() {
     }
   }
 
-  // ── Playback control ───────────────────────────────────────────────────────
+  // ── Core: load recording into a specific slot ──────────────────────────────
 
-  const stopPlayback = () => {
-    playbackCleaningRef.current = true
-    toast.dismiss()
-    playbackKeyRef.current = null
-    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
-    const sid = playbackSessionIdRef.current
-    if (sid) {
-      apiDelete(`/recordings/playback/${sid}`).catch(() => {})
-      playbackSessionIdRef.current = null
-      setPlaybackSessionId(null)
-    }
-    setPlaybackUrl(null)
-    setPlaybackStatus('idle')
-    setPlaybackMimeType(null)
-    setVodProgress(null)
-    setDownloadUrl(null)
-  }
-
-  useEffect(() => { playbackSessionIdRef.current = playbackSessionId }, [playbackSessionId])
-  useEffect(() => { selectedRecRef.current = selectedRec }, [selectedRec])
-
-  // Clean up on unmount
-  useEffect(() => stopPlayback, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Attach video source when playbackUrl / mimeType changes
-  useEffect(() => {
-    const video = videoRef.current
-    if (!video || !playbackUrl) return
-
-    playbackEndedRef.current    = false
-    playbackCleaningRef.current = false
-    const attachedKey = playbackKeyRef.current
-
-    const handleVideoEnded = () => {
-      playbackEndedRef.current = true
-      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
-      const sid = playbackSessionIdRef.current
-      if (sid) {
-        apiDelete(`/recordings/playback/${sid}`).catch(() => {})
-        playbackSessionIdRef.current = null
-        setPlaybackSessionId(null)
-      }
-      setPlaybackStatus('idle')
-    }
-
-    video.addEventListener('ended', handleVideoEnded)
-
-    if (playbackMimeType === 'video/mp4') {
-      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
-
-      const handleVideoError = () => {
-        if (playbackEndedRef.current)             return
-        if (playbackCleaningRef.current)          return
-        if (attachedKey !== playbackKeyRef.current) return
-        const err = video.error
-        console.error(`[recordings-ui] mp4_video_error code=${err?.code} message=${err?.message} currentSrc=${video.currentSrc}`)
-
-        if (hevcCopyAttemptedRef.current && !hevcRetryDoneRef.current && selectedRecRef.current) {
-          hevcRetryDoneRef.current = true
-          const recToRetry = selectedRecRef.current
-          console.info('[recordings-ui] mp4_hevc_copy_failed retrying with forceTranscode=true')
-          toast('Video HEVC no compatible con este navegador. Reintentando con conversión H.264…', { duration: 6000 })
-          stopPlayback()
-          setTimeout(() => handlePlayFnRef.current(recToRetry, { forceTranscode: true }), 150)
-          return
-        }
-
-        toast.error('El video fue generado pero el navegador no pudo abrir el archivo MP4', { duration: 8000 })
-      }
-
-      const handleCanPlay = () => {
-        console.info(`[recordings-ui] mp4_canplay sessionId=${playbackSessionIdRef.current} duration=${video.duration?.toFixed(1)}s`)
-      }
-      const handlePlaying = () => {
-        console.info(`[recordings-ui] mp4_playing sessionId=${playbackSessionIdRef.current}`)
-      }
-
-      console.info(`[recordings-ui] mp4_attach_url sessionId=${playbackSessionIdRef.current} url=${playbackUrl}`)
-      video.addEventListener('error',   handleVideoError)
-      video.addEventListener('canplay', handleCanPlay)
-      video.addEventListener('playing', handlePlaying)
-      video.src = playbackUrl
-      video.play().catch(() => {})
-      return () => {
-        video.removeEventListener('ended',   handleVideoEnded)
-        video.removeEventListener('error',   handleVideoError)
-        video.removeEventListener('canplay', handleCanPlay)
-        video.removeEventListener('playing', handlePlaying)
-      }
-    }
-
-    // HLS.js path
-    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
-    if (Hls.isSupported()) {
-      const hls = new Hls({
-        enableWorker: false,
-        xhrSetup: (xhr) => { xhr.withCredentials = true },
-      })
-      hlsRef.current = hls
-      hls.loadSource(playbackUrl)
-      hls.attachMedia(video)
-      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
-      hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (!data.fatal)                           return
-        if (playbackEndedRef.current)              return
-        if (playbackCleaningRef.current)           return
-        if (attachedKey !== playbackKeyRef.current) return
-        const status = (data.response as any)?.code ?? 0
-        if (status === 401) {
-          toast.error('Sesión expirada — vuelve a seleccionar la grabación', { duration: 6000 })
-        } else {
-          toast.error('Error al reproducir la grabación', { duration: 5000 })
-        }
-      })
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = playbackUrl
-      video.play().catch(() => {})
-    }
-
-    return () => { video.removeEventListener('ended', handleVideoEnded) }
-  }, [playbackUrl, playbackMimeType])
-
-  // ── handlePlay ─────────────────────────────────────────────────────────────
-
-  const handlePlay = async (rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => {
+  const loadRecordingInSlot = async (
+    slotIndex: number,
+    rec: RecordingWithCamera,
+    opts?: { forceTranscode?: boolean },
+  ) => {
     const forceTranscode = opts?.forceTranscode ?? false
-    const isSameRec = selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId
-
-    if (isSameRec && playbackStatus === 'ready')    return
-    if (isSameRec && playbackStatus === 'starting') return
-
-    stopPlayback()
-    setSelectedRec(rec)
-    setStartDate(toLocalDatetimeString(new Date(rec.startTime)))
-    setEndDate(toLocalDatetimeString(new Date(rec.endTime)))
 
     const myKey = `${Date.now()}-${Math.random()}`
-    playbackKeyRef.current      = myKey
-    playbackEndedRef.current    = false
-    playbackCleaningRef.current = false
-    setPlaybackMimeType(null)
-    setVodProgress(null)
-    setPlaybackLoading(true)
-    setPlaybackStatus('starting')
+    slotKeysRef.current[slotIndex] = myKey
 
-    const videoEl        = videoRef.current ?? document.createElement('video')
+    // Stop existing session + video for this slot
+    if (videoCleanupRef.current[slotIndex]) {
+      videoCleanupRef.current[slotIndex]!()
+      videoCleanupRef.current[slotIndex] = null
+    }
+    const existingSession = slotsRef.current[slotIndex]?.sessionId
+    if (existingSession) apiDelete(`/recordings/playback/${existingSession}`).catch(() => {})
+    const vid0 = videoRefs.current[slotIndex]
+    if (vid0) { vid0.src = ''; vid0.load() }
+
+    // Transition to loading
+    setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+      ...s,
+      recording: rec,
+      status: 'loading',
+      playbackUrl: null,
+      sessionId: null,
+      downloadUrl: null,
+      errorMsg: null,
+      vodProgress: null,
+      mimeType: null,
+    } : s))
+
+    const videoEl = videoRefs.current[slotIndex] ?? document.createElement('video')
     const canPlayHevcMp4 = !forceTranscode && (
       videoEl.canPlayType('video/mp4; codecs="hvc1"') !== '' ||
       videoEl.canPlayType('video/mp4; codecs="hev1"') !== ''
     )
+    hevcAttemptedRef.current[slotIndex] = canPlayHevcMp4
+    if (!forceTranscode) hevcRetryRef.current[slotIndex] = false
 
-    hevcCopyAttemptedRef.current = canPlayHevcMp4
-    if (!forceTranscode) hevcRetryDoneRef.current = false
+    // Attach video + event handlers once URL is ready
+    const attachAndPlay = (url: string, mimeType: string | null, sessionId: string | null, downloadUrl: string | null) => {
+      if (slotKeysRef.current[slotIndex] !== myKey) return
+      const vid = videoRefs.current[slotIndex]
+      if (!vid) return
 
-    console.info(`[recordings-ui] playback_start cameraId=${rec.cameraId} canPlayHevcMp4=${canPlayHevcMp4} forceTranscode=${forceTranscode}`)
+      const handleError = () => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        const slot = slotsRef.current[slotIndex]
+        if (hevcAttemptedRef.current[slotIndex] && !hevcRetryRef.current[slotIndex] && slot?.recording) {
+          hevcRetryRef.current[slotIndex] = true
+          const recToRetry = slot.recording
+          toast('Video HEVC no compatible. Reintentando con conversión H.264…', { duration: 6000 })
+          loadInSlotRef.current(slotIndex, recToRetry, { forceTranscode: true })
+          return
+        }
+        setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+          ...s, status: 'error', errorMsg: 'El navegador no pudo abrir el archivo MP4',
+        } : s))
+      }
 
-    let sessionId: string | null = null
+      const handleEnded = () => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        const slot = slotsRef.current[slotIndex]
+        if (slot?.sessionId) apiDelete(`/recordings/playback/${slot.sessionId}`).catch(() => {})
+        setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+          ...s, status: 'idle', sessionId: null,
+        } : s))
+        setGlobalPlaying(false)
+      }
+
+      // Remove previous handlers before attaching new ones
+      if (videoCleanupRef.current[slotIndex]) videoCleanupRef.current[slotIndex]!()
+      vid.addEventListener('error', handleError)
+      vid.addEventListener('ended', handleEnded)
+      videoCleanupRef.current[slotIndex] = () => {
+        vid.removeEventListener('error', handleError)
+        vid.removeEventListener('ended', handleEnded)
+      }
+
+      vid.src = url
+      vid.playbackRate = globalPlaybackRateRef.current
+      if (globalPlayingRef.current) vid.play().catch(() => {})
+
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s,
+        status: 'ready',
+        playbackUrl: url,
+        mimeType,
+        sessionId,
+        downloadUrl,
+        vodProgress: null,
+      } : s))
+    }
 
     try {
       const result = await apiPost<{
         status: string
         sessionId: string
-        pollUrl: string
-        expiresAt: string
         expectedDurationSec?: number
         url?: string
         mimeType?: string
@@ -422,84 +470,62 @@ export function RecordingsPage() {
         forceTranscode,
       })
 
-      if (playbackKeyRef.current !== myKey) return
-      console.info(`[recordings-ui] playback_post_response sessionId=${result.sessionId} status=${result.status} expectedDurationSec=${result.expectedDurationSec}`)
+      if (slotKeysRef.current[slotIndex] !== myKey) return
 
-      sessionId = result.sessionId
-      setPlaybackSessionId(sessionId)
-      playbackSessionIdRef.current = sessionId
+      const sessionId = result.sessionId
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? { ...s, sessionId } : s))
 
       if (result.status === 'ready' && result.url) {
-        setPlaybackMimeType(result.mimeType ?? null)
-        setPlaybackUrl(result.url)
-        setPlaybackStatus('ready')
-        setPlaybackLoading(false)
-        if (result.downloadUrl) setDownloadUrl(result.downloadUrl)
+        attachAndPlay(result.url, result.mimeType ?? null, sessionId, result.downloadUrl ?? null)
         return
       }
 
-      const expectedSec    = result.expectedDurationSec ?? 60
-      const dynamicPollMs  = Math.min(POLL_ABSOLUTE_MAX_MS, Math.max(180_000, expectedSec * 2500 + 60_000))
+      const expectedSec   = result.expectedDurationSec ?? 60
+      const dynamicPollMs = Math.min(POLL_ABSOLUTE_MAX_MS, Math.max(180_000, expectedSec * 2500 + 60_000))
 
       let lastSeenOutTimeSec = -1
       let lastProgressTick   = Date.now()
+      const pollStart        = Date.now()
 
-      const pollStart = Date.now()
       while (Date.now() - pollStart < dynamicPollMs) {
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
-
-        if (playbackKeyRef.current !== myKey) return
+        if (slotKeysRef.current[slotIndex] !== myKey) return
 
         let statusRes: PlaybackStatusResponse
         try {
-          statusRes = await apiGet<PlaybackStatusResponse>(
-            `/recordings/playback/${sessionId}/status`, {}
-          )
+          statusRes = await apiGet<PlaybackStatusResponse>(`/recordings/playback/${sessionId}/status`, {})
         } catch (pollErr: any) {
-          if (playbackKeyRef.current !== myKey) return
+          if (slotKeysRef.current[slotIndex] !== myKey) return
           const httpStatus = pollErr?.response?.status
-          if (httpStatus === 404) {
-            toast.error('Sesión de reproducción no encontrada o expirada', { duration: 6000 })
-          } else {
-            toast.error('Error al consultar estado de reproducción', { duration: 5000 })
-          }
-          setPlaybackLoading(false)
-          setPlaybackStatus('idle')
+          const errMsg = httpStatus === 404
+            ? 'Sesión no encontrada o expirada'
+            : 'Error al consultar estado de reproducción'
+          setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+            ...s, status: 'error', errorMsg: errMsg,
+          } : s))
           return
         }
 
-        if (playbackKeyRef.current !== myKey) return
+        if (slotKeysRef.current[slotIndex] !== myKey) return
 
-        if (statusRes.status === 'ready') {
-          setPlaybackMimeType(statusRes.mimeType ?? null)
-          setPlaybackUrl(statusRes.url ?? null)
-          setPlaybackStatus('ready')
-          setPlaybackLoading(false)
-          setVodProgress(null)
-          if (statusRes.downloadUrl) setDownloadUrl(statusRes.downloadUrl)
+        if (statusRes.status === 'ready' && statusRes.url) {
+          attachAndPlay(statusRes.url, statusRes.mimeType ?? null, sessionId, statusRes.downloadUrl ?? null)
           return
         }
 
         if (statusRes.status === 'error') {
-          const code = statusRes.errorCode ?? ''
-          const msg  = statusRes.error ?? 'Error desconocido'
-          if (code === 'RECORDING_STREAM_STALLED') {
-            toast.error(msg, { duration: 8000 })
-          } else if (code === 'TRANSCODE_FAILED') {
-            toast.error(`Error al generar video: ${msg}`, { duration: 8000 })
-          } else {
-            toast.error(msg || 'No se pudo cargar la grabación', { duration: 6000 })
-          }
-          setPlaybackLoading(false)
-          setPlaybackStatus('idle')
-          setVodProgress(null)
+          setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+            ...s, status: 'error', errorMsg: statusRes.error ?? 'Error desconocido',
+          } : s))
           return
         }
 
         const outSec = statusRes.outTimeSec ?? 0
         const expSec = statusRes.expectedDurationSec ?? expectedSec
         if (outSec > 0) {
-          setVodProgress({ outTimeSec: outSec, expectedDurationSec: expSec })
+          setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+            ...s, vodProgress: { outTimeSec: outSec, expectedDurationSec: expSec },
+          } : s))
           if (outSec > lastSeenOutTimeSec) {
             lastSeenOutTimeSec = outSec
             lastProgressTick   = Date.now()
@@ -508,62 +534,130 @@ export function RecordingsPage() {
 
         if (lastSeenOutTimeSec >= 0 && Date.now() - lastProgressTick > POLL_STALL_MS) {
           const pct = statusRes.progressPercent ?? 0
-          if (pct >= 95) {
-            console.info(`[recordings-ui] vod_client_stall_ignored_near_complete pct=${pct}`)
-          } else {
-            toast.error(
-              `Sin progreso de video durante ${POLL_STALL_MS / 1000}s — el NVR puede haber cortado el stream`,
-              { duration: 8000 },
-            )
-            setPlaybackLoading(false)
-            setPlaybackStatus('idle')
-            setVodProgress(null)
+          if (pct < 95) {
+            setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+              ...s, status: 'error', errorMsg: `Sin progreso durante ${POLL_STALL_MS / 1000}s`,
+            } : s))
             return
           }
         }
       }
 
-      if (playbackKeyRef.current !== myKey) return
-      toast.error('Tiempo de generación superado (>15 min). Intenta de nuevo.', { duration: 8000 })
-      setPlaybackLoading(false)
-      setPlaybackStatus('idle')
-      setVodProgress(null)
+      if (slotKeysRef.current[slotIndex] !== myKey) return
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s, status: 'error', errorMsg: 'Tiempo de generación superado (>15 min)',
+      } : s))
 
     } catch (err: any) {
-      if (playbackKeyRef.current !== myKey) return
+      if (slotKeysRef.current[slotIndex] !== myKey) return
       const data   = err?.response?.data ?? {}
-      const detail = data.detail ?? data.message ?? ''
-      toast.error(detail || 'No se pudo iniciar la reproducción', { duration: 5000 })
-      setPlaybackLoading(false)
-      setPlaybackStatus('idle')
+      const detail = data.detail ?? data.message ?? 'No se pudo iniciar la reproducción'
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s, status: 'error', errorMsg: detail,
+      } : s))
     }
   }
 
-  handlePlayFnRef.current = handlePlay
+  loadInSlotRef.current = loadRecordingInSlot
 
-  // ── Derived UI values ──────────────────────────────────────────────────────
+  // ── Global synchronized controls ──────────────────────────────────────────
 
-  const vodPct = vodProgress && vodProgress.expectedDurationSec > 0
-    ? Math.min(99, Math.round(vodProgress.outTimeSec / vodProgress.expectedDurationSec * 100))
-    : null
-  const isNearComplete = (vodPct ?? 0) >= 95
-  const loadingLabel = isNearComplete
-    ? `Finalizando video… ${vodPct}%`
-    : vodPct !== null
-      ? `Generando video… ${vodPct}%`
-      : playbackStatus === 'transcoding'
-        ? 'Transcodificando H.265 → H.264…'
-        : 'Preparando grabación…'
-
-  // ── Grid layout helpers ────────────────────────────────────────────────────
-
-  const gridColsClass: Record<PlaybackLayout, string> = {
-    '1x1': 'grid-cols-1',
-    '2x2': 'grid-cols-2',
-    '3x3': 'grid-cols-3',
-    '4x4': 'grid-cols-4',
+  const syncedTogglePlayPause = () => {
+    if (globalPlayingRef.current) {
+      slotsRef.current.forEach((_, i) => videoRefs.current[i]?.pause())
+      setGlobalPlaying(false)
+    } else {
+      slotsRef.current.forEach((s, i) => {
+        if (s.status === 'ready') videoRefs.current[i]?.play().catch(() => {})
+      })
+      setGlobalPlaying(true)
+    }
   }
-  const slotCount: Record<PlaybackLayout, number> = { '1x1': 1, '2x2': 4, '3x3': 9, '4x4': 16 }
+
+  const syncedRate = (rate: number) => {
+    slotsRef.current.forEach((s, i) => {
+      const vid = videoRefs.current[i]
+      if (vid && s.status === 'ready') {
+        vid.playbackRate = rate
+        if ('preservesPitch' in vid) (vid as any).preservesPitch = false
+      }
+    })
+    setGlobalPlaybackRate(rate)
+  }
+
+  const syncedJump = (seconds: number) => {
+    slotsRef.current.forEach((s, i) => {
+      const vid = videoRefs.current[i]
+      if (vid && s.status === 'ready') {
+        vid.currentTime = Math.max(0, Math.min(vid.duration || 0, vid.currentTime + seconds))
+      }
+    })
+  }
+
+  const syncedFrameForward = () => {
+    slotsRef.current.forEach((s, i) => {
+      const vid = videoRefs.current[i]
+      if (vid && s.status === 'ready') {
+        vid.pause()
+        vid.currentTime = Math.min(vid.duration || 0, vid.currentTime + 1 / 25)
+      }
+    })
+    setGlobalPlaying(false)
+  }
+
+  // ── Timeline click-to-seek ─────────────────────────────────────────────────
+
+  const recordingsByCamera = useMemo(() => {
+    const map = new Map<string, RecordingWithCamera[]>()
+    recordings.forEach(rec => {
+      if (!map.has(rec.cameraId)) map.set(rec.cameraId, [])
+      map.get(rec.cameraId)!.push(rec)
+    })
+    return map
+  }, [recordings])
+
+  const handleTimelineSeek = (time: Date) => {
+    const timeMs = time.getTime()
+    slotsRef.current.forEach((slot, slotIndex) => {
+      if (!slot.cameraId) return
+
+      const camRecs  = recordingsByCamera.get(slot.cameraId) ?? []
+      const covering = camRecs.find(r =>
+        new Date(r.startTime).getTime() <= timeMs && new Date(r.endTime).getTime() > timeMs
+      )
+
+      if (!covering) {
+        stopSlot(slotIndex)
+        setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+          ...s, status: 'no_recording', recording: null, playbackUrl: null, sessionId: null,
+        } : s))
+        return
+      }
+
+      if (slot.recording?.id === covering.id && slot.status === 'ready') {
+        const vid = videoRefs.current[slotIndex]
+        if (vid) {
+          const recStartMs = new Date(covering.startTime).getTime()
+          vid.currentTime = Math.max(0, Math.min(vid.duration || 0, (timeMs - recStartMs) / 1000))
+        }
+        return
+      }
+
+      loadRecordingInSlot(slotIndex, covering)
+    })
+    setGlobalPlaybackTime(time)
+  }
+
+  // ── Derived values ─────────────────────────────────────────────────────────
+
+  const anySlotReady = slots.some(s => s.status === 'ready')
+
+  // Active slot info for controls / sidebar
+  const activeRecording = activeSlot.recording
+  const activeDownloadUrl = activeSlot.downloadUrl
+
+  // For sidebar: highlight recording matching active slot's current time
+  const highlightedRecId = activeSlot.recording?.id ?? null
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -581,6 +675,7 @@ export function RecordingsPage() {
           onToggleNVR={toggleNVR}
           onSelectAll={selectAll}
           onClearAll={clearAll}
+          onAssignCamera={assignCameraToSlot}
         />
       </aside>
 
@@ -650,75 +745,109 @@ export function RecordingsPage() {
 
           {/* Video grid */}
           <div className="flex-1 min-w-0 bg-black">
-            <div className={clsx('grid h-full gap-0.5 bg-surface-800', gridColsClass[layout])}>
-              {Array.from({ length: slotCount[layout] }).map((_, idx) => {
-                const isActive = idx === 0
+            <div className={clsx('grid h-full gap-0.5 bg-surface-800', GRID_COLS[layout])}>
+              {Array.from({ length: SLOT_COUNT[layout] }).map((_, idx) => {
+                const slot      = slots[idx] ?? emptySlot(idx)
+                const isActive  = idx === activeSlotIndex
+                const vodPct    = slot.vodProgress && slot.vodProgress.expectedDurationSec > 0
+                  ? Math.min(99, Math.round(slot.vodProgress.outTimeSec / slot.vodProgress.expectedDurationSec * 100))
+                  : null
+                const loadLabel = (vodPct !== null && vodPct >= 95)
+                  ? `Finalizando… ${vodPct}%`
+                  : vodPct !== null
+                    ? `Generando… ${vodPct}%`
+                    : 'Preparando grabación…'
 
                 return (
                   <div
                     key={idx}
+                    onClick={() => setActiveSlotIndex(idx)}
                     className={clsx(
-                      'relative flex flex-col overflow-hidden',
-                      isActive ? 'bg-black' : 'bg-surface-900'
+                      'relative flex flex-col overflow-hidden cursor-pointer',
+                      isActive
+                        ? 'ring-2 ring-inset ring-red-600'
+                        : 'bg-surface-900'
                     )}
                   >
                     {/* Slot label bar */}
                     <div className="absolute top-0 left-0 right-0 z-10 flex items-center gap-1.5 px-2 py-1 bg-gradient-to-b from-black/70 to-transparent pointer-events-none">
-                      <span className="text-[9px] text-surface-400 font-medium">
-                        {isActive && selectedRec
-                          ? `${selectedRec.nvrName} · ${selectedRec.cameraName}`
+                      <span className="text-[9px] text-surface-300 font-medium truncate">
+                        {slot.cameraId
+                          ? `${slot.nvrName} · ${slot.cameraName}`
                           : `Canal ${idx + 1}`
                         }
                       </span>
-                      {isActive && playbackStatus === 'ready' && (
-                        <span className="text-[8px] px-1 py-0.5 rounded bg-green-700/60 text-green-300">●  En vivo</span>
+                      {slot.status === 'ready' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-green-700/60 text-green-300">● Play</span>
                       )}
                     </div>
 
-                    {/* Active slot: real video + loading overlay */}
-                    {isActive ? (
-                      <>
-                        <video
-                          ref={videoRef}
-                          controls
-                          controlsList="nodownload"
-                          className={clsx('absolute inset-0 w-full h-full', !playbackUrl && 'hidden')}
-                          style={{ background: '#000' }}
-                        />
-                        {!playbackUrl && (
-                          <div className="absolute inset-0 flex flex-col items-center justify-center">
-                            {playbackLoading ? (
-                              <>
-                                <Loader2 size={24} className="text-brand-400 mb-2 animate-spin" />
-                                <p className="text-xs text-surface-300">{loadingLabel}</p>
-                                {vodPct !== null && (
-                                  <div className="w-40 mt-2 bg-surface-700 rounded-full h-1.5">
-                                    <div
-                                      className="bg-brand-500 h-1.5 rounded-full transition-all duration-500"
-                                      style={{ width: `${vodPct}%` }}
-                                    />
-                                  </div>
-                                )}
-                              </>
-                            ) : (
-                              <>
-                                <Play size={28} className="text-surface-700 mb-2" />
-                                <p className="text-[11px] text-surface-600">
-                                  {recordings.length > 0
-                                    ? 'Selecciona una grabación'
-                                    : 'Busca grabaciones primero'
-                                  }
-                                </p>
-                              </>
-                            )}
+                    {/* Video element — always rendered, shown only when ready */}
+                    <video
+                      ref={el => { videoRefs.current[idx] = el }}
+                      controls
+                      controlsList="nodownload"
+                      className={clsx(
+                        'absolute inset-0 w-full h-full bg-black',
+                        slot.status === 'ready' ? 'block' : 'hidden'
+                      )}
+                    />
+
+                    {/* Overlays */}
+                    {slot.status === 'empty' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-surface-900">
+                        <Video size={20} className="text-surface-800" />
+                        <span className="text-[9px] text-surface-700">
+                          {isActive ? 'Doble clic en cámara para asignar' : `Canal ${idx + 1}`}
+                        </span>
+                      </div>
+                    )}
+
+                    {slot.status === 'idle' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black">
+                        <Play size={20} className="text-surface-700" />
+                        <span className="text-[9px] text-surface-500">
+                          {recordings.length > 0 ? 'Selecciona una grabación' : 'Busca grabaciones primero'}
+                        </span>
+                      </div>
+                    )}
+
+                    {slot.status === 'no_recording' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black">
+                        <Clock size={18} className="text-surface-700" />
+                        <span className="text-[9px] text-surface-600">Sin grabación en este momento</span>
+                      </div>
+                    )}
+
+                    {slot.status === 'loading' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black">
+                        <Loader2 size={20} className="text-brand-400 animate-spin" />
+                        <p className="text-[10px] text-surface-300">{loadLabel}</p>
+                        {vodPct !== null && (
+                          <div className="w-32 bg-surface-700 rounded-full h-1">
+                            <div
+                              className="bg-brand-500 h-1 rounded-full transition-all duration-500"
+                              style={{ width: `${vodPct}%` }}
+                            />
                           </div>
                         )}
-                      </>
-                    ) : (
-                      /* Inactive slot placeholder */
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
-                        <Play size={16} className="text-surface-800" />
-                        <span className="text-[9px] text-surface-700">Vacío</span>
+                      </div>
+                    )}
+
+                    {slot.status === 'error' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black px-3">
+                        <AlertTriangle size={18} className="text-red-500 flex-shrink-0" />
+                        <p className="text-[9px] text-surface-400 text-center line-clamp-2">
+                          {slot.errorMsg ?? 'Error desconocido'}
+                        </p>
+                        {slot.recording && (
+                          <button
+                            onClick={e => { e.stopPropagation(); loadRecordingInSlot(idx, slot.recording!) }}
+                            className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300 transition-colors"
+                          >
+                            Reintentar
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -739,6 +868,15 @@ export function RecordingsPage() {
                 </span>
               )}
             </div>
+            {/* Active slot hint */}
+            <div className="px-3 py-1 border-b border-surface-800 flex-shrink-0">
+              <span className="text-[9px] text-surface-600">
+                Cargando en: <span className="text-surface-400 font-medium">Canal {activeSlotIndex + 1}</span>
+                {activeSlot.cameraName && (
+                  <> · <span className="text-brand-500">{activeSlot.cameraName}</span></>
+                )}
+              </span>
+            </div>
             <div className="flex-1 overflow-y-auto divide-y divide-surface-800">
               {recordings.length === 0 ? (
                 <div className="py-10 flex flex-col items-center gap-1.5">
@@ -749,14 +887,14 @@ export function RecordingsPage() {
                 </div>
               ) : (
                 recordings.map(rec => {
-                  const isSelected = selectedRec?.id === rec.id && selectedRec?.cameraId === rec.cameraId
+                  const isHighlighted = highlightedRecId === rec.id && activeSlot.recording?.cameraId === rec.cameraId
                   return (
                     <button
                       key={`${rec.cameraId}-${rec.id}`}
-                      onClick={() => handlePlay(rec)}
+                      onClick={() => loadRecordingInSlot(activeSlotIndex, rec)}
                       className={clsx(
                         'w-full text-left px-3 py-2 transition-colors',
-                        isSelected
+                        isHighlighted
                           ? 'bg-brand-900/30 border-l-2 border-brand-500'
                           : 'hover:bg-surface-800/60 border-l-2 border-transparent'
                       )}
@@ -787,27 +925,31 @@ export function RecordingsPage() {
         <div className="flex-shrink-0 border-t border-surface-700 bg-surface-900">
           <RecordingTimeline
             recordings={recordings}
-            selectedRec={selectedRec}
+            selectedRec={activeRecording}
             startDate={startDate}
             endDate={endDate}
-            onSelectRecording={handlePlay}
+            onSelectRecording={rec => loadRecordingInSlot(activeSlotIndex, rec)}
+            globalTime={globalPlaybackTime}
+            onSeekToTime={recordings.length > 0 ? handleTimelineSeek : undefined}
           />
         </div>
 
         {/* ── Controls toolbar ──────────────────────────────────────────── */}
-        {playbackStatus === 'ready' && (
+        {anySlotReady && (
           <div className="flex-shrink-0 border-t border-surface-700">
             {/* Download row */}
             <div className="flex items-center justify-between px-3 py-1.5 bg-surface-800/30">
               <span className="text-[10px] text-surface-500 truncate max-w-[50%]">
-                {selectedRec
-                  ? `${selectedRec.nvrName} · ${selectedRec.cameraName} — ${format(new Date(selectedRec.startTime), 'dd/MM HH:mm')}`
-                  : ''
+                {activeRecording
+                  ? `${activeRecording.nvrName} · ${activeRecording.cameraName} — ${format(new Date(activeRecording.startTime), 'dd/MM HH:mm')}`
+                  : activeSlot.cameraName
+                    ? `${activeSlot.nvrName} · ${activeSlot.cameraName}`
+                    : ''
                 }
               </span>
-              {downloadUrl && (
+              {activeDownloadUrl && (
                 <a
-                  href={downloadUrl}
+                  href={activeDownloadUrl}
                   download
                   className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
                 >
@@ -817,8 +959,12 @@ export function RecordingsPage() {
               )}
             </div>
             <RecordingPlaybackControls
-              key={playbackSessionId ?? 'idle'}
-              videoRef={videoRef}
+              key={`slot-${activeSlotIndex}-${activeSlot.sessionId ?? 'idle'}`}
+              video={videoRefs.current[activeSlotIndex] ?? undefined}
+              onTogglePlayPause={syncedTogglePlayPause}
+              onSeekRelative={syncedJump}
+              onFrameForward={syncedFrameForward}
+              onApplyRate={syncedRate}
             />
           </div>
         )}
