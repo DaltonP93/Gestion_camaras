@@ -242,6 +242,8 @@ export function RecordingsPage() {
     if (!cam) return
     const nvrObj = nvrs.find(n => n.id === cam.nvrId)
 
+    console.info(`[recordings-ui] slot_camera_assigned slot=${activeSlotIndex} cameraId=${cameraId} cameraName=${cam.name}`)
+
     stopSlot(activeSlotIndex)
 
     setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
@@ -259,6 +261,15 @@ export function RecordingsPage() {
       vodProgress: null,
       mimeType: null,
     } : s))
+
+    // If we already have recordings for this camera, auto-load the most recent one
+    const camRecs = recordingsByCamera.get(cameraId)
+    if (camRecs && camRecs.length > 0) {
+      const first = camRecs[0]
+      console.info(`[recordings-ui] slot_camera_assigned_autoload slot=${activeSlotIndex} cameraId=${cameraId} recId=${first.id} recStart=${first.startTime}`)
+      // Slight delay so setSlots above has committed
+      setTimeout(() => loadInSlotRef.current(activeSlotIndex, first), 0)
+    }
   }
 
   // ── Search ─────────────────────────────────────────────────────────────────
@@ -364,6 +375,25 @@ export function RecordingsPage() {
     opts?: { forceTranscode?: boolean },
   ) => {
     const forceTranscode = opts?.forceTranscode ?? false
+
+    // Guard: if slot has an explicit camera assignment, reject recordings from different cameras
+    // (unless this is a forceTranscode retry, which always uses the same rec)
+    const currentSlot = slotsRef.current[slotIndex]
+    if (!forceTranscode && currentSlot?.cameraId && currentSlot.cameraId !== rec.cameraId) {
+      console.info(
+        `[recordings-ui] slot_recording_rejected_camera_mismatch slot=${slotIndex}` +
+        ` slotCameraId=${currentSlot.cameraId} recCameraId=${rec.cameraId}` +
+        ` recId=${rec.id} recStart=${rec.startTime}`
+      )
+      return
+    }
+
+    console.info(
+      `[recordings-ui] slot_recording_load slot=${slotIndex}` +
+      ` slotCameraId=${currentSlot?.cameraId ?? 'none'} recCameraId=${rec.cameraId}` +
+      ` recId=${rec.id} recStart=${rec.startTime} recEnd=${rec.endTime}` +
+      ` forceTranscode=${forceTranscode}`
+    )
 
     const myKey = `${Date.now()}-${Math.random()}`
     slotKeysRef.current[slotIndex] = myKey
@@ -756,7 +786,10 @@ export function RecordingsPage() {
                 return (
                   <div
                     key={idx}
-                    onClick={() => setActiveSlotIndex(idx)}
+                    onClick={() => {
+                      console.info(`[recordings-ui] slot_selected slot=${idx} cameraId=${slots[idx]?.cameraId ?? 'none'} status=${slots[idx]?.status ?? 'empty'}`)
+                      setActiveSlotIndex(idx)
+                    }}
                     className={clsx(
                       'relative flex flex-col overflow-hidden cursor-pointer',
                       isActive
