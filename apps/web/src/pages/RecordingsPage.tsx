@@ -687,6 +687,19 @@ export function RecordingsPage() {
   const activeRecording = activeSlot.recording
   const activeDownloadUrl = activeSlot.downloadUrl
 
+  // Cameras assigned to slots — passed to timeline to always show their row
+  const assignedCameras = useMemo(() =>
+    slots
+      .filter(s => s.cameraId !== null)
+      .map(s => ({
+        cameraId:   s.cameraId!,
+        cameraName: s.cameraName!,
+        nvrName:    s.nvrName ?? '',
+        slotIndex:  s.slotIndex,
+      })),
+    [slots]
+  )
+
   // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
@@ -888,12 +901,13 @@ export function RecordingsPage() {
         <div className="flex-shrink-0 border-t border-surface-700 bg-surface-900">
           <RecordingTimeline
             recordings={recordings}
+            assignedCameras={assignedCameras}
             selectedRec={activeRecording}
             startDate={startDate}
             endDate={endDate}
             onSelectRecording={rec => loadRecordingInSlot(activeSlotIndex, rec)}
             globalTime={globalPlaybackTime}
-            onSeekToTime={recordings.length > 0 ? handleTimelineSeek : undefined}
+            onSeekToTime={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelineSeek : undefined}
           />
         </div>
 
