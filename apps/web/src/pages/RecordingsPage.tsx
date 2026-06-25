@@ -4,6 +4,7 @@ import {
   Play, Clock, AlertTriangle, RefreshCw, ExternalLink,
   XCircle, Loader2, Info, Download, Video,
 } from 'lucide-react'
+// Clock kept for slot overlays
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet, apiDelete } from '@/lib/api'
 import { format, subHours } from 'date-fns'
@@ -652,12 +653,9 @@ export function RecordingsPage() {
 
   const anySlotReady = slots.some(s => s.status === 'ready')
 
-  // Active slot info for controls / sidebar
+  // Active slot info for controls
   const activeRecording = activeSlot.recording
   const activeDownloadUrl = activeSlot.downloadUrl
-
-  // For sidebar: highlight recording matching active slot's current time
-  const highlightedRecId = activeSlot.recording?.id ?? null
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -740,12 +738,9 @@ export function RecordingsPage() {
           </div>
         )}
 
-        {/* ── Central: video grid + recordings list ─────────────────────── */}
-        <div className="flex-1 flex min-h-0 overflow-hidden">
-
-          {/* Video grid */}
-          <div className="flex-1 min-w-0 bg-black">
-            <div className={clsx('grid h-full gap-0.5 bg-surface-800', GRID_COLS[layout])}>
+        {/* ── Central: video grid (full width) ─────────────────────────── */}
+        <div className="flex-1 min-h-0 bg-black overflow-hidden">
+          <div className={clsx('grid h-full gap-0.5 bg-surface-800', GRID_COLS[layout])}>
               {Array.from({ length: SLOT_COUNT[layout] }).map((_, idx) => {
                 const slot      = slots[idx] ?? emptySlot(idx)
                 const isActive  = idx === activeSlotIndex
@@ -853,71 +848,6 @@ export function RecordingsPage() {
                   </div>
                 )
               })}
-            </div>
-          </div>
-
-          {/* Recordings list sidebar */}
-          <div className="w-52 flex-shrink-0 border-l border-surface-700 flex flex-col overflow-hidden">
-            <div className="px-3 py-2 border-b border-surface-700 flex items-center gap-1.5 flex-shrink-0">
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500">
-                Grabaciones
-              </span>
-              {recordings.length > 0 && (
-                <span className="ml-auto text-[10px] text-surface-600 tabular-nums">
-                  {recordings.length}
-                </span>
-              )}
-            </div>
-            {/* Active slot hint */}
-            <div className="px-3 py-1 border-b border-surface-800 flex-shrink-0">
-              <span className="text-[9px] text-surface-600">
-                Cargando en: <span className="text-surface-400 font-medium">Canal {activeSlotIndex + 1}</span>
-                {activeSlot.cameraName && (
-                  <> · <span className="text-brand-500">{activeSlot.cameraName}</span></>
-                )}
-              </span>
-            </div>
-            <div className="flex-1 overflow-y-auto divide-y divide-surface-800">
-              {recordings.length === 0 ? (
-                <div className="py-10 flex flex-col items-center gap-1.5">
-                  <Play size={18} className="text-surface-700" />
-                  <p className="text-[10px] text-surface-600 text-center px-3">
-                    {isSearching ? 'Buscando…' : 'Sin resultados'}
-                  </p>
-                </div>
-              ) : (
-                recordings.map(rec => {
-                  const isHighlighted = highlightedRecId === rec.id && activeSlot.recording?.cameraId === rec.cameraId
-                  return (
-                    <button
-                      key={`${rec.cameraId}-${rec.id}`}
-                      onClick={() => loadRecordingInSlot(activeSlotIndex, rec)}
-                      className={clsx(
-                        'w-full text-left px-3 py-2 transition-colors',
-                        isHighlighted
-                          ? 'bg-brand-900/30 border-l-2 border-brand-500'
-                          : 'hover:bg-surface-800/60 border-l-2 border-transparent'
-                      )}
-                    >
-                      <div className="text-[10px] text-surface-400 truncate">
-                        {rec.nvrName} · {rec.cameraName}
-                      </div>
-                      <div className="text-xs text-surface-200 mt-0.5">
-                        {format(new Date(rec.startTime), 'HH:mm:ss')}
-                      </div>
-                      <div className="flex items-center gap-1.5 mt-0.5">
-                        <span className="text-[10px] text-surface-500 flex items-center gap-0.5">
-                          <Clock size={9} /> {formatDuration(rec.startTime, rec.endTime)}
-                        </span>
-                        {rec.size > 0 && (
-                          <span className="text-[10px] text-surface-600">{formatSize(rec.size)}</span>
-                        )}
-                      </div>
-                    </button>
-                  )
-                })
-              )}
-            </div>
           </div>
         </div>
 
