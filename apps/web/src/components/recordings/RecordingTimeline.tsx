@@ -10,6 +10,8 @@ interface Props {
   startDate: string
   endDate: string
   onSelectRecording: (rec: RecordingWithCamera) => void
+  globalTime?: Date | null
+  onSeekToTime?: (time: Date) => void
 }
 
 function getTickInterval(totalMs: number): number {
@@ -22,7 +24,6 @@ function getTickInterval(totalMs: number): number {
 
 function generateTicks(rangeStart: number, rangeEnd: number, intervalMs: number) {
   const ticks: { time: number; label: string }[] = []
-  // Start at first tick boundary after rangeStart
   const first = Math.ceil(rangeStart / intervalMs) * intervalMs
   const spansDays = (rangeEnd - rangeStart) > 24 * 3600_000
   for (let t = first; t <= rangeEnd; t += intervalMs) {
@@ -40,12 +41,12 @@ const LABEL_W = 120 // px — left label column width
 
 export function RecordingTimeline({
   recordings, selectedRec, startDate, endDate, onSelectRecording,
+  globalTime, onSeekToTime,
 }: Props) {
   const rangeStart = useMemo(() => new Date(startDate).getTime(), [startDate])
   const rangeEnd   = useMemo(() => new Date(endDate).getTime(),   [endDate])
   const totalMs    = rangeEnd - rangeStart
 
-  // Group recordings by NVR + camera
   const groups = useMemo(() => {
     if (totalMs <= 0) return []
     const map = new Map<string, { label: string; recs: RecordingWithCamera[] }>()
@@ -80,14 +81,27 @@ export function RecordingTimeline({
     return `${Math.max(0, clamped / totalMs * 100).toFixed(3)}%`
   }
 
+  const handleTrackClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!onSeekToTime) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const ratio = Math.max(0, Math.min(1, x / rect.width))
+    const clickedMs = rangeStart + ratio * totalMs
+    onSeekToTime(new Date(clickedMs))
+  }
+
+  const playheadMs = globalTime ? globalTime.getTime() : null
+  const playheadVisible = playheadMs !== null && playheadMs >= rangeStart && playheadMs <= rangeEnd
+
   return (
     <div className="flex flex-col select-none" style={{ minHeight: 0 }}>
       {/* Time axis */}
       <div className="flex flex-shrink-0 border-b border-surface-700/60 h-6">
-        {/* Label column spacer */}
         <div style={{ width: LABEL_W }} className="flex-shrink-0 border-r border-surface-700/60" />
-        {/* Ticks */}
-        <div className="flex-1 relative overflow-hidden">
+        <div
+          className={clsx('flex-1 relative overflow-hidden', onSeekToTime && 'cursor-crosshair')}
+          onClick={handleTrackClick}
+        >
           {ticks.map(tick => (
             <div
               key={tick.time}
@@ -100,6 +114,13 @@ export function RecordingTimeline({
               </span>
             </div>
           ))}
+          {/* Playhead in tick row */}
+          {playheadVisible && (
+            <div
+              className="absolute top-0 bottom-0 w-px bg-red-500/70 z-20 pointer-events-none"
+              style={{ left: pct(playheadMs!) }}
+            />
+          )}
         </div>
       </div>
 
@@ -121,7 +142,10 @@ export function RecordingTimeline({
             </div>
 
             {/* Recording blocks */}
-            <div className="flex-1 relative bg-surface-900">
+            <div
+              className={clsx('flex-1 relative bg-surface-900', onSeekToTime && 'cursor-crosshair')}
+              onClick={handleTrackClick}
+            >
               {recs.map(rec => {
                 const recStart = new Date(rec.startTime).getTime()
                 const recEnd   = new Date(rec.endTime).getTime()
@@ -131,7 +155,7 @@ export function RecordingTimeline({
                 return (
                   <button
                     key={`${rec.cameraId}-${rec.id}`}
-                    onClick={() => onSelectRecording(rec)}
+                    onClick={e => { e.stopPropagation(); onSelectRecording(rec) }}
                     title={`${format(new Date(rec.startTime), 'HH:mm:ss')} – ${format(new Date(rec.endTime), 'HH:mm:ss')} (${durationMin}min)`}
                     className={clsx(
                       'absolute top-1 bottom-1 rounded-sm transition-colors cursor-pointer',
@@ -147,6 +171,13 @@ export function RecordingTimeline({
                   />
                 )
               })}
+              {/* Playhead in row */}
+              {playheadVisible && (
+                <div
+                  className="absolute top-0 bottom-0 w-px bg-red-500 z-20 pointer-events-none"
+                  style={{ left: pct(playheadMs!) }}
+                />
+              )}
             </div>
           </div>
         ))}

@@ -6,7 +6,11 @@ import {
 } from 'lucide-react'
 
 interface Props {
-  videoRef: React.RefObject<HTMLVideoElement | null>
+  video?: HTMLVideoElement | null
+  onTogglePlayPause?: () => void
+  onSeekRelative?: (seconds: number) => void
+  onFrameForward?: () => void
+  onApplyRate?: (rate: number) => void
 }
 
 const SPEEDS: { value: number; label: string }[] = [
@@ -30,15 +34,20 @@ function formatTime(secs: number): string {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
-export function RecordingPlaybackControls({ videoRef }: Props) {
-  const [paused, setPaused]           = useState(false)
+export function RecordingPlaybackControls({
+  video,
+  onTogglePlayPause,
+  onSeekRelative,
+  onFrameForward,
+  onApplyRate,
+}: Props) {
+  const [paused, setPaused]           = useState(true)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration]       = useState(0)
   const [currentRate, setCurrentRate] = useState(1)
 
   // Sync UI state from native video events
   useEffect(() => {
-    const video = videoRef.current
     if (!video) return
 
     const onPlay     = () => setPaused(false)
@@ -53,12 +62,12 @@ export function RecordingPlaybackControls({ videoRef }: Props) {
     setDuration(video.duration || 0)
     setCurrentRate(video.playbackRate)
 
-    video.addEventListener('play',             onPlay)
-    video.addEventListener('pause',            onPause)
-    video.addEventListener('timeupdate',       onTimeup)
-    video.addEventListener('loadedmetadata',   onMeta)
-    video.addEventListener('durationchange',   onDuration)
-    video.addEventListener('ratechange',       onRate)
+    video.addEventListener('play',           onPlay)
+    video.addEventListener('pause',          onPause)
+    video.addEventListener('timeupdate',     onTimeup)
+    video.addEventListener('loadedmetadata', onMeta)
+    video.addEventListener('durationchange', onDuration)
+    video.addEventListener('ratechange',     onRate)
 
     return () => {
       video.removeEventListener('play',           onPlay)
@@ -68,41 +77,35 @@ export function RecordingPlaybackControls({ videoRef }: Props) {
       video.removeEventListener('durationchange', onDuration)
       video.removeEventListener('ratechange',     onRate)
     }
-  }, [videoRef])
+  }, [video])
 
   const togglePlayPause = useCallback(() => {
-    const video = videoRef.current
+    if (onTogglePlayPause) { onTogglePlayPause(); return }
     if (!video) return
-    if (video.paused) {
-      video.play().catch(() => {})
-    } else {
-      video.pause()
-    }
-  }, [videoRef])
+    if (video.paused) video.play().catch(() => {})
+    else video.pause()
+  }, [video, onTogglePlayPause])
 
   const frameForward = useCallback(() => {
-    const video = videoRef.current
+    if (onFrameForward) { onFrameForward(); return }
     if (!video) return
     video.pause()
     video.currentTime = Math.min(video.duration || 0, video.currentTime + 1 / 25)
-    console.info('[recordings-ui] frame_forward')
-  }, [videoRef])
+  }, [video, onFrameForward])
 
   const seekRelative = useCallback((seconds: number) => {
-    const video = videoRef.current
+    if (onSeekRelative) { onSeekRelative(seconds); return }
     if (!video) return
     video.currentTime = Math.max(0, Math.min(video.duration || 0, video.currentTime + seconds))
-    console.info(`[recordings-ui] seek_relative seconds=${seconds}`)
-  }, [videoRef])
+  }, [video, onSeekRelative])
 
   const applyRate = useCallback((rate: number) => {
-    const video = videoRef.current
+    if (onApplyRate) { onApplyRate(rate); return }
     if (!video) return
     video.playbackRate = rate
     if ('preservesPitch' in video) (video as any).preservesPitch = false
     setCurrentRate(rate)
-    console.info(`[recordings-ui] playback_rate_set rate=${rate}`)
-  }, [videoRef])
+  }, [video, onApplyRate])
 
   const currentSpeed = SPEEDS.find(s => Math.abs(s.value - currentRate) < 0.001) ?? null
 

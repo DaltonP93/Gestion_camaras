@@ -14,11 +14,13 @@ interface Props {
   onToggleNVR: (nvrId: string) => void
   onSelectAll: () => void
   onClearAll: () => void
+  onAssignCamera?: (cameraId: string) => void
 }
 
 export function RecordingCameraTree({
   nvrs, cameras, selectedCameras, nvrErrors,
   onToggleCamera, onToggleNVR, onSelectAll, onClearAll,
+  onAssignCamera,
 }: Props) {
   const [query, setQuery]             = useState('')
   const [collapsed, setCollapsed]     = useState<Set<string>>(new Set())
@@ -142,6 +144,8 @@ export function RecordingCameraTree({
                     <button
                       key={cam.id}
                       onClick={() => onToggleCamera(cam.id)}
+                      onDoubleClick={() => onAssignCamera?.(cam.id)}
+                      title={onAssignCamera ? 'Doble clic para asignar al slot activo' : cam.name}
                       className={clsx(
                         'w-full flex items-center gap-2 pl-6 pr-3 py-1.5 text-left transition-colors border-b border-surface-800/40',
                         selected
