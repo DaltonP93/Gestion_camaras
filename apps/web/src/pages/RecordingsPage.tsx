@@ -911,30 +911,45 @@ export function RecordingsPage() {
           />
         </div>
 
-        {/* ── Controls toolbar ──────────────────────────────────────────── */}
-        {anySlotReady && (
-          <div className="flex-shrink-0 border-t border-surface-700">
-            {/* Download row */}
-            <div className="flex items-center justify-between px-3 py-1.5 bg-surface-800/30">
-              <span className="text-[10px] text-surface-500 truncate max-w-[50%]">
-                {activeRecording
-                  ? `${activeRecording.nvrName} · ${activeRecording.cameraName} — ${format(new Date(activeRecording.startTime), 'dd/MM HH:mm')}`
-                  : activeSlot.cameraName
-                    ? `${activeSlot.nvrName} · ${activeSlot.cameraName}`
-                    : ''
-                }
-              </span>
-              {activeDownloadUrl && (
-                <a
-                  href={activeDownloadUrl}
-                  download
-                  className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
-                >
-                  <Download size={11} />
-                  Descargar MP4
-                </a>
-              )}
-            </div>
+        {/* ── Controls toolbar — always visible ─────────────────────── */}
+        <div className="flex-shrink-0 border-t border-surface-700">
+          {/* Info row: playhead time · slot label · download */}
+          <div className="flex items-center gap-3 px-3 py-1.5 bg-surface-800/50 border-b border-surface-700/60">
+            {/* Playhead time — main clock */}
+            <span className="text-[11px] font-mono text-surface-200 tabular-nums flex-shrink-0">
+              {globalPlaybackTime
+                ? format(globalPlaybackTime, 'dd/MM HH:mm:ss')
+                : activeRecording
+                  ? format(new Date(activeRecording.startTime), 'dd/MM HH:mm:ss')
+                  : '--/-- --:--:--'
+              }
+            </span>
+
+            {/* Slot indicator */}
+            <span className="text-[9px] text-surface-600 flex-shrink-0">
+              {activeSlot.cameraName
+                ? `S${activeSlotIndex + 1} · ${activeSlot.nvrName} · ${activeSlot.cameraName}`
+                : `S${activeSlotIndex + 1} — sin cámara`
+              }
+            </span>
+
+            <div className="flex-1" />
+
+            {/* Download button for active slot */}
+            {activeDownloadUrl && (
+              <a
+                href={activeDownloadUrl}
+                download
+                className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
+              >
+                <Download size={11} />
+                Descargar MP4
+              </a>
+            )}
+          </div>
+
+          {/* Playback controls — grayed when nothing is ready */}
+          <div className={clsx(!anySlotReady && 'opacity-40 pointer-events-none')}>
             <RecordingPlaybackControls
               key={`slot-${activeSlotIndex}-${activeSlot.sessionId ?? 'idle'}`}
               video={videoRefs.current[activeSlotIndex] ?? undefined}
@@ -944,7 +959,7 @@ export function RecordingsPage() {
               onApplyRate={syncedRate}
             />
           </div>
-        )}
+        </div>
       </div>
     </div>
   )
