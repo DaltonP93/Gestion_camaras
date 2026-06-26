@@ -763,6 +763,11 @@ export function RecordingsPage() {
 
       const handleError = () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
+        const mediaErr = vid.error
+        console.error(
+          `[recordings-ui] preview_video_error slot=${slotIndex} sessionId=${sessionId}` +
+          ` code=${mediaErr?.code ?? 'none'} msg=${mediaErr?.message ?? 'none'}`
+        )
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
           ...s, status: 'error', errorMsg: 'No se pudo reproducir el stream del NVR',
         } : s))
@@ -787,7 +792,11 @@ export function RecordingsPage() {
 
       vid.src = streamUrl
       vid.playbackRate = globalPlaybackRateRef.current
-      if (globalPlayingRef.current) vid.play().catch(() => {})
+      if (globalPlayingRef.current) {
+        vid.play()
+          .then(() => console.info(`[recordings-ui] preview_playing slot=${slotIndex} sessionId=${sessionId}`))
+          .catch((e: Error) => console.warn(`[recordings-ui] preview_play_rejected slot=${slotIndex} reason=${e.message}`))
+      }
 
       setSlots(prev => prev.map((s, i) => i === slotIndex ? {
         ...s,

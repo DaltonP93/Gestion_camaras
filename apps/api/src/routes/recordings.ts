@@ -1293,7 +1293,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const expiresAt   = Date.now() + RECORDING_SESSION_TTL_MS
 
     server.log.info(
-      `[recordings] preview_init sessionId=${sessionId} slotIndex=${body.slotIndex}` +
+      `[recordings-preview] session_init sessionId=${sessionId} slotIndex=${body.slotIndex}` +
       ` cameraId=${body.cameraId} ch=${camera.channel}` +
       ` urlStrategy=${urlStrategy} startTime=${body.startTime} endTime=${body.endTime}` +
       ` forceTranscode=${body.forceTranscode ?? false} source=${rtspMasked}`
@@ -1325,7 +1325,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const session       = previewSessions.get(sessionId)
 
     if (!session || !session.streamToken || !token || token !== session.streamToken) {
-      server.log.warn(`[recordings] preview_token_invalid sessionId=${sessionId} hasSession=${!!session}`)
+      server.log.warn(`[recordings-preview] token_invalid sessionId=${sessionId} hasSession=${!!session}`)
       return reply.status(401).send({ message: 'Token de stream inválido o expirado' })
     }
     if (Date.now() > session.expiresAt) {
@@ -1343,7 +1343,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const rtspTimeoutOpt = getRtspTimeoutOption()
     const rtspTimeoutUs  = 60_000_000 // 60s for NVR seek + locate
 
-    // Skip ffprobe — saves 3-5s; browser will error and frontend retries with forceTranscode if needed
+    // Skip ffprobe to save 3-5s startup time; browser errors and frontend retries with forceTranscode
     const codecArgs = buildCodecArgs(forceTranscode ? 'hevc_transcode_preview' : 'copy_h264')
 
     const ffmpegArgs = [
@@ -1360,8 +1360,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     ]
 
     const maskedArgs = ffmpegArgs.map(a => a === rtspUrl ? rtspMasked : a)
+    const streamStartMs = Date.now()
+
     server.log.info(
-      `[recordings] preview_stream_start sessionId=${sessionId}` +
+      `[recordings-preview] stream_start sessionId=${sessionId}` +
       ` slotIndex=${session.slotIndex} cameraId=${session.cameraId}` +
       ` forceTranscode=${forceTranscode} cmd=ffmpeg ${maskedArgs.join(' ')}`
     )
@@ -1371,7 +1373,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     proc.stderr?.on('data', (chunk: Buffer) => {
       const line = chunk.toString().trim()
-      if (line) server.log.debug(`[recordings] preview_stderr sessionId=${sessionId} ${line.slice(0, 200)}`)
+      if (line) server.log.debug(`[recordings-preview] ffmpeg_stderr sessionId=${sessionId} ${line.slice(0, 200)}`)
     })
 
     // Hijack the raw TCP connection — bypass Fastify serialization entirely
@@ -1385,10 +1387,24 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       'X-Session-Id':  sessionId,
     })
 
+    // Log time-to-first-byte — key latency metric for preview
+    let firstByteSent = false
+    proc.stdout?.once('data', (chunk: Buffer) => {
+      firstByteSent = true
+      server.log.info(
+        `[recordings-preview] first_byte sessionId=${sessionId}` +
+        ` elapsedMs=${Date.now() - streamStartMs} bytes=${chunk.length}`
+      )
+    })
+
     proc.stdout?.pipe(res, { end: true })
 
     const cleanup = (reason: string) => {
-      server.log.info(`[recordings] preview_stream_end sessionId=${sessionId} reason=${reason}`)
+      const elapsedMs = Date.now() - streamStartMs
+      server.log.info(
+        `[recordings-preview] stream_closed sessionId=${sessionId}` +
+        ` reason=${reason} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
+      )
       if (session.vodProcess === proc) session.vodProcess = undefined
       try { proc.kill('SIGTERM') } catch {}
       try { res.end() } catch {}
@@ -1397,12 +1413,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     request.raw.on('close', () => cleanup('client_disconnect'))
     request.raw.on('error', () => cleanup('request_error'))
     proc.on('exit', (code) => {
-      server.log.info(`[recordings] preview_ffmpeg_exit sessionId=${sessionId} code=${code}`)
+      const elapsedMs = Date.now() - streamStartMs
+      server.log.info(
+        `[recordings-preview] ffmpeg_exit sessionId=${sessionId}` +
+        ` code=${code} elapsedMs=${elapsedMs}`
+      )
       if (session.vodProcess === proc) session.vodProcess = undefined
       try { res.end() } catch {}
     })
     proc.on('error', (err: Error) => {
-      server.log.warn(`[recordings] preview_ffmpeg_error sessionId=${sessionId} err=${err.message}`)
+      server.log.warn(`[recordings-preview] ffmpeg_error sessionId=${sessionId} err=${err.message}`)
       cleanup('ffmpeg_error')
     })
   })
@@ -1419,7 +1439,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     if (session.vodProcess) {
       try { session.vodProcess.kill('SIGTERM') } catch {}
     }
-    server.log.info(`[recordings] preview_stopped sessionId=${sessionId} slotIndex=${session.slotIndex}`)
+    server.log.info(`[recordings-preview] session_deleted sessionId=${sessionId} slotIndex=${session.slotIndex}`)
     return reply.send({ ok: true })
   })
 }
