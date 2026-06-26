@@ -122,7 +122,9 @@ export function RecordingsPage() {
   const globalPlayingRef     = useRef(false)
   const globalPlaybackRateRef = useRef(1)
   const videoCleanupRef = useRef<{ [k: number]: (() => void) | null }>({})
-  const loadInSlotRef   = useRef<(si: number, rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
+  const loadInSlotRef         = useRef<(si: number, rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
+  const startPreviewInSlotRef = useRef<(si: number, rec: RecordingWithCamera, playheadTime: Date) => void>(() => {})
+  const previewStartTimesRef  = useRef<{ [k: number]: number | null }>({})
 
   // Keep refs in sync
   useEffect(() => { slotsRef.current = slots }, [slots])
@@ -141,11 +143,17 @@ export function RecordingsPage() {
         // Stop sessions for removed slots
         prev.slice(count).forEach(s => {
           slotKeysRef.current[s.slotIndex] = null
+          previewStartTimesRef.current[s.slotIndex] = null
           if (videoCleanupRef.current[s.slotIndex]) {
             videoCleanupRef.current[s.slotIndex]!()
             videoCleanupRef.current[s.slotIndex] = null
           }
-          if (s.sessionId) apiDelete(`/recordings/playback/${s.sessionId}`).catch(() => {})
+          if (s.sessionId) {
+            const ep = s.sessionType === 'preview'
+              ? `/recordings/preview/${s.sessionId}`
+              : `/recordings/playback/${s.sessionId}`
+            apiDelete(ep).catch(() => {})
+          }
         })
         return prev.slice(0, count)
       }
@@ -159,8 +167,14 @@ export function RecordingsPage() {
   useEffect(() => () => {
     slotsRef.current.forEach(s => {
       slotKeysRef.current[s.slotIndex] = null
+      previewStartTimesRef.current[s.slotIndex] = null
       if (videoCleanupRef.current[s.slotIndex]) videoCleanupRef.current[s.slotIndex]!()
-      if (s.sessionId) apiDelete(`/recordings/playback/${s.sessionId}`).catch(() => {})
+      if (s.sessionId) {
+        const ep = s.sessionType === 'preview'
+          ? `/recordings/preview/${s.sessionId}`
+          : `/recordings/playback/${s.sessionId}`
+        apiDelete(ep).catch(() => {})
+      }
     })
   }, [])
 
@@ -172,13 +186,19 @@ export function RecordingsPage() {
     const slot = slotsRef.current[activeSlotIndex]
     if (!vid || slot?.status !== 'ready' || !slot?.recording) return
 
-    const recStartMs = new Date(slot.recording.startTime).getTime()
     const handleTimeUpdate = () => {
-      setGlobalPlaybackTime(new Date(recStartMs + vid.currentTime * 1000))
+      const currentSlot  = slotsRef.current[activeSlotIndex]
+      const previewStart = previewStartTimesRef.current[activeSlotIndex]
+      if (currentSlot?.sessionType === 'preview' && previewStart != null) {
+        setGlobalPlaybackTime(new Date(previewStart + vid.currentTime * 1000))
+      } else if (currentSlot?.recording) {
+        const recStartMs = new Date(currentSlot.recording.startTime).getTime()
+        setGlobalPlaybackTime(new Date(recStartMs + vid.currentTime * 1000))
+      }
     }
     vid.addEventListener('timeupdate', handleTimeUpdate)
     return () => vid.removeEventListener('timeupdate', handleTimeUpdate)
-  }, [activeSlotIndex, activeSlot.status, activeSlot.recording?.startTime])
+  }, [activeSlotIndex, activeSlot.status, activeSlot.recording?.startTime, activeSlot.sessionType])
 
   // ── Camera selection helpers ───────────────────────────────────────────────
   const toggleCamera = (cameraId: string) =>
@@ -206,6 +226,7 @@ export function RecordingsPage() {
 
   const stopSlot = (slotIndex: number) => {
     slotKeysRef.current[slotIndex] = null
+    previewStartTimesRef.current[slotIndex] = null
     if (videoCleanupRef.current[slotIndex]) {
       videoCleanupRef.current[slotIndex]!()
       videoCleanupRef.current[slotIndex] = null
@@ -214,7 +235,10 @@ export function RecordingsPage() {
     if (vid) { vid.src = ''; vid.load() }
     const s = slotsRef.current[slotIndex]
     if (s?.sessionId) {
-      apiDelete(`/recordings/playback/${s.sessionId}`).catch(() => {})
+      const ep = s.sessionType === 'preview'
+        ? `/recordings/preview/${s.sessionId}`
+        : `/recordings/playback/${s.sessionId}`
+      apiDelete(ep).catch(() => {})
     }
   }
 
@@ -227,6 +251,7 @@ export function RecordingsPage() {
       status: s.cameraId ? 'idle' : 'empty',
       playbackUrl: null,
       sessionId: null,
+      sessionType: null,
       downloadUrl: null,
       errorMsg: null,
       vodProgress: null,
@@ -264,13 +289,16 @@ export function RecordingsPage() {
       mimeType: null,
     } : s))
 
-    // If we already have recordings for this camera, auto-load the most recent one
+    // If we already have recordings for this camera, auto-load via preview
     const camRecs = recordingsByCamera.get(cameraId)
     if (camRecs && camRecs.length > 0) {
       const first = camRecs[0]
       console.info(`[recordings-ui] slot_camera_assigned_autoload slot=${activeSlotIndex} cameraId=${cameraId} recId=${first.id} recStart=${first.startTime}`)
       // Slight delay so setSlots above has committed
-      setTimeout(() => loadInSlotRef.current(activeSlotIndex, first), 0)
+      setTimeout(() => {
+        const playhead = globalPlaybackTime ?? new Date(first.startTime)
+        startPreviewInSlotRef.current(activeSlotIndex, first, playhead)
+      }, 0)
     }
   }
 
@@ -434,8 +462,14 @@ export function RecordingsPage() {
       videoCleanupRef.current[slotIndex]!()
       videoCleanupRef.current[slotIndex] = null
     }
-    const existingSession = slotsRef.current[slotIndex]?.sessionId
-    if (existingSession) apiDelete(`/recordings/playback/${existingSession}`).catch(() => {})
+    const existingSlot = slotsRef.current[slotIndex]
+    if (existingSlot?.sessionId) {
+      const ep = existingSlot.sessionType === 'preview'
+        ? `/recordings/preview/${existingSlot.sessionId}`
+        : `/recordings/playback/${existingSlot.sessionId}`
+      apiDelete(ep).catch(() => {})
+    }
+    previewStartTimesRef.current[slotIndex] = null
     const vid0 = videoRefs.current[slotIndex]
     if (vid0) { vid0.src = ''; vid0.load() }
 
@@ -446,6 +480,7 @@ export function RecordingsPage() {
       status: 'loading',
       playbackUrl: null,
       sessionId: null,
+      sessionType: null,
       downloadUrl: null,
       errorMsg: null,
       vodProgress: null,
@@ -510,6 +545,7 @@ export function RecordingsPage() {
         playbackUrl: url,
         mimeType,
         sessionId,
+        sessionType: 'mp4',
         downloadUrl,
         vodProgress: null,
       } : s))
@@ -622,6 +658,142 @@ export function RecordingsPage() {
 
   loadInSlotRef.current = loadRecordingInSlot
 
+  // ── Preview streaming ─────────────────────────────────────────────────────
+  // Starts an fMP4 stream directly from NVR RTSP → browser <video>.
+  // Starts in 1-3s instead of waiting for full MP4 generation.
+  const startPreviewInSlot = async (
+    slotIndex:    number,
+    rec:          RecordingWithCamera,
+    playheadTime: Date,
+  ) => {
+    const currentSlot = slotsRef.current[slotIndex]
+    if (currentSlot?.cameraId && currentSlot.cameraId !== rec.cameraId) {
+      console.info(
+        `[recordings-ui] preview_rejected_camera_mismatch slot=${slotIndex}` +
+        ` slotCameraId=${currentSlot.cameraId} recCameraId=${rec.cameraId}`
+      )
+      return
+    }
+
+    const playheadMs    = playheadTime.getTime()
+    const recStartMs    = new Date(rec.startTime).getTime()
+    const recEndMs      = new Date(rec.endTime).getTime()
+    const effectiveMs   = Math.max(recStartMs, Math.min(playheadMs, recEndMs - 1000))
+    const effectiveStart = new Date(effectiveMs).toISOString()
+
+    console.info(
+      `[recordings-ui] preview_start slot=${slotIndex}` +
+      ` cameraId=${rec.cameraId} recId=${rec.id}` +
+      ` playhead=${playheadTime.toISOString()} effectiveStart=${effectiveStart}`
+    )
+
+    const myKey = `${Date.now()}-${Math.random()}`
+    slotKeysRef.current[slotIndex] = myKey
+    previewStartTimesRef.current[slotIndex] = null
+
+    // Stop existing session
+    if (videoCleanupRef.current[slotIndex]) {
+      videoCleanupRef.current[slotIndex]!()
+      videoCleanupRef.current[slotIndex] = null
+    }
+    const existing = slotsRef.current[slotIndex]
+    if (existing?.sessionId) {
+      const ep = existing.sessionType === 'preview'
+        ? `/recordings/preview/${existing.sessionId}`
+        : `/recordings/playback/${existing.sessionId}`
+      apiDelete(ep).catch(() => {})
+    }
+    const vid0 = videoRefs.current[slotIndex]
+    if (vid0) { vid0.src = ''; vid0.load() }
+
+    setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+      ...s,
+      recording: rec,
+      status: 'loading',
+      playbackUrl: null,
+      sessionId: null,
+      sessionType: null,
+      downloadUrl: null,
+      errorMsg: null,
+      vodProgress: null,
+      mimeType: null,
+    } : s))
+
+    try {
+      const result = await apiPost<{ sessionId: string; streamUrl: string }>(
+        '/recordings/preview/start',
+        {
+          cameraId:    rec.cameraId,
+          slotIndex,
+          startTime:   effectiveStart,
+          endTime:     rec.endTime,
+          playbackURI: (rec as any).playbackURI,
+          forceTranscode: false,
+        }
+      )
+
+      if (slotKeysRef.current[slotIndex] !== myKey) return
+
+      const { sessionId, streamUrl } = result
+      // Track when this preview starts (video.currentTime = 0 → effectiveMs)
+      previewStartTimesRef.current[slotIndex] = effectiveMs
+
+      const vid = videoRefs.current[slotIndex]
+      if (!vid) return
+
+      const handleError = () => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+          ...s, status: 'error', errorMsg: 'No se pudo reproducir el stream del NVR',
+        } : s))
+      }
+
+      const handleEnded = () => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        apiDelete(`/recordings/preview/${sessionId}`).catch(() => {})
+        setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+          ...s, status: 'idle', sessionId: null, sessionType: null,
+        } : s))
+        setGlobalPlaying(false)
+      }
+
+      ;(videoCleanupRef.current[slotIndex] as (() => void) | null)?.()
+      vid.addEventListener('error', handleError)
+      vid.addEventListener('ended', handleEnded)
+      videoCleanupRef.current[slotIndex] = () => {
+        vid.removeEventListener('error', handleError)
+        vid.removeEventListener('ended', handleEnded)
+      }
+
+      vid.src = streamUrl
+      vid.playbackRate = globalPlaybackRateRef.current
+      if (globalPlayingRef.current) vid.play().catch(() => {})
+
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s,
+        status: 'ready',
+        playbackUrl: streamUrl,
+        mimeType: 'video/mp4',
+        sessionId,
+        sessionType: 'preview',
+        downloadUrl: null,
+        vodProgress: null,
+      } : s))
+
+      console.info(`[recordings-ui] preview_ready slot=${slotIndex} sessionId=${sessionId}`)
+
+    } catch (err: any) {
+      if (slotKeysRef.current[slotIndex] !== myKey) return
+      const detail = err?.response?.data?.message ?? 'No se pudo iniciar el stream de preview'
+      console.error(`[recordings-ui] preview_error slot=${slotIndex} err=${detail}`)
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s, status: 'error', errorMsg: detail,
+      } : s))
+    }
+  }
+
+  startPreviewInSlotRef.current = startPreviewInSlot
+
   // ── Global synchronized controls ──────────────────────────────────────────
 
   const syncedTogglePlayPause = () => {
@@ -663,7 +835,7 @@ export function RecordingsPage() {
             ` cameraId=${slot.cameraId} recId=${covering.id}` +
             ` recStart=${covering.startTime} recEnd=${covering.endTime}`
           )
-          loadInSlotRef.current(slot.slotIndex, covering)
+          startPreviewInSlotRef.current(slot.slotIndex, covering, new Date(playheadMs))
         } else {
           console.info(
             `[recordings-ui] slot_no_recording_at_playhead slot=${slot.slotIndex}` +
@@ -723,7 +895,15 @@ export function RecordingsPage() {
 
   const handleTimelineSeek = (time: Date) => {
     const timeMs = time.getTime()
-    console.info(`[recordings-ui] timeline_seek playhead=${time.toISOString()}`)
+    console.info(`[recordings-ui] timeline_seek playhead=${time.toISOString()} isPlaying=${globalPlayingRef.current}`)
+
+    // Not playing: just move the playhead — don't restart any stream
+    if (!globalPlayingRef.current) {
+      setGlobalPlaybackTime(time)
+      return
+    }
+
+    // Playing: restart preview from new seek point for each assigned slot
     slotsRef.current.forEach((slot, slotIndex) => {
       if (!slot.cameraId) return
 
@@ -740,18 +920,8 @@ export function RecordingsPage() {
         return
       }
 
-      if (slot.recording?.id === covering.id && slot.status === 'ready') {
-        const vid = videoRefs.current[slotIndex]
-        if (vid) {
-          const recStartMs = new Date(covering.startTime).getTime()
-          const newTime = Math.max(0, Math.min(vid.duration || 0, (timeMs - recStartMs) / 1000))
-          vid.currentTime = newTime
-          console.info(`[recordings-ui] slot_seek_within_loaded_recording slot=${slotIndex} currentTime=${newTime.toFixed(2)}`)
-        }
-        return
-      }
-
-      loadRecordingInSlot(slotIndex, covering)
+      // Preview streams don't support random seek — always restart from new point
+      startPreviewInSlotRef.current(slotIndex, covering, time)
     })
     setGlobalPlaybackTime(time)
   }
@@ -870,8 +1040,8 @@ export function RecordingsPage() {
                 const loadLabel = (vodPct !== null && vodPct >= 95)
                   ? `Finalizando… ${vodPct}%`
                   : vodPct !== null
-                    ? `Generando… ${vodPct}%`
-                    : 'Preparando grabación…'
+                    ? `Generando MP4… ${vodPct}%`
+                    : 'Conectando al NVR…'
 
                 return (
                   <div
@@ -960,7 +1130,7 @@ export function RecordingsPage() {
                         </p>
                         {slot.recording && (
                           <button
-                            onClick={e => { e.stopPropagation(); loadRecordingInSlot(idx, slot.recording!) }}
+                            onClick={e => { e.stopPropagation(); startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime)) }}
                             className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300 transition-colors"
                           >
                             Reintentar
@@ -982,7 +1152,7 @@ export function RecordingsPage() {
             selectedRec={activeRecording}
             startDate={startDate}
             endDate={endDate}
-            onSelectRecording={rec => loadRecordingInSlot(activeSlotIndex, rec)}
+            onSelectRecording={rec => startPreviewInSlotRef.current(activeSlotIndex, rec, globalPlaybackTime ?? new Date(rec.startTime))}
             globalTime={globalPlaybackTime}
             onSeekToTime={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelineSeek : undefined}
           />
@@ -1012,8 +1182,8 @@ export function RecordingsPage() {
 
             <div className="flex-1" />
 
-            {/* Download button for active slot */}
-            {activeDownloadUrl && (
+            {/* Download: link when MP4 ready, button to generate when only preview is active */}
+            {activeDownloadUrl ? (
               <a
                 href={activeDownloadUrl}
                 download
@@ -1022,7 +1192,16 @@ export function RecordingsPage() {
                 <Download size={11} />
                 Descargar MP4
               </a>
-            )}
+            ) : activeRecording && (activeSlot.sessionType === 'preview' || activeSlot.status === 'ready') ? (
+              <button
+                onClick={() => loadRecordingInSlot(activeSlotIndex, activeRecording)}
+                title="Genera y descarga el MP4 completo de esta grabación"
+                className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:bg-surface-600 hover:text-surface-200 transition-colors flex-shrink-0"
+              >
+                <Download size={11} />
+                Generar MP4…
+              </button>
+            ) : null}
           </div>
 
           {/* Playback controls — grayed when nothing is ready */}
