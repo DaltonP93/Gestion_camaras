@@ -297,6 +297,37 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000)
 
+// ─── Preview sessions (instant streaming — fMP4 over HTTP) ───────
+interface PreviewSession {
+  streamToken: string     // short-lived token for unauthenticated /stream URL
+  userId:      string
+  createdAt:   number
+  expiresAt:   number     // 30 min TTL
+  rtspUrl:     string
+  rtspMasked:  string
+  cameraId:    string
+  slotIndex:   number
+  startTime:   string
+  endTime:     string
+  forceTranscode: boolean
+  vodProcess?: ChildProcess
+}
+
+const previewSessions = new Map<string, PreviewSession>()
+
+// Periodic cleanup of stale preview sessions
+setInterval(() => {
+  const now = Date.now()
+  for (const [sid, session] of previewSessions.entries()) {
+    if (now > session.expiresAt) {
+      previewSessions.delete(sid)
+      if (session.vodProcess) {
+        try { session.vodProcess.kill('SIGTERM') } catch {}
+      }
+    }
+  }
+}, 5 * 60 * 1000)
+
 // ─── RTSP URL helpers ─────────────────────────────────────────────
 
 function injectCredentialsIntoPlaybackUri(opts: {
@@ -652,6 +683,15 @@ const playbackSchema = z.object({
   endTime:        z.string().datetime(),
   playbackURI:    z.string().startsWith('/').optional(),
   canPlayHevcMp4: z.boolean().optional(),
+  forceTranscode: z.boolean().optional(),
+})
+
+const previewStartSchema = z.object({
+  cameraId:       z.string().min(1),
+  slotIndex:      z.number().int().min(0),
+  startTime:      z.string().datetime(),
+  endTime:        z.string().datetime(),
+  playbackURI:    z.string().startsWith('/').optional(),
   forceTranscode: z.boolean().optional(),
 })
 
@@ -1198,5 +1238,188 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     })
 
     return reply.send({ logs, total, page: parseInt(page), limit: parseInt(limit) })
+  })
+
+  // ── Preview streaming endpoints ────────────────────────────────────────────
+
+  // POST /api/recordings/preview/start — Create session, return streamUrl immediately.
+  // No FFmpeg spawned here — FFmpeg only starts when browser GETs /stream.
+  server.post('/preview/start', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const user = request.user
+    if (user.role === 'OPERATOR') return reply.status(403).send({ message: 'Sin acceso a grabaciones' })
+
+    const body = previewStartSchema.parse(request.body)
+
+    const camera = await server.prisma.camera.findUnique({
+      where: { id: body.cameraId }, include: { nvr: true },
+    })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+
+    if (user.role === 'AUDITOR') {
+      const perm = await server.prisma.userPermission.findFirst({
+        where: { userId: user.sub, cameraId: body.cameraId, canPlayback: true },
+      })
+      if (!perm) return reply.status(403).send({ message: 'Sin permiso de reproducción' })
+    }
+
+    const plainPass = decryptPass(camera.nvr.password)
+    if (!plainPass) return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
+
+    let rtspUrl:    string
+    let rtspMasked: string
+    let urlStrategy: string
+
+    if (body.playbackURI) {
+      const injected = injectCredentialsIntoPlaybackUri({
+        playbackURI: body.playbackURI, username: camera.nvr.username,
+        password: plainPass, ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort,
+      })
+      rtspUrl     = injected.url
+      rtspMasked  = injected.masked
+      urlStrategy = 'nvr_playbackURI'
+    } else {
+      const built = buildFallbackRecordingRtspUrl({
+        username: camera.nvr.username, password: plainPass,
+        ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort,
+        channel: camera.channel, start: new Date(body.startTime), end: new Date(body.endTime),
+      })
+      rtspUrl     = built.url
+      rtspMasked  = built.masked
+      urlStrategy = 'fallback_timestamps'
+    }
+
+    const sessionId   = crypto.randomBytes(8).toString('hex')
+    const streamToken = crypto.randomBytes(24).toString('hex')
+    const expiresAt   = Date.now() + RECORDING_SESSION_TTL_MS
+
+    server.log.info(
+      `[recordings] preview_init sessionId=${sessionId} slotIndex=${body.slotIndex}` +
+      ` cameraId=${body.cameraId} ch=${camera.channel}` +
+      ` urlStrategy=${urlStrategy} startTime=${body.startTime} endTime=${body.endTime}` +
+      ` forceTranscode=${body.forceTranscode ?? false} source=${rtspMasked}`
+    )
+
+    previewSessions.set(sessionId, {
+      streamToken, userId: user.sub, createdAt: Date.now(), expiresAt,
+      rtspUrl, rtspMasked, cameraId: body.cameraId, slotIndex: body.slotIndex,
+      startTime: body.startTime, endTime: body.endTime,
+      forceTranscode: body.forceTranscode ?? false,
+    })
+
+    AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
+      startTime: body.startTime, endTime: body.endTime, sessionId, mode: 'preview',
+    }).catch(() => {})
+
+    return reply.send({
+      sessionId,
+      streamUrl: `/api/recordings/preview/${sessionId}/stream?token=${streamToken}`,
+      expiresAt: new Date(expiresAt).toISOString(),
+    })
+  })
+
+  // GET /api/recordings/preview/:sessionId/stream — Spawn FFmpeg, pipe fMP4 stdout to client.
+  // Uses reply.hijack() to take raw control of the TCP connection.
+  server.get('/preview/:sessionId/stream', async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string }
+    const { token }     = request.query as { token?: string }
+    const session       = previewSessions.get(sessionId)
+
+    if (!session || !session.streamToken || !token || token !== session.streamToken) {
+      server.log.warn(`[recordings] preview_token_invalid sessionId=${sessionId} hasSession=${!!session}`)
+      return reply.status(401).send({ message: 'Token de stream inválido o expirado' })
+    }
+    if (Date.now() > session.expiresAt) {
+      previewSessions.delete(sessionId)
+      return reply.status(401).send({ message: 'Sesión de preview expirada' })
+    }
+
+    // Kill any FFmpeg already running for this session (re-stream on seek)
+    if (session.vodProcess) {
+      try { session.vodProcess.kill('SIGTERM') } catch {}
+      session.vodProcess = undefined
+    }
+
+    const { rtspUrl, rtspMasked, forceTranscode } = session
+    const rtspTimeoutOpt = getRtspTimeoutOption()
+    const rtspTimeoutUs  = 60_000_000 // 60s for NVR seek + locate
+
+    // Skip ffprobe — saves 3-5s; browser will error and frontend retries with forceTranscode if needed
+    const codecArgs = buildCodecArgs(forceTranscode ? 'hevc_transcode_preview' : 'copy_h264')
+
+    const ffmpegArgs = [
+      '-rtsp_transport', 'tcp',
+      '-fflags', '+genpts+discardcorrupt',
+      '-use_wallclock_as_timestamps', '1',
+      ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
+      '-reorder_queue_size', '0',
+      '-i', rtspUrl,
+      ...codecArgs,
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      '-f', 'mp4',
+      'pipe:1',
+    ]
+
+    const maskedArgs = ffmpegArgs.map(a => a === rtspUrl ? rtspMasked : a)
+    server.log.info(
+      `[recordings] preview_stream_start sessionId=${sessionId}` +
+      ` slotIndex=${session.slotIndex} cameraId=${session.cameraId}` +
+      ` forceTranscode=${forceTranscode} cmd=ffmpeg ${maskedArgs.join(' ')}`
+    )
+
+    const proc = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
+    session.vodProcess = proc
+
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      const line = chunk.toString().trim()
+      if (line) server.log.debug(`[recordings] preview_stderr sessionId=${sessionId} ${line.slice(0, 200)}`)
+    })
+
+    // Hijack the raw TCP connection — bypass Fastify serialization entirely
+    reply.hijack()
+    const res = reply.raw
+
+    res.writeHead(200, {
+      'Content-Type':  'video/mp4',
+      'Cache-Control': 'no-cache, no-store',
+      'Connection':    'keep-alive',
+      'X-Session-Id':  sessionId,
+    })
+
+    proc.stdout?.pipe(res, { end: true })
+
+    const cleanup = (reason: string) => {
+      server.log.info(`[recordings] preview_stream_end sessionId=${sessionId} reason=${reason}`)
+      if (session.vodProcess === proc) session.vodProcess = undefined
+      try { proc.kill('SIGTERM') } catch {}
+      try { res.end() } catch {}
+    }
+
+    request.raw.on('close', () => cleanup('client_disconnect'))
+    request.raw.on('error', () => cleanup('request_error'))
+    proc.on('exit', (code) => {
+      server.log.info(`[recordings] preview_ffmpeg_exit sessionId=${sessionId} code=${code}`)
+      if (session.vodProcess === proc) session.vodProcess = undefined
+      try { res.end() } catch {}
+    })
+    proc.on('error', (err: Error) => {
+      server.log.warn(`[recordings] preview_ffmpeg_error sessionId=${sessionId} err=${err.message}`)
+      cleanup('ffmpeg_error')
+    })
+  })
+
+  // DELETE /api/recordings/preview/:sessionId — Stop FFmpeg, remove session.
+  server.delete('/preview/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string }
+    const session = previewSessions.get(sessionId)
+    if (!session) return reply.status(404).send({ message: 'Sesión de preview no encontrada' })
+    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
+    previewSessions.delete(sessionId)
+    if (session.vodProcess) {
+      try { session.vodProcess.kill('SIGTERM') } catch {}
+    }
+    server.log.info(`[recordings] preview_stopped sessionId=${sessionId} slotIndex=${session.slotIndex}`)
+    return reply.send({ ok: true })
   })
 }

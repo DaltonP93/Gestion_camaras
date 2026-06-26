@@ -30,6 +30,7 @@ export interface PlaybackSlot {
   status: SlotStatus
   playbackUrl: string | null
   sessionId: string | null
+  sessionType: 'preview' | 'mp4' | null
   downloadUrl: string | null
   errorMsg: string | null
   vodProgress: { outTimeSec: number; expectedDurationSec: number } | null
@@ -47,6 +48,7 @@ export function emptySlot(slotIndex: number): PlaybackSlot {
     status: 'empty',
     playbackUrl: null,
     sessionId: null,
+    sessionType: null,
     downloadUrl: null,
     errorMsg: null,
     vodProgress: null,
