@@ -44,6 +44,14 @@ interface RecordingCapabilities {
   recordingCapabilityError: string | null
 }
 
+interface DownloadJob {
+  sessionId: string
+  status: 'generating' | 'ready' | 'error'
+  progress: { outTimeSec: number; expectedDurationSec: number } | null
+  downloadUrl: string | null
+  errorMsg: string | null
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function toLocalDatetimeString(date: Date): string {
@@ -113,6 +121,10 @@ export function RecordingsPage() {
   const [globalPlaybackRate, setGlobalPlaybackRate] = useState(1)
   const [globalPlaybackTime, setGlobalPlaybackTime] = useState<Date | null>(null)
 
+  // ── Background MP4 download job (independent of slot preview state) ────────
+  const [downloadJob, setDownloadJob]   = useState<DownloadJob | null>(null)
+  const downloadJobKeyRef               = useRef<string | null>(null)
+
   // ── Refs ───────────────────────────────────────────────────────────────────
   const videoRefs       = useRef<{ [k: number]: HTMLVideoElement | null }>({})
   const slotKeysRef     = useRef<{ [k: number]: string | null }>({})
@@ -130,6 +142,12 @@ export function RecordingsPage() {
   useEffect(() => { slotsRef.current = slots }, [slots])
   useEffect(() => { globalPlayingRef.current = globalPlaying }, [globalPlaying])
   useEffect(() => { globalPlaybackRateRef.current = globalPlaybackRate }, [globalPlaybackRate])
+
+  // Cancel background download job when active slot or recording changes
+  useEffect(() => {
+    downloadJobKeyRef.current = null
+    setDownloadJob(null)
+  }, [activeSlotIndex, slots[activeSlotIndex]?.recording?.id])
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
   useEffect(() => { loadNVRs(); loadCameras() }, [])
@@ -322,6 +340,8 @@ export function RecordingsPage() {
     clearAllPlayback()
     setRecordings([])
     setNvrErrors([])
+    downloadJobKeyRef.current = null
+    setDownloadJob(null)
 
     const cameraIds = [...effectiveCameraIds]
     const camToNvr = new Map<string, { nvrId: string; nvrName: string }>()
@@ -743,6 +763,11 @@ export function RecordingsPage() {
 
       const handleError = () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
+        const mediaErr = vid.error
+        console.error(
+          `[recordings-ui] preview_video_error slot=${slotIndex} sessionId=${sessionId}` +
+          ` code=${mediaErr?.code ?? 'none'} msg=${mediaErr?.message ?? 'none'}`
+        )
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
           ...s, status: 'error', errorMsg: 'No se pudo reproducir el stream del NVR',
         } : s))
@@ -767,7 +792,11 @@ export function RecordingsPage() {
 
       vid.src = streamUrl
       vid.playbackRate = globalPlaybackRateRef.current
-      if (globalPlayingRef.current) vid.play().catch(() => {})
+      if (globalPlayingRef.current) {
+        vid.play()
+          .then(() => console.info(`[recordings-ui] preview_playing slot=${slotIndex} sessionId=${sessionId}`))
+          .catch((e: Error) => console.warn(`[recordings-ui] preview_play_rejected slot=${slotIndex} reason=${e.message}`))
+      }
 
       setSlots(prev => prev.map((s, i) => i === slotIndex ? {
         ...s,
@@ -793,6 +822,80 @@ export function RecordingsPage() {
   }
 
   startPreviewInSlotRef.current = startPreviewInSlot
+
+  // ── Background MP4 download — does NOT interrupt the preview slot ─────────
+  const triggerMp4Download = async (rec: RecordingWithCamera) => {
+    const jobKey = `${Date.now()}-${Math.random()}`
+    downloadJobKeyRef.current = jobKey
+    setDownloadJob({ sessionId: '', status: 'generating', progress: null, downloadUrl: null, errorMsg: null })
+
+    console.info(
+      `[recordings-ui] mp4_download_triggered cameraId=${rec.cameraId}` +
+      ` recId=${rec.id} recStart=${rec.startTime}`
+    )
+
+    try {
+      const result = await apiPost<{
+        status: string; sessionId: string;
+        expectedDurationSec?: number; url?: string; downloadUrl?: string; mimeType?: string;
+      }>('/recordings/playback', {
+        cameraId:    rec.cameraId,
+        startTime:   rec.startTime,
+        endTime:     rec.endTime,
+        playbackURI: (rec as any).playbackURI,
+        canPlayHevcMp4: false,
+        forceTranscode: false,
+      })
+
+      if (downloadJobKeyRef.current !== jobKey) return
+
+      const sessionId = result.sessionId
+      setDownloadJob(prev => prev ? { ...prev, sessionId } : null)
+
+      if (result.status === 'ready' && result.downloadUrl) {
+        setDownloadJob({ sessionId, status: 'ready', progress: null, downloadUrl: result.downloadUrl, errorMsg: null })
+        return
+      }
+
+      const expectedSec = result.expectedDurationSec ?? 60
+      const pollMax = Math.min(POLL_ABSOLUTE_MAX_MS, Math.max(180_000, expectedSec * 2500 + 60_000))
+      const pollStart = Date.now()
+
+      while (Date.now() - pollStart < pollMax) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
+        if (downloadJobKeyRef.current !== jobKey) return
+
+        let statusRes: PlaybackStatusResponse
+        try {
+          statusRes = await apiGet<PlaybackStatusResponse>(`/recordings/playback/${sessionId}/status`, {})
+        } catch { break }
+
+        if (downloadJobKeyRef.current !== jobKey) return
+
+        if (statusRes.status === 'ready' && statusRes.downloadUrl) {
+          setDownloadJob({ sessionId, status: 'ready', progress: null, downloadUrl: statusRes.downloadUrl, errorMsg: null })
+          return
+        }
+        if (statusRes.status === 'error') {
+          setDownloadJob(prev => prev ? { ...prev, status: 'error', errorMsg: statusRes.error ?? 'Error al generar' } : null)
+          return
+        }
+        const outSec = statusRes.outTimeSec ?? 0
+        const expSec = statusRes.expectedDurationSec ?? expectedSec
+        if (outSec > 0) {
+          setDownloadJob(prev => prev ? { ...prev, progress: { outTimeSec: outSec, expectedDurationSec: expSec } } : null)
+        }
+      }
+
+      if (downloadJobKeyRef.current !== jobKey) return
+      setDownloadJob(prev => prev ? { ...prev, status: 'error', errorMsg: 'Tiempo límite superado' } : null)
+
+    } catch (err: any) {
+      if (downloadJobKeyRef.current !== jobKey) return
+      const msg = err?.response?.data?.message ?? 'No se pudo generar el MP4'
+      setDownloadJob(prev => prev ? { ...prev, status: 'error', errorMsg: msg } : null)
+    }
+  }
 
   // ── Global synchronized controls ──────────────────────────────────────────
 
@@ -1182,20 +1285,37 @@ export function RecordingsPage() {
 
             <div className="flex-1" />
 
-            {/* Download: link when MP4 ready, button to generate when only preview is active */}
-            {activeDownloadUrl ? (
+            {/* Download area — independent of preview slot state */}
+            {downloadJob?.status === 'ready' && downloadJob.downloadUrl ? (
               <a
-                href={activeDownloadUrl}
+                href={downloadJob.downloadUrl}
                 download
-                className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-300 hover:bg-surface-600 hover:text-surface-100 transition-colors flex-shrink-0"
+                className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-green-800/60 text-green-300 hover:bg-green-800 transition-colors flex-shrink-0"
               >
                 <Download size={11} />
                 Descargar MP4
               </a>
-            ) : activeRecording && (activeSlot.sessionType === 'preview' || activeSlot.status === 'ready') ? (
+            ) : downloadJob?.status === 'generating' ? (
+              <span className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 text-surface-400 flex-shrink-0">
+                <Loader2 size={11} className="animate-spin" />
+                {downloadJob.progress && downloadJob.progress.expectedDurationSec > 0
+                  ? `MP4 ${Math.min(99, Math.round(downloadJob.progress.outTimeSec / downloadJob.progress.expectedDurationSec * 100))}%`
+                  : 'Generando MP4…'
+                }
+              </span>
+            ) : downloadJob?.status === 'error' ? (
               <button
-                onClick={() => loadRecordingInSlot(activeSlotIndex, activeRecording)}
-                title="Genera y descarga el MP4 completo de esta grabación"
+                onClick={() => activeRecording && triggerMp4Download(activeRecording)}
+                title={downloadJob.errorMsg ?? 'Error'}
+                className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-red-900/40 text-red-400 hover:bg-red-900/60 transition-colors flex-shrink-0"
+              >
+                <Download size={11} />
+                Reintentar MP4
+              </button>
+            ) : activeRecording ? (
+              <button
+                onClick={() => triggerMp4Download(activeRecording)}
+                title="Genera el MP4 completo en segundo plano (el preview sigue activo)"
                 className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:bg-surface-600 hover:text-surface-200 transition-colors flex-shrink-0"
               >
                 <Download size={11} />
