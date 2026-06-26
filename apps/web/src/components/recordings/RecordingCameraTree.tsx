@@ -143,9 +143,8 @@ export function RecordingCameraTree({
                   return (
                     <button
                       key={cam.id}
-                      onClick={() => onToggleCamera(cam.id)}
-                      onDoubleClick={() => onAssignCamera?.(cam.id)}
-                      title={onAssignCamera ? 'Doble clic para asignar al slot activo' : cam.name}
+                      onClick={() => { onToggleCamera(cam.id); onAssignCamera?.(cam.id) }}
+                      title={onAssignCamera ? 'Clic para seleccionar y asignar al slot activo' : cam.name}
                       className={clsx(
                         'w-full flex items-center gap-2 pl-6 pr-3 py-1.5 text-left transition-colors border-b border-surface-800/40',
                         selected

@@ -135,8 +135,9 @@ export function RecordingsPage() {
   const globalPlaybackRateRef = useRef(1)
   const videoCleanupRef = useRef<{ [k: number]: (() => void) | null }>({})
   const loadInSlotRef         = useRef<(si: number, rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
-  const startPreviewInSlotRef = useRef<(si: number, rec: RecordingWithCamera, playheadTime: Date) => void>(() => {})
+  const startPreviewInSlotRef = useRef<(si: number, rec: RecordingWithCamera, playheadTime: Date, opts?: { forceTranscode?: boolean }) => void>(() => {})
   const previewStartTimesRef  = useRef<{ [k: number]: number | null }>({})
+  const previewRetriedRef     = useRef<{ [k: number]: boolean }>({})
 
   // Keep refs in sync
   useEffect(() => { slotsRef.current = slots }, [slots])
@@ -285,7 +286,7 @@ export function RecordingsPage() {
     if (!cam) return
     const nvrObj = nvrs.find(n => n.id === cam.nvrId)
 
-    console.info(`[recordings-ui] slot_camera_assigned slot=${activeSlotIndex} cameraId=${cameraId} cameraName=${cam.name}`)
+    console.info(`[recordings-ui] slot_camera_assigned slot=${activeSlotIndex} cameraId=${cameraId} cameraName=${cam.name} source=single_click`)
     console.info(`[recordings-ui] assigned_camera_added_to_search slot=${activeSlotIndex} cameraId=${cameraId}`)
     setSelectedCameras(prev => new Set([...prev, cameraId]))
 
@@ -400,11 +401,32 @@ export function RecordingsPage() {
     setIsSearching(false)
 
     // Initialize playhead to start of earliest recording found
+    let earliest: RecordingWithCamera | null = null
     if (all.length > 0) {
-      const earliest = all.reduce((min, r) =>
+      earliest = all.reduce((min, r) =>
         new Date(r.startTime).getTime() < new Date(min.startTime).getTime() ? r : min
       )
       setGlobalPlaybackTime(new Date(earliest.startTime))
+    }
+
+    // Auto-assign: if exactly 1 camera selected and no slot has a camera assigned, assign to active slot
+    if (all.length > 0 && selectedCameras.size === 1 && assignedCameraIds.size === 0) {
+      const singleCamId = [...selectedCameras][0]
+      const cam = cameras.find(c => c.id === singleCamId)
+      const nvrObj = cam ? nvrs.find(n => n.id === cam.nvrId) : null
+      const camRecs = all.filter(r => r.cameraId === singleCamId)
+      if (cam && camRecs.length > 0) {
+        console.info(`[recordings-ui] search_auto_assign cameraId=${singleCamId} slot=${activeSlotIndex}`)
+        stopSlot(activeSlotIndex)
+        setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
+          ...s,
+          cameraId: cam.id, cameraName: cam.name, nvrId: cam.nvrId, nvrName: nvrObj?.name ?? '',
+          recording: null, status: 'idle', playbackUrl: null, sessionId: null, sessionType: null,
+          downloadUrl: null, errorMsg: null, vodProgress: null, mimeType: null,
+        } : s))
+        const playhead = earliest ? new Date(earliest.startTime) : new Date(camRecs[0].startTime)
+        setTimeout(() => startPreviewInSlotRef.current(activeSlotIndex, camRecs[0], playhead), 0)
+      }
     }
 
     if (all.length === 0 && errsByNvr.size === 0) {
@@ -685,7 +707,9 @@ export function RecordingsPage() {
     slotIndex:    number,
     rec:          RecordingWithCamera,
     playheadTime: Date,
+    opts?:        { forceTranscode?: boolean },
   ) => {
+    const forceTranscode = opts?.forceTranscode ?? false
     const currentSlot = slotsRef.current[slotIndex]
     if (currentSlot?.cameraId && currentSlot.cameraId !== rec.cameraId) {
       console.info(
@@ -701,15 +725,23 @@ export function RecordingsPage() {
     const effectiveMs   = Math.max(recStartMs, Math.min(playheadMs, recEndMs - 1000))
     const effectiveStart = new Date(effectiveMs).toISOString()
 
+    const videoEl = videoRefs.current[slotIndex] ?? document.createElement('video')
+    const canPlayHevcMp4 = !forceTranscode && (
+      videoEl.canPlayType('video/mp4; codecs="hvc1"') !== '' ||
+      videoEl.canPlayType('video/mp4; codecs="hev1"') !== ''
+    )
+
     console.info(
       `[recordings-ui] preview_start slot=${slotIndex}` +
       ` cameraId=${rec.cameraId} recId=${rec.id}` +
-      ` playhead=${playheadTime.toISOString()} effectiveStart=${effectiveStart}`
+      ` playhead=${playheadTime.toISOString()} effectiveStart=${effectiveStart}` +
+      ` forceTranscode=${forceTranscode} canPlayHevcMp4=${canPlayHevcMp4}`
     )
 
     const myKey = `${Date.now()}-${Math.random()}`
     slotKeysRef.current[slotIndex] = myKey
     previewStartTimesRef.current[slotIndex] = null
+    if (!forceTranscode) previewRetriedRef.current[slotIndex] = false
 
     // Stop existing session
     if (videoCleanupRef.current[slotIndex]) {
@@ -743,12 +775,13 @@ export function RecordingsPage() {
       const result = await apiPost<{ sessionId: string; streamUrl: string }>(
         '/recordings/preview/start',
         {
-          cameraId:    rec.cameraId,
+          cameraId:       rec.cameraId,
           slotIndex,
-          startTime:   effectiveStart,
-          endTime:     rec.endTime,
-          playbackURI: (rec as any).playbackURI,
-          forceTranscode: false,
+          startTime:      effectiveStart,
+          endTime:        rec.endTime,
+          playbackURI:    (rec as any).playbackURI,
+          forceTranscode,
+          canPlayHevcMp4,
         }
       )
 
@@ -766,8 +799,17 @@ export function RecordingsPage() {
         const mediaErr = vid.error
         console.error(
           `[recordings-ui] preview_video_error slot=${slotIndex} sessionId=${sessionId}` +
-          ` code=${mediaErr?.code ?? 'none'} msg=${mediaErr?.message ?? 'none'}`
+          ` code=${mediaErr?.code ?? 'none'} msg=${mediaErr?.message ?? 'none'}` +
+          ` forceTranscode=${forceTranscode} alreadyRetried=${previewRetriedRef.current[slotIndex] ?? false}`
         )
+        // Auto-retry once with forceTranscode=true (transcodes HEVC → H.264 compatible)
+        if (!forceTranscode && !previewRetriedRef.current[slotIndex]) {
+          previewRetriedRef.current[slotIndex] = true
+          toast('Reintentando con H.264…', { duration: 5000 })
+          startPreviewInSlotRef.current(slotIndex, rec, playheadTime, { forceTranscode: true })
+          return
+        }
+        previewRetriedRef.current[slotIndex] = false
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
           ...s, status: 'error', errorMsg: 'No se pudo reproducir el stream del NVR',
         } : s))
@@ -985,7 +1027,7 @@ export function RecordingsPage() {
     setGlobalPlaying(false)
   }
 
-  // ── Timeline click-to-seek ─────────────────────────────────────────────────
+  // ── Timeline seek handlers ────────────────────────────────────────────────
 
   const recordingsByCamera = useMemo(() => {
     const map = new Map<string, RecordingWithCamera[]>()
@@ -996,15 +1038,21 @@ export function RecordingsPage() {
     return map
   }, [recordings])
 
-  const handleTimelineSeek = (time: Date) => {
-    const timeMs = time.getTime()
-    console.info(`[recordings-ui] timeline_seek playhead=${time.toISOString()} isPlaying=${globalPlayingRef.current}`)
+  // Called on every mousemove — only updates playhead, never restarts preview
+  const handleTimelinePreviewChange = (time: Date) => {
+    console.info(`[recordings-ui] timeline_drag_preview playhead=${time.toISOString()}`)
+    setGlobalPlaybackTime(time)
+  }
 
-    // Not playing: just move the playhead — don't restart any stream
-    if (!globalPlayingRef.current) {
-      setGlobalPlaybackTime(time)
-      return
-    }
+  // Called on mouseup — commits the seek; restarts preview if currently playing
+  const handleTimelineCommit = (time: Date) => {
+    const timeMs    = time.getTime()
+    const wasPlaying = globalPlayingRef.current
+    console.info(`[recordings-ui] timeline_seek_commit playhead=${time.toISOString()} wasPlaying=${wasPlaying}`)
+
+    setGlobalPlaybackTime(time)
+
+    if (!wasPlaying) return
 
     // Playing: restart preview from new seek point for each assigned slot
     slotsRef.current.forEach((slot, slotIndex) => {
@@ -1023,15 +1071,20 @@ export function RecordingsPage() {
         return
       }
 
-      // Preview streams don't support random seek — always restart from new point
+      // Preview streams don't support random seek — restart from the new point
       startPreviewInSlotRef.current(slotIndex, covering, time)
     })
-    setGlobalPlaybackTime(time)
   }
 
   // ── Derived values ─────────────────────────────────────────────────────────
 
-  const anySlotReady = slots.some(s => s.status === 'ready')
+  const anySlotReady   = slots.some(s => s.status === 'ready')
+  const assignedSlotCount = slots.filter(s => s.cameraId !== null).length
+  const canGlobalPlay  = Boolean(
+    globalPlaybackTime &&
+    recordings.length > 0 &&
+    (assignedSlotCount > 0 || selectedCameras.size > 0)
+  )
 
   // Active slot info for controls
   const activeRecording = activeSlot.recording
@@ -1189,7 +1242,7 @@ export function RecordingsPage() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-surface-900">
                         <Video size={20} className="text-surface-800" />
                         <span className="text-[9px] text-surface-700">
-                          {isActive ? 'Doble clic en cámara para asignar' : `Canal ${idx + 1}`}
+                          {isActive ? 'Clic en cámara para asignar' : `Canal ${idx + 1}`}
                         </span>
                       </div>
                     )}
@@ -1257,7 +1310,8 @@ export function RecordingsPage() {
             endDate={endDate}
             onSelectRecording={rec => startPreviewInSlotRef.current(activeSlotIndex, rec, globalPlaybackTime ?? new Date(rec.startTime))}
             globalTime={globalPlaybackTime}
-            onSeekToTime={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelineSeek : undefined}
+            onPreviewTimeChange={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelinePreviewChange : undefined}
+            onCommitSeekTime={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelineCommit : undefined}
           />
         </div>
 
@@ -1324,8 +1378,8 @@ export function RecordingsPage() {
             ) : null}
           </div>
 
-          {/* Playback controls — grayed when nothing is ready */}
-          <div className={clsx(!anySlotReady && 'opacity-40 pointer-events-none')}>
+          {/* Playback controls — Play enabled by canGlobalPlay; seek/speed disabled until a slot is ready */}
+          <div className={clsx(!canGlobalPlay && 'opacity-40 pointer-events-none')}>
             <RecordingPlaybackControls
               key={`slot-${activeSlotIndex}-${activeSlot.sessionId ?? 'idle'}`}
               video={videoRefs.current[activeSlotIndex] ?? undefined}
@@ -1333,6 +1387,7 @@ export function RecordingsPage() {
               onSeekRelative={syncedJump}
               onFrameForward={syncedFrameForward}
               onApplyRate={syncedRate}
+              disableSeekControls={!anySlotReady}
             />
           </div>
         </div>
