@@ -20,7 +20,10 @@ interface Props {
   endDate: string
   onSelectRecording: (rec: RecordingWithCamera) => void
   globalTime?: Date | null
-  onSeekToTime?: (time: Date) => void
+  /** Called on every mousemove — fast playhead update only, no preview restart */
+  onPreviewTimeChange?: (time: Date) => void
+  /** Called on mouseup — full seek commit, may restart preview stream */
+  onCommitSeekTime?: (time: Date) => void
 }
 
 function getTickInterval(totalMs: number): number {
@@ -51,7 +54,7 @@ const ROW_H     = 28  // px per camera row
 
 export function RecordingTimeline({
   recordings, assignedCameras, selectedRec, startDate, endDate,
-  onSelectRecording, globalTime, onSeekToTime,
+  onSelectRecording, globalTime, onPreviewTimeChange, onCommitSeekTime,
 }: Props) {
   const rangeStart = useMemo(() => new Date(startDate).getTime(), [startDate])
   const rangeEnd   = useMemo(() => new Date(endDate).getTime(),   [endDate])
@@ -119,25 +122,28 @@ export function RecordingTimeline({
   }, [rangeStart, totalMs])
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if (!onSeekToTime) return
+    if (!onPreviewTimeChange && !onCommitSeekTime) return
     e.preventDefault()
     isDraggingRef.current = true
     const t = timeFromX(e.clientX)
-    if (t) onSeekToTime(t)
+    if (t) onPreviewTimeChange?.(t)
 
     const onMove = (ev: MouseEvent) => {
       if (!isDraggingRef.current) return
       const t2 = timeFromX(ev.clientX)
-      if (t2) onSeekToTime(t2)
+      if (t2) onPreviewTimeChange?.(t2)
     }
-    const onUp = () => {
+    const onUp = (ev: MouseEvent) => {
+      if (!isDraggingRef.current) return
       isDraggingRef.current = false
+      const t3 = timeFromX(ev.clientX)
+      if (t3) onCommitSeekTime?.(t3)
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
     }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
-  }, [onSeekToTime, timeFromX])
+  }, [onPreviewTimeChange, onCommitSeekTime, timeFromX])
 
   const showEmpty = totalMs <= 0 || (rows.length === 0 && recordings.length === 0)
 
@@ -172,7 +178,7 @@ export function RecordingTimeline({
         <div style={{ width: LABEL_W }} className="flex-shrink-0 border-r border-surface-700/60 bg-surface-900" />
         <div
           ref={trackRef}
-          className={clsx('flex-1 relative overflow-hidden bg-surface-900', onSeekToTime && 'cursor-crosshair')}
+          className={clsx('flex-1 relative overflow-hidden bg-surface-900', (onPreviewTimeChange || onCommitSeekTime) && 'cursor-crosshair')}
           onMouseDown={handleMouseDown}
         >
           {ticks.map(tick => (
@@ -223,7 +229,7 @@ export function RecordingTimeline({
                 className={clsx(
                   'flex-1 relative',
                   hasRecs ? 'bg-surface-900' : 'bg-surface-900/50',
-                  onSeekToTime && 'cursor-crosshair'
+                  (onPreviewTimeChange || onCommitSeekTime) && 'cursor-crosshair'
                 )}
                 onMouseDown={handleMouseDown}
               >

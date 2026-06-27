@@ -11,6 +11,7 @@ interface Props {
   onSeekRelative?: (seconds: number) => void
   onFrameForward?: () => void
   onApplyRate?: (rate: number) => void
+  disableSeekControls?: boolean
 }
 
 const SPEEDS: { value: number; label: string }[] = [
@@ -40,6 +41,7 @@ export function RecordingPlaybackControls({
   onSeekRelative,
   onFrameForward,
   onApplyRate,
+  disableSeekControls = false,
 }: Props) {
   const [paused, setPaused]           = useState(true)
   const [currentTime, setCurrentTime] = useState(0)
@@ -118,19 +120,21 @@ export function RecordingPlaybackControls({
         <button
           onClick={() => seekRelative(-30)}
           title="Retroceder 30 s"
-          className="btn-ghost text-[10px] px-1.5 py-1 flex items-center gap-0.5 tabular-nums"
+          disabled={disableSeekControls}
+          className="btn-ghost text-[10px] px-1.5 py-1 flex items-center gap-0.5 tabular-nums disabled:opacity-40 disabled:pointer-events-none"
         >
           <ChevronLeft size={10} />30s
         </button>
         <button
           onClick={() => seekRelative(-10)}
           title="Retroceder 10 s"
-          className="btn-ghost text-[10px] px-1.5 py-1 flex items-center gap-0.5 tabular-nums"
+          disabled={disableSeekControls}
+          className="btn-ghost text-[10px] px-1.5 py-1 flex items-center gap-0.5 tabular-nums disabled:opacity-40 disabled:pointer-events-none"
         >
           <ChevronLeft size={10} />10s
         </button>
 
-        {/* Play / Pause */}
+        {/* Play / Pause — never disabled by disableSeekControls */}
         <button
           onClick={togglePlayPause}
           title={paused ? 'Reproducir' : 'Pausar'}
@@ -146,14 +150,16 @@ export function RecordingPlaybackControls({
         <button
           onClick={() => seekRelative(10)}
           title="Avanzar 10 s"
-          className="btn-ghost text-[10px] px-1.5 py-1 flex items-center gap-0.5 tabular-nums"
+          disabled={disableSeekControls}
+          className="btn-ghost text-[10px] px-1.5 py-1 flex items-center gap-0.5 tabular-nums disabled:opacity-40 disabled:pointer-events-none"
         >
           10s<ChevronRight size={10} />
         </button>
         <button
           onClick={() => seekRelative(30)}
           title="Avanzar 30 s"
-          className="btn-ghost text-[10px] px-1.5 py-1 flex items-center gap-0.5 tabular-nums"
+          disabled={disableSeekControls}
+          className="btn-ghost text-[10px] px-1.5 py-1 flex items-center gap-0.5 tabular-nums disabled:opacity-40 disabled:pointer-events-none"
         >
           30s<ChevronRight size={10} />
         </button>
@@ -165,7 +171,8 @@ export function RecordingPlaybackControls({
         <button
           onClick={frameForward}
           title="Avanzar un fotograma"
-          className="btn-ghost p-1.5 flex items-center gap-0.5"
+          disabled={disableSeekControls}
+          className="btn-ghost p-1.5 flex items-center gap-0.5 disabled:opacity-40 disabled:pointer-events-none"
         >
           <SkipForward size={12} className="text-surface-400" />
         </button>
@@ -195,7 +202,7 @@ export function RecordingPlaybackControls({
       </div>
 
       {/* Row 2: speed selector */}
-      <div className="flex items-center gap-1 justify-center flex-wrap">
+      <div className={clsx('flex items-center gap-1 justify-center flex-wrap', disableSeekControls && 'opacity-40 pointer-events-none')}>
         {SPEEDS.map(({ value, label }) => (
           <button
             key={label}

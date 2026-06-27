@@ -98,6 +98,37 @@ function buildCodecArgs(strategy: VodStrategy): string[] {
   return args
 }
 
+function determinePreviewStrategy(opts: {
+  detectedCodec:  string
+  canPlayHevcMp4: boolean
+  forceTranscode: boolean
+}): PreviewStrategy {
+  const { detectedCodec, canPlayHevcMp4, forceTranscode } = opts
+  if (forceTranscode) return 'preview_transcode_h264'
+  if (!isHevcCodec(detectedCodec)) return 'preview_copy_h264'
+  return canPlayHevcMp4 ? 'preview_copy_hevc' : 'preview_transcode_h264'
+}
+
+function buildPreviewCodecArgs(strategy: PreviewStrategy): string[] {
+  if (strategy === 'preview_copy_h264' || strategy === 'preview_copy_hevc') {
+    return ['-an', '-c:v', 'copy']
+  }
+  // preview_transcode_h264 — tuned for low-latency live preview
+  return [
+    '-an',
+    '-c:v',        'libx264',
+    '-preset',     'ultrafast',
+    '-tune',       'zerolatency',
+    '-crf',        '30',
+    '-maxrate',    '1500k',
+    '-bufsize',    '3000k',
+    '-pix_fmt',    'yuv420p',
+    '-profile:v',  'main',
+    '-level',      '4.1',
+    '-vf',         "scale='min(1280,iw)':-2:flags=fast_bilinear",
+  ]
+}
+
 // ─── Cache helpers ────────────────────────────────────────────────
 
 function computeCacheKey(opts: {
@@ -298,6 +329,8 @@ setInterval(() => {
 }, 5 * 60 * 1000)
 
 // ─── Preview sessions (instant streaming — fMP4 over HTTP) ───────
+type PreviewStrategy = 'preview_copy_h264' | 'preview_copy_hevc' | 'preview_transcode_h264'
+
 interface PreviewSession {
   streamToken: string     // short-lived token for unauthenticated /stream URL
   userId:      string
@@ -309,7 +342,10 @@ interface PreviewSession {
   slotIndex:   number
   startTime:   string
   endTime:     string
-  forceTranscode: boolean
+  forceTranscode:  boolean
+  strategy:        PreviewStrategy
+  detectedCodec:   string
+  canPlayHevcMp4:  boolean
   vodProcess?: ChildProcess
 }
 
@@ -693,6 +729,7 @@ const previewStartSchema = z.object({
   endTime:        z.string().datetime(),
   playbackURI:    z.string().startsWith('/').optional(),
   forceTranscode: z.boolean().optional(),
+  canPlayHevcMp4: z.boolean().optional(),
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
@@ -1288,6 +1325,44 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       urlStrategy = 'fallback_timestamps'
     }
 
+    // Probe RTSP stream to detect codec — use 5s timeout to avoid long POST delays
+    const forceTranscode   = body.forceTranscode ?? false
+    const canPlayHevcMp4   = body.canPlayHevcMp4 ?? false
+    let detectedCodec      = 'unknown'
+    let probeElapsedMs     = 0
+
+    if (!forceTranscode) {
+      const probeStart = Date.now()
+      try {
+        const probeResult = await Promise.race([
+          probeRtspStream(rtspUrl),
+          new Promise<{ ok: false; error: string; latencyMs: number }>(resolve =>
+            setTimeout(() => resolve({ ok: false, error: 'probe_timeout_5s', latencyMs: 5000 }), 5000)
+          ),
+        ])
+        probeElapsedMs = Date.now() - probeStart
+        server.log.info(
+          `[recordings-preview] probe_result sessionId=pending ok=${probeResult.ok}` +
+          ` codec=${probeResult.ok ? probeResult.codec : 'n/a'}` +
+          ` error=${!probeResult.ok ? probeResult.error : 'none'}` +
+          ` elapsedMs=${probeElapsedMs}`
+        )
+        if (probeResult.ok && probeResult.codec) {
+          detectedCodec = probeResult.codec
+        }
+      } catch {
+        probeElapsedMs = Date.now() - probeStart
+        server.log.warn(`[recordings-preview] probe_failed elapsedMs=${probeElapsedMs}`)
+      }
+    }
+
+    const strategy = determinePreviewStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
+    server.log.info(
+      `[recordings-preview] preview_strategy codec=${detectedCodec}` +
+      ` canPlayHevcMp4=${canPlayHevcMp4} forceTranscode=${forceTranscode} strategy=${strategy}`
+    )
+    server.log.info(`[recordings-preview] encoder_selected strategy=${strategy} forceTranscode=${forceTranscode}`)
+
     const sessionId   = crypto.randomBytes(8).toString('hex')
     const streamToken = crypto.randomBytes(24).toString('hex')
     const expiresAt   = Date.now() + RECORDING_SESSION_TTL_MS
@@ -1296,14 +1371,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       `[recordings-preview] session_init sessionId=${sessionId} slotIndex=${body.slotIndex}` +
       ` cameraId=${body.cameraId} ch=${camera.channel}` +
       ` urlStrategy=${urlStrategy} startTime=${body.startTime} endTime=${body.endTime}` +
-      ` forceTranscode=${body.forceTranscode ?? false} source=${rtspMasked}`
+      ` strategy=${strategy} source=${rtspMasked}`
     )
 
     previewSessions.set(sessionId, {
       streamToken, userId: user.sub, createdAt: Date.now(), expiresAt,
       rtspUrl, rtspMasked, cameraId: body.cameraId, slotIndex: body.slotIndex,
       startTime: body.startTime, endTime: body.endTime,
-      forceTranscode: body.forceTranscode ?? false,
+      forceTranscode, strategy, detectedCodec, canPlayHevcMp4,
     })
 
     AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
@@ -1339,12 +1414,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       session.vodProcess = undefined
     }
 
-    const { rtspUrl, rtspMasked, forceTranscode } = session
+    const { rtspUrl, rtspMasked, strategy } = session
     const rtspTimeoutOpt = getRtspTimeoutOption()
     const rtspTimeoutUs  = 60_000_000 // 60s for NVR seek + locate
 
-    // Skip ffprobe to save 3-5s startup time; browser errors and frontend retries with forceTranscode
-    const codecArgs = buildCodecArgs(forceTranscode ? 'hevc_transcode_preview' : 'copy_h264')
+    // Use codec strategy determined at session creation (probe ran in POST /preview/start)
+    const codecArgs = buildPreviewCodecArgs(strategy)
 
     const ffmpegArgs = [
       '-rtsp_transport', 'tcp',
@@ -1365,7 +1440,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     server.log.info(
       `[recordings-preview] stream_start sessionId=${sessionId}` +
       ` slotIndex=${session.slotIndex} cameraId=${session.cameraId}` +
-      ` forceTranscode=${forceTranscode} cmd=ffmpeg ${maskedArgs.join(' ')}`
+      ` strategy=${strategy} codec=${session.detectedCodec} cmd=ffmpeg ${maskedArgs.join(' ')}`
     )
 
     const proc = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
