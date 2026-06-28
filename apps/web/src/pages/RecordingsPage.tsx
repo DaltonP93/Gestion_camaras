@@ -134,6 +134,11 @@ export function RecordingsPage() {
   const [globalPlaybackRate, setGlobalPlaybackRate] = useState(1)
   const [globalPlaybackTime, setGlobalPlaybackTime] = useState<Date | null>(null)
 
+  // ── Timeline window ────────────────────────────────────────────────────────
+  // Separate from search range: user can zoom/pan without re-searching.
+  const [timelineWindowMs,     setTimelineWindowMs]     = useState(24 * 3600_000)
+  const [timelineWindowCenter, setTimelineWindowCenter] = useState<number | null>(null)
+
   // ── Background MP4 download job (independent of slot preview state) ────────
   const [downloadJob, setDownloadJob]   = useState<DownloadJob | null>(null)
   const downloadJobKeyRef               = useRef<string | null>(null)
@@ -413,13 +418,21 @@ export function RecordingsPage() {
     setNvrErrors([...errsByNvr.values()])
     setIsSearching(false)
 
-    // Initialize playhead to start of earliest recording found
+    // Initialize playhead and timeline window to earliest recording
     let earliest: RecordingWithCamera | null = null
     if (all.length > 0) {
       earliest = all.reduce((min, r) =>
         new Date(r.startTime).getTime() < new Date(min.startTime).getTime() ? r : min
       )
-      setGlobalPlaybackTime(new Date(earliest.startTime))
+      const earliestMs = new Date(earliest.startTime).getTime()
+      setGlobalPlaybackTime(new Date(earliestMs))
+      // Center the 24h window on the first result
+      setTimelineWindowCenter(earliestMs + 12 * 3600_000)
+      setTimelineWindowMs(24 * 3600_000)
+    } else {
+      // No results: center window on search range midpoint
+      const mid = (new Date(startDate).getTime() + new Date(endDate).getTime()) / 2
+      setTimelineWindowCenter(mid)
     }
 
     // Auto-assign: if exactly 1 camera selected and no slot has a camera assigned, assign to active slot
@@ -1115,6 +1128,22 @@ export function RecordingsPage() {
     [slots]
   )
 
+  // ── Timeline window derived values ─────────────────────────────────────────
+  const windowCenter = timelineWindowCenter ?? Date.now()
+  const windowStartMs = windowCenter - timelineWindowMs / 2
+  const windowEndMs   = windowCenter + timelineWindowMs / 2
+
+  const zoomWindow = (newWindowMs: number) => {
+    setTimelineWindowMs(newWindowMs)
+    // Keep playhead (or current center) in view
+    const center = (globalPlaybackTime?.getTime() ?? windowCenter)
+    setTimelineWindowCenter(center)
+  }
+
+  const shiftWindow = (deltaMs: number) => {
+    setTimelineWindowCenter(c => (c ?? windowCenter) + deltaMs)
+  }
+
   // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
@@ -1314,12 +1343,64 @@ export function RecordingsPage() {
 
         {/* ── Timeline ──────────────────────────────────────────────────── */}
         <div className="flex-shrink-0 border-t border-surface-700 bg-surface-900">
+          {/* Zoom / pan toolbar */}
+          <div className="flex items-center gap-1 px-2 py-1 border-b border-surface-800/60 bg-surface-900">
+            <span className="text-[9px] text-surface-600 mr-1">Ventana:</span>
+            {[
+              { label: '1h',  ms: 3600_000 },
+              { label: '6h',  ms: 6 * 3600_000 },
+              { label: '24h', ms: 24 * 3600_000 },
+              { label: '7d',  ms: 7 * 24 * 3600_000 },
+            ].map(({ label, ms }) => (
+              <button
+                key={label}
+                onClick={() => zoomWindow(ms)}
+                className={clsx(
+                  'text-[9px] px-1.5 py-0.5 rounded border transition-colors',
+                  timelineWindowMs === ms
+                    ? 'bg-surface-600 border-surface-500 text-surface-100'
+                    : 'bg-surface-800 border-surface-700 text-surface-500 hover:text-surface-200 hover:border-surface-600'
+                )}
+              >{label}</button>
+            ))}
+            <div className="w-px h-3 bg-surface-700 mx-1 self-center" />
+            <button
+              onClick={() => shiftWindow(-timelineWindowMs)}
+              title="Ventana anterior"
+              className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
+            >«</button>
+            <button
+              onClick={() => shiftWindow(-timelineWindowMs / 4)}
+              title="Retroceder un cuarto de ventana"
+              className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
+            >‹</button>
+            <button
+              onClick={() => shiftWindow(timelineWindowMs / 4)}
+              title="Avanzar un cuarto de ventana"
+              className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
+            >›</button>
+            <button
+              onClick={() => shiftWindow(timelineWindowMs)}
+              title="Ventana siguiente"
+              className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
+            >»</button>
+            {globalPlaybackTime && (
+              <>
+                <div className="w-px h-3 bg-surface-700 mx-1 self-center" />
+                <button
+                  onClick={() => setTimelineWindowCenter(globalPlaybackTime.getTime())}
+                  title="Centrar en el playhead"
+                  className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
+                >⊙ centrar</button>
+              </>
+            )}
+          </div>
           <RecordingTimeline
             recordings={recordings}
             assignedCameras={assignedCameras}
             selectedRec={activeRecording}
-            startDate={startDate}
-            endDate={endDate}
+            windowStartMs={windowStartMs}
+            windowEndMs={windowEndMs}
             onSelectRecording={rec => startPreviewInSlotRef.current(activeSlotIndex, rec, globalPlaybackTime ?? new Date(rec.startTime))}
             globalTime={globalPlaybackTime}
             onPreviewTimeChange={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelinePreviewChange : undefined}

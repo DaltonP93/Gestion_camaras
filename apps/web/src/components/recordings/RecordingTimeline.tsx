@@ -24,8 +24,9 @@ interface Props {
   /** Cameras assigned to slots — always show a row even with no recordings */
   assignedCameras: AssignedCamera[]
   selectedRec: RecordingWithCamera | null
-  startDate: string
-  endDate: string
+  /** Visible window bounds (epoch ms, UTC) */
+  windowStartMs: number
+  windowEndMs: number
   onSelectRecording: (rec: RecordingWithCamera) => void
   globalTime?: Date | null
   /** Called on every mousemove — fast playhead update only, no preview restart */
@@ -61,11 +62,11 @@ const LABEL_W   = 130 // px — camera label column
 const ROW_H     = 28  // px per camera row
 
 export function RecordingTimeline({
-  recordings, assignedCameras, selectedRec, startDate, endDate,
+  recordings, assignedCameras, selectedRec, windowStartMs, windowEndMs,
   onSelectRecording, globalTime, onPreviewTimeChange, onCommitSeekTime,
 }: Props) {
-  const rangeStart = useMemo(() => new Date(startDate).getTime(), [startDate])
-  const rangeEnd   = useMemo(() => new Date(endDate).getTime(),   [endDate])
+  const rangeStart = windowStartMs
+  const rangeEnd   = windowEndMs
   const totalMs    = rangeEnd - rangeStart
 
   // Build ordered rows: assigned slots first (preserve slot order), then extra cameras from recordings
@@ -153,13 +154,13 @@ export function RecordingTimeline({
     window.addEventListener('mouseup', onUp)
   }, [onPreviewTimeChange, onCommitSeekTime, timeFromX])
 
-  const showEmpty = totalMs <= 0 || (rows.length === 0 && recordings.length === 0)
+  const showEmpty = totalMs <= 0 || rows.length === 0
 
   if (showEmpty) {
     return (
       <div className="h-20 flex items-center justify-center border-t border-surface-700 bg-surface-900">
         <p className="text-[11px] text-surface-600">
-          {totalMs <= 0 ? 'Rango de fechas inválido' : 'Sin grabaciones — realiza una búsqueda'}
+          {totalMs <= 0 ? 'Ventana de tiempo inválida' : 'Sin grabaciones — realiza una búsqueda'}
         </p>
       </div>
     )
