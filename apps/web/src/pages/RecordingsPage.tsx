@@ -156,11 +156,14 @@ export function RecordingsPage() {
   const startPreviewInSlotRef = useRef<(si: number, rec: RecordingWithCamera, playheadTime: Date, opts?: { forceTranscode?: boolean }) => void>(() => {})
   const previewStartTimesRef  = useRef<{ [k: number]: number | null }>({})
   const previewRetriedRef     = useRef<{ [k: number]: boolean }>({})
+  const recordingsRef         = useRef<RecordingWithCamera[]>([])
+  const nextRecBySlotRef      = useRef<{ [k: number]: RecordingWithCamera | null }>({})
 
   // Keep refs in sync
   useEffect(() => { slotsRef.current = slots }, [slots])
   useEffect(() => { globalPlayingRef.current = globalPlaying }, [globalPlaying])
   useEffect(() => { globalPlaybackRateRef.current = globalPlaybackRate }, [globalPlaybackRate])
+  useEffect(() => { recordingsRef.current = recordings }, [recordings])
 
   // Cancel background download job when active slot or recording changes
   useEffect(() => {
@@ -842,11 +845,46 @@ export function RecordingsPage() {
 
       const handleEnded = () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
+        // Compute wall-clock position when the clip ended
+        const previewStart = previewStartTimesRef.current[slotIndex]
+        const endedAtMs = previewStart != null
+          ? previewStart + (vid.currentTime * 1000)
+          : new Date(rec.endTime).getTime()
+
         apiDelete(`/recordings/preview/${sessionId}`).catch(() => {})
+
+        // Find the next recording for this camera within 3s of where we just ended
+        const CONTINUITY_GAP_MS = 3_000
+        const allRecs = recordingsRef.current
+        const nextRec = allRecs
+          .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > endedAtMs - 500)
+          .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
+
+        if (nextRec) {
+          const nextStartMs = new Date(nextRec.startTime).getTime()
+          const gap = nextStartMs - endedAtMs
+          console.info(
+            `[recordings-ui] clip_ended_continuity slot=${slotIndex} endedAt=${new Date(endedAtMs).toISOString()}` +
+            ` nextRec=${nextRec.id} nextStart=${nextRec.startTime} gapMs=${gap}`
+          )
+          if (gap <= CONTINUITY_GAP_MS) {
+            // Auto-load next clip seamlessly
+            startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs))
+            return
+          }
+        }
+
+        // Gap too large or no next recording — show no_recording overlay with skip button
+        console.info(
+          `[recordings-ui] clip_ended_no_continuity slot=${slotIndex}` +
+          ` endedAt=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
+        )
+        // Stash next rec so the overlay can offer a skip button
+        nextRecBySlotRef.current[slotIndex] = nextRec
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
-          ...s, status: 'idle', sessionId: null, sessionType: null,
+          ...s, status: 'no_recording', sessionId: null, sessionType: null, errorMsg: null,
         } : s))
-        setGlobalPlaying(false)
+        if (!nextRec) setGlobalPlaying(false)
       }
 
       ;(videoCleanupRef.current[slotIndex] as (() => void) | null)?.()
@@ -1297,12 +1335,27 @@ export function RecordingsPage() {
                       </div>
                     )}
 
-                    {slot.status === 'no_recording' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black">
-                        <Clock size={18} className="text-surface-700" />
-                        <span className="text-[9px] text-surface-600">Sin grabación en este momento</span>
-                      </div>
-                    )}
+                    {slot.status === 'no_recording' && (() => {
+                      const nextRec = nextRecBySlotRef.current[idx] ?? null
+                      return (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
+                          <Clock size={18} className="text-surface-700" />
+                          <span className="text-[9px] text-surface-600 text-center">Sin grabación en este momento</span>
+                          {nextRec && (
+                            <button
+                              onClick={e => {
+                                e.stopPropagation()
+                                nextRecBySlotRef.current[idx] = null
+                                startPreviewInSlotRef.current(idx, nextRec, new Date(nextRec.startTime))
+                              }}
+                              className="text-[9px] px-2 py-0.5 rounded bg-brand-700/60 hover:bg-brand-600/70 border border-brand-600/50 text-brand-300 transition-colors"
+                            >
+                              Saltar al siguiente bloque
+                            </button>
+                          )}
+                        </div>
+                      )
+                    })()}
 
                     {slot.status === 'loading' && (
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black">
