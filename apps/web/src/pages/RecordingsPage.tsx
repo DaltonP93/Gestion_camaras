@@ -370,7 +370,7 @@ export function RecordingsPage() {
   }
 
   // ── Search ─────────────────────────────────────────────────────────────────
-  const handleSearch = async () => {
+  const handleSearch = async (dateOverride?: { startDate: string; endDate: string }) => {
     const assignedCameraIds = new Set(slotsRef.current.filter(s => s.cameraId).map(s => s.cameraId!))
     const effectiveCameraIds = new Set([...selectedCameras, ...assignedCameraIds])
 
@@ -380,8 +380,10 @@ export function RecordingsPage() {
     )
 
     if (effectiveCameraIds.size === 0) { toast.error('Selecciona o asigna al menos una cámara'); return }
-    const start = new Date(startDate)
-    const end   = new Date(endDate)
+    const sd = dateOverride?.startDate ?? startDate
+    const ed = dateOverride?.endDate   ?? endDate
+    const start = new Date(sd)
+    const end   = new Date(ed)
     if (isNaN(start.getTime()) || isNaN(end.getTime())) { toast.error('Fechas inválidas'); return }
     if (start >= end) { toast.error('La fecha Desde debe ser anterior a Hasta'); return }
 
@@ -404,8 +406,8 @@ export function RecordingsPage() {
       cameraIds.map(cameraId =>
         apiGet<{ recordings: Recording[] }>('/recordings/search', {
           cameraId,
-          startTime: new Date(startDate).toISOString(),
-          endTime:   new Date(endDate).toISOString(),
+          startTime: new Date(sd).toISOString(),
+          endTime:   new Date(ed).toISOString(),
         }).then(res => {
           const cam = cameras.find(c => c.id === cameraId)
           return (res?.recordings ?? []).map((r): RecordingWithCamera => ({
@@ -461,7 +463,7 @@ export function RecordingsPage() {
       setTimelineWindowMs(24 * 3600_000)
     } else {
       // No results: center window on search range midpoint
-      const mid = (new Date(startDate).getTime() + new Date(endDate).getTime()) / 2
+      const mid = (new Date(sd).getTime() + new Date(ed).getTime()) / 2
       setTimelineWindowCenter(mid)
     }
 
@@ -1252,6 +1254,7 @@ export function RecordingsPage() {
           onStartDateChange={setStartDate}
           onEndDateChange={setEndDate}
           onSearch={handleSearch}
+          onQuickSearch={(from, to) => handleSearch({ startDate: from, endDate: to })}
           isSearching={isSearching}
           cameraCount={new Set([...selectedCameras, ...slots.filter(s => s.cameraId).map(s => s.cameraId!)]).size}
           layout={layout}
@@ -1413,18 +1416,32 @@ export function RecordingsPage() {
                     )}
 
                     {slot.status === 'error' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black px-3">
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
                         <AlertTriangle size={18} className="text-red-500 flex-shrink-0" />
                         <p className="text-[9px] text-surface-400 text-center line-clamp-2">
                           {slot.errorMsg ?? 'Error desconocido'}
                         </p>
                         {slot.recording && (
-                          <button
-                            onClick={e => { e.stopPropagation(); startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime)) }}
-                            className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300 transition-colors"
-                          >
-                            Reintentar
-                          </button>
+                          <div className="flex flex-col gap-1 items-center">
+                            <button
+                              onClick={e => {
+                                e.stopPropagation()
+                                startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime), { forceTranscode: true })
+                              }}
+                              className="text-[9px] px-2 py-0.5 rounded bg-brand-700/60 hover:bg-brand-600/70 border border-brand-600/50 text-brand-300 transition-colors"
+                            >
+                              Reintentar con H.264
+                            </button>
+                            <button
+                              onClick={e => {
+                                e.stopPropagation()
+                                startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime))
+                              }}
+                              className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-400 transition-colors"
+                            >
+                              Reintentar
+                            </button>
+                          </div>
                         )}
                       </div>
                     )}
