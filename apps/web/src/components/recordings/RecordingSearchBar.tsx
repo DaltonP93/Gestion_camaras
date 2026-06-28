@@ -11,6 +11,8 @@ interface Props {
   onStartDateChange: (v: string) => void
   onEndDateChange: (v: string) => void
   onSearch: () => void
+  /** Called when a quick preset is chosen — passes from/to so the page can search without stale state */
+  onQuickSearch?: (from: string, to: string) => void
   isSearching: boolean
   cameraCount: number
   layout: PlaybackLayout
@@ -23,10 +25,10 @@ function toLocalDatetimeString(date: Date): string {
 }
 
 const QUICK_PRESETS = [
-  { label: '1h',  from: () => subHours(new Date(), 1), to: () => new Date() },
-  { label: 'Hoy', from: () => startOfDay(new Date()), to: () => new Date() },
-  { label: 'Ayer', from: () => startOfDay(subDays(new Date(), 1)), to: () => endOfDay(subDays(new Date(), 1)) },
-  { label: '7d',  from: () => startOfDay(subDays(new Date(), 7)), to: () => new Date() },
+  { label: 'Últ. 4h', from: () => subHours(new Date(), 4),          to: () => new Date() },
+  { label: 'Hoy',     from: () => startOfDay(new Date()),            to: () => new Date() },
+  { label: 'Ayer',    from: () => startOfDay(subDays(new Date(), 1)),to: () => endOfDay(subDays(new Date(), 1)) },
+  { label: '7d',      from: () => startOfDay(subDays(new Date(), 7)),to: () => new Date() },
 ]
 
 const LAYOUTS: { value: PlaybackLayout; label: string; title: string }[] = [
@@ -39,7 +41,7 @@ const LAYOUTS: { value: PlaybackLayout; label: string; title: string }[] = [
 export function RecordingSearchBar({
   startDate, endDate,
   onStartDateChange, onEndDateChange,
-  onSearch, isSearching, cameraCount,
+  onSearch, onQuickSearch, isSearching, cameraCount,
   layout, onLayoutChange,
 }: Props) {
   const startRef = useRef<HTMLInputElement>(null)
@@ -52,8 +54,14 @@ export function RecordingSearchBar({
   }
 
   const setQuick = (from: Date, to: Date) => {
-    onStartDateChange(toLocalDatetimeString(from))
-    onEndDateChange(toLocalDatetimeString(to))
+    const fromStr = toLocalDatetimeString(from)
+    const toStr   = toLocalDatetimeString(to)
+    onStartDateChange(fromStr)
+    onEndDateChange(toStr)
+    // Auto-search if cameras are available — pass dates directly to avoid stale state
+    if (cameraCount > 0 && !isSearching && onQuickSearch) {
+      onQuickSearch(fromStr, toStr)
+    }
   }
 
   return (
