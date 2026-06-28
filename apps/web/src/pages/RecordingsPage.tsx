@@ -218,27 +218,54 @@ export function RecordingsPage() {
     })
   }, [])
 
-  // ── Track global time from active slot ────────────────────────────────────
+  // ── Master clock via requestAnimationFrame ────────────────────────────────
+  // Advances globalPlaybackTime independently of any video element, so the
+  // timeline playhead stays smooth even when a slot is buffering or loading.
   const activeSlot = slots[activeSlotIndex] ?? emptySlot(activeSlotIndex)
 
-  useEffect(() => {
-    const vid = videoRefs.current[activeSlotIndex]
-    const slot = slotsRef.current[activeSlotIndex]
-    if (!vid || slot?.status !== 'ready' || !slot?.recording) return
+  const masterClockRef = useRef<{ wallMs: number; playheadMs: number; rate: number } | null>(null)
+  const rafHandleRef   = useRef<number | null>(null)
 
-    const handleTimeUpdate = () => {
-      const currentSlot  = slotsRef.current[activeSlotIndex]
-      const previewStart = previewStartTimesRef.current[activeSlotIndex]
-      if (currentSlot?.sessionType === 'preview' && previewStart != null) {
-        setGlobalPlaybackTime(new Date(previewStart + vid.currentTime * 1000))
-      } else if (currentSlot?.recording) {
-        const recStartMs = new Date(currentSlot.recording.startTime).getTime()
-        setGlobalPlaybackTime(new Date(recStartMs + vid.currentTime * 1000))
+  useEffect(() => {
+    if (!globalPlaying || !globalPlaybackTime) {
+      if (rafHandleRef.current !== null) {
+        cancelAnimationFrame(rafHandleRef.current)
+        rafHandleRef.current = null
+      }
+      masterClockRef.current = null
+      return
+    }
+
+    // Snapshot the playhead at the moment playback starts (or resumes)
+    masterClockRef.current = {
+      wallMs:     performance.now(),
+      playheadMs: globalPlaybackTime.getTime(),
+      rate:       globalPlaybackRateRef.current,
+    }
+
+    let lastSetMs = performance.now()
+    const tick = () => {
+      const clock = masterClockRef.current
+      if (!clock) return
+      const now       = performance.now()
+      const elapsed   = now - clock.wallMs
+      const newPlayMs = clock.playheadMs + elapsed * clock.rate
+      // Throttle React state updates to ~10 fps for timeline — RAF is 60fps
+      if (now - lastSetMs >= 100) {
+        setGlobalPlaybackTime(new Date(newPlayMs))
+        lastSetMs = now
+      }
+      rafHandleRef.current = requestAnimationFrame(tick)
+    }
+    rafHandleRef.current = requestAnimationFrame(tick)
+
+    return () => {
+      if (rafHandleRef.current !== null) {
+        cancelAnimationFrame(rafHandleRef.current)
+        rafHandleRef.current = null
       }
     }
-    vid.addEventListener('timeupdate', handleTimeUpdate)
-    return () => vid.removeEventListener('timeupdate', handleTimeUpdate)
-  }, [activeSlotIndex, activeSlot.status, activeSlot.recording?.startTime, activeSlot.sessionType])
+  }, [globalPlaying])
 
   // ── Camera selection helpers ───────────────────────────────────────────────
   const toggleCamera = (cameraId: string) =>
@@ -1060,6 +1087,15 @@ export function RecordingsPage() {
   }
 
   const syncedRate = (rate: number) => {
+    // Re-snapshot master clock at the current computed playhead before changing rate
+    if (masterClockRef.current && globalPlaybackTime) {
+      const elapsed = performance.now() - masterClockRef.current.wallMs
+      masterClockRef.current = {
+        wallMs:     performance.now(),
+        playheadMs: masterClockRef.current.playheadMs + elapsed * masterClockRef.current.rate,
+        rate,
+      }
+    }
     slotsRef.current.forEach((s, i) => {
       const vid = videoRefs.current[i]
       if (vid && s.status === 'ready') {
@@ -1113,6 +1149,10 @@ export function RecordingsPage() {
     const wasPlaying = globalPlayingRef.current
     console.info(`[recordings-ui] timeline_seek_commit playhead=${time.toISOString()} wasPlaying=${wasPlaying}`)
 
+    // Re-anchor master clock to the new seek position
+    if (masterClockRef.current) {
+      masterClockRef.current = { ...masterClockRef.current, wallMs: performance.now(), playheadMs: timeMs }
+    }
     setGlobalPlaybackTime(time)
 
     if (!wasPlaying) return
