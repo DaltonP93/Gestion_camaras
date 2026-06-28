@@ -105,6 +105,8 @@ function determinePreviewStrategy(opts: {
 }): PreviewStrategy {
   const { detectedCodec, canPlayHevcMp4, forceTranscode } = opts
   if (forceTranscode) return 'preview_transcode_h264'
+  // Unknown codec → always transcode to avoid DEMUXER_ERROR_NO_SUPPORTED_STREAMS
+  if (!detectedCodec || detectedCodec === 'unknown') return 'preview_transcode_h264'
   if (!isHevcCodec(detectedCodec)) return 'preview_copy_h264'
   return canPlayHevcMp4 ? 'preview_copy_hevc' : 'preview_transcode_h264'
 }
@@ -113,19 +115,24 @@ function buildPreviewCodecArgs(strategy: PreviewStrategy): string[] {
   if (strategy === 'preview_copy_h264' || strategy === 'preview_copy_hevc') {
     return ['-an', '-c:v', 'copy']
   }
-  // preview_transcode_h264 — tuned for low-latency live preview
+  // preview_transcode_h264 — baseline profile + fixed keyframe interval for reliable fMP4 seek
   return [
     '-an',
-    '-c:v',        'libx264',
-    '-preset',     'ultrafast',
-    '-tune',       'zerolatency',
-    '-crf',        '30',
-    '-maxrate',    '1500k',
-    '-bufsize',    '3000k',
-    '-pix_fmt',    'yuv420p',
-    '-profile:v',  'main',
-    '-level',      '4.1',
-    '-vf',         "scale='min(1280,iw)':-2:flags=fast_bilinear",
+    '-c:v',             'libx264',
+    '-preset',          'ultrafast',
+    '-tune',            'zerolatency',
+    '-crf',             '30',
+    '-maxrate',         '1500k',
+    '-bufsize',         '3000k',
+    '-pix_fmt',         'yuv420p',
+    '-profile:v',       'baseline',
+    '-level',           '3.1',
+    '-g',               '25',
+    '-keyint_min',      '25',
+    '-sc_threshold',    '0',
+    '-reset_timestamps','1',
+    '-avoid_negative_ts','make_zero',
+    '-vf',              "scale='min(1280,iw)':-2:flags=fast_bilinear",
   ]
 }
 
@@ -350,6 +357,10 @@ interface PreviewSession {
 }
 
 const previewSessions = new Map<string, PreviewSession>()
+
+// Per-camera override: when forceTranscode=true succeeds, persist transcode requirement
+// so subsequent previews of the same camera skip the probe and go straight to transcode.
+const cameraPreviewStrategyOverride = new Map<string, PreviewStrategy>()
 
 // Periodic cleanup of stale preview sessions
 setInterval(() => {
@@ -1331,7 +1342,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     let detectedCodec      = 'unknown'
     let probeElapsedMs     = 0
 
-    if (!forceTranscode) {
+    // Check per-camera override first (set when a previous forceTranscode retry succeeded)
+    const overrideStrategy = cameraPreviewStrategyOverride.get(body.cameraId)
+
+    if (forceTranscode) {
+      // Save override so future requests for this camera skip the probe
+      cameraPreviewStrategyOverride.set(body.cameraId, 'preview_transcode_h264')
+      server.log.info(`[recordings-preview] strategy_override_saved cameraId=${body.cameraId} strategy=preview_transcode_h264`)
+    } else if (overrideStrategy) {
+      server.log.info(`[recordings-preview] strategy_override_hit cameraId=${body.cameraId} strategy=${overrideStrategy}`)
+    } else {
       const probeStart = Date.now()
       try {
         const probeResult = await Promise.race([
@@ -1356,10 +1376,20 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    const strategy = determinePreviewStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
+    const strategy = overrideStrategy && !forceTranscode
+      ? overrideStrategy
+      : determinePreviewStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
+
+    server.log.info(
+      `[recordings-time] preview_time_mapping cameraId=${body.cameraId} ch=${camera.channel}` +
+      ` startTime=${body.startTime} endTime=${body.endTime}` +
+      ` startTime_utc=${new Date(body.startTime).toUTCString()}` +
+      ` urlStrategy=${urlStrategy} rtsp_masked=${rtspMasked.substring(0, 100)}`
+    )
     server.log.info(
       `[recordings-preview] preview_strategy codec=${detectedCodec}` +
-      ` canPlayHevcMp4=${canPlayHevcMp4} forceTranscode=${forceTranscode} strategy=${strategy}`
+      ` canPlayHevcMp4=${canPlayHevcMp4} forceTranscode=${forceTranscode}` +
+      ` overrideHit=${!!overrideStrategy} strategy=${strategy}`
     )
     server.log.info(`[recordings-preview] encoder_selected strategy=${strategy} forceTranscode=${forceTranscode}`)
 
@@ -1424,7 +1454,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const ffmpegArgs = [
       '-rtsp_transport', 'tcp',
       '-fflags', '+genpts+discardcorrupt',
-      '-use_wallclock_as_timestamps', '1',
       ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
       '-reorder_queue_size', '0',
       '-i', rtspUrl,
