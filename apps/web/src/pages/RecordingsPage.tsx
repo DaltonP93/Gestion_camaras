@@ -59,6 +59,19 @@ function toLocalDatetimeString(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+// Display NVR timestamps in UTC — NVRs store wall-clock time as UTC.
+// Shifting by the local timezone offset makes date-fns render UTC components
+// correctly regardless of the browser's local timezone.
+function nvrTimeMs(epochMs: number): number {
+  return epochMs + new Date(epochMs).getTimezoneOffset() * 60_000
+}
+function formatNvrTime(isoOrMs: string | number | Date, fmt: string): string {
+  const ms = isoOrMs instanceof Date ? isoOrMs.getTime()
+    : typeof isoOrMs === 'number' ? isoOrMs
+    : new Date(isoOrMs as string).getTime()
+  return format(new Date(nvrTimeMs(ms)), fmt)
+}
+
 function classifyError(err: any): 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFFLINE' | 'UNKNOWN' {
   const msg = (err?.response?.data?.message || err?.message || '').toLowerCase()
   if (msg.includes('isapi') || msg.includes('no soporta') || msg.includes('unsupported')) return 'ISAPI_UNSUPPORTED'
@@ -484,14 +497,13 @@ export function RecordingsPage() {
     )
 
     // ── Timezone diagnostic ──────────────────────────────────────────────────
-    // Helps identify whether UI displays wrong time vs what the NVR returns.
-    const browserTz   = Intl.DateTimeFormat().resolvedOptions().timeZone
-    const displayedStart = format(new Date(rec.startTime), 'dd/MM/yyyy HH:mm:ss')
-    const displayedEnd   = format(new Date(rec.endTime),   'dd/MM/yyyy HH:mm:ss')
+    const browserTz      = Intl.DateTimeFormat().resolvedOptions().timeZone
+    const displayedStart = formatNvrTime(rec.startTime, 'dd/MM/yyyy HH:mm:ss')
+    const displayedEnd   = formatNvrTime(rec.endTime,   'dd/MM/yyyy HH:mm:ss')
     console.info(
-      `[recordings-ui] time_mapping slot=${slotIndex}` +
+      `[recordings-time] slot=${slotIndex}` +
       ` recStart_raw=${rec.startTime} recEnd_raw=${rec.endTime}` +
-      ` displayedStart=${displayedStart} displayedEnd=${displayedEnd}` +
+      ` displayedStart_utc=${displayedStart} displayedEnd_utc=${displayedEnd}` +
       ` browserTz=${browserTz}` +
       ` playbackURI=${(rec as any).playbackURI ?? 'none'}`
     )
@@ -1319,12 +1331,12 @@ export function RecordingsPage() {
         <div className="flex-shrink-0 border-t border-surface-700">
           {/* Info row: playhead time · slot label · download */}
           <div className="flex items-center gap-3 px-3 py-1.5 bg-surface-800/50 border-b border-surface-700/60">
-            {/* Playhead time — main clock */}
+            {/* Playhead time — shown as NVR wall clock (UTC) */}
             <span className="text-[11px] font-mono text-surface-200 tabular-nums flex-shrink-0">
               {globalPlaybackTime
-                ? format(globalPlaybackTime, 'dd/MM HH:mm:ss')
+                ? formatNvrTime(globalPlaybackTime, 'dd/MM HH:mm:ss')
                 : activeRecording
-                  ? format(new Date(activeRecording.startTime), 'dd/MM HH:mm:ss')
+                  ? formatNvrTime(activeRecording.startTime, 'dd/MM HH:mm:ss')
                   : '--/-- --:--:--'
               }
             </span>

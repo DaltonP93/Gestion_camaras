@@ -4,6 +4,14 @@ import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import type { RecordingWithCamera } from './types'
 
+// Display NVR timestamps in UTC — same formula as RecordingsPage.formatNvrTime
+function nvrTimeMs(epochMs: number): number {
+  return epochMs + new Date(epochMs).getTimezoneOffset() * 60_000
+}
+function formatNvrTime(epochMs: number, fmt: string): string {
+  return format(new Date(nvrTimeMs(epochMs)), fmt)
+}
+
 interface AssignedCamera {
   cameraId:   string
   cameraName: string
@@ -42,8 +50,8 @@ function generateTicks(rangeStart: number, rangeEnd: number, intervalMs: number)
     ticks.push({
       time: t,
       label: spansDays
-        ? format(new Date(t), 'dd HH:mm')
-        : format(new Date(t), 'HH:mm'),
+        ? formatNvrTime(t, 'dd HH:mm')
+        : formatNvrTime(t, 'HH:mm'),
     })
   }
   return ticks
@@ -250,7 +258,7 @@ export function RecordingTimeline({
                       key={`${rec.cameraId}-${rec.id}`}
                       onMouseDown={e => e.stopPropagation()}
                       onClick={e => { e.stopPropagation(); onSelectRecording(rec) }}
-                      title={`${format(new Date(rec.startTime), 'HH:mm:ss')} – ${format(new Date(rec.endTime), 'HH:mm:ss')} (${durationMin}min)`}
+                      title={`${formatNvrTime(recStart, 'HH:mm:ss')} – ${formatNvrTime(recEnd, 'HH:mm:ss')} (${durationMin}min)`}
                       className={clsx(
                         'absolute top-1 bottom-1 rounded-sm transition-colors cursor-pointer',
                         isSelected
