@@ -8,6 +8,7 @@ import {
   Loader2, Play, RotateCcw, Stethoscope, Plus, X, Search, Check,
   Pencil, Trash2, KeyRound, UserPlus, ShieldCheck, ShieldOff,
   Copy, Download, ChevronDown, Zap, Video as VideoIcon, Film, ExternalLink,
+  ArrowRightLeft,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '@/lib/api'
 import { useAuthStore } from '@/stores/authStore'
@@ -988,6 +989,7 @@ function CamerasTab({
   bgSyncResult?: { sourceUsed?: string; syncedAt?: string } | null
 }) {
   const [showAdopt, setShowAdopt] = useState(false)
+  const [migrateCam, setMigrateCam] = useState<CameraType | null>(null)
   const [isapDebug, setIsapDebug] = useState<any[] | null>(null)
   const [isapDebugLoading, setIsapDebugLoading] = useState(false)
   const [isapDebugError, setIsapDebugError] = useState<string | null>(null)
@@ -1151,6 +1153,15 @@ function CamerasTab({
         />
       )}
 
+      {migrateCam && isAdmin && (
+        <MigrateCameraModal
+          camera={migrateCam}
+          currentNvrId={nvrId}
+          onClose={() => setMigrateCam(null)}
+          onSuccess={() => { setMigrateCam(null); onRefresh() }}
+        />
+      )}
+
       <div className="card overflow-x-auto">
         <table className="w-full text-xs min-w-[900px]">
           <thead>
@@ -1274,6 +1285,15 @@ function CamerasTab({
                           title="Reiniciar stream"
                         >
                           <RotateCcw size={11} />
+                        </button>
+                      )}
+                      {isAdmin && (
+                        <button
+                          onClick={() => setMigrateCam(cam)}
+                          className="p-1 rounded text-surface-400 hover:text-blue-400 hover:bg-surface-700 transition-colors"
+                          title="Migrar a otro NVR"
+                        >
+                          <ArrowRightLeft size={11} />
                         </button>
                       )}
                       <Link
@@ -2728,6 +2748,92 @@ function AdoptCameraModal({ nvrId, onClose, onSuccess }: { nvrId: string; onClos
               <button onClick={onClose} className="btn-secondary text-xs">Cancelar</button>
               <button onClick={handleSave} disabled={saving || freeChannels.length === 0} className="btn-primary text-xs">
                 {saving ? <><Loader2 size={12} className="animate-spin" /> Adoptando...</> : <><Plus size={12} /> Adoptar cámara</>}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Migrate camera to another NVR ───────────────────────────
+function MigrateCameraModal({ camera, currentNvrId, onClose, onSuccess }: {
+  camera: CameraType
+  currentNvrId: string
+  onClose: () => void
+  onSuccess: () => void
+}) {
+  const [nvrs, setNvrs]           = useState<NVR[]>([])
+  const [loading, setLoading]     = useState(true)
+  const [targetNvrId, setTarget]  = useState('')
+  const [channel, setChannel]     = useState<number>(camera.channel)
+  const [saving, setSaving]       = useState(false)
+
+  useEffect(() => {
+    apiGet<NVR[]>('/nvrs')
+      .then(list => {
+        const others = list.filter(n => n.id !== currentNvrId)
+        setNvrs(others)
+        if (others.length > 0) setTarget(others[0].id)
+      })
+      .catch(() => toast.error('No se pudieron cargar los NVRs'))
+      .finally(() => setLoading(false))
+  }, [currentNvrId])
+
+  const handleMigrate = async () => {
+    if (!targetNvrId) { toast.error('Selecciona un NVR destino'); return }
+    setSaving(true)
+    try {
+      await apiPost(`/cameras/${camera.id}/migrate`, { targetNvrId, channel })
+      toast.success(`"${camera.name}" migrada al canal ${channel}`)
+      onSuccess()
+    } catch (err: any) {
+      toast.error(err?.response?.data?.message || 'Error al migrar la cámara')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+      <div className="card w-full max-w-md p-6 animate-slide-in shadow-2xl">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-sm font-semibold text-surface-100">Migrar cámara a otro NVR</h3>
+          <button onClick={onClose} className="btn-ghost p-1"><X size={14} /></button>
+        </div>
+        <p className="text-xs text-surface-400 mb-4">
+          <span className="text-surface-200 font-medium">{camera.name}</span> (canal {camera.channel}) —
+          se actualiza el registro local; verifica que la cámara ya esté agregada físicamente en el NVR destino.
+        </p>
+
+        {loading ? (
+          <div className="flex justify-center py-8"><Loader2 size={20} className="animate-spin text-surface-400" /></div>
+        ) : nvrs.length === 0 ? (
+          <p className="text-xs text-amber-400 py-4">No hay otros NVRs registrados.</p>
+        ) : (
+          <div className="space-y-3">
+            <div>
+              <label className="label">NVR destino</label>
+              <select className="input w-full" value={targetNvrId} onChange={e => setTarget(e.target.value)}>
+                {nvrs.map(n => <option key={n.id} value={n.id}>{n.name} ({n.ipAddress})</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="label">Canal en el NVR destino</label>
+              <input
+                className="input w-full"
+                type="number" min={1} max={128}
+                value={channel}
+                onChange={e => setChannel(Number(e.target.value))}
+              />
+              <p className="text-[10px] text-surface-500 mt-1">Si el canal está ocupado, la migración se rechaza.</p>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button onClick={onClose} className="btn-ghost text-xs">Cancelar</button>
+              <button onClick={handleMigrate} disabled={saving} className="btn-primary text-xs flex items-center gap-1.5">
+                {saving ? <Loader2 size={12} className="animate-spin" /> : <ArrowRightLeft size={12} />}
+                Migrar
               </button>
             </div>
           </div>

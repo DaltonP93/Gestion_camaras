@@ -1,7 +1,7 @@
 // apps/api/src/routes/recordings.ts
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { searchRecordings } from '../services/hikvision'
+import { searchRecordings, getRecordingDailyDistribution } from '../services/hikvision'
 import { AuditAction } from '../services/audit'
 import { probeRtspStream } from '../services/rtsp-probe'
 import { getRtspTimeoutOption } from '../services/stream'
@@ -697,6 +697,12 @@ async function runVodBackground(opts: {
   }
 }
 
+// ─── Recording-days calendar cache ────────────────────────────────
+// key: cameraId|year|month → days with recordings. Short TTL — the current
+// month gains new days as the NVR records.
+const calendarCache = new Map<string, { days: number[]; supported: boolean; expiresAt: number }>()
+const CALENDAR_TTL_MS = 5 * 60 * 1000
+
 // ─── Capability cache ─────────────────────────────────────────────
 const nvrCapabilityCache = new Map<string, { result: string; expiresAt: number }>()
 const CAPABILITY_TTL_MS = 15 * 60 * 1000
@@ -786,6 +792,53 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     })
 
     return reply.send({ recordings, source: 'nvr_isapi', camera: { id: camera.id, name: camera.name, channel: camera.channel }, nvrModel: camera.nvr.model })
+  })
+
+  // GET /api/recordings/calendar — Days of a month with recordings (iVMS-style
+  // calendar marks). Uses ISAPI dailyDistribution; short-cached per camera+month.
+  server.get('/calendar', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const user = request.user
+    if (user.role === 'OPERATOR') return reply.status(403).send({ message: 'Sin acceso a grabaciones' })
+
+    const q = z.object({
+      cameraId: z.string().min(1),
+      year:     z.coerce.number().int().min(2000).max(2100),
+      month:    z.coerce.number().int().min(1).max(12),
+    }).parse(request.query)
+
+    const camera = await server.prisma.camera.findUnique({
+      where: { id: q.cameraId }, include: { nvr: true },
+    })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+
+    if (user.role === 'AUDITOR') {
+      const perm = await server.prisma.userPermission.findFirst({
+        where: { userId: user.sub, cameraId: q.cameraId, canPlayback: true },
+      })
+      if (!perm) return reply.status(403).send({ message: 'Sin permiso para grabaciones de esta cámara' })
+    }
+
+    const cacheKey = `${q.cameraId}|${q.year}|${q.month}`
+    const cached   = calendarCache.get(cacheKey)
+    if (cached && Date.now() < cached.expiresAt) {
+      return reply.send({ days: cached.days, supported: cached.supported, cached: true })
+    }
+
+    const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
+    try {
+      const days = await getRecordingDailyDistribution(nvr as any, camera.channel, q.year, q.month)
+      calendarCache.set(cacheKey, { days, supported: true, expiresAt: Date.now() + CALENDAR_TTL_MS })
+      server.log.info(`[recordings] calendar cameraId=${q.cameraId} ch=${camera.channel} ${q.year}-${q.month} days=${days.length}`)
+      return reply.send({ days, supported: true })
+    } catch (err: any) {
+      if (err?.unsupported) {
+        calendarCache.set(cacheKey, { days: [], supported: false, expiresAt: Date.now() + CALENDAR_TTL_MS })
+        return reply.send({ days: [], supported: false })
+      }
+      if (err?.authError) return reply.status(502).send({ code: 'NVR_AUTH_ERROR', message: 'Error de autenticación con el NVR' })
+      server.log.warn(`[recordings] calendar_error cameraId=${q.cameraId} err=${err?.message}`)
+      return reply.status(502).send({ code: 'NVR_ERROR', message: 'No se pudo consultar el NVR' })
+    }
   })
 
   // POST /api/recordings/batch-search

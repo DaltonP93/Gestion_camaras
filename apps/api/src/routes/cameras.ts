@@ -537,6 +537,65 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     return reply.send(camera)
   })
+
+  // POST /api/cameras/:id/migrate — Mover cámara a otro NVR (ADMIN)
+  // Actualiza nvrId + canal en la BD local. No toca la configuración del NVR:
+  // es para reflejar un traslado físico/lógico ya realizado en los equipos.
+  server.post('/:id/migrate', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const body = z.object({
+      targetNvrId: z.string().min(1),
+      channel:     z.number().int().min(1).max(128).optional(),
+    }).parse(request.body)
+
+    const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+
+    const targetNvr = await server.prisma.nVR.findUnique({ where: { id: body.targetNvrId } })
+    if (!targetNvr) return reply.status(404).send({ message: 'NVR destino no encontrado' })
+
+    if (targetNvr.id === camera.nvrId && (body.channel === undefined || body.channel === camera.channel)) {
+      return reply.status(400).send({ message: 'La cámara ya está en ese NVR y canal' })
+    }
+
+    const newChannel = body.channel ?? camera.channel
+    const occupied = await server.prisma.camera.findFirst({
+      where: { nvrId: targetNvr.id, channel: newChannel, NOT: { id } },
+      select: { id: true, name: true },
+    })
+    if (occupied) {
+      return reply.status(409).send({
+        message: `El canal ${newChannel} del NVR destino ya está ocupado por "${occupied.name}"`,
+      })
+    }
+
+    // Remove any published stream before moving — RTSP paths point to the old NVR
+    try { await removeStream(camera.nvr as any, camera as any) } catch {}
+
+    const updated = await server.prisma.camera.update({
+      where: { id },
+      data: {
+        nvrId:       targetNvr.id,
+        channel:     newChannel,
+        channelCode: `D${newChannel}`,
+        // Codec/diagnostic info belongs to the old NVR connection — reset so
+        // the next validation re-probes against the new NVR
+        rtspMainOk: null, rtspSubOk: null, lastRtspError: null,
+        streamHealthStatus: 'UNKNOWN', onlineInNvr: null,
+      },
+    })
+
+    server.log.info(
+      `[cameras] camera_migrated cameraId=${id} name=${camera.name}` +
+      ` fromNvr=${camera.nvrId} toNvr=${targetNvr.id} fromCh=${camera.channel} toCh=${newChannel}`
+    )
+    await AuditAction(server.prisma, request.user.sub, 'CAMERA_MIGRATE', id, request, {
+      fromNvrId: camera.nvrId, fromNvrName: camera.nvr.name, fromChannel: camera.channel,
+      toNvrId: targetNvr.id, toNvrName: targetNvr.name, toChannel: newChannel,
+    })
+
+    return reply.send(updated)
+  })
 }
 
 function user(request: any) { return request.user }

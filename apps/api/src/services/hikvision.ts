@@ -1721,6 +1721,54 @@ export async function searchRecordings(
   }))
 }
 
+/** Days of a month that have recordings for a channel — same ISAPI endpoint
+ *  iVMS-4200 uses to mark days in its Remote Playback calendar.
+ *  Returns the list of dayOfMonth values (1-31) with at least one recording. */
+export async function getRecordingDailyDistribution(
+  nvr: NVR, channel: number, year: number, month: number
+): Promise<number[]> {
+  const client  = createHikClient(nvr)
+  const trackID = channel * 100 + 1
+  const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
+<trackDailyParam xmlns="http://www.hikvision.com/ver20/XMLSchema">
+  <year>${year}</year>
+  <monthOfYear>${month}</monthOfYear>
+</trackDailyParam>`
+
+  let responseData: string
+  try {
+    const resp = await client.post(
+      `/ISAPI/ContentMgmt/record/tracks/${trackID}/dailyDistribution`,
+      xmlBody,
+      { headers: { 'Content-Type': 'application/xml', 'Accept': 'application/xml' } }
+    )
+    responseData = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data)
+  } catch (err: any) {
+    const status = err?.response?.status
+    if (status === 401 || status === 403) {
+      const e: any = new Error('ISAPI auth error')
+      e.authError = true
+      throw e
+    }
+    if (status === 404 || status === 405 || status === 501 || status === 400) {
+      const e: any = new Error('ISAPI dailyDistribution not supported')
+      e.unsupported = true
+      throw e
+    }
+    throw err
+  }
+
+  const days: number[] = []
+  for (const block of xmlGetAll(responseData, 'day')) {
+    const hasRecord = /<record>\s*true\s*<\/record>/i.test(block)
+    if (!hasRecord) continue
+    const dom = xmlGet(block, 'dayOfMonth') || xmlGet(block, 'id')
+    const n = parseInt(dom || '', 10)
+    if (!isNaN(n) && n >= 1 && n <= 31) days.push(n)
+  }
+  return days
+}
+
 function unescapeXml(s: string): string {
   return s
     .replace(/&amp;/g, '&')
