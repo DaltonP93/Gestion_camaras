@@ -4,6 +4,7 @@ import { clsx } from 'clsx'
 import { Calendar, Search, Loader2 } from 'lucide-react'
 import { subDays, subHours, startOfDay, endOfDay } from 'date-fns'
 import type { PlaybackLayout } from './types'
+import { RecordingAvailabilityCalendar } from './RecordingAvailabilityCalendar'
 
 interface Props {
   startDate: string
@@ -17,6 +18,9 @@ interface Props {
   cameraCount: number
   layout: PlaybackLayout
   onLayoutChange: (v: PlaybackLayout) => void
+  /** Camera to query the recording-days calendar for (single selected camera) */
+  availabilityCameraId?: string | null
+  availabilityCameraName?: string
 }
 
 function toLocalDatetimeString(date: Date): string {
@@ -43,6 +47,7 @@ export function RecordingSearchBar({
   onStartDateChange, onEndDateChange,
   onSearch, onQuickSearch, isSearching, cameraCount,
   layout, onLayoutChange,
+  availabilityCameraId, availabilityCameraName,
 }: Props) {
   const startRef = useRef<HTMLInputElement>(null)
   const endRef   = useRef<HTMLInputElement>(null)
@@ -119,6 +124,18 @@ export function RecordingSearchBar({
             {label}
           </button>
         ))}
+        {/* iVMS-style recording-days calendar — shown when a single camera is selected */}
+        {availabilityCameraId && (
+          <RecordingAvailabilityCalendar
+            cameraId={availabilityCameraId}
+            cameraName={availabilityCameraName ?? 'Cámara'}
+            onPickDay={(fromStr, toStr) => {
+              onStartDateChange(fromStr)
+              onEndDateChange(toStr)
+              if (cameraCount > 0 && !isSearching && onQuickSearch) onQuickSearch(fromStr, toStr)
+            }}
+          />
+        )}
       </div>
 
       {/* Divider */}

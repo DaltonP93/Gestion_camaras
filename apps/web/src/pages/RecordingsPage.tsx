@@ -1256,6 +1256,15 @@ export function RecordingsPage() {
     [slots]
   )
 
+  // Camera for the recording-days calendar: the single selected camera,
+  // else the active slot's camera
+  const availabilityCameraId = selectedCameras.size === 1
+    ? [...selectedCameras][0]
+    : (activeSlot.cameraId ?? (selectedCameras.size > 0 ? [...selectedCameras][0] : null))
+  const availabilityCamera = availabilityCameraId
+    ? cameras.find(c => c.id === availabilityCameraId) ?? null
+    : null
+
   // ── Timeline range: exactly the searched range ─────────────────────────────
   const windowStartMs = searchRangeMs?.start ?? new Date(localInputToNvrIso(startDate)).getTime()
   const windowEndMs   = searchRangeMs?.end   ?? new Date(localInputToNvrIso(endDate)).getTime()
@@ -1295,6 +1304,8 @@ export function RecordingsPage() {
           cameraCount={new Set([...selectedCameras, ...slots.filter(s => s.cameraId).map(s => s.cameraId!)]).size}
           layout={layout}
           onLayoutChange={setLayout}
+          availabilityCameraId={availabilityCamera?.id ?? null}
+          availabilityCameraName={availabilityCamera?.name}
         />
 
         {/* NVR error banners */}
