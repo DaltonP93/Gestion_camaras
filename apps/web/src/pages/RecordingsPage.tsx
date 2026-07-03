@@ -59,6 +59,14 @@ function toLocalDatetimeString(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+// Convert a datetime-local input value into NVR wall-clock ISO (UTC components).
+// NVR timestamps carry the wall clock in the UTC fields, so the search range must
+// be sent in the same frame — NOT shifted through the browser timezone.
+function localInputToNvrIso(s: string): string {
+  if (!s) return s
+  return s.length === 16 ? `${s}:00Z` : `${s}Z`
+}
+
 // Display NVR timestamps in UTC — NVRs store wall-clock time as UTC.
 // Shifting by the local timezone offset makes date-fns render UTC components
 // correctly regardless of the browser's local timezone.
@@ -134,10 +142,8 @@ export function RecordingsPage() {
   const [globalPlaybackRate, setGlobalPlaybackRate] = useState(1)
   const [globalPlaybackTime, setGlobalPlaybackTime] = useState<Date | null>(null)
 
-  // ── Timeline window ────────────────────────────────────────────────────────
-  // Separate from search range: user can zoom/pan without re-searching.
-  const [timelineWindowMs,     setTimelineWindowMs]     = useState(24 * 3600_000)
-  const [timelineWindowCenter, setTimelineWindowCenter] = useState<number | null>(null)
+  // ── Timeline range = last searched range (NVR wall-clock epoch ms) ─────────
+  const [searchRangeMs, setSearchRangeMs] = useState<{ start: number; end: number } | null>(null)
 
   // ── Background MP4 download job (independent of slot preview state) ────────
   const [downloadJob, setDownloadJob]   = useState<DownloadJob | null>(null)
@@ -267,6 +273,38 @@ export function RecordingsPage() {
     }
   }, [globalPlaying])
 
+  // ── iVMS-style auto-start: while playing, slots waiting without a recording
+  // auto-load when the master clock reaches one of their recordings ──────────
+  const autoStartLockRef = useRef<{ [k: number]: number }>({})
+
+  useEffect(() => {
+    if (!globalPlaying || !globalPlaybackTime) return
+    const playheadMs = globalPlaybackTime.getTime()
+
+    slotsRef.current.forEach(slot => {
+      if (!slot.cameraId) return
+      if (slot.status !== 'no_recording' && slot.status !== 'idle') return
+
+      // Debounce: don't retry the same slot more than once every 5 s
+      const lastAttempt = autoStartLockRef.current[slot.slotIndex] ?? 0
+      if (Date.now() - lastAttempt < 5_000) return
+
+      const covering = recordingsRef.current.find(r =>
+        r.cameraId === slot.cameraId &&
+        new Date(r.startTime).getTime() <= playheadMs &&
+        new Date(r.endTime).getTime() > playheadMs
+      )
+      if (covering) {
+        autoStartLockRef.current[slot.slotIndex] = Date.now()
+        console.info(
+          `[recordings-ui] slot_autostart_at_playhead slot=${slot.slotIndex}` +
+          ` cameraId=${slot.cameraId} recId=${covering.id} playhead=${globalPlaybackTime.toISOString()}`
+        )
+        startPreviewInSlotRef.current(slot.slotIndex, covering, globalPlaybackTime)
+      }
+    })
+  }, [globalPlaybackTime, globalPlaying])
+
   // ── Camera selection helpers ───────────────────────────────────────────────
   const toggleCamera = (cameraId: string) =>
     setSelectedCameras(prev => {
@@ -382,10 +420,15 @@ export function RecordingsPage() {
     if (effectiveCameraIds.size === 0) { toast.error('Selecciona o asigna al menos una cámara'); return }
     const sd = dateOverride?.startDate ?? startDate
     const ed = dateOverride?.endDate   ?? endDate
-    const start = new Date(sd)
-    const end   = new Date(ed)
+    // Interpret picker values as NVR wall clock (UTC components), not browser local time
+    const startIso = localInputToNvrIso(sd)
+    const endIso   = localInputToNvrIso(ed)
+    const start = new Date(startIso)
+    const end   = new Date(endIso)
     if (isNaN(start.getTime()) || isNaN(end.getTime())) { toast.error('Fechas inválidas'); return }
     if (start >= end) { toast.error('La fecha Desde debe ser anterior a Hasta'); return }
+
+    console.info(`[recordings-time] search_range input=${sd}→${ed} sent=${startIso}→${endIso}`)
 
     setIsSearching(true)
     clearAllPlayback()
@@ -406,8 +449,8 @@ export function RecordingsPage() {
       cameraIds.map(cameraId =>
         apiGet<{ recordings: Recording[] }>('/recordings/search', {
           cameraId,
-          startTime: new Date(sd).toISOString(),
-          endTime:   new Date(ed).toISOString(),
+          startTime: startIso,
+          endTime:   endIso,
         }).then(res => {
           const cam = cameras.find(c => c.id === cameraId)
           return (res?.recordings ?? []).map((r): RecordingWithCamera => ({
@@ -450,21 +493,16 @@ export function RecordingsPage() {
     setNvrErrors([...errsByNvr.values()])
     setIsSearching(false)
 
-    // Initialize playhead and timeline window to earliest recording
+    // Timeline spans exactly the searched range
+    setSearchRangeMs({ start: start.getTime(), end: end.getTime() })
+
+    // Initialize playhead to earliest recording found
     let earliest: RecordingWithCamera | null = null
     if (all.length > 0) {
       earliest = all.reduce((min, r) =>
         new Date(r.startTime).getTime() < new Date(min.startTime).getTime() ? r : min
       )
-      const earliestMs = new Date(earliest.startTime).getTime()
-      setGlobalPlaybackTime(new Date(earliestMs))
-      // Center the 24h window on the first result
-      setTimelineWindowCenter(earliestMs + 12 * 3600_000)
-      setTimelineWindowMs(24 * 3600_000)
-    } else {
-      // No results: center window on search range midpoint
-      const mid = (new Date(sd).getTime() + new Date(ed).getTime()) / 2
-      setTimelineWindowCenter(mid)
+      setGlobalPlaybackTime(new Date(new Date(earliest.startTime).getTime()))
     }
 
     // Auto-assign: if exactly 1 camera selected and no slot has a camera assigned, assign to active slot
@@ -768,12 +806,22 @@ export function RecordingsPage() {
   ) => {
     const forceTranscode = opts?.forceTranscode ?? false
     const currentSlot = slotsRef.current[slotIndex]
-    if (currentSlot?.cameraId && currentSlot.cameraId !== rec.cameraId) {
+    // If the slot shows a different camera, adopt the recording's camera —
+    // the caller routed this recording here deliberately.
+    const adoptCamera = !currentSlot?.cameraId || currentSlot.cameraId !== rec.cameraId
+    if (adoptCamera) {
+      const cam = cameras.find(c => c.id === rec.cameraId)
       console.info(
-        `[recordings-ui] preview_rejected_camera_mismatch slot=${slotIndex}` +
-        ` slotCameraId=${currentSlot.cameraId} recCameraId=${rec.cameraId}`
+        `[recordings-ui] slot_adopt_camera slot=${slotIndex}` +
+        ` prevCameraId=${currentSlot?.cameraId ?? 'none'} newCameraId=${rec.cameraId}`
       )
-      return
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s,
+        cameraId:   rec.cameraId,
+        cameraName: rec.cameraName,
+        nvrId:      cam?.nvrId ?? s.nvrId,
+        nvrName:    rec.nvrName,
+      } : s))
     }
 
     const playheadMs    = playheadTime.getTime()
@@ -1208,21 +1256,9 @@ export function RecordingsPage() {
     [slots]
   )
 
-  // ── Timeline window derived values ─────────────────────────────────────────
-  const windowCenter = timelineWindowCenter ?? Date.now()
-  const windowStartMs = windowCenter - timelineWindowMs / 2
-  const windowEndMs   = windowCenter + timelineWindowMs / 2
-
-  const zoomWindow = (newWindowMs: number) => {
-    setTimelineWindowMs(newWindowMs)
-    // Keep playhead (or current center) in view
-    const center = (globalPlaybackTime?.getTime() ?? windowCenter)
-    setTimelineWindowCenter(center)
-  }
-
-  const shiftWindow = (deltaMs: number) => {
-    setTimelineWindowCenter(c => (c ?? windowCenter) + deltaMs)
-  }
+  // ── Timeline range: exactly the searched range ─────────────────────────────
+  const windowStartMs = searchRangeMs?.start ?? new Date(localInputToNvrIso(startDate)).getTime()
+  const windowEndMs   = searchRangeMs?.end   ?? new Date(localInputToNvrIso(endDate)).getTime()
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -1453,65 +1489,22 @@ export function RecordingsPage() {
 
         {/* ── Timeline ──────────────────────────────────────────────────── */}
         <div className="flex-shrink-0 border-t border-surface-700 bg-surface-900">
-          {/* Zoom / pan toolbar */}
-          <div className="flex items-center gap-1 px-2 py-1 border-b border-surface-800/60 bg-surface-900">
-            <span className="text-[9px] text-surface-600 mr-1">Ventana:</span>
-            {[
-              { label: '1h',  ms: 3600_000 },
-              { label: '6h',  ms: 6 * 3600_000 },
-              { label: '24h', ms: 24 * 3600_000 },
-              { label: '7d',  ms: 7 * 24 * 3600_000 },
-            ].map(({ label, ms }) => (
-              <button
-                key={label}
-                onClick={() => zoomWindow(ms)}
-                className={clsx(
-                  'text-[9px] px-1.5 py-0.5 rounded border transition-colors',
-                  timelineWindowMs === ms
-                    ? 'bg-surface-600 border-surface-500 text-surface-100'
-                    : 'bg-surface-800 border-surface-700 text-surface-500 hover:text-surface-200 hover:border-surface-600'
-                )}
-              >{label}</button>
-            ))}
-            <div className="w-px h-3 bg-surface-700 mx-1 self-center" />
-            <button
-              onClick={() => shiftWindow(-timelineWindowMs)}
-              title="Ventana anterior"
-              className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
-            >«</button>
-            <button
-              onClick={() => shiftWindow(-timelineWindowMs / 4)}
-              title="Retroceder un cuarto de ventana"
-              className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
-            >‹</button>
-            <button
-              onClick={() => shiftWindow(timelineWindowMs / 4)}
-              title="Avanzar un cuarto de ventana"
-              className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
-            >›</button>
-            <button
-              onClick={() => shiftWindow(timelineWindowMs)}
-              title="Ventana siguiente"
-              className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
-            >»</button>
-            {globalPlaybackTime && (
-              <>
-                <div className="w-px h-3 bg-surface-700 mx-1 self-center" />
-                <button
-                  onClick={() => setTimelineWindowCenter(globalPlaybackTime.getTime())}
-                  title="Centrar en el playhead"
-                  className="text-[9px] px-1.5 py-0.5 rounded border border-surface-700 bg-surface-800 text-surface-500 hover:text-surface-200 hover:border-surface-600 transition-colors"
-                >⊙ centrar</button>
-              </>
-            )}
-          </div>
           <RecordingTimeline
             recordings={recordings}
             assignedCameras={assignedCameras}
             selectedRec={activeRecording}
             windowStartMs={windowStartMs}
             windowEndMs={windowEndMs}
-            onSelectRecording={rec => startPreviewInSlotRef.current(activeSlotIndex, rec, globalPlaybackTime ?? new Date(rec.startTime))}
+            onSelectRecording={rec => {
+              // Route the recording to the slot showing its camera; fall back to
+              // the first empty slot, then the active slot.
+              const currentSlots = slotsRef.current
+              let si = currentSlots.findIndex(s => s.cameraId === rec.cameraId)
+              if (si < 0) si = currentSlots.findIndex(s => !s.cameraId)
+              if (si < 0) si = activeSlotIndex
+              console.info(`[recordings-ui] timeline_rec_selected recCameraId=${rec.cameraId} routedSlot=${si}`)
+              startPreviewInSlotRef.current(si, rec, new Date(rec.startTime))
+            }}
             globalTime={globalPlaybackTime}
             onPreviewTimeChange={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelinePreviewChange : undefined}
             onCommitSeekTime={recordings.length > 0 || assignedCameras.length > 0 ? handleTimelineCommit : undefined}
