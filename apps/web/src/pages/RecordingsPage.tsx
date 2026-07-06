@@ -164,6 +164,7 @@ export function RecordingsPage() {
   const previewRetriedRef     = useRef<{ [k: number]: boolean }>({})
   const recordingsRef         = useRef<RecordingWithCamera[]>([])
   const nextRecBySlotRef      = useRef<{ [k: number]: RecordingWithCamera | null }>({})
+  const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
 
   // Keep refs in sync
   useEffect(() => { slotsRef.current = slots }, [slots])
@@ -899,7 +900,7 @@ export function RecordingsPage() {
       const vid = videoRefs.current[slotIndex]
       if (!vid) return
 
-      const handleError = () => {
+      const handleError = async () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
         const mediaErr = vid.error
         console.error(
@@ -907,16 +908,42 @@ export function RecordingsPage() {
           ` code=${mediaErr?.code ?? 'none'} msg=${mediaErr?.message ?? 'none'}` +
           ` forceTranscode=${forceTranscode} alreadyRetried=${previewRetriedRef.current[slotIndex] ?? false}`
         )
-        // Auto-retry once with forceTranscode=true (transcodes HEVC → H.264 compatible)
-        if (!forceTranscode && !previewRetriedRef.current[slotIndex]) {
+
+        // Ask the backend what actually failed (FFmpeg stderr classification)
+        let category: string | null = null
+        let detail:   string | null = null
+        try {
+          const st = await apiGet<{ errorCategory: string | null; errorDetail: string | null }>(
+            `/recordings/preview/${sessionId}/status`, {}
+          )
+          category = st.errorCategory
+          detail   = st.errorDetail
+        } catch { /* session may already be gone */ }
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        console.info(`[recordings-ui] preview_error_category slot=${slotIndex} category=${category ?? 'unknown'} detail=${detail ?? ''}`)
+
+        const CATEGORY_MSG: Record<string, string> = {
+          RTSP_AUTH_OR_TRACK_DENIED: 'Canal/track no autorizado por el NVR (401)',
+          RTSP_TRACK_NOT_FOUND:      'Track de grabación no disponible en el NVR (404)',
+          NVR_OFFLINE_OR_TIMEOUT:    'El NVR no responde (timeout / conexión rechazada)',
+          RTSP_OPEN_FAILED:          'No se pudo abrir el RTSP de reproducción',
+          CODEC_UNSUPPORTED:         'Codec no soportado por el navegador',
+        }
+        const isCodecIssue = !category || category === 'CODEC_UNSUPPORTED' || category === 'UNKNOWN'
+
+        // Auto-retry with H.264 only when the failure is codec-related —
+        // transcoding can't fix auth/track/offline errors
+        if (isCodecIssue && !forceTranscode && !previewRetriedRef.current[slotIndex]) {
           previewRetriedRef.current[slotIndex] = true
           toast('Reintentando con H.264…', { duration: 5000 })
           startPreviewInSlotRef.current(slotIndex, rec, playheadTime, { forceTranscode: true })
           return
         }
         previewRetriedRef.current[slotIndex] = false
+        errorCategoryBySlotRef.current[slotIndex] = category
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
-          ...s, status: 'error', errorMsg: 'No se pudo reproducir el stream del NVR',
+          ...s, status: 'error',
+          errorMsg: (category && CATEGORY_MSG[category]) ?? 'No se pudo reproducir el stream del NVR',
         } : s))
       }
 
@@ -1462,36 +1489,42 @@ export function RecordingsPage() {
                       </div>
                     )}
 
-                    {slot.status === 'error' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
-                        <AlertTriangle size={18} className="text-red-500 flex-shrink-0" />
-                        <p className="text-[9px] text-surface-400 text-center line-clamp-2">
-                          {slot.errorMsg ?? 'Error desconocido'}
-                        </p>
-                        {slot.recording && (
-                          <div className="flex flex-col gap-1 items-center">
-                            <button
-                              onClick={e => {
-                                e.stopPropagation()
-                                startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime), { forceTranscode: true })
-                              }}
-                              className="text-[9px] px-2 py-0.5 rounded bg-brand-700/60 hover:bg-brand-600/70 border border-brand-600/50 text-brand-300 transition-colors"
-                            >
-                              Reintentar con H.264
-                            </button>
-                            <button
-                              onClick={e => {
-                                e.stopPropagation()
-                                startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime))
-                              }}
-                              className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-400 transition-colors"
-                            >
-                              Reintentar
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
+                    {slot.status === 'error' && (() => {
+                      const errCategory = errorCategoryBySlotRef.current[idx] ?? null
+                      const showH264 = !errCategory || errCategory === 'CODEC_UNSUPPORTED' || errCategory === 'UNKNOWN'
+                      return (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
+                          <AlertTriangle size={18} className="text-red-500 flex-shrink-0" />
+                          <p className="text-[9px] text-surface-400 text-center line-clamp-2">
+                            {slot.errorMsg ?? 'Error desconocido'}
+                          </p>
+                          {slot.recording && (
+                            <div className="flex flex-col gap-1 items-center">
+                              {showH264 && (
+                                <button
+                                  onClick={e => {
+                                    e.stopPropagation()
+                                    startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime), { forceTranscode: true })
+                                  }}
+                                  className="text-[9px] px-2 py-0.5 rounded bg-brand-700/60 hover:bg-brand-600/70 border border-brand-600/50 text-brand-300 transition-colors"
+                                >
+                                  Reintentar con H.264
+                                </button>
+                              )}
+                              <button
+                                onClick={e => {
+                                  e.stopPropagation()
+                                  startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime))
+                                }}
+                                className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-400 transition-colors"
+                              >
+                                Reintentar
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
                   </div>
                 )
               })}
