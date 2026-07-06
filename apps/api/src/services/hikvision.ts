@@ -1613,12 +1613,27 @@ export async function rebootDevice(nvr: NVR): Promise<boolean> {
 
 // ─── Buscar grabaciones ───────────────────────────────────────
 
-export async function searchRecordings(
-  nvr: NVR, channel: number, startTime: Date, endTime: Date
-): Promise<HikRecording[]> {
-  const client = createHikClient(nvr)
+// ─── ISAPI recording search — paginated ─────────────────────────────
+// Modeled on the official Hikvision WebSDK / KVision behavior:
+// - maxResults 1000 per page
+// - <searchResultPostion> (sic — the ISAPI schema really uses this typo;
+//   NVRs ignore the correctly-spelled variant, capping results at one page)
+// - loop while <responseStatusStrg> is MORE, advancing by items received
+// - time-chunk fallback if the NVR reports MORE but ignores the position
+
+const SEARCH_PAGE_SIZE = 1000
+const SEARCH_MAX_PAGES = 50
+
+interface SearchPage {
+  items:  HikRecording[]
+  status: string   // OK | MORE | NO MATCHES | ''
+}
+
+async function searchRecordingsPage(
+  nvr: NVR, channel: number, startTime: Date, endTime: Date, position: number
+): Promise<SearchPage> {
+  const client  = createHikClient(nvr, 15000)
   const trackID = channel * 100 + 1
-  const now = new Date()
   const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
 <CMSearchDescription xmlns="http://www.hikvision.com/ver20/XMLSchema">
   <searchID>${crypto.randomUUID()}</searchID>
@@ -1631,8 +1646,8 @@ export async function searchRecordings(
       <endTime>${endTime.toISOString().replace(/\.\d{3}Z$/, 'Z')}</endTime>
     </timeSpan>
   </timeSpanList>
-  <maxResults>200</maxResults>
-  <searchResultPosition>0</searchResultPosition>
+  <maxResults>${SEARCH_PAGE_SIZE}</maxResults>
+  <searchResultPostion>${position}</searchResultPostion>
   <metadataList>
     <metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>
   </metadataList>
@@ -1667,9 +1682,7 @@ export async function searchRecordings(
     throw err
   }
 
-  // Parse XML or JSON response
   if (typeof responseData === 'string') {
-    // Check for error status
     const statusCode = xmlGet(responseData, 'statusCode')
     if (statusCode && statusCode !== '1' && statusCode !== '200') {
       const statusStr = xmlGet(responseData, 'statusString')
@@ -1679,46 +1692,107 @@ export async function searchRecordings(
         throw e
       }
     }
+    const respStatus = (xmlGet(responseData, 'responseStatusStrg') || '').trim().toUpperCase()
 
-    const items = xmlGetAll(responseData, 'searchMatchItem')
-    if (items.length === 0) {
-      // Some firmware uses PascalCase
-      const itemsPascal = xmlGetAll(responseData, 'SearchMatchItem')
-      if (itemsPascal.length > 0) {
-        const parsed = itemsPascal.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
-        const withUri = parsed.filter(r => r.playbackURI).length
-        if (itemsPascal.length > 0 && withUri === 0) {
-          // Log first block snippet to confirm whether playbackURI tag is present in the XML
-          console.warn(`[hikvision] search ch=${channel} total=${itemsPascal.length} withPlaybackUri=0 first_block_snippet=${itemsPascal[0].slice(0, 400).replace(/\s+/g, ' ')}`)
-        }
-        return parsed
-      }
-      return []
-    }
-    const parsed = items.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, index))
+    let blocks = xmlGetAll(responseData, 'searchMatchItem')
+    if (blocks.length === 0) blocks = xmlGetAll(responseData, 'SearchMatchItem') // PascalCase firmware
+    const parsed = blocks.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, position + index))
     const withUri = parsed.filter(r => r.playbackURI).length
-    if (items.length > 0 && withUri === 0) {
-      // Log first block snippet to confirm whether playbackURI tag is present in the XML
-      console.warn(`[hikvision] search ch=${channel} total=${items.length} withPlaybackUri=0 first_block_snippet=${items[0].slice(0, 400).replace(/\s+/g, ' ')}`)
+    if (blocks.length > 0 && withUri === 0) {
+      console.warn(`[hikvision] search ch=${channel} total=${blocks.length} withPlaybackUri=0 first_block_snippet=${blocks[0].slice(0, 400).replace(/\s+/g, ' ')}`)
     }
-    return parsed
+    return { items: parsed, status: respStatus }
   }
 
   // JSON fallback (unlikely for ISAPI search but handle gracefully)
   const result = responseData?.CMSearchResult
-  if (!result) return []
+  if (!result) return { items: [], status: '' }
   const items = result?.matchList?.searchMatchItem ?? result?.matchList?.SearchMatchItem
-  if (!items) return []
+  if (!items) return { items: [], status: String(result?.responseStatusStrg ?? '') }
   const list = Array.isArray(items) ? items : [items]
-  return list.map((item: any, index: number) => ({
-    id:          `${nvr.id}_${channel}_${index}`,
-    channel,
-    startTime:   item.timeSpan?.startTime || '',
-    endTime:     item.timeSpan?.endTime || '',
-    size:        Number(item.mediaSegmentDescriptor?.contentLength || 0),
-    type:        item.mediaSegmentDescriptor?.contentType || 'video/mp4',
-    playbackURI: extractPlaybackPathQuery(item.mediaSegmentDescriptor?.playbackURI) || undefined,
-  }))
+  return {
+    status: String(result?.responseStatusStrg ?? '').toUpperCase(),
+    items: list.map((item: any, index: number) => ({
+      id:          `${nvr.id}_${channel}_${position + index}`,
+      channel,
+      startTime:   item.timeSpan?.startTime || '',
+      endTime:     item.timeSpan?.endTime || '',
+      size:        Number(item.mediaSegmentDescriptor?.contentLength || 0),
+      type:        item.mediaSegmentDescriptor?.contentType || 'video/mp4',
+      playbackURI: extractPlaybackPathQuery(item.mediaSegmentDescriptor?.playbackURI) || undefined,
+    })),
+  }
+}
+
+function recordingDedupeKey(r: HikRecording): string {
+  return `${r.startTime}|${r.endTime}|${r.playbackURI ?? ''}`
+}
+
+export async function searchRecordings(
+  nvr: NVR, channel: number, startTime: Date, endTime: Date
+): Promise<HikRecording[]> {
+  const seen = new Map<string, HikRecording>()
+  let position     = 0
+  let pages        = 0
+  let rawCount     = 0
+  let lastStatus   = ''
+  let stalledMore  = false
+
+  while (pages < SEARCH_MAX_PAGES) {
+    const page = await searchRecordingsPage(nvr, channel, startTime, endTime, position)
+    pages++
+    rawCount   += page.items.length
+    lastStatus  = page.status
+
+    let newItems = 0
+    for (const item of page.items) {
+      const key = recordingDedupeKey(item)
+      if (!seen.has(key)) { seen.set(key, item); newItems++ }
+    }
+    console.log(`[recordings] isapi_page nvrId=${nvr.id} ch=${channel} position=${position} count=${page.items.length} new=${newItems} status=${page.status || 'n/a'}`)
+
+    if (page.items.length === 0) break
+    if (page.status !== 'MORE') break
+    if (newItems === 0) {
+      // NVR reports MORE but repeats the same items — position tag ignored.
+      stalledMore = true
+      break
+    }
+    position += page.items.length
+    if (position > 100000) break
+  }
+
+  // Fallback: chunk by time when pagination stalled with results pending
+  if (stalledMore) {
+    const rangeMs  = endTime.getTime() - startTime.getTime()
+    const chunkMs  = rangeMs > 24 * 3600_000 ? 6 * 3600_000 : 2 * 3600_000
+    let chunkStart = startTime.getTime()
+    let chunks     = 0
+    while (chunkStart < endTime.getTime() && chunks < 64) {
+      const chunkEnd = Math.min(chunkStart + chunkMs, endTime.getTime())
+      try {
+        const page = await searchRecordingsPage(nvr, channel, new Date(chunkStart), new Date(chunkEnd), 0)
+        rawCount += page.items.length
+        let newItems = 0
+        for (const item of page.items) {
+          const key = recordingDedupeKey(item)
+          if (!seen.has(key)) { seen.set(key, item); newItems++ }
+        }
+        console.log(`[recordings] search_chunk nvrId=${nvr.id} ch=${channel} from=${new Date(chunkStart).toISOString()} to=${new Date(chunkEnd).toISOString()} count=${page.items.length} new=${newItems}`)
+      } catch (err: any) {
+        console.warn(`[recordings] search_chunk_error nvrId=${nvr.id} ch=${channel} from=${new Date(chunkStart).toISOString()} err=${err?.message}`)
+      }
+      chunkStart = chunkEnd
+      chunks++
+    }
+    console.log(`[recordings] search_merged nvrId=${nvr.id} ch=${channel} chunks=${chunks} raw=${rawCount} deduped=${seen.size}`)
+  }
+
+  const results = [...seen.values()].sort(
+    (a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime()
+  )
+  console.log(`[recordings] isapi_search_complete nvrId=${nvr.id} ch=${channel} pages=${pages} totalRaw=${rawCount} totalDeduped=${results.length} lastStatus=${lastStatus || 'n/a'} stalledMore=${stalledMore}`)
+  return results
 }
 
 /** Days of a month that have recordings for a channel — same ISAPI endpoint

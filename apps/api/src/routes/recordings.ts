@@ -354,6 +354,21 @@ interface PreviewSession {
   detectedCodec:   string
   canPlayHevcMp4:  boolean
   vodProcess?: ChildProcess
+  stderrTail?:     string[]
+  errorCategory?:  string
+  errorDetail?:    string
+}
+
+// Classify RTSP/FFmpeg failures into actionable categories so the frontend
+// can show the real cause instead of a generic "retry with H.264".
+function classifyRtspError(text: string): string {
+  const t = text.toLowerCase()
+  if (/401|unauthorized|credenciales/.test(t))                        return 'RTSP_AUTH_OR_TRACK_DENIED'
+  if (/404|not found|no encontrado/.test(t))                          return 'RTSP_TRACK_NOT_FOUND'
+  if (/connection refused|conexi.n rechazada|timed? ?out|timeout/.test(t)) return 'NVR_OFFLINE_OR_TIMEOUT'
+  if (/no supported streams|invalid data found|could not find codec/.test(t)) return 'CODEC_UNSUPPORTED'
+  if (/could not open|open context|error opening input/.test(t))      return 'RTSP_OPEN_FAILED'
+  return 'UNKNOWN'
 }
 
 const previewSessions = new Map<string, PreviewSession>()
@@ -390,6 +405,24 @@ function injectCredentialsIntoPlaybackUri(opts: {
   return {
     url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
     masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
+  }
+}
+
+// Rewrite the starttime in an NVR playbackURI so preview begins at the
+// requested playhead instead of the start of the recorded block. The NVR's
+// playbackURI carries starttime/endtime as YYYYMMDDTHHmmssZ query params.
+function rewritePlaybackUriStart(playbackURI: string, effectiveStart: Date): {
+  uri: string; rewritten: boolean; originalStart: string | null
+} {
+  const fmtTs = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const m = playbackURI.match(/([?&]starttime=)(\d{8}T\d{6}Z)/i)
+  if (!m) return { uri: playbackURI, rewritten: false, originalStart: null }
+  const newTs = fmtTs(effectiveStart)
+  if (m[2] === newTs) return { uri: playbackURI, rewritten: false, originalStart: m[2] }
+  return {
+    uri: playbackURI.replace(m[0], `${m[1]}${newTs}`),
+    rewritten: true,
+    originalStart: m[2],
   }
 }
 
@@ -1371,13 +1404,23 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     let urlStrategy: string
 
     if (body.playbackURI) {
+      // Rewrite starttime so preview begins at the requested playhead, not at
+      // the start of the recorded block the NVR embedded in playbackURI.
+      const rewrite = rewritePlaybackUriStart(body.playbackURI, new Date(body.startTime))
+      if (rewrite.rewritten) {
+        server.log.info(
+          `[recordings-time] playback_uri_rewritten cameraId=${body.cameraId}` +
+          ` originalStart=${rewrite.originalStart} effectiveStart=${body.startTime}` +
+          ` finalUri=${rewrite.uri.slice(0, 140)}`
+        )
+      }
       const injected = injectCredentialsIntoPlaybackUri({
-        playbackURI: body.playbackURI, username: camera.nvr.username,
+        playbackURI: rewrite.uri, username: camera.nvr.username,
         password: plainPass, ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort,
       })
       rtspUrl     = injected.url
       rtspMasked  = injected.masked
-      urlStrategy = 'nvr_playbackURI'
+      urlStrategy = rewrite.rewritten ? 'nvr_playbackURI_rewritten' : 'nvr_playbackURI'
     } else {
       const built = buildFallbackRecordingRtspUrl({
         username: camera.nvr.username, password: plainPass,
@@ -1394,6 +1437,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const canPlayHevcMp4   = body.canPlayHevcMp4 ?? false
     let detectedCodec      = 'unknown'
     let probeElapsedMs     = 0
+    let probeErrorCategory: string | undefined
+    let probeErrorDetail:   string | undefined
 
     // Check per-camera override first (set when a previous forceTranscode retry succeeded)
     const overrideStrategy = cameraPreviewStrategyOverride.get(body.cameraId)
@@ -1422,6 +1467,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         )
         if (probeResult.ok && probeResult.codec) {
           detectedCodec = probeResult.codec
+        } else if (!probeResult.ok && probeResult.error) {
+          probeErrorCategory = classifyRtspError(probeResult.error)
+          probeErrorDetail   = probeResult.error.slice(0, 300)
         }
       } catch {
         probeElapsedMs = Date.now() - probeStart
@@ -1462,6 +1510,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       rtspUrl, rtspMasked, cameraId: body.cameraId, slotIndex: body.slotIndex,
       startTime: body.startTime, endTime: body.endTime,
       forceTranscode, strategy, detectedCodec, canPlayHevcMp4,
+      // Probe failure (e.g. 401 on the playback track) — pre-seed the category
+      // so the frontend can show the real cause if the stream also fails
+      errorCategory: probeErrorCategory,
+      errorDetail:   probeErrorDetail,
     })
 
     AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
@@ -1528,9 +1580,17 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const proc = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
     session.vodProcess = proc
 
+    // Ring buffer of the last 30 stderr lines — used to classify failures
+    const stderrTail: string[] = []
+    session.stderrTail = stderrTail
     proc.stderr?.on('data', (chunk: Buffer) => {
-      const line = chunk.toString().trim()
-      if (line) server.log.debug(`[recordings-preview] ffmpeg_stderr sessionId=${sessionId} ${line.slice(0, 200)}`)
+      for (const raw of chunk.toString().split('\n')) {
+        const line = raw.trim()
+        if (!line) continue
+        stderrTail.push(line)
+        if (stderrTail.length > 30) stderrTail.shift()
+        server.log.debug(`[recordings-preview] ffmpeg_stderr sessionId=${sessionId} line=${line.slice(0, 200)}`)
+      }
     })
 
     // Hijack the raw TCP connection — bypass Fastify serialization entirely
@@ -1573,8 +1633,20 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       const elapsedMs = Date.now() - streamStartMs
       server.log.info(
         `[recordings-preview] ffmpeg_exit sessionId=${sessionId}` +
-        ` code=${code} elapsedMs=${elapsedMs}`
+        ` code=${code} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
       )
+      // Failure before any output → classify from stderr so the frontend
+      // can show the real cause (auth vs track vs codec vs offline)
+      if (code !== 0 && code !== null && !firstByteSent) {
+        const tail = (session.stderrTail ?? []).join('\n')
+        const category = classifyRtspError(tail)
+        session.errorCategory = category
+        session.errorDetail   = (session.stderrTail ?? []).slice(-5).join(' | ').slice(0, 400)
+        server.log.warn(
+          `[recordings-preview] ffmpeg_failed sessionId=${sessionId}` +
+          ` code=${code} category=${category} stderr_tail=${session.errorDetail}`
+        )
+      }
       if (session.vodProcess === proc) session.vodProcess = undefined
       try { res.end() } catch {}
     })
@@ -1584,11 +1656,31 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     })
   })
 
-  // DELETE /api/recordings/preview/:sessionId — Stop FFmpeg, remove session.
-  server.delete('/preview/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
+  // GET /api/recordings/preview/:sessionId/status — Error category after a
+  // failed stream, so the frontend can show the real cause.
+  server.get('/preview/:sessionId/status', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string }
     const session = previewSessions.get(sessionId)
     if (!session) return reply.status(404).send({ message: 'Sesión de preview no encontrada' })
+    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
+    return reply.send({
+      errorCategory: session.errorCategory ?? null,
+      errorDetail:   session.errorDetail ?? null,
+      strategy:      session.strategy,
+      detectedCodec: session.detectedCodec,
+    })
+  })
+
+  // DELETE /api/recordings/preview/:sessionId — Stop FFmpeg, remove session.
+  // Idempotent: deleting an unknown/expired/already-deleted session is OK.
+  server.delete('/preview/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string }
+    const session = previewSessions.get(sessionId)
+    if (!session) {
+      return reply.send({ ok: true, alreadyDeleted: true })
+    }
     if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
       return reply.status(403).send({ message: 'Sin permiso' })
     }

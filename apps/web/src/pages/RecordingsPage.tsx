@@ -164,6 +164,19 @@ export function RecordingsPage() {
   const previewRetriedRef     = useRef<{ [k: number]: boolean }>({})
   const recordingsRef         = useRef<RecordingWithCamera[]>([])
   const nextRecBySlotRef      = useRef<{ [k: number]: RecordingWithCamera | null }>({})
+  const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
+  // Sessions already deleted — avoids duplicate DELETE from error/ended/unmount/slot-change
+  const deletedSessionsRef    = useRef<Set<string>>(new Set())
+
+  const deleteSessionOnce = (sessionType: string | null, sessionId: string | null | undefined) => {
+    if (!sessionId) return
+    if (deletedSessionsRef.current.has(sessionId)) return
+    deletedSessionsRef.current.add(sessionId)
+    const ep = sessionType === 'preview'
+      ? `/recordings/preview/${sessionId}`
+      : `/recordings/playback/${sessionId}`
+    apiDelete(ep).catch(() => {})
+  }
 
   // Keep refs in sync
   useEffect(() => { slotsRef.current = slots }, [slots])
@@ -195,10 +208,7 @@ export function RecordingsPage() {
             videoCleanupRef.current[s.slotIndex] = null
           }
           if (s.sessionId) {
-            const ep = s.sessionType === 'preview'
-              ? `/recordings/preview/${s.sessionId}`
-              : `/recordings/playback/${s.sessionId}`
-            apiDelete(ep).catch(() => {})
+            deleteSessionOnce(s.sessionType, s.sessionId)
           }
         })
         return prev.slice(0, count)
@@ -216,10 +226,7 @@ export function RecordingsPage() {
       previewStartTimesRef.current[s.slotIndex] = null
       if (videoCleanupRef.current[s.slotIndex]) videoCleanupRef.current[s.slotIndex]!()
       if (s.sessionId) {
-        const ep = s.sessionType === 'preview'
-          ? `/recordings/preview/${s.sessionId}`
-          : `/recordings/playback/${s.sessionId}`
-        apiDelete(ep).catch(() => {})
+        deleteSessionOnce(s.sessionType, s.sessionId)
       }
     })
   }, [])
@@ -340,11 +347,18 @@ export function RecordingsPage() {
     if (vid) { vid.src = ''; vid.load() }
     const s = slotsRef.current[slotIndex]
     if (s?.sessionId) {
-      const ep = s.sessionType === 'preview'
-        ? `/recordings/preview/${s.sessionId}`
-        : `/recordings/playback/${s.sessionId}`
-      apiDelete(ep).catch(() => {})
+      deleteSessionOnce(s.sessionType, s.sessionId)
     }
+  }
+
+  // Close a single slot: stop its preview, free the camera, keep search
+  // results, timeline and other slots untouched.
+  const closeSlot = (slotIndex: number) => {
+    console.info(`[recordings-ui] slot_close slot=${slotIndex} cameraId=${slotsRef.current[slotIndex]?.cameraId ?? 'none'}`)
+    stopSlot(slotIndex)
+    nextRecBySlotRef.current[slotIndex] = null
+    errorCategoryBySlotRef.current[slotIndex] = null
+    setSlots(prev => prev.map((s, i) => i === slotIndex ? emptySlot(i) : s))
   }
 
   const clearAllPlayback = () => {
@@ -376,23 +390,36 @@ export function RecordingsPage() {
     console.info(`[recordings-ui] assigned_camera_added_to_search slot=${activeSlotIndex} cameraId=${cameraId}`)
     setSelectedCameras(prev => new Set([...prev, cameraId]))
 
+    // Move instead of duplicate: if this camera lives in another slot, free it
+    const previousSlot = slotsRef.current.findIndex(
+      (s, i) => s.cameraId === cameraId && i !== activeSlotIndex
+    )
+    if (previousSlot >= 0) {
+      console.info(`[recordings-ui] slot_assign_existing_moved from=${previousSlot} to=${activeSlotIndex} cameraId=${cameraId}`)
+      stopSlot(previousSlot)
+    }
+
     stopSlot(activeSlotIndex)
 
-    setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
-      ...s,
-      cameraId: cam.id,
-      cameraName: cam.name,
-      nvrId: cam.nvrId,
-      nvrName: nvrObj?.name ?? '',
-      recording: null,
-      status: 'idle',
-      playbackUrl: null,
-      sessionId: null,
-      downloadUrl: null,
-      errorMsg: null,
-      vodProgress: null,
-      mimeType: null,
-    } : s))
+    setSlots(prev => prev.map((s, i) => {
+      if (i === previousSlot) return emptySlot(i)
+      if (i !== activeSlotIndex) return s
+      return {
+        ...s,
+        cameraId: cam.id,
+        cameraName: cam.name,
+        nvrId: cam.nvrId,
+        nvrName: nvrObj?.name ?? '',
+        recording: null,
+        status: 'idle',
+        playbackUrl: null,
+        sessionId: null,
+        downloadUrl: null,
+        errorMsg: null,
+        vodProgress: null,
+        mimeType: null,
+      }
+    }))
 
     // If we already have recordings for this camera, auto-load via preview
     const camRecs = recordingsByCamera.get(cameraId)
@@ -601,10 +628,7 @@ export function RecordingsPage() {
     }
     const existingSlot = slotsRef.current[slotIndex]
     if (existingSlot?.sessionId) {
-      const ep = existingSlot.sessionType === 'preview'
-        ? `/recordings/preview/${existingSlot.sessionId}`
-        : `/recordings/playback/${existingSlot.sessionId}`
-      apiDelete(ep).catch(() => {})
+      deleteSessionOnce(existingSlot.sessionType, existingSlot.sessionId)
     }
     previewStartTimesRef.current[slotIndex] = null
     const vid0 = videoRefs.current[slotIndex]
@@ -656,7 +680,7 @@ export function RecordingsPage() {
       const handleEnded = () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
         const slot = slotsRef.current[slotIndex]
-        if (slot?.sessionId) apiDelete(`/recordings/playback/${slot.sessionId}`).catch(() => {})
+        if (slot?.sessionId) deleteSessionOnce(slot.sessionType, slot.sessionId)
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
           ...s, status: 'idle', sessionId: null,
         } : s))
@@ -855,10 +879,7 @@ export function RecordingsPage() {
     }
     const existing = slotsRef.current[slotIndex]
     if (existing?.sessionId) {
-      const ep = existing.sessionType === 'preview'
-        ? `/recordings/preview/${existing.sessionId}`
-        : `/recordings/playback/${existing.sessionId}`
-      apiDelete(ep).catch(() => {})
+      deleteSessionOnce(existing.sessionType, existing.sessionId)
     }
     const vid0 = videoRefs.current[slotIndex]
     if (vid0) { vid0.src = ''; vid0.load() }
@@ -899,7 +920,7 @@ export function RecordingsPage() {
       const vid = videoRefs.current[slotIndex]
       if (!vid) return
 
-      const handleError = () => {
+      const handleError = async () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
         const mediaErr = vid.error
         console.error(
@@ -907,16 +928,42 @@ export function RecordingsPage() {
           ` code=${mediaErr?.code ?? 'none'} msg=${mediaErr?.message ?? 'none'}` +
           ` forceTranscode=${forceTranscode} alreadyRetried=${previewRetriedRef.current[slotIndex] ?? false}`
         )
-        // Auto-retry once with forceTranscode=true (transcodes HEVC → H.264 compatible)
-        if (!forceTranscode && !previewRetriedRef.current[slotIndex]) {
+
+        // Ask the backend what actually failed (FFmpeg stderr classification)
+        let category: string | null = null
+        let detail:   string | null = null
+        try {
+          const st = await apiGet<{ errorCategory: string | null; errorDetail: string | null }>(
+            `/recordings/preview/${sessionId}/status`, {}
+          )
+          category = st.errorCategory
+          detail   = st.errorDetail
+        } catch { /* session may already be gone */ }
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        console.info(`[recordings-ui] preview_error_category slot=${slotIndex} category=${category ?? 'unknown'} detail=${detail ?? ''}`)
+
+        const CATEGORY_MSG: Record<string, string> = {
+          RTSP_AUTH_OR_TRACK_DENIED: 'Canal/track no autorizado por el NVR (401)',
+          RTSP_TRACK_NOT_FOUND:      'Track de grabación no disponible en el NVR (404)',
+          NVR_OFFLINE_OR_TIMEOUT:    'El NVR no responde (timeout / conexión rechazada)',
+          RTSP_OPEN_FAILED:          'No se pudo abrir el RTSP de reproducción',
+          CODEC_UNSUPPORTED:         'Codec no soportado por el navegador',
+        }
+        const isCodecIssue = !category || category === 'CODEC_UNSUPPORTED' || category === 'UNKNOWN'
+
+        // Auto-retry with H.264 only when the failure is codec-related —
+        // transcoding can't fix auth/track/offline errors
+        if (isCodecIssue && !forceTranscode && !previewRetriedRef.current[slotIndex]) {
           previewRetriedRef.current[slotIndex] = true
           toast('Reintentando con H.264…', { duration: 5000 })
           startPreviewInSlotRef.current(slotIndex, rec, playheadTime, { forceTranscode: true })
           return
         }
         previewRetriedRef.current[slotIndex] = false
+        errorCategoryBySlotRef.current[slotIndex] = category
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
-          ...s, status: 'error', errorMsg: 'No se pudo reproducir el stream del NVR',
+          ...s, status: 'error',
+          errorMsg: (category && CATEGORY_MSG[category]) ?? 'No se pudo reproducir el stream del NVR',
         } : s))
       }
 
@@ -928,7 +975,7 @@ export function RecordingsPage() {
           ? previewStart + (vid.currentTime * 1000)
           : new Date(rec.endTime).getTime()
 
-        apiDelete(`/recordings/preview/${sessionId}`).catch(() => {})
+        deleteSessionOnce('preview', sessionId)
 
         // Find the next recording for this camera within 3s of where we just ended
         const CONTINUITY_GAP_MS = 3_000
@@ -1393,6 +1440,25 @@ export function RecordingsPage() {
                       {slot.status === 'ready' && (
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-green-700/60 text-green-300">● Play</span>
                       )}
+                      {slot.status === 'loading' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-300">Cargando…</span>
+                      )}
+                      {slot.status === 'error' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-red-900/70 text-red-300">Error</span>
+                      )}
+                      {slot.status === 'no_recording' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-400">Sin grabación</span>
+                      )}
+                      <span className="flex-1" />
+                      {slot.cameraId && (
+                        <button
+                          onClick={e => { e.stopPropagation(); closeSlot(idx) }}
+                          title="Cerrar cámara de este canal"
+                          className="pointer-events-auto flex-shrink-0 p-0.5 rounded text-surface-400 hover:text-red-400 hover:bg-black/60 transition-colors"
+                        >
+                          <XCircle size={12} />
+                        </button>
+                      )}
                     </div>
 
                     {/* Video element — always rendered, shown only when ready */}
@@ -1462,36 +1528,42 @@ export function RecordingsPage() {
                       </div>
                     )}
 
-                    {slot.status === 'error' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
-                        <AlertTriangle size={18} className="text-red-500 flex-shrink-0" />
-                        <p className="text-[9px] text-surface-400 text-center line-clamp-2">
-                          {slot.errorMsg ?? 'Error desconocido'}
-                        </p>
-                        {slot.recording && (
-                          <div className="flex flex-col gap-1 items-center">
-                            <button
-                              onClick={e => {
-                                e.stopPropagation()
-                                startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime), { forceTranscode: true })
-                              }}
-                              className="text-[9px] px-2 py-0.5 rounded bg-brand-700/60 hover:bg-brand-600/70 border border-brand-600/50 text-brand-300 transition-colors"
-                            >
-                              Reintentar con H.264
-                            </button>
-                            <button
-                              onClick={e => {
-                                e.stopPropagation()
-                                startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime))
-                              }}
-                              className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-400 transition-colors"
-                            >
-                              Reintentar
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
+                    {slot.status === 'error' && (() => {
+                      const errCategory = errorCategoryBySlotRef.current[idx] ?? null
+                      const showH264 = !errCategory || errCategory === 'CODEC_UNSUPPORTED' || errCategory === 'UNKNOWN'
+                      return (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
+                          <AlertTriangle size={18} className="text-red-500 flex-shrink-0" />
+                          <p className="text-[9px] text-surface-400 text-center line-clamp-2">
+                            {slot.errorMsg ?? 'Error desconocido'}
+                          </p>
+                          {slot.recording && (
+                            <div className="flex flex-col gap-1 items-center">
+                              {showH264 && (
+                                <button
+                                  onClick={e => {
+                                    e.stopPropagation()
+                                    startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime), { forceTranscode: true })
+                                  }}
+                                  className="text-[9px] px-2 py-0.5 rounded bg-brand-700/60 hover:bg-brand-600/70 border border-brand-600/50 text-brand-300 transition-colors"
+                                >
+                                  Reintentar con H.264
+                                </button>
+                              )}
+                              <button
+                                onClick={e => {
+                                  e.stopPropagation()
+                                  startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime))
+                                }}
+                                className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-400 transition-colors"
+                              >
+                                Reintentar
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
                   </div>
                 )
               })}
