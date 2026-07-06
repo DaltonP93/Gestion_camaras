@@ -971,21 +971,29 @@ export function RecordingsPage() {
           ` forceTranscode=${forceTranscode} alreadyRetried=${previewRetriedRef.current[slotIndex] ?? false}`
         )
 
-        // Ask the backend what actually failed (FFmpeg stderr classification)
+        // Ask the backend what actually failed (FFmpeg stderr classification).
+        // Retry once after a short delay: the FFmpeg exit that produces the
+        // category can land milliseconds after the video element errors.
         let category: string | null = null
         let detail:   string | null = null
-        try {
-          const st = await apiGet<{ errorCategory: string | null; errorDetail: string | null }>(
-            `/recordings/preview/${sessionId}/status`, {}
-          )
-          category = st.errorCategory
-          detail   = st.errorDetail
-        } catch { /* session may already be gone */ }
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const st = await apiGet<{
+              category?: string | null; detail?: string | null
+              errorCategory?: string | null; errorDetail?: string | null
+            }>(`/recordings/preview/${sessionId}/status`, {})
+            category = st.category ?? st.errorCategory ?? null
+            detail   = st.detail ?? st.errorDetail ?? null
+            console.info(`[recordings-ui] preview_status_loaded slot=${slotIndex} sessionId=${sessionId} category=${category ?? 'none'}`)
+            if (category) break
+          } catch { /* retained record may not exist yet */ }
+          if (attempt === 0) await new Promise(r => setTimeout(r, 700))
+        }
         if (slotKeysRef.current[slotIndex] !== myKey) return
         console.info(`[recordings-ui] preview_error_category slot=${slotIndex} category=${category ?? 'unknown'} detail=${detail ?? ''}`)
 
         const CATEGORY_MSG: Record<string, string> = {
-          NVR_BANDWIDTH_OR_SESSION_LIMIT: 'El NVR no permite más reproducciones simultáneas. Cerrá otro slot o reintentá secuencialmente.',
+          NVR_BANDWIDTH_OR_SESSION_LIMIT: 'El NVR rechazó la reproducción por límite de sesiones/ancho de banda. Cerrá otras vistas en vivo o probá una sola cámara.',
           RTSP_AUTH_OR_TRACK_DENIED:      'Canal/track no autorizado por el NVR.',
           RTSP_TRACK_NOT_FOUND:           'Track de grabación no disponible.',
           NVR_OFFLINE_OR_TIMEOUT:         'El NVR no responde (timeout / conexión rechazada).',
@@ -1006,6 +1014,7 @@ export function RecordingsPage() {
         }
         previewRetriedRef.current[slotIndex] = false
         errorCategoryBySlotRef.current[slotIndex] = category
+        console.info(`[recordings-ui] preview_error_rendered slot=${slotIndex} category=${category ?? 'unknown'} showH264Retry=${isCodecIssue}`)
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
           ...s, status: 'error',
           errorMsg: (category && CATEGORY_MSG[category]) ?? 'No se pudo reproducir el stream del NVR',
