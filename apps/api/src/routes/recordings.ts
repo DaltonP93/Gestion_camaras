@@ -393,6 +393,24 @@ function injectCredentialsIntoPlaybackUri(opts: {
   }
 }
 
+// Rewrite the starttime in an NVR playbackURI so preview begins at the
+// requested playhead instead of the start of the recorded block. The NVR's
+// playbackURI carries starttime/endtime as YYYYMMDDTHHmmssZ query params.
+function rewritePlaybackUriStart(playbackURI: string, effectiveStart: Date): {
+  uri: string; rewritten: boolean; originalStart: string | null
+} {
+  const fmtTs = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const m = playbackURI.match(/([?&]starttime=)(\d{8}T\d{6}Z)/i)
+  if (!m) return { uri: playbackURI, rewritten: false, originalStart: null }
+  const newTs = fmtTs(effectiveStart)
+  if (m[2] === newTs) return { uri: playbackURI, rewritten: false, originalStart: m[2] }
+  return {
+    uri: playbackURI.replace(m[0], `${m[1]}${newTs}`),
+    rewritten: true,
+    originalStart: m[2],
+  }
+}
+
 function buildFallbackRecordingRtspUrl(opts: {
   username:  string
   password:  string
@@ -1371,13 +1389,23 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     let urlStrategy: string
 
     if (body.playbackURI) {
+      // Rewrite starttime so preview begins at the requested playhead, not at
+      // the start of the recorded block the NVR embedded in playbackURI.
+      const rewrite = rewritePlaybackUriStart(body.playbackURI, new Date(body.startTime))
+      if (rewrite.rewritten) {
+        server.log.info(
+          `[recordings-time] playback_uri_rewritten cameraId=${body.cameraId}` +
+          ` originalStart=${rewrite.originalStart} effectiveStart=${body.startTime}` +
+          ` finalUri=${rewrite.uri.slice(0, 140)}`
+        )
+      }
       const injected = injectCredentialsIntoPlaybackUri({
-        playbackURI: body.playbackURI, username: camera.nvr.username,
+        playbackURI: rewrite.uri, username: camera.nvr.username,
         password: plainPass, ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort,
       })
       rtspUrl     = injected.url
       rtspMasked  = injected.masked
-      urlStrategy = 'nvr_playbackURI'
+      urlStrategy = rewrite.rewritten ? 'nvr_playbackURI_rewritten' : 'nvr_playbackURI'
     } else {
       const built = buildFallbackRecordingRtspUrl({
         username: camera.nvr.username, password: plainPass,
