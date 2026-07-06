@@ -432,15 +432,20 @@ function getNvrPreviewState(nvrId: string): NvrPreviewState {
 }
 
 /** Wait for a free preview slot on this NVR (bounded), enforce stagger, and
- *  return a release function. After the wait cap, proceeds anyway so a stuck
- *  queue can never freeze playback entirely. */
+ *  return a release function — or null when the wait cap expires with the
+ *  slot still busy. Returning null (instead of opening an extra FFmpeg)
+ *  guarantees MAX_PREVIEW_PER_NVR is a hard limit. */
 async function acquireNvrPreviewSlot(
   nvrId: string, slotIndex: number, log: (msg: string) => void
-): Promise<() => void> {
+): Promise<(() => void) | null> {
   const st = getNvrPreviewState(nvrId)
   const waitStart = Date.now()
 
-  while (st.active >= MAX_PREVIEW_PER_NVR && Date.now() - waitStart < PREVIEW_QUEUE_WAIT_MAX_MS) {
+  while (st.active >= MAX_PREVIEW_PER_NVR) {
+    if (Date.now() - waitStart >= PREVIEW_QUEUE_WAIT_MAX_MS) {
+      log(`[recordings-preview] nvr_preview_queue_timeout nvrId=${nvrId} slot=${slotIndex} active=${st.active} waitedMs=${Date.now() - waitStart}`)
+      return null
+    }
     log(`[recordings-preview] nvr_preview_queue nvrId=${nvrId} slot=${slotIndex} queued=${st.queue.length + 1} active=${st.active}`)
     await new Promise<void>(resolve => {
       st.queue.push(resolve)
@@ -1682,6 +1687,20 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const releaseNvrSlot = await acquireNvrPreviewSlot(
       session.nvrId, session.slotIndex, (msg) => server.log.info(msg)
     )
+
+    if (!releaseNvrSlot) {
+      // Hard limit: never open an extra FFmpeg against a saturated NVR.
+      // Record the category so the frontend shows the session-limit message.
+      session.errorCategory = 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
+      session.errorDetail   = `Cola de previews del NVR llena (max=${MAX_PREVIEW_PER_NVR}) — timeout de ${PREVIEW_QUEUE_WAIT_MAX_MS}ms`
+      session.hadFirstByte  = false
+      retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+      server.log.warn(
+        `[recordings-preview] nvr_preview_rejected_453 nvrId=${session.nvrId}` +
+        ` cameraId=${session.cameraId} slot=${session.slotIndex} reason=queue_timeout`
+      )
+      return reply.status(503).send({ message: 'El NVR no tiene sesiones de reproducción libres' })
+    }
 
     // Session may have been deleted while waiting in the queue
     if (!previewSessions.has(sessionId)) {
