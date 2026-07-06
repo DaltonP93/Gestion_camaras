@@ -137,14 +137,17 @@ export function RecordingCameraTree({
                   </span>
                 </button>
 
-                {/* Camera items */}
+                {/* Camera items — checkbox selects for search; row click assigns/moves to active slot */}
                 {isOpen && cams.map(cam => {
                   const selected = selectedCameras.has(cam.id)
                   return (
                     <button
                       key={cam.id}
-                      onClick={() => { onToggleCamera(cam.id); onAssignCamera?.(cam.id) }}
-                      title={onAssignCamera ? 'Clic para seleccionar y asignar al slot activo' : cam.name}
+                      onClick={() => {
+                        if (onAssignCamera) onAssignCamera(cam.id)
+                        else onToggleCamera(cam.id)
+                      }}
+                      title={onAssignCamera ? 'Clic: asignar/mover al slot activo · Casilla: incluir en búsqueda' : cam.name}
                       className={clsx(
                         'w-full flex items-center gap-2 pl-6 pr-3 py-1.5 text-left transition-colors border-b border-surface-800/40',
                         selected
@@ -152,10 +155,16 @@ export function RecordingCameraTree({
                           : 'hover:bg-surface-700/30'
                       )}
                     >
-                      {selected
-                        ? <CheckSquare size={12} className="text-brand-400 flex-shrink-0" />
-                        : <Square size={12} className="text-surface-600 flex-shrink-0" />
-                      }
+                      <span
+                        onClick={e => { e.stopPropagation(); onToggleCamera(cam.id) }}
+                        title={selected ? 'Quitar de la búsqueda' : 'Incluir en la búsqueda'}
+                        className="flex-shrink-0"
+                      >
+                        {selected
+                          ? <CheckSquare size={12} className="text-brand-400" />
+                          : <Square size={12} className="text-surface-600" />
+                        }
+                      </span>
                       <span className={clsx(
                         'text-xs truncate flex-1',
                         selected ? 'text-surface-100' : 'text-surface-400'

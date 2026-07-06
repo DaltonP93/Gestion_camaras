@@ -167,6 +167,9 @@ export function RecordingsPage() {
   const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
   // Sessions already deleted — avoids duplicate DELETE from error/ended/unmount/slot-change
   const deletedSessionsRef    = useRef<Set<string>>(new Set())
+  // Cameras manually closed (slot X / unchecked) — blocked from autostart
+  // until the user selects or assigns them again
+  const closedCamerasRef      = useRef<Set<string>>(new Set())
 
   const deleteSessionOnce = (sessionType: string | null, sessionId: string | null | undefined) => {
     if (!sessionId) return
@@ -291,6 +294,8 @@ export function RecordingsPage() {
     slotsRef.current.forEach(slot => {
       if (!slot.cameraId) return
       if (slot.status !== 'no_recording' && slot.status !== 'idle') return
+      // Manually closed cameras never autostart until re-selected/assigned
+      if (closedCamerasRef.current.has(slot.cameraId)) return
 
       // Debounce: don't retry the same slot more than once every 5 s
       const lastAttempt = autoStartLockRef.current[slot.slotIndex] ?? 0
@@ -313,12 +318,35 @@ export function RecordingsPage() {
   }, [globalPlaybackTime, globalPlaying])
 
   // ── Camera selection helpers ───────────────────────────────────────────────
-  const toggleCamera = (cameraId: string) =>
+  const toggleCamera = (cameraId: string) => {
+    const isDeselecting = selectedCameras.has(cameraId)
+    if (isDeselecting) {
+      // Deselecting also closes any slot showing this camera and hides its
+      // timeline rows (results stay in memory — re-selecting restores them)
+      const closedSlots: number[] = []
+      slotsRef.current.forEach(s => {
+        if (s.cameraId === cameraId) {
+          closedSlots.push(s.slotIndex)
+          stopSlot(s.slotIndex)
+          nextRecBySlotRef.current[s.slotIndex] = null
+          errorCategoryBySlotRef.current[s.slotIndex] = null
+          previewRetriedRef.current[s.slotIndex] = false
+        }
+      })
+      if (closedSlots.length > 0) {
+        setSlots(prev => prev.map((s, i) => closedSlots.includes(i) ? emptySlot(i) : s))
+      }
+      closedCamerasRef.current.add(cameraId)
+      console.info(`[recordings-ui] camera_unselected cameraId=${cameraId} closedSlots=${closedSlots.join(',') || 'none'}`)
+    } else {
+      closedCamerasRef.current.delete(cameraId)
+    }
     setSelectedCameras(prev => {
       const next = new Set(prev)
       next.has(cameraId) ? next.delete(cameraId) : next.add(cameraId)
       return next
     })
+  }
 
   const toggleNVR = (nvrId: string) => {
     const ids = cameras.filter(c => c.nvrId === nvrId).map(c => c.id)
@@ -351,13 +379,26 @@ export function RecordingsPage() {
     }
   }
 
-  // Close a single slot: stop its preview, free the camera, keep search
-  // results, timeline and other slots untouched.
+  // Close a single slot: stop its preview, free the camera, remove it from
+  // the search selection (so it leaves the visible timeline) and block
+  // autostart until the user selects/assigns it again. Search results stay
+  // in memory; other slots are untouched.
   const closeSlot = (slotIndex: number) => {
-    console.info(`[recordings-ui] slot_close slot=${slotIndex} cameraId=${slotsRef.current[slotIndex]?.cameraId ?? 'none'}`)
+    const cameraId = slotsRef.current[slotIndex]?.cameraId ?? null
+    console.info(`[recordings-ui] slot_close slot=${slotIndex} cameraId=${cameraId ?? 'none'} removeFromSelection=true`)
     stopSlot(slotIndex)
     nextRecBySlotRef.current[slotIndex] = null
     errorCategoryBySlotRef.current[slotIndex] = null
+    previewRetriedRef.current[slotIndex] = false
+    if (cameraId) {
+      closedCamerasRef.current.add(cameraId)
+      setSelectedCameras(prev => {
+        if (!prev.has(cameraId)) return prev
+        const next = new Set(prev)
+        next.delete(cameraId)
+        return next
+      })
+    }
     setSlots(prev => prev.map((s, i) => i === slotIndex ? emptySlot(i) : s))
   }
 
@@ -388,6 +429,7 @@ export function RecordingsPage() {
 
     console.info(`[recordings-ui] slot_camera_assigned slot=${activeSlotIndex} cameraId=${cameraId} cameraName=${cam.name} source=single_click`)
     console.info(`[recordings-ui] assigned_camera_added_to_search slot=${activeSlotIndex} cameraId=${cameraId}`)
+    closedCamerasRef.current.delete(cameraId)
     setSelectedCameras(prev => new Set([...prev, cameraId]))
 
     // Move instead of duplicate: if this camera lives in another slot, free it
@@ -980,6 +1022,9 @@ export function RecordingsPage() {
 
         deleteSessionOnce('preview', sessionId)
 
+        // Camera manually closed while playing — don't chain into the next clip
+        if (closedCamerasRef.current.has(rec.cameraId)) return
+
         // Find the next recording for this camera within 3s of where we just ended
         const CONTINUITY_GAP_MS = 3_000
         const allRecs = recordingsRef.current
@@ -1306,6 +1351,14 @@ export function RecordingsPage() {
     [slots]
   )
 
+  // Timeline shows only visible cameras: selected ∪ assigned to slots.
+  // Closing/deselecting a camera hides its rows; results stay in memory.
+  const visibleRecordings = useMemo(() => {
+    const visible = new Set(selectedCameras)
+    slots.forEach(s => { if (s.cameraId) visible.add(s.cameraId) })
+    return recordings.filter(r => visible.has(r.cameraId))
+  }, [recordings, selectedCameras, slots])
+
   // Camera for the recording-days calendar: the single selected camera,
   // else the active slot's camera
   const availabilityCameraId = selectedCameras.size === 1
@@ -1579,7 +1632,7 @@ export function RecordingsPage() {
         {/* ── Timeline ──────────────────────────────────────────────────── */}
         <div className="flex-shrink-0 border-t border-surface-700 bg-surface-900">
           <RecordingTimeline
-            recordings={recordings}
+            recordings={visibleRecordings}
             assignedCameras={assignedCameras}
             selectedRec={activeRecording}
             windowStartMs={windowStartMs}
