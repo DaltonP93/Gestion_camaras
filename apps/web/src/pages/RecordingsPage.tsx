@@ -103,6 +103,10 @@ function formatSize(bytes: number) {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+// Continuity tuning — overridable at build time via Vite env
+const CONTINUITY_GAP_MS        = Number(import.meta.env.VITE_RECORDINGS_CONTINUITY_GAP_MS)        || 5_000
+const MIN_PREVIEW_DURATION_MS  = Number(import.meta.env.VITE_RECORDINGS_MIN_PREVIEW_DURATION_MS)  || 3_000
+
 const POLL_INTERVAL_MS     = 1_000
 const POLL_ABSOLUTE_MAX_MS = 15 * 60 * 1_000
 const POLL_STALL_MS        = 45_000
@@ -165,6 +169,7 @@ export function RecordingsPage() {
   const recordingsRef         = useRef<RecordingWithCamera[]>([])
   const nextRecBySlotRef      = useRef<{ [k: number]: RecordingWithCamera | null }>({})
   const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
+  const errorDetailBySlotRef   = useRef<{ [k: number]: string | null }>({})
   // Sessions already deleted — avoids duplicate DELETE from error/ended/unmount/slot-change
   const deletedSessionsRef    = useRef<Set<string>>(new Set())
   // Cameras manually closed (slot X / unchecked) — blocked from autostart
@@ -342,9 +347,9 @@ export function RecordingsPage() {
       }
       closedCamerasRef.current.add(cameraId)
       closedSlots.forEach(si =>
-        console.info(`[recordings-ui] camera_unselected_closed_slot cameraId=${cameraId} slot=${si}`)
+        console.info(`[recordings-ui] camera_unselected_close_slot cameraId=${cameraId} slot=${si}`)
       )
-      console.info(`[recordings-ui] camera_unselected cameraId=${cameraId} closedSlots=${closedSlots.join(',') || 'none'}`)
+      console.info(`[recordings-ui] checkbox_unselected cameraId=${cameraId} closedSlots=${closedSlots.join(',') || 'none'}`)
     } else {
       closedCamerasRef.current.delete(cameraId)
       // Incremental search: an active range exists → fetch just this camera
@@ -366,11 +371,11 @@ export function RecordingsPage() {
     if (!range) return
     const key = `${cameraId}|${range.start}|${range.end}`
     if (searchedKeysRef.current.has(key)) {
-      console.info(`[recordings-ui] camera_results_cached cameraId=${cameraId}`)
+      console.info(`[recordings-ui] incremental_search_cache_hit cameraId=${cameraId}`)
       return
     }
     searchedKeysRef.current.add(key)
-    console.info(`[recordings-ui] camera_selected_incremental_search cameraId=${cameraId} start=${range.start} end=${range.end}`)
+    console.info(`[recordings-ui] incremental_search_start cameraId=${cameraId} from=${range.start} to=${range.end}`)
     const cam = cameras.find(c => c.id === cameraId)
     apiGet<{ recordings: Recording[] }>('/recordings/search', {
       cameraId, startTime: range.start, endTime: range.end,
@@ -382,6 +387,7 @@ export function RecordingsPage() {
           cameraName: cam?.name || 'Desconocida',
           nvrName:    cam?.nvr?.name || '',
         }))
+        console.info(`[recordings-ui] incremental_search_done cameraId=${cameraId} count=${mapped.length}`)
         setRecordings(prev => {
           const existing = new Set(prev.map(r => `${r.cameraId}|${r.id}`))
           const fresh = mapped.filter(r => !existing.has(`${r.cameraId}|${r.id}`))
@@ -429,26 +435,16 @@ export function RecordingsPage() {
     }
   }
 
-  // Close a single slot: stop its preview, free the camera, remove it from
-  // the search selection (so it leaves the visible timeline) and block
-  // autostart until the user selects/assigns it again. Search results stay
-  // in memory; other slots are untouched.
+  // Close a single slot: stops ONLY the video of that slot. The camera stays
+  // selected, its timeline rows stay visible and the search cache is kept —
+  // matching iVMS semantics (X = close video, checkbox = remove camera).
   const closeSlot = (slotIndex: number) => {
     const cameraId = slotsRef.current[slotIndex]?.cameraId ?? null
-    console.info(`[recordings-ui] slot_close slot=${slotIndex} cameraId=${cameraId ?? 'none'} removeFromSelection=true`)
+    console.info(`[recordings-ui] slot_closed_video_only slot=${slotIndex} cameraId=${cameraId ?? 'none'}`)
     stopSlot(slotIndex)
     nextRecBySlotRef.current[slotIndex] = null
     errorCategoryBySlotRef.current[slotIndex] = null
     previewRetriedRef.current[slotIndex] = false
-    if (cameraId) {
-      closedCamerasRef.current.add(cameraId)
-      setSelectedCameras(prev => {
-        if (!prev.has(cameraId)) return prev
-        const next = new Set(prev)
-        next.delete(cameraId)
-        return next
-      })
-    }
     setSlots(prev => prev.map((s, i) => i === slotIndex ? emptySlot(i) : s))
   }
 
@@ -952,6 +948,25 @@ export function RecordingsPage() {
     const effectiveMs   = Math.max(recStartMs, Math.min(playheadMs, recEndMs - 1000))
     const effectiveStart = new Date(effectiveMs).toISOString()
 
+    // Never open a preview shorter than MIN_PREVIEW_DURATION_MS — the playhead
+    // is at the tail of this block, so jump straight to the next block instead
+    const remainingMs = recEndMs - effectiveMs
+    if (remainingMs < MIN_PREVIEW_DURATION_MS) {
+      console.info(`[recordings-ui] continuity_skip_short_clip slot=${slotIndex} durationMs=${remainingMs} recId=${rec.id}`)
+      const next = recordingsRef.current
+        .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > effectiveMs)
+        .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
+      if (next && next.id !== rec.id) {
+        startPreviewInSlotRef.current(slotIndex, next, new Date(next.startTime), opts)
+        return
+      }
+      nextRecBySlotRef.current[slotIndex] = null
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s, status: 'no_recording', sessionId: null, sessionType: null, errorMsg: null,
+      } : s))
+      return
+    }
+
     const videoEl = videoRefs.current[slotIndex] ?? document.createElement('video')
     const canPlayHevcMp4 = !forceTranscode && (
       videoEl.canPlayType('video/mp4; codecs="hvc1"') !== '' ||
@@ -1070,6 +1085,7 @@ export function RecordingsPage() {
         }
         previewRetriedRef.current[slotIndex] = false
         errorCategoryBySlotRef.current[slotIndex] = category
+        errorDetailBySlotRef.current[slotIndex]   = detail
         console.info(`[recordings-ui] preview_error_rendered slot=${slotIndex} category=${category ?? 'unknown'} showH264Retry=${isCodecIssue}`)
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
           ...s, status: 'error',
@@ -1090,22 +1106,24 @@ export function RecordingsPage() {
         // Camera manually closed while playing — don't chain into the next clip
         if (closedCamerasRef.current.has(rec.cameraId)) return
 
-        // Find the next recording for this camera within 3s of where we just ended
-        const CONTINUITY_GAP_MS = 3_000
-        const allRecs = recordingsRef.current
-        const nextRec = allRecs
-          .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > endedAtMs - 500)
+        // Continuity is driven by recording METADATA, not by invented ranges:
+        // find the next block of this camera after the current one and start
+        // it from ITS OWN startTime (never from currentRecording.endTime)
+        const currentStartMs = new Date(rec.startTime).getTime()
+        const currentEndMs   = new Date(rec.endTime).getTime()
+        const nextRec = recordingsRef.current
+          .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > currentStartMs && r.id !== rec.id)
           .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
 
         if (nextRec) {
           const nextStartMs = new Date(nextRec.startTime).getTime()
-          const gap = nextStartMs - endedAtMs
+          const gap = nextStartMs - currentEndMs
           console.info(
-            `[recordings-ui] clip_ended_continuity slot=${slotIndex} endedAt=${new Date(endedAtMs).toISOString()}` +
-            ` nextRec=${nextRec.id} nextStart=${nextRec.startTime} gapMs=${gap}`
+            `[recordings-ui] continuity_next_clip slot=${slotIndex}` +
+            ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime} gapMs=${gap}`
           )
           if (gap <= CONTINUITY_GAP_MS) {
-            // Auto-load next clip seamlessly
+            // Contiguous (or near) block — play it from its own start
             startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs))
             return
           }
@@ -1113,8 +1131,8 @@ export function RecordingsPage() {
 
         // Gap too large or no next recording — show no_recording overlay with skip button
         console.info(
-          `[recordings-ui] clip_ended_no_continuity slot=${slotIndex}` +
-          ` endedAt=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
+          `[recordings-ui] no_recording_at_playhead slot=${slotIndex}` +
+          ` playhead=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
         )
         // Stash next rec so the overlay can offer a skip button
         nextRecBySlotRef.current[slotIndex] = nextRec
@@ -1688,6 +1706,17 @@ export function RecordingsPage() {
                               >
                                 {retryLabel}
                               </button>
+                              {(!errCategory || errCategory === 'UNKNOWN') && errorDetailBySlotRef.current[idx] && (
+                                <button
+                                  onClick={e => {
+                                    e.stopPropagation()
+                                    toast(errorDetailBySlotRef.current[idx] ?? '', { duration: 10000 })
+                                  }}
+                                  className="text-[9px] px-2 py-0.5 rounded bg-surface-800 hover:bg-surface-700 border border-surface-700 text-surface-500 transition-colors"
+                                >
+                                  Detalles
+                                </button>
+                              )}
                             </div>
                           )}
                         </div>

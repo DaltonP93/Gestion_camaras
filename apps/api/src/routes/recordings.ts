@@ -418,6 +418,10 @@ const previewSessions = new Map<string, PreviewSession>()
 // Hikvision NVRs cap simultaneous playback sessions/bandwidth and answer
 // "453 Not Enough Bandwidth" when exceeded. Serialize preview starts per NVR
 // and stagger them so 2x2 grids don't burst-open sessions.
+// ffprobe before preview costs one extra RTSP DESCRIBE per start — disabled
+// by default to minimize 453 Not Enough Bandwidth on session-limited NVRs.
+const PREVIEW_PROBE_ENABLED = process.env.RECORDINGS_PREVIEW_PROBE === 'true'
+
 const MAX_PREVIEW_PER_NVR = Math.max(1, parseInt(process.env.RECORDINGS_MAX_PREVIEW_PER_NVR || '1', 10) || 1)
 const PREVIEW_START_STAGGER_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVIEW_START_STAGGER_MS || '1200', 10) || 1200)
 const PREVIEW_QUEUE_WAIT_MAX_MS = 30_000
@@ -474,6 +478,11 @@ async function acquireNvrPreviewSlot(
     if (next) next()
   }
 }
+
+// Cameras whose full playbackURI variant failed but no_name_size worked —
+// next previews start directly with the working variant (one less failed
+// RTSP attempt against the NVR).
+const previewVariantPreferenceByCamera = new Map<string, 'no_name_size'>()
 
 // Strip name/size params from a playback RTSP URL — some NVR firmwares
 // reject the full variant under load but accept the plain time-range form.
@@ -1546,7 +1555,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       urlStrategy = 'fallback_timestamps'
     }
 
-    // Probe RTSP stream to detect codec — use 5s timeout to avoid long POST delays
     const forceTranscode   = body.forceTranscode ?? false
     const canPlayHevcMp4   = body.canPlayHevcMp4 ?? false
     let detectedCodec      = 'unknown'
@@ -1563,7 +1571,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       server.log.info(`[recordings-preview] strategy_override_saved cameraId=${body.cameraId} strategy=preview_transcode_h264`)
     } else if (overrideStrategy) {
       server.log.info(`[recordings-preview] strategy_override_hit cameraId=${body.cameraId} strategy=${overrideStrategy}`)
+    } else if (!PREVIEW_PROBE_ENABLED) {
+      // No probe by default: every ffprobe costs an extra RTSP DESCRIBE
+      // against the NVR, raising the chance of 453 on session-limited
+      // Hikvision units. Without codec knowledge we always transcode —
+      // safe for any browser, no DESCRIBE spent.
+      server.log.info(`[recordings-preview] probe_skipped reason=disabled strategy=preview_transcode_h264 cameraId=${body.cameraId}`)
     } else {
+      // RECORDINGS_PREVIEW_PROBE=true — probe to allow copy strategies
       const probeStart = Date.now()
       try {
         const probeResult = await Promise.race([
@@ -1593,7 +1608,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     const strategy = overrideStrategy && !forceTranscode
       ? overrideStrategy
-      : determinePreviewStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
+      : !PREVIEW_PROBE_ENABLED && !forceTranscode
+        ? 'preview_transcode_h264'
+        : determinePreviewStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
 
     server.log.info(
       `[recordings-time] preview_time_mapping cameraId=${body.cameraId} ch=${camera.channel}` +
@@ -1763,8 +1780,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       proc.stdout?.once('data', (chunk: Buffer) => {
         firstByteSent = true
         session.hadFirstByte  = true
+        // A working variant wipes any error state from earlier attempts
         session.errorCategory = undefined
         session.errorDetail   = undefined
+        failedPreviewSessions.delete(sessionId)
+        if (variant === 'no_name_size') {
+          previewVariantPreferenceByCamera.set(session.cameraId, 'no_name_size')
+          server.log.info(`[recordings-preview] rtsp_variant_preferred cameraId=${session.cameraId} variant=no_name_size`)
+        }
+        server.log.info(
+          `[recordings-preview] variant_success sessionId=${sessionId}` +
+          ` variant=${variant} firstByteMs=${Date.now() - streamStartMs}`
+        )
         server.log.info(
           `[recordings-preview] first_byte sessionId=${sessionId}` +
           ` variant=${variant} elapsedMs=${Date.now() - streamStartMs} bytes=${chunk.length}`
@@ -1784,21 +1811,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
         const failedBeforeOutput = code !== 0 && code !== null && !firstByteSent
         if (failedBeforeOutput) {
+          // Classify locally first — session error state is only written when
+          // NO more variants remain, so a successful fallback never leaves a
+          // stale error behind
           const category = classifyRtspError(stderrTail.join('\n'))
-          session.errorCategory = category
-          session.errorDetail   = stderrTail.slice(-5).join(' | ').slice(0, 400)
-          session.hadFirstByte  = false
-          retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+          const detail   = stderrTail.slice(-5).join(' | ').slice(0, 400)
           server.log.warn(
             `[recordings-preview] ffmpeg_failed sessionId=${sessionId}` +
-            ` code=${code} variant=${variant} category=${category} stderr_tail=${session.errorDetail}`
+            ` code=${code} variant=${variant} category=${category} stderr_tail=${detail}`
           )
-          if (category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT') {
-            server.log.warn(
-              `[recordings-preview] nvr_preview_rejected_453 nvrId=${session.nvrId}` +
-              ` cameraId=${session.cameraId} slot=${session.slotIndex}`
-            )
-          }
+          server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=${variant}`)
 
           // One controlled fallback: retry without name/size params when the
           // full playbackURI variant fails to open
@@ -1806,7 +1828,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           const retriableCategory =
             category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT' || category === 'RTSP_OPEN_FAILED'
           if (variant === 'full' && hasNameSize && retriableCategory && !clientGone) {
-            server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=full — trying no_name_size`)
             setTimeout(() => {
               if (!clientGone && previewSessions.has(sessionId)) {
                 startAttempt(stripNameSizeParams(inputUrl), 'no_name_size')
@@ -1816,8 +1837,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             }, 800)
             return
           }
-          if (variant === 'no_name_size') {
-            server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=no_name_size`)
+
+          // All variants exhausted — now persist the final error state
+          session.errorCategory = category
+          session.errorDetail   = detail
+          session.hadFirstByte  = false
+          retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+          server.log.warn(`[recordings-preview] all_variants_failed sessionId=${sessionId} category=${category}`)
+          if (category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT') {
+            server.log.warn(
+              `[recordings-preview] nvr_preview_rejected_453 nvrId=${session.nvrId}` +
+              ` cameraId=${session.cameraId} slot=${session.slotIndex}`
+            )
           }
         }
 
@@ -1841,7 +1872,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     request.raw.on('close', () => onClientGone('client_disconnect'))
     request.raw.on('error', () => onClientGone('request_error'))
 
-    startAttempt(rtspUrl, 'full')
+    // Start with the variant that worked last time for this camera
+    const preferNoNameSize =
+      previewVariantPreferenceByCamera.get(session.cameraId) === 'no_name_size' &&
+      /[?&](name|size)=/i.test(rtspUrl)
+    if (preferNoNameSize) {
+      server.log.info(`[recordings-preview] rtsp_variant_preferred cameraId=${session.cameraId} variant=no_name_size (start)`)
+      startAttempt(stripNameSizeParams(rtspUrl), 'no_name_size')
+    } else {
+      startAttempt(rtspUrl, 'full')
+    }
   })
 
   // GET /api/recordings/preview/:sessionId/status — Error category after a
