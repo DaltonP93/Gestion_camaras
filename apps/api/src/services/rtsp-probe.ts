@@ -74,6 +74,8 @@ export async function probeRtspStream(rtspUrl: string): Promise<RtspProbeResult>
 
     if (err.code === 'ETIMEDOUT' || latencyMs >= PROBE_TIMEOUT_MS) {
       error = `Timeout después de ${PROBE_TIMEOUT_MS}ms`
+    } else if (error.includes('453') || /not enough bandwidth/i.test(error)) {
+      error = 'NVR sin ancho de banda / sesiones libres (453)'
     } else if (error.includes('401') || error.includes('Unauthorized')) {
       error = 'Credenciales RTSP incorrectas (401)'
     } else if (error.includes('Connection refused') || error.includes('ECONNREFUSED')) {

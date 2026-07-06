@@ -346,6 +346,7 @@ interface PreviewSession {
   rtspUrl:     string
   rtspMasked:  string
   cameraId:    string
+  nvrId:       string
   slotIndex:   number
   startTime:   string
   endTime:     string
@@ -359,10 +360,20 @@ interface PreviewSession {
   errorDetail?:    string
 }
 
+// Mask credentials in any rtsp:// or http(s):// URL embedded in log text.
+// FFmpeg stderr echoes the full input URL including the password — never
+// store or log it in clear.
+function maskUrlCredentials(text: string): string {
+  return text.replace(/(rtsps?|https?):\/\/([^:\/\s@]+):([^@\/\s]+)@/gi, '$1://$2:***@')
+}
+
 // Classify RTSP/FFmpeg failures into actionable categories so the frontend
 // can show the real cause instead of a generic "retry with H.264".
 function classifyRtspError(text: string): string {
   const t = text.toLowerCase()
+  // 453 first — its stderr also contains "4XX Client Error" and "DESCRIBE
+  // failed", which would otherwise mismatch as auth/open errors
+  if (/453|not enough bandwidth/.test(t))                             return 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
   if (/401|unauthorized|credenciales/.test(t))                        return 'RTSP_AUTH_OR_TRACK_DENIED'
   if (/404|not found|no encontrado/.test(t))                          return 'RTSP_TRACK_NOT_FOUND'
   if (/connection refused|conexi.n rechazada|timed? ?out|timeout/.test(t)) return 'NVR_OFFLINE_OR_TIMEOUT'
@@ -372,6 +383,71 @@ function classifyRtspError(text: string): string {
 }
 
 const previewSessions = new Map<string, PreviewSession>()
+
+// ─── Per-NVR preview concurrency ──────────────────────────────────
+// Hikvision NVRs cap simultaneous playback sessions/bandwidth and answer
+// "453 Not Enough Bandwidth" when exceeded. Serialize preview starts per NVR
+// and stagger them so 2x2 grids don't burst-open sessions.
+const MAX_PREVIEW_PER_NVR = Math.max(1, parseInt(process.env.RECORDINGS_MAX_PREVIEW_PER_NVR || '1', 10) || 1)
+const PREVIEW_START_STAGGER_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVIEW_START_STAGGER_MS || '1200', 10) || 1200)
+const PREVIEW_QUEUE_WAIT_MAX_MS = 30_000
+
+interface NvrPreviewState { active: number; lastStartAt: number; queue: Array<() => void> }
+const nvrPreviewStates = new Map<string, NvrPreviewState>()
+
+function getNvrPreviewState(nvrId: string): NvrPreviewState {
+  let st = nvrPreviewStates.get(nvrId)
+  if (!st) { st = { active: 0, lastStartAt: 0, queue: [] }; nvrPreviewStates.set(nvrId, st) }
+  return st
+}
+
+/** Wait for a free preview slot on this NVR (bounded), enforce stagger, and
+ *  return a release function. After the wait cap, proceeds anyway so a stuck
+ *  queue can never freeze playback entirely. */
+async function acquireNvrPreviewSlot(
+  nvrId: string, slotIndex: number, log: (msg: string) => void
+): Promise<() => void> {
+  const st = getNvrPreviewState(nvrId)
+  const waitStart = Date.now()
+
+  while (st.active >= MAX_PREVIEW_PER_NVR && Date.now() - waitStart < PREVIEW_QUEUE_WAIT_MAX_MS) {
+    log(`[recordings-preview] nvr_preview_queue nvrId=${nvrId} slot=${slotIndex} queued=${st.queue.length + 1} active=${st.active}`)
+    await new Promise<void>(resolve => {
+      st.queue.push(resolve)
+      // Safety: also wake up periodically in case a release was missed
+      setTimeout(resolve, 2_000)
+    })
+  }
+
+  // Stagger consecutive starts against the same NVR
+  const sinceLast = Date.now() - st.lastStartAt
+  if (sinceLast < PREVIEW_START_STAGGER_MS) {
+    await new Promise(r => setTimeout(r, PREVIEW_START_STAGGER_MS - sinceLast))
+  }
+
+  st.active++
+  st.lastStartAt = Date.now()
+  log(`[recordings-preview] nvr_preview_acquired nvrId=${nvrId} slot=${slotIndex} active=${st.active}`)
+
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    st.active = Math.max(0, st.active - 1)
+    log(`[recordings-preview] nvr_preview_released nvrId=${nvrId} active=${st.active}`)
+    const next = st.queue.shift()
+    if (next) next()
+  }
+}
+
+// Strip name/size params from a playback RTSP URL — some NVR firmwares
+// reject the full variant under load but accept the plain time-range form.
+function stripNameSizeParams(url: string): string {
+  return url
+    .replace(/([?&])name=[^&]*&?/i, '$1')
+    .replace(/([?&])size=[^&]*&?/i, '$1')
+    .replace(/[?&]$/, '')
+}
 
 // Per-camera override: when forceTranscode=true succeeds, persist transcode requirement
 // so subsequent previews of the same camera skip the probe and go straight to transcode.
@@ -1469,7 +1545,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           detectedCodec = probeResult.codec
         } else if (!probeResult.ok && probeResult.error) {
           probeErrorCategory = classifyRtspError(probeResult.error)
-          probeErrorDetail   = probeResult.error.slice(0, 300)
+          probeErrorDetail   = maskUrlCredentials(probeResult.error).slice(0, 300)
         }
       } catch {
         probeElapsedMs = Date.now() - probeStart
@@ -1507,7 +1583,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     previewSessions.set(sessionId, {
       streamToken, userId: user.sub, createdAt: Date.now(), expiresAt,
-      rtspUrl, rtspMasked, cameraId: body.cameraId, slotIndex: body.slotIndex,
+      rtspUrl, rtspMasked, cameraId: body.cameraId, nvrId: camera.nvr.id, slotIndex: body.slotIndex,
       startTime: body.startTime, endTime: body.endTime,
       forceTranscode, strategy, detectedCodec, canPlayHevcMp4,
       // Probe failure (e.g. 401 on the playback track) — pre-seed the category
@@ -1556,42 +1632,29 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // Use codec strategy determined at session creation (probe ran in POST /preview/start)
     const codecArgs = buildPreviewCodecArgs(strategy)
 
-    const ffmpegArgs = [
+    const buildFfmpegArgs = (inputUrl: string) => [
       '-rtsp_transport', 'tcp',
       '-fflags', '+genpts+discardcorrupt',
       ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
       '-reorder_queue_size', '0',
-      '-i', rtspUrl,
+      '-i', inputUrl,
       ...codecArgs,
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
       'pipe:1',
     ]
 
-    const maskedArgs = ffmpegArgs.map(a => a === rtspUrl ? rtspMasked : a)
-    const streamStartMs = Date.now()
-
-    server.log.info(
-      `[recordings-preview] stream_start sessionId=${sessionId}` +
-      ` slotIndex=${session.slotIndex} cameraId=${session.cameraId}` +
-      ` strategy=${strategy} codec=${session.detectedCodec} cmd=ffmpeg ${maskedArgs.join(' ')}`
+    // Per-NVR concurrency: wait for a free playback slot + stagger before
+    // opening another RTSP playback session against the same NVR
+    const releaseNvrSlot = await acquireNvrPreviewSlot(
+      session.nvrId, session.slotIndex, (msg) => server.log.info(msg)
     )
 
-    const proc = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
-    session.vodProcess = proc
-
-    // Ring buffer of the last 30 stderr lines — used to classify failures
-    const stderrTail: string[] = []
-    session.stderrTail = stderrTail
-    proc.stderr?.on('data', (chunk: Buffer) => {
-      for (const raw of chunk.toString().split('\n')) {
-        const line = raw.trim()
-        if (!line) continue
-        stderrTail.push(line)
-        if (stderrTail.length > 30) stderrTail.shift()
-        server.log.debug(`[recordings-preview] ffmpeg_stderr sessionId=${sessionId} line=${line.slice(0, 200)}`)
-      }
-    })
+    // Session may have been deleted while waiting in the queue
+    if (!previewSessions.has(sessionId)) {
+      releaseNvrSlot()
+      return reply.status(410).send({ message: 'Sesión de preview cancelada' })
+    }
 
     // Hijack the raw TCP connection — bypass Fastify serialization entirely
     reply.hijack()
@@ -1604,56 +1667,126 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       'X-Session-Id':  sessionId,
     })
 
-    // Log time-to-first-byte — key latency metric for preview
+    const streamStartMs = Date.now()
     let firstByteSent = false
-    proc.stdout?.once('data', (chunk: Buffer) => {
-      firstByteSent = true
-      server.log.info(
-        `[recordings-preview] first_byte sessionId=${sessionId}` +
-        ` elapsedMs=${Date.now() - streamStartMs} bytes=${chunk.length}`
-      )
-    })
+    let clientGone    = false
+    let currentProc: ChildProcess | null = null
 
-    proc.stdout?.pipe(res, { end: true })
+    const stderrTail: string[] = []
+    session.stderrTail = stderrTail
 
-    const cleanup = (reason: string) => {
+    const finish = (reason: string) => {
       const elapsedMs = Date.now() - streamStartMs
       server.log.info(
         `[recordings-preview] stream_closed sessionId=${sessionId}` +
         ` reason=${reason} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
       )
-      if (session.vodProcess === proc) session.vodProcess = undefined
-      try { proc.kill('SIGTERM') } catch {}
+      releaseNvrSlot()
       try { res.end() } catch {}
     }
 
-    request.raw.on('close', () => cleanup('client_disconnect'))
-    request.raw.on('error', () => cleanup('request_error'))
-    proc.on('exit', (code) => {
-      const elapsedMs = Date.now() - streamStartMs
+    const startAttempt = (inputUrl: string, variant: 'full' | 'no_name_size') => {
+      const maskedUrl = maskUrlCredentials(inputUrl)
+      server.log.info(`[recordings-preview] rtsp_variant_try sessionId=${sessionId} variant=${variant}`)
       server.log.info(
-        `[recordings-preview] ffmpeg_exit sessionId=${sessionId}` +
-        ` code=${code} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
+        `[recordings-preview] stream_start sessionId=${sessionId}` +
+        ` slotIndex=${session.slotIndex} cameraId=${session.cameraId}` +
+        ` strategy=${strategy} codec=${session.detectedCodec} variant=${variant} url=${maskedUrl.slice(0, 160)}`
       )
-      // Failure before any output → classify from stderr so the frontend
-      // can show the real cause (auth vs track vs codec vs offline)
-      if (code !== 0 && code !== null && !firstByteSent) {
-        const tail = (session.stderrTail ?? []).join('\n')
-        const category = classifyRtspError(tail)
-        session.errorCategory = category
-        session.errorDetail   = (session.stderrTail ?? []).slice(-5).join(' | ').slice(0, 400)
-        server.log.warn(
-          `[recordings-preview] ffmpeg_failed sessionId=${sessionId}` +
-          ` code=${code} category=${category} stderr_tail=${session.errorDetail}`
+
+      const proc = spawn('ffmpeg', buildFfmpegArgs(inputUrl), { stdio: ['ignore', 'pipe', 'pipe'] })
+      currentProc = proc
+      session.vodProcess = proc
+
+      proc.stderr?.on('data', (chunk: Buffer) => {
+        for (const raw of chunk.toString().split('\n')) {
+          const line = maskUrlCredentials(raw.trim())
+          if (!line) continue
+          stderrTail.push(line)
+          if (stderrTail.length > 30) stderrTail.shift()
+          server.log.debug(`[recordings-preview] ffmpeg_stderr sessionId=${sessionId} line=${line.slice(0, 200)}`)
+        }
+      })
+
+      proc.stdout?.once('data', (chunk: Buffer) => {
+        firstByteSent = true
+        session.errorCategory = undefined
+        session.errorDetail   = undefined
+        server.log.info(
+          `[recordings-preview] first_byte sessionId=${sessionId}` +
+          ` variant=${variant} elapsedMs=${Date.now() - streamStartMs} bytes=${chunk.length}`
         )
-      }
-      if (session.vodProcess === proc) session.vodProcess = undefined
-      try { res.end() } catch {}
-    })
-    proc.on('error', (err: Error) => {
-      server.log.warn(`[recordings-preview] ffmpeg_error sessionId=${sessionId} err=${err.message}`)
-      cleanup('ffmpeg_error')
-    })
+      })
+
+      // end:false — on a failed first variant we reuse the same response for the fallback
+      proc.stdout?.pipe(res, { end: false })
+
+      proc.on('exit', (code) => {
+        const elapsedMs = Date.now() - streamStartMs
+        server.log.info(
+          `[recordings-preview] ffmpeg_exit sessionId=${sessionId}` +
+          ` code=${code} variant=${variant} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
+        )
+        if (session.vodProcess === proc) session.vodProcess = undefined
+
+        const failedBeforeOutput = code !== 0 && code !== null && !firstByteSent
+        if (failedBeforeOutput) {
+          const category = classifyRtspError(stderrTail.join('\n'))
+          session.errorCategory = category
+          session.errorDetail   = stderrTail.slice(-5).join(' | ').slice(0, 400)
+          server.log.warn(
+            `[recordings-preview] ffmpeg_failed sessionId=${sessionId}` +
+            ` code=${code} variant=${variant} category=${category} stderr_tail=${session.errorDetail}`
+          )
+          if (category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT') {
+            server.log.warn(
+              `[recordings-preview] nvr_preview_rejected_453 nvrId=${session.nvrId}` +
+              ` cameraId=${session.cameraId} slot=${session.slotIndex}`
+            )
+          }
+
+          // One controlled fallback: retry without name/size params when the
+          // full playbackURI variant fails to open
+          const hasNameSize = /[?&](name|size)=/i.test(inputUrl)
+          const retriableCategory =
+            category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT' || category === 'RTSP_OPEN_FAILED'
+          if (variant === 'full' && hasNameSize && retriableCategory && !clientGone) {
+            server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=full — trying no_name_size`)
+            setTimeout(() => {
+              if (!clientGone && previewSessions.has(sessionId)) {
+                startAttempt(stripNameSizeParams(inputUrl), 'no_name_size')
+              } else {
+                finish('cancelled_before_fallback')
+              }
+            }, 800)
+            return
+          }
+          if (variant === 'no_name_size') {
+            server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=no_name_size`)
+          }
+        }
+
+        finish(failedBeforeOutput ? 'ffmpeg_failed' : 'ffmpeg_exit')
+      })
+
+      proc.on('error', (err: Error) => {
+        server.log.warn(`[recordings-preview] ffmpeg_error sessionId=${sessionId} err=${err.message}`)
+        try { proc.kill('SIGTERM') } catch {}
+        finish('ffmpeg_error')
+      })
+    }
+
+    const onClientGone = (reason: string) => {
+      if (clientGone) return
+      clientGone = true
+      if (currentProc) { try { currentProc.kill('SIGTERM') } catch {} }
+      if (session.vodProcess === currentProc) session.vodProcess = undefined
+      finish(reason)
+    }
+    request.raw.on('close', () => onClientGone('client_disconnect'))
+    request.raw.on('error', () => onClientGone('request_error'))
+
+    startAttempt(rtspUrl, 'full')
   })
 
   // GET /api/recordings/preview/:sessionId/status — Error category after a

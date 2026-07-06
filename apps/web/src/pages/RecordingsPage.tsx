@@ -167,6 +167,9 @@ export function RecordingsPage() {
   const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
   // Sessions already deleted — avoids duplicate DELETE from error/ended/unmount/slot-change
   const deletedSessionsRef    = useRef<Set<string>>(new Set())
+  // Cameras manually closed (slot X / unchecked) — blocked from autostart
+  // until the user selects or assigns them again
+  const closedCamerasRef      = useRef<Set<string>>(new Set())
 
   const deleteSessionOnce = (sessionType: string | null, sessionId: string | null | undefined) => {
     if (!sessionId) return
@@ -291,6 +294,8 @@ export function RecordingsPage() {
     slotsRef.current.forEach(slot => {
       if (!slot.cameraId) return
       if (slot.status !== 'no_recording' && slot.status !== 'idle') return
+      // Manually closed cameras never autostart until re-selected/assigned
+      if (closedCamerasRef.current.has(slot.cameraId)) return
 
       // Debounce: don't retry the same slot more than once every 5 s
       const lastAttempt = autoStartLockRef.current[slot.slotIndex] ?? 0
@@ -313,12 +318,35 @@ export function RecordingsPage() {
   }, [globalPlaybackTime, globalPlaying])
 
   // ── Camera selection helpers ───────────────────────────────────────────────
-  const toggleCamera = (cameraId: string) =>
+  const toggleCamera = (cameraId: string) => {
+    const isDeselecting = selectedCameras.has(cameraId)
+    if (isDeselecting) {
+      // Deselecting also closes any slot showing this camera and hides its
+      // timeline rows (results stay in memory — re-selecting restores them)
+      const closedSlots: number[] = []
+      slotsRef.current.forEach(s => {
+        if (s.cameraId === cameraId) {
+          closedSlots.push(s.slotIndex)
+          stopSlot(s.slotIndex)
+          nextRecBySlotRef.current[s.slotIndex] = null
+          errorCategoryBySlotRef.current[s.slotIndex] = null
+          previewRetriedRef.current[s.slotIndex] = false
+        }
+      })
+      if (closedSlots.length > 0) {
+        setSlots(prev => prev.map((s, i) => closedSlots.includes(i) ? emptySlot(i) : s))
+      }
+      closedCamerasRef.current.add(cameraId)
+      console.info(`[recordings-ui] camera_unselected cameraId=${cameraId} closedSlots=${closedSlots.join(',') || 'none'}`)
+    } else {
+      closedCamerasRef.current.delete(cameraId)
+    }
     setSelectedCameras(prev => {
       const next = new Set(prev)
       next.has(cameraId) ? next.delete(cameraId) : next.add(cameraId)
       return next
     })
+  }
 
   const toggleNVR = (nvrId: string) => {
     const ids = cameras.filter(c => c.nvrId === nvrId).map(c => c.id)
@@ -351,13 +379,26 @@ export function RecordingsPage() {
     }
   }
 
-  // Close a single slot: stop its preview, free the camera, keep search
-  // results, timeline and other slots untouched.
+  // Close a single slot: stop its preview, free the camera, remove it from
+  // the search selection (so it leaves the visible timeline) and block
+  // autostart until the user selects/assigns it again. Search results stay
+  // in memory; other slots are untouched.
   const closeSlot = (slotIndex: number) => {
-    console.info(`[recordings-ui] slot_close slot=${slotIndex} cameraId=${slotsRef.current[slotIndex]?.cameraId ?? 'none'}`)
+    const cameraId = slotsRef.current[slotIndex]?.cameraId ?? null
+    console.info(`[recordings-ui] slot_close slot=${slotIndex} cameraId=${cameraId ?? 'none'} removeFromSelection=true`)
     stopSlot(slotIndex)
     nextRecBySlotRef.current[slotIndex] = null
     errorCategoryBySlotRef.current[slotIndex] = null
+    previewRetriedRef.current[slotIndex] = false
+    if (cameraId) {
+      closedCamerasRef.current.add(cameraId)
+      setSelectedCameras(prev => {
+        if (!prev.has(cameraId)) return prev
+        const next = new Set(prev)
+        next.delete(cameraId)
+        return next
+      })
+    }
     setSlots(prev => prev.map((s, i) => i === slotIndex ? emptySlot(i) : s))
   }
 
@@ -388,6 +429,7 @@ export function RecordingsPage() {
 
     console.info(`[recordings-ui] slot_camera_assigned slot=${activeSlotIndex} cameraId=${cameraId} cameraName=${cam.name} source=single_click`)
     console.info(`[recordings-ui] assigned_camera_added_to_search slot=${activeSlotIndex} cameraId=${cameraId}`)
+    closedCamerasRef.current.delete(cameraId)
     setSelectedCameras(prev => new Set([...prev, cameraId]))
 
     // Move instead of duplicate: if this camera lives in another slot, free it
@@ -943,12 +985,15 @@ export function RecordingsPage() {
         console.info(`[recordings-ui] preview_error_category slot=${slotIndex} category=${category ?? 'unknown'} detail=${detail ?? ''}`)
 
         const CATEGORY_MSG: Record<string, string> = {
-          RTSP_AUTH_OR_TRACK_DENIED: 'Canal/track no autorizado por el NVR (401)',
-          RTSP_TRACK_NOT_FOUND:      'Track de grabación no disponible en el NVR (404)',
-          NVR_OFFLINE_OR_TIMEOUT:    'El NVR no responde (timeout / conexión rechazada)',
-          RTSP_OPEN_FAILED:          'No se pudo abrir el RTSP de reproducción',
-          CODEC_UNSUPPORTED:         'Codec no soportado por el navegador',
+          NVR_BANDWIDTH_OR_SESSION_LIMIT: 'El NVR no permite más reproducciones simultáneas. Cerrá otro slot o reintentá secuencialmente.',
+          RTSP_AUTH_OR_TRACK_DENIED:      'Canal/track no autorizado por el NVR.',
+          RTSP_TRACK_NOT_FOUND:           'Track de grabación no disponible.',
+          NVR_OFFLINE_OR_TIMEOUT:         'El NVR no responde (timeout / conexión rechazada).',
+          RTSP_OPEN_FAILED:               'No se pudo abrir RTSP de reproducción.',
+          CODEC_UNSUPPORTED:              'Codec no soportado. Probá convertir a H.264.',
         }
+        // H.264 transcode only fixes codec problems — never retry it for
+        // bandwidth/auth/track/offline failures
         const isCodecIssue = !category || category === 'CODEC_UNSUPPORTED' || category === 'UNKNOWN'
 
         // Auto-retry with H.264 only when the failure is codec-related —
@@ -976,6 +1021,9 @@ export function RecordingsPage() {
           : new Date(rec.endTime).getTime()
 
         deleteSessionOnce('preview', sessionId)
+
+        // Camera manually closed while playing — don't chain into the next clip
+        if (closedCamerasRef.current.has(rec.cameraId)) return
 
         // Find the next recording for this camera within 3s of where we just ended
         const CONTINUITY_GAP_MS = 3_000
@@ -1303,6 +1351,14 @@ export function RecordingsPage() {
     [slots]
   )
 
+  // Timeline shows only visible cameras: selected ∪ assigned to slots.
+  // Closing/deselecting a camera hides its rows; results stay in memory.
+  const visibleRecordings = useMemo(() => {
+    const visible = new Set(selectedCameras)
+    slots.forEach(s => { if (s.cameraId) visible.add(s.cameraId) })
+    return recordings.filter(r => visible.has(r.cameraId))
+  }, [recordings, selectedCameras, slots])
+
   // Camera for the recording-days calendar: the single selected camera,
   // else the active slot's camera
   const availabilityCameraId = selectedCameras.size === 1
@@ -1531,6 +1587,9 @@ export function RecordingsPage() {
                     {slot.status === 'error' && (() => {
                       const errCategory = errorCategoryBySlotRef.current[idx] ?? null
                       const showH264 = !errCategory || errCategory === 'CODEC_UNSUPPORTED' || errCategory === 'UNKNOWN'
+                      const retryLabel = errCategory === 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
+                        ? 'Reintentar cuando haya sesión libre'
+                        : 'Reintentar'
                       return (
                         <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
                           <AlertTriangle size={18} className="text-red-500 flex-shrink-0" />
@@ -1557,7 +1616,7 @@ export function RecordingsPage() {
                                 }}
                                 className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-400 transition-colors"
                               >
-                                Reintentar
+                                {retryLabel}
                               </button>
                             </div>
                           )}
@@ -1573,7 +1632,7 @@ export function RecordingsPage() {
         {/* ── Timeline ──────────────────────────────────────────────────── */}
         <div className="flex-shrink-0 border-t border-surface-700 bg-surface-900">
           <RecordingTimeline
-            recordings={recordings}
+            recordings={visibleRecordings}
             assignedCameras={assignedCameras}
             selectedRec={activeRecording}
             windowStartMs={windowStartMs}
