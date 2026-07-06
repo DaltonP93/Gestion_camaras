@@ -479,6 +479,11 @@ async function acquireNvrPreviewSlot(
   }
 }
 
+// Cameras whose full playbackURI variant failed but no_name_size worked —
+// next previews start directly with the working variant (one less failed
+// RTSP attempt against the NVR).
+const previewVariantPreferenceByCamera = new Map<string, 'no_name_size'>()
+
 // Strip name/size params from a playback RTSP URL — some NVR firmwares
 // reject the full variant under load but accept the plain time-range form.
 function stripNameSizeParams(url: string): string {
@@ -1775,8 +1780,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       proc.stdout?.once('data', (chunk: Buffer) => {
         firstByteSent = true
         session.hadFirstByte  = true
+        // A working variant wipes any error state from earlier attempts
         session.errorCategory = undefined
         session.errorDetail   = undefined
+        failedPreviewSessions.delete(sessionId)
+        if (variant === 'no_name_size') {
+          previewVariantPreferenceByCamera.set(session.cameraId, 'no_name_size')
+          server.log.info(`[recordings-preview] rtsp_variant_preferred cameraId=${session.cameraId} variant=no_name_size`)
+        }
+        server.log.info(
+          `[recordings-preview] variant_success sessionId=${sessionId}` +
+          ` variant=${variant} firstByteMs=${Date.now() - streamStartMs}`
+        )
         server.log.info(
           `[recordings-preview] first_byte sessionId=${sessionId}` +
           ` variant=${variant} elapsedMs=${Date.now() - streamStartMs} bytes=${chunk.length}`
@@ -1796,21 +1811,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
         const failedBeforeOutput = code !== 0 && code !== null && !firstByteSent
         if (failedBeforeOutput) {
+          // Classify locally first — session error state is only written when
+          // NO more variants remain, so a successful fallback never leaves a
+          // stale error behind
           const category = classifyRtspError(stderrTail.join('\n'))
-          session.errorCategory = category
-          session.errorDetail   = stderrTail.slice(-5).join(' | ').slice(0, 400)
-          session.hadFirstByte  = false
-          retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+          const detail   = stderrTail.slice(-5).join(' | ').slice(0, 400)
           server.log.warn(
             `[recordings-preview] ffmpeg_failed sessionId=${sessionId}` +
-            ` code=${code} variant=${variant} category=${category} stderr_tail=${session.errorDetail}`
+            ` code=${code} variant=${variant} category=${category} stderr_tail=${detail}`
           )
-          if (category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT') {
-            server.log.warn(
-              `[recordings-preview] nvr_preview_rejected_453 nvrId=${session.nvrId}` +
-              ` cameraId=${session.cameraId} slot=${session.slotIndex}`
-            )
-          }
+          server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=${variant}`)
 
           // One controlled fallback: retry without name/size params when the
           // full playbackURI variant fails to open
@@ -1818,7 +1828,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           const retriableCategory =
             category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT' || category === 'RTSP_OPEN_FAILED'
           if (variant === 'full' && hasNameSize && retriableCategory && !clientGone) {
-            server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=full — trying no_name_size`)
             setTimeout(() => {
               if (!clientGone && previewSessions.has(sessionId)) {
                 startAttempt(stripNameSizeParams(inputUrl), 'no_name_size')
@@ -1828,8 +1837,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             }, 800)
             return
           }
-          if (variant === 'no_name_size') {
-            server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=no_name_size`)
+
+          // All variants exhausted — now persist the final error state
+          session.errorCategory = category
+          session.errorDetail   = detail
+          session.hadFirstByte  = false
+          retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+          server.log.warn(`[recordings-preview] all_variants_failed sessionId=${sessionId} category=${category}`)
+          if (category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT') {
+            server.log.warn(
+              `[recordings-preview] nvr_preview_rejected_453 nvrId=${session.nvrId}` +
+              ` cameraId=${session.cameraId} slot=${session.slotIndex}`
+            )
           }
         }
 
@@ -1853,7 +1872,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     request.raw.on('close', () => onClientGone('client_disconnect'))
     request.raw.on('error', () => onClientGone('request_error'))
 
-    startAttempt(rtspUrl, 'full')
+    // Start with the variant that worked last time for this camera
+    const preferNoNameSize =
+      previewVariantPreferenceByCamera.get(session.cameraId) === 'no_name_size' &&
+      /[?&](name|size)=/i.test(rtspUrl)
+    if (preferNoNameSize) {
+      server.log.info(`[recordings-preview] rtsp_variant_preferred cameraId=${session.cameraId} variant=no_name_size (start)`)
+      startAttempt(stripNameSizeParams(rtspUrl), 'no_name_size')
+    } else {
+      startAttempt(rtspUrl, 'full')
+    }
   })
 
   // GET /api/recordings/preview/:sessionId/status — Error category after a
