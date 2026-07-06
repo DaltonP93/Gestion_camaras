@@ -163,13 +163,14 @@ export function RecordingsPage() {
   const globalPlaybackRateRef = useRef(1)
   const videoCleanupRef = useRef<{ [k: number]: (() => void) | null }>({})
   const loadInSlotRef         = useRef<(si: number, rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
-  const startPreviewInSlotRef = useRef<(si: number, rec: RecordingWithCamera, playheadTime: Date, opts?: { forceTranscode?: boolean }) => void>(() => {})
+  const startPreviewInSlotRef = useRef<(si: number, rec: RecordingWithCamera, playheadTime: Date, opts?: { forceTranscode?: boolean; noClockAnchor?: boolean }) => void>(() => {})
   const previewStartTimesRef  = useRef<{ [k: number]: number | null }>({})
   const previewRetriedRef     = useRef<{ [k: number]: boolean }>({})
   const recordingsRef         = useRef<RecordingWithCamera[]>([])
   const nextRecBySlotRef      = useRef<{ [k: number]: RecordingWithCamera | null }>({})
   const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
   const errorDetailBySlotRef   = useRef<{ [k: number]: string | null }>({})
+  const clipInfoBySlotRef      = useRef<{ [k: number]: { clipStartMs: number; clipEndMs: number; effectiveStartMs: number } | null }>({})
   // Sessions already deleted — avoids duplicate DELETE from error/ended/unmount/slot-change
   const deletedSessionsRef    = useRef<Set<string>>(new Set())
   // Cameras manually closed (slot X / unchecked) — blocked from autostart
@@ -321,7 +322,9 @@ export function RecordingsPage() {
           `[recordings-ui] slot_autostart_at_playhead slot=${slot.slotIndex}` +
           ` cameraId=${slot.cameraId} recId=${covering.id} playhead=${globalPlaybackTime.toISOString()}`
         )
-        startPreviewInSlotRef.current(slot.slotIndex, covering, globalPlaybackTime)
+        // Never re-anchor the master clock from a watcher start — the clock
+        // is already running and other slots follow it
+        startPreviewInSlotRef.current(slot.slotIndex, covering, globalPlaybackTime, { noClockAnchor: true })
       }
     })
   }, [globalPlaybackTime, globalPlaying])
@@ -920,7 +923,7 @@ export function RecordingsPage() {
     slotIndex:    number,
     rec:          RecordingWithCamera,
     playheadTime: Date,
-    opts?:        { forceTranscode?: boolean },
+    opts?:        { forceTranscode?: boolean; noClockAnchor?: boolean },
   ) => {
     const forceTranscode = opts?.forceTranscode ?? false
     const currentSlot = slotsRef.current[slotIndex]
@@ -965,6 +968,28 @@ export function RecordingsPage() {
         ...s, status: 'no_recording', sessionId: null, sessionType: null, errorMsg: null,
       } : s))
       return
+    }
+
+    // The slot remembers its clip bounds and real start point
+    clipInfoBySlotRef.current[slotIndex] = {
+      clipStartMs: recStartMs, clipEndMs: recEndMs, effectiveStartMs: effectiveMs,
+    }
+
+    // Anchor the master clock to the REAL start of this preview so the
+    // toolbar clock / timeline playhead match the camera overlay exactly.
+    // Skipped (noClockAnchor) when another slot is already driving the clock.
+    if (!opts?.noClockAnchor) {
+      setGlobalPlaybackTime(new Date(effectiveMs))
+      if (masterClockRef.current) {
+        masterClockRef.current = {
+          wallMs: performance.now(), playheadMs: effectiveMs, rate: globalPlaybackRateRef.current,
+        }
+      }
+      console.info(
+        `[recordings-ui] preview_clock_anchor slot=${slotIndex}` +
+        ` effectiveStart=${effectiveStart} clipStart=${rec.startTime} clipEnd=${rec.endTime}` +
+        ` globalPlaybackTime=${effectiveStart}`
+      )
     }
 
     const videoEl = videoRefs.current[slotIndex] ?? document.createElement('video')
@@ -1123,8 +1148,12 @@ export function RecordingsPage() {
             ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime} gapMs=${gap}`
           )
           if (gap <= CONTINUITY_GAP_MS) {
-            // Contiguous (or near) block — play it from its own start
-            startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs))
+            // Contiguous (or near) block — play it from its own start. The
+            // clock only re-anchors if no OTHER slot is currently playing.
+            const otherPlaying = slotsRef.current.some(
+              (s, i) => i !== slotIndex && s.status === 'ready'
+            )
+            startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs), { noClockAnchor: otherPlaying })
             return
           }
         }
@@ -1270,17 +1299,38 @@ export function RecordingsPage() {
     const readySlots     = currentSlots.filter(s => s.status === 'ready')
     const assignedSlots  = currentSlots.filter(s => s.cameraId && s.status !== 'loading')
 
+    // Play never requires a prior timeline click: without a playhead, start
+    // from the earliest recording of the assigned/selected cameras
+    let playheadMs = globalPlaybackTime ? globalPlaybackTime.getTime() : null
+    if (playheadMs === null) {
+      const candidateCams = new Set<string>([
+        ...assignedSlots.map(s => s.cameraId!).filter(Boolean),
+        ...selectedCameras,
+      ])
+      const earliest = recordingsRef.current
+        .filter(r => candidateCams.has(r.cameraId))
+        .reduce<number | null>((min, r) => {
+          const t = new Date(r.startTime).getTime()
+          return min === null || t < min ? t : min
+        }, null)
+      if (earliest !== null) {
+        playheadMs = earliest
+        setGlobalPlaybackTime(new Date(earliest))
+      }
+    }
+
     console.info(
       `[recordings-ui] global_play_requested` +
-      ` playhead=${globalPlaybackTime?.toISOString() ?? 'null'}` +
+      ` playhead=${playheadMs !== null ? new Date(playheadMs).toISOString() : 'null'}` +
       ` readySlots=${readySlots.length} assignedSlots=${assignedSlots.length}`
     )
 
     // Play all slots that are already ready
     readySlots.forEach(s => videoRefs.current[s.slotIndex]?.play().catch(() => {}))
 
-    // For assigned-but-not-ready slots, auto-load recording covering the playhead
-    const playheadMs = globalPlaybackTime ? globalPlaybackTime.getTime() : null
+    // For assigned-but-not-ready slots: start at the playhead if a recording
+    // covers it, otherwise jump to that camera's NEXT block in range
+    let clockAnchored = readySlots.length > 0
     assignedSlots
       .filter(s => s.status !== 'ready')
       .forEach(slot => {
@@ -1289,20 +1339,27 @@ export function RecordingsPage() {
 
         const camRecs   = recordingsByCamera.get(slot.cameraId) ?? []
         const covering  = camRecs.find(r =>
-          new Date(r.startTime).getTime() <= playheadMs && new Date(r.endTime).getTime() > playheadMs
+          new Date(r.startTime).getTime() <= playheadMs! && new Date(r.endTime).getTime() > playheadMs!
         )
+        const target = covering ?? camRecs
+          .filter(r => new Date(r.startTime).getTime() > playheadMs!)
+          .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
 
-        if (covering) {
+        if (target) {
           console.info(
             `[recordings-ui] slot_autoload_from_playhead slot=${slot.slotIndex}` +
-            ` cameraId=${slot.cameraId} recId=${covering.id}` +
-            ` recStart=${covering.startTime} recEnd=${covering.endTime}`
+            ` cameraId=${slot.cameraId} recId=${target.id} covering=${!!covering}` +
+            ` recStart=${target.startTime} recEnd=${target.endTime}`
           )
-          startPreviewInSlotRef.current(slot.slotIndex, covering, new Date(playheadMs))
+          const startAt = covering ? new Date(playheadMs!) : new Date(target.startTime)
+          // Only the first started slot re-anchors the master clock — later
+          // slots follow it instead of bouncing the playhead around
+          startPreviewInSlotRef.current(slot.slotIndex, target, startAt, { noClockAnchor: clockAnchored })
+          clockAnchored = true
         } else {
           console.info(
-            `[recordings-ui] slot_no_recording_at_playhead slot=${slot.slotIndex}` +
-            ` cameraId=${slot.cameraId} playhead=${new Date(playheadMs).toISOString()}`
+            `[recordings-ui] no_recording_at_playhead slot=${slot.slotIndex}` +
+            ` cameraId=${slot.cameraId} playhead=${new Date(playheadMs!).toISOString()}`
           )
           stopSlot(slot.slotIndex)
           setSlots(prev => prev.map((s, i) => i === slot.slotIndex ? {
