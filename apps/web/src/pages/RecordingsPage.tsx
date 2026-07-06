@@ -165,6 +165,18 @@ export function RecordingsPage() {
   const recordingsRef         = useRef<RecordingWithCamera[]>([])
   const nextRecBySlotRef      = useRef<{ [k: number]: RecordingWithCamera | null }>({})
   const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
+  // Sessions already deleted — avoids duplicate DELETE from error/ended/unmount/slot-change
+  const deletedSessionsRef    = useRef<Set<string>>(new Set())
+
+  const deleteSessionOnce = (sessionType: string | null, sessionId: string | null | undefined) => {
+    if (!sessionId) return
+    if (deletedSessionsRef.current.has(sessionId)) return
+    deletedSessionsRef.current.add(sessionId)
+    const ep = sessionType === 'preview'
+      ? `/recordings/preview/${sessionId}`
+      : `/recordings/playback/${sessionId}`
+    apiDelete(ep).catch(() => {})
+  }
 
   // Keep refs in sync
   useEffect(() => { slotsRef.current = slots }, [slots])
@@ -196,10 +208,7 @@ export function RecordingsPage() {
             videoCleanupRef.current[s.slotIndex] = null
           }
           if (s.sessionId) {
-            const ep = s.sessionType === 'preview'
-              ? `/recordings/preview/${s.sessionId}`
-              : `/recordings/playback/${s.sessionId}`
-            apiDelete(ep).catch(() => {})
+            deleteSessionOnce(s.sessionType, s.sessionId)
           }
         })
         return prev.slice(0, count)
@@ -217,10 +226,7 @@ export function RecordingsPage() {
       previewStartTimesRef.current[s.slotIndex] = null
       if (videoCleanupRef.current[s.slotIndex]) videoCleanupRef.current[s.slotIndex]!()
       if (s.sessionId) {
-        const ep = s.sessionType === 'preview'
-          ? `/recordings/preview/${s.sessionId}`
-          : `/recordings/playback/${s.sessionId}`
-        apiDelete(ep).catch(() => {})
+        deleteSessionOnce(s.sessionType, s.sessionId)
       }
     })
   }, [])
@@ -341,10 +347,7 @@ export function RecordingsPage() {
     if (vid) { vid.src = ''; vid.load() }
     const s = slotsRef.current[slotIndex]
     if (s?.sessionId) {
-      const ep = s.sessionType === 'preview'
-        ? `/recordings/preview/${s.sessionId}`
-        : `/recordings/playback/${s.sessionId}`
-      apiDelete(ep).catch(() => {})
+      deleteSessionOnce(s.sessionType, s.sessionId)
     }
   }
 
@@ -602,10 +605,7 @@ export function RecordingsPage() {
     }
     const existingSlot = slotsRef.current[slotIndex]
     if (existingSlot?.sessionId) {
-      const ep = existingSlot.sessionType === 'preview'
-        ? `/recordings/preview/${existingSlot.sessionId}`
-        : `/recordings/playback/${existingSlot.sessionId}`
-      apiDelete(ep).catch(() => {})
+      deleteSessionOnce(existingSlot.sessionType, existingSlot.sessionId)
     }
     previewStartTimesRef.current[slotIndex] = null
     const vid0 = videoRefs.current[slotIndex]
@@ -657,7 +657,7 @@ export function RecordingsPage() {
       const handleEnded = () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
         const slot = slotsRef.current[slotIndex]
-        if (slot?.sessionId) apiDelete(`/recordings/playback/${slot.sessionId}`).catch(() => {})
+        if (slot?.sessionId) deleteSessionOnce(slot.sessionType, slot.sessionId)
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
           ...s, status: 'idle', sessionId: null,
         } : s))
@@ -856,10 +856,7 @@ export function RecordingsPage() {
     }
     const existing = slotsRef.current[slotIndex]
     if (existing?.sessionId) {
-      const ep = existing.sessionType === 'preview'
-        ? `/recordings/preview/${existing.sessionId}`
-        : `/recordings/playback/${existing.sessionId}`
-      apiDelete(ep).catch(() => {})
+      deleteSessionOnce(existing.sessionType, existing.sessionId)
     }
     const vid0 = videoRefs.current[slotIndex]
     if (vid0) { vid0.src = ''; vid0.load() }
@@ -955,7 +952,7 @@ export function RecordingsPage() {
           ? previewStart + (vid.currentTime * 1000)
           : new Date(rec.endTime).getTime()
 
-        apiDelete(`/recordings/preview/${sessionId}`).catch(() => {})
+        deleteSessionOnce('preview', sessionId)
 
         // Find the next recording for this camera within 3s of where we just ended
         const CONTINUITY_GAP_MS = 3_000

@@ -1674,10 +1674,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // DELETE /api/recordings/preview/:sessionId — Stop FFmpeg, remove session.
+  // Idempotent: deleting an unknown/expired/already-deleted session is OK.
   server.delete('/preview/:sessionId', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string }
     const session = previewSessions.get(sessionId)
-    if (!session) return reply.status(404).send({ message: 'Sesión de preview no encontrada' })
+    if (!session) {
+      return reply.send({ ok: true, alreadyDeleted: true })
+    }
     if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
       return reply.status(403).send({ message: 'Sin permiso' })
     }
