@@ -358,6 +358,36 @@ interface PreviewSession {
   stderrTail?:     string[]
   errorCategory?:  string
   errorDetail?:    string
+  hadFirstByte?:   boolean
+}
+
+// Failed previews are retained here after the session is deleted so the
+// frontend can still fetch the error category (the slot cleanup often
+// DELETEs the session before the status query lands).
+interface FailedPreviewInfo {
+  userId:       string
+  slotIndex:    number
+  category:     string
+  detail:       string
+  stderrTail:   string
+  hadFirstByte: boolean
+  expiresAt:    number
+}
+const failedPreviewSessions = new Map<string, FailedPreviewInfo>()
+const FAILED_PREVIEW_TTL_MS = 60_000
+
+function retainFailedPreview(sessionId: string, session: PreviewSession, log: (msg: string) => void) {
+  if (!session.errorCategory) return
+  failedPreviewSessions.set(sessionId, {
+    userId:       session.userId,
+    slotIndex:    session.slotIndex,
+    category:     session.errorCategory,
+    detail:       session.errorDetail ?? '',
+    stderrTail:   (session.stderrTail ?? []).slice(-10).join(' | ').slice(0, 600),
+    hadFirstByte: session.hadFirstByte ?? false,
+    expiresAt:    Date.now() + FAILED_PREVIEW_TTL_MS,
+  })
+  log(`[recordings-preview] failed_session_retained sessionId=${sessionId} ttlMs=${FAILED_PREVIEW_TTL_MS} category=${session.errorCategory}`)
 }
 
 // Mask credentials in any rtsp:// or http(s):// URL embedded in log text.
@@ -402,15 +432,20 @@ function getNvrPreviewState(nvrId: string): NvrPreviewState {
 }
 
 /** Wait for a free preview slot on this NVR (bounded), enforce stagger, and
- *  return a release function. After the wait cap, proceeds anyway so a stuck
- *  queue can never freeze playback entirely. */
+ *  return a release function — or null when the wait cap expires with the
+ *  slot still busy. Returning null (instead of opening an extra FFmpeg)
+ *  guarantees MAX_PREVIEW_PER_NVR is a hard limit. */
 async function acquireNvrPreviewSlot(
   nvrId: string, slotIndex: number, log: (msg: string) => void
-): Promise<() => void> {
+): Promise<(() => void) | null> {
   const st = getNvrPreviewState(nvrId)
   const waitStart = Date.now()
 
-  while (st.active >= MAX_PREVIEW_PER_NVR && Date.now() - waitStart < PREVIEW_QUEUE_WAIT_MAX_MS) {
+  while (st.active >= MAX_PREVIEW_PER_NVR) {
+    if (Date.now() - waitStart >= PREVIEW_QUEUE_WAIT_MAX_MS) {
+      log(`[recordings-preview] nvr_preview_queue_timeout nvrId=${nvrId} slot=${slotIndex} active=${st.active} waitedMs=${Date.now() - waitStart}`)
+      return null
+    }
     log(`[recordings-preview] nvr_preview_queue nvrId=${nvrId} slot=${slotIndex} queued=${st.queue.length + 1} active=${st.active}`)
     await new Promise<void>(resolve => {
       st.queue.push(resolve)
@@ -453,7 +488,7 @@ function stripNameSizeParams(url: string): string {
 // so subsequent previews of the same camera skip the probe and go straight to transcode.
 const cameraPreviewStrategyOverride = new Map<string, PreviewStrategy>()
 
-// Periodic cleanup of stale preview sessions
+// Periodic cleanup of stale preview sessions + expired failure records
 setInterval(() => {
   const now = Date.now()
   for (const [sid, session] of previewSessions.entries()) {
@@ -464,7 +499,10 @@ setInterval(() => {
       }
     }
   }
-}, 5 * 60 * 1000)
+  for (const [sid, info] of failedPreviewSessions.entries()) {
+    if (now > info.expiresAt) failedPreviewSessions.delete(sid)
+  }
+}, 60 * 1000)
 
 // ─── RTSP URL helpers ─────────────────────────────────────────────
 
@@ -1650,6 +1688,20 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       session.nvrId, session.slotIndex, (msg) => server.log.info(msg)
     )
 
+    if (!releaseNvrSlot) {
+      // Hard limit: never open an extra FFmpeg against a saturated NVR.
+      // Record the category so the frontend shows the session-limit message.
+      session.errorCategory = 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
+      session.errorDetail   = `Cola de previews del NVR llena (max=${MAX_PREVIEW_PER_NVR}) — timeout de ${PREVIEW_QUEUE_WAIT_MAX_MS}ms`
+      session.hadFirstByte  = false
+      retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+      server.log.warn(
+        `[recordings-preview] nvr_preview_rejected_453 nvrId=${session.nvrId}` +
+        ` cameraId=${session.cameraId} slot=${session.slotIndex} reason=queue_timeout`
+      )
+      return reply.status(503).send({ message: 'El NVR no tiene sesiones de reproducción libres' })
+    }
+
     // Session may have been deleted while waiting in the queue
     if (!previewSessions.has(sessionId)) {
       releaseNvrSlot()
@@ -1710,6 +1762,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
       proc.stdout?.once('data', (chunk: Buffer) => {
         firstByteSent = true
+        session.hadFirstByte  = true
         session.errorCategory = undefined
         session.errorDetail   = undefined
         server.log.info(
@@ -1734,6 +1787,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           const category = classifyRtspError(stderrTail.join('\n'))
           session.errorCategory = category
           session.errorDetail   = stderrTail.slice(-5).join(' | ').slice(0, 400)
+          session.hadFirstByte  = false
+          retainFailedPreview(sessionId, session, (m) => server.log.info(m))
           server.log.warn(
             `[recordings-preview] ffmpeg_failed sessionId=${sessionId}` +
             ` code=${code} variant=${variant} category=${category} stderr_tail=${session.errorDetail}`
@@ -1790,20 +1845,57 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // GET /api/recordings/preview/:sessionId/status — Error category after a
-  // failed stream, so the frontend can show the real cause.
+  // failed stream, so the frontend can show the real cause. Falls back to
+  // the retained failure record when the session was already deleted.
   server.get('/preview/:sessionId/status', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string }
     const session = previewSessions.get(sessionId)
-    if (!session) return reply.status(404).send({ message: 'Sesión de preview no encontrada' })
-    if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
-      return reply.status(403).send({ message: 'Sin permiso' })
+
+    if (session) {
+      if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+        return reply.status(403).send({ message: 'Sin permiso' })
+      }
+      if (session.errorCategory) {
+        server.log.info(`[recordings-preview] status_error sessionId=${sessionId} category=${session.errorCategory}`)
+      }
+      return reply.send({
+        ok:            !session.errorCategory,
+        status:        session.errorCategory ? 'error' : 'active',
+        category:      session.errorCategory ?? null,
+        message:       session.errorCategory ?? null,
+        detail:        session.errorDetail ?? null,
+        stderrTail:    (session.stderrTail ?? []).slice(-10).join(' | ').slice(0, 600) || null,
+        hadFirstByte:  session.hadFirstByte ?? null,
+        // legacy fields
+        errorCategory: session.errorCategory ?? null,
+        errorDetail:   session.errorDetail ?? null,
+        strategy:      session.strategy,
+        detectedCodec: session.detectedCodec,
+      })
     }
-    return reply.send({
-      errorCategory: session.errorCategory ?? null,
-      errorDetail:   session.errorDetail ?? null,
-      strategy:      session.strategy,
-      detectedCodec: session.detectedCodec,
-    })
+
+    const failed = failedPreviewSessions.get(sessionId)
+    if (failed && Date.now() <= failed.expiresAt) {
+      if (failed.userId !== request.user.sub && request.user.role !== 'ADMIN') {
+        return reply.status(403).send({ message: 'Sin permiso' })
+      }
+      server.log.info(`[recordings-preview] status_error sessionId=${sessionId} category=${failed.category} source=retained`)
+      return reply.send({
+        ok:            false,
+        status:        'error',
+        category:      failed.category,
+        message:       failed.category,
+        detail:        failed.detail,
+        stderrTail:    failed.stderrTail || null,
+        hadFirstByte:  failed.hadFirstByte,
+        // legacy fields
+        errorCategory: failed.category,
+        errorDetail:   failed.detail,
+      })
+    }
+
+    server.log.info(`[recordings-preview] status_not_found sessionId=${sessionId}`)
+    return reply.status(404).send({ message: 'Sesión de preview no encontrada' })
   })
 
   // DELETE /api/recordings/preview/:sessionId — Stop FFmpeg, remove session.
@@ -1817,6 +1909,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
       return reply.status(403).send({ message: 'Sin permiso' })
     }
+    // Preserve failure info so a status query arriving after this DELETE
+    // still gets the real category
+    retainFailedPreview(sessionId, session, (m) => server.log.info(m))
     previewSessions.delete(sessionId)
     if (session.vodProcess) {
       try { session.vodProcess.kill('SIGTERM') } catch {}
