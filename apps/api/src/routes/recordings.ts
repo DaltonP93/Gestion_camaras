@@ -370,6 +370,9 @@ function maskUrlCredentials(text: string): string {
 // can show the real cause instead of a generic "retry with H.264".
 function classifyRtspError(text: string): string {
   const t = text.toLowerCase()
+  // 453 first — its stderr also contains "4XX Client Error" and "DESCRIBE
+  // failed", which would otherwise mismatch as auth/open errors
+  if (/453|not enough bandwidth/.test(t))                             return 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
   if (/401|unauthorized|credenciales/.test(t))                        return 'RTSP_AUTH_OR_TRACK_DENIED'
   if (/404|not found|no encontrado/.test(t))                          return 'RTSP_TRACK_NOT_FOUND'
   if (/connection refused|conexi.n rechazada|timed? ?out|timeout/.test(t)) return 'NVR_OFFLINE_OR_TIMEOUT'
