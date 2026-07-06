@@ -1107,7 +1107,7 @@ export function RecordingsPage() {
         console.info(`[recordings-ui] preview_error_category slot=${slotIndex} category=${category ?? 'unknown'} detail=${detail ?? ''}`)
 
         const CATEGORY_MSG: Record<string, string> = {
-          NVR_BANDWIDTH_OR_SESSION_LIMIT: 'El NVR rechazó la reproducción por límite de sesiones/ancho de banda. Cerrá otras vistas en vivo o probá una sola cámara.',
+          NVR_BANDWIDTH_OR_SESSION_LIMIT: 'El NVR rechazó esta segunda reproducción por límite de sesiones/ancho de banda. Probá cerrar vistas en vivo o reproducir una sola cámara de este NVR.',
           RTSP_AUTH_OR_TRACK_DENIED:      'Canal/track no autorizado por el NVR.',
           RTSP_TRACK_NOT_FOUND:           'Track de grabación no disponible.',
           NVR_OFFLINE_OR_TIMEOUT:         'El NVR no responde (timeout / conexión rechazada).',
