@@ -1067,6 +1067,24 @@ export function RecordingsPage() {
           ` forceTranscode=${forceTranscode} alreadyRetried=${previewRetriedRef.current[slotIndex] ?? false}`
         )
 
+        // Natural end of clip disguised as an error: the stream closed after
+        // playing to (near) the end of the recorded block. Some browsers fire
+        // `error` instead of `ended` when the fMP4 stream terminates.
+        const previewStartForEnd = previewStartTimesRef.current[slotIndex]
+        const clipInfo = clipInfoBySlotRef.current[slotIndex]
+        if (previewStartForEnd != null && vid.currentTime > 1 && clipInfo) {
+          const positionMs  = previewStartForEnd + vid.currentTime * 1000
+          const remainingMs = clipInfo.clipEndMs - positionMs
+          if (remainingMs < 5_000) {
+            console.info(
+              `[recordings-ui] continuity_skip_error_because_natural_end slot=${slotIndex}` +
+              ` position=${new Date(positionMs).toISOString()} remainingMs=${remainingMs}`
+            )
+            runClipContinuity('stream_closed_at_tail')
+            return
+          }
+        }
+
         // Ask the backend what actually failed (FFmpeg stderr classification).
         // Retry once after a short delay: the FFmpeg exit that produces the
         // category can land milliseconds after the video element errors.
@@ -1118,13 +1136,19 @@ export function RecordingsPage() {
         } : s))
       }
 
-      const handleEnded = () => {
+      // Shared by the natural `ended` event AND stream-close-at-tail errors —
+      // both mean "clip finished", never a failure.
+      const runClipContinuity = (reason: string) => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
         // Compute wall-clock position when the clip ended
         const previewStart = previewStartTimesRef.current[slotIndex]
         const endedAtMs = previewStart != null
           ? previewStart + (vid.currentTime * 1000)
           : new Date(rec.endTime).getTime()
+        console.info(
+          `[recordings-ui] continuity_end_detected slot=${slotIndex} reason=${reason}` +
+          ` endedAt=${new Date(endedAtMs).toISOString()}`
+        )
 
         deleteSessionOnce('preview', sessionId)
 
@@ -1160,7 +1184,7 @@ export function RecordingsPage() {
 
         // Gap too large or no next recording — show no_recording overlay with skip button
         console.info(
-          `[recordings-ui] no_recording_at_playhead slot=${slotIndex}` +
+          `[recordings-ui] ${nextRec ? 'no_recording_at_playhead' : 'continuity_no_next_clip'} slot=${slotIndex}` +
           ` playhead=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
         )
         // Stash next rec so the overlay can offer a skip button
@@ -1170,6 +1194,8 @@ export function RecordingsPage() {
         } : s))
         if (!nextRec) setGlobalPlaying(false)
       }
+
+      const handleEnded = () => runClipContinuity('ended_event')
 
       ;(videoCleanupRef.current[slotIndex] as (() => void) | null)?.()
       vid.addEventListener('error', handleError)
