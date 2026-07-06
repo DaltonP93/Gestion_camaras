@@ -57,7 +57,9 @@ api.interceptors.response.use(
     const isSilentEndpoint = url.includes('/nvrs/test-connection') || url.includes('/nvrs/detect') || url.includes('/alerts/settings/test-email')
     // /auth/me se llama en cada recarga de página — un 500/error de red no debe mostrar
     // toast porque el usuario ya tiene sesión activa y es un error interno del servidor.
-    const isToastSuppressed = isSilentEndpoint || url.includes('/auth/me')
+    // /recordings/preview maneja sus errores por slot — sin toast global
+    // (pero mantiene el refresh de token en 401, por eso no va en isSilentEndpoint).
+    const isToastSuppressed = isSilentEndpoint || url.includes('/auth/me') || url.includes('/recordings/preview')
 
     if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint && !isSilentEndpoint) {
       originalRequest._retry = true

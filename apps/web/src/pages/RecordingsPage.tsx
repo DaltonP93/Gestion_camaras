@@ -943,12 +943,15 @@ export function RecordingsPage() {
         console.info(`[recordings-ui] preview_error_category slot=${slotIndex} category=${category ?? 'unknown'} detail=${detail ?? ''}`)
 
         const CATEGORY_MSG: Record<string, string> = {
-          RTSP_AUTH_OR_TRACK_DENIED: 'Canal/track no autorizado por el NVR (401)',
-          RTSP_TRACK_NOT_FOUND:      'Track de grabación no disponible en el NVR (404)',
-          NVR_OFFLINE_OR_TIMEOUT:    'El NVR no responde (timeout / conexión rechazada)',
-          RTSP_OPEN_FAILED:          'No se pudo abrir el RTSP de reproducción',
-          CODEC_UNSUPPORTED:         'Codec no soportado por el navegador',
+          NVR_BANDWIDTH_OR_SESSION_LIMIT: 'El NVR no permite más reproducciones simultáneas. Cerrá otro slot o reintentá secuencialmente.',
+          RTSP_AUTH_OR_TRACK_DENIED:      'Canal/track no autorizado por el NVR.',
+          RTSP_TRACK_NOT_FOUND:           'Track de grabación no disponible.',
+          NVR_OFFLINE_OR_TIMEOUT:         'El NVR no responde (timeout / conexión rechazada).',
+          RTSP_OPEN_FAILED:               'No se pudo abrir RTSP de reproducción.',
+          CODEC_UNSUPPORTED:              'Codec no soportado. Probá convertir a H.264.',
         }
+        // H.264 transcode only fixes codec problems — never retry it for
+        // bandwidth/auth/track/offline failures
         const isCodecIssue = !category || category === 'CODEC_UNSUPPORTED' || category === 'UNKNOWN'
 
         // Auto-retry with H.264 only when the failure is codec-related —
@@ -1531,6 +1534,9 @@ export function RecordingsPage() {
                     {slot.status === 'error' && (() => {
                       const errCategory = errorCategoryBySlotRef.current[idx] ?? null
                       const showH264 = !errCategory || errCategory === 'CODEC_UNSUPPORTED' || errCategory === 'UNKNOWN'
+                      const retryLabel = errCategory === 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
+                        ? 'Reintentar cuando haya sesión libre'
+                        : 'Reintentar'
                       return (
                         <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
                           <AlertTriangle size={18} className="text-red-500 flex-shrink-0" />
@@ -1557,7 +1563,7 @@ export function RecordingsPage() {
                                 }}
                                 className="text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-400 transition-colors"
                               >
-                                Reintentar
+                                {retryLabel}
                               </button>
                             </div>
                           )}
