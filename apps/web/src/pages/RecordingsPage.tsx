@@ -351,6 +351,16 @@ export function RecordingsPage() {
     }
   }
 
+  // Close a single slot: stop its preview, free the camera, keep search
+  // results, timeline and other slots untouched.
+  const closeSlot = (slotIndex: number) => {
+    console.info(`[recordings-ui] slot_close slot=${slotIndex} cameraId=${slotsRef.current[slotIndex]?.cameraId ?? 'none'}`)
+    stopSlot(slotIndex)
+    nextRecBySlotRef.current[slotIndex] = null
+    errorCategoryBySlotRef.current[slotIndex] = null
+    setSlots(prev => prev.map((s, i) => i === slotIndex ? emptySlot(i) : s))
+  }
+
   const clearAllPlayback = () => {
     const count = slotsRef.current.length
     for (let i = 0; i < count; i++) stopSlot(i)
@@ -380,23 +390,36 @@ export function RecordingsPage() {
     console.info(`[recordings-ui] assigned_camera_added_to_search slot=${activeSlotIndex} cameraId=${cameraId}`)
     setSelectedCameras(prev => new Set([...prev, cameraId]))
 
+    // Move instead of duplicate: if this camera lives in another slot, free it
+    const previousSlot = slotsRef.current.findIndex(
+      (s, i) => s.cameraId === cameraId && i !== activeSlotIndex
+    )
+    if (previousSlot >= 0) {
+      console.info(`[recordings-ui] slot_assign_existing_moved from=${previousSlot} to=${activeSlotIndex} cameraId=${cameraId}`)
+      stopSlot(previousSlot)
+    }
+
     stopSlot(activeSlotIndex)
 
-    setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
-      ...s,
-      cameraId: cam.id,
-      cameraName: cam.name,
-      nvrId: cam.nvrId,
-      nvrName: nvrObj?.name ?? '',
-      recording: null,
-      status: 'idle',
-      playbackUrl: null,
-      sessionId: null,
-      downloadUrl: null,
-      errorMsg: null,
-      vodProgress: null,
-      mimeType: null,
-    } : s))
+    setSlots(prev => prev.map((s, i) => {
+      if (i === previousSlot) return emptySlot(i)
+      if (i !== activeSlotIndex) return s
+      return {
+        ...s,
+        cameraId: cam.id,
+        cameraName: cam.name,
+        nvrId: cam.nvrId,
+        nvrName: nvrObj?.name ?? '',
+        recording: null,
+        status: 'idle',
+        playbackUrl: null,
+        sessionId: null,
+        downloadUrl: null,
+        errorMsg: null,
+        vodProgress: null,
+        mimeType: null,
+      }
+    }))
 
     // If we already have recordings for this camera, auto-load via preview
     const camRecs = recordingsByCamera.get(cameraId)
@@ -1416,6 +1439,25 @@ export function RecordingsPage() {
                       </span>
                       {slot.status === 'ready' && (
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-green-700/60 text-green-300">● Play</span>
+                      )}
+                      {slot.status === 'loading' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-300">Cargando…</span>
+                      )}
+                      {slot.status === 'error' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-red-900/70 text-red-300">Error</span>
+                      )}
+                      {slot.status === 'no_recording' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-400">Sin grabación</span>
+                      )}
+                      <span className="flex-1" />
+                      {slot.cameraId && (
+                        <button
+                          onClick={e => { e.stopPropagation(); closeSlot(idx) }}
+                          title="Cerrar cámara de este canal"
+                          className="pointer-events-auto flex-shrink-0 p-0.5 rounded text-surface-400 hover:text-red-400 hover:bg-black/60 transition-colors"
+                        >
+                          <XCircle size={12} />
+                        </button>
                       )}
                     </div>
 
