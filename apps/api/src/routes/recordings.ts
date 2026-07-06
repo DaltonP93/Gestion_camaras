@@ -359,6 +359,13 @@ interface PreviewSession {
   errorDetail?:    string
 }
 
+// Mask credentials in any rtsp:// or http(s):// URL embedded in log text.
+// FFmpeg stderr echoes the full input URL including the password — never
+// store or log it in clear.
+function maskUrlCredentials(text: string): string {
+  return text.replace(/(rtsps?|https?):\/\/([^:\/\s@]+):([^@\/\s]+)@/gi, '$1://$2:***@')
+}
+
 // Classify RTSP/FFmpeg failures into actionable categories so the frontend
 // can show the real cause instead of a generic "retry with H.264".
 function classifyRtspError(text: string): string {
@@ -1469,7 +1476,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           detectedCodec = probeResult.codec
         } else if (!probeResult.ok && probeResult.error) {
           probeErrorCategory = classifyRtspError(probeResult.error)
-          probeErrorDetail   = probeResult.error.slice(0, 300)
+          probeErrorDetail   = maskUrlCredentials(probeResult.error).slice(0, 300)
         }
       } catch {
         probeElapsedMs = Date.now() - probeStart
@@ -1585,7 +1592,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     session.stderrTail = stderrTail
     proc.stderr?.on('data', (chunk: Buffer) => {
       for (const raw of chunk.toString().split('\n')) {
-        const line = raw.trim()
+        const line = maskUrlCredentials(raw.trim())
         if (!line) continue
         stderrTail.push(line)
         if (stderrTail.length > 30) stderrTail.shift()
