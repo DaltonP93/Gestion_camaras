@@ -418,6 +418,10 @@ const previewSessions = new Map<string, PreviewSession>()
 // Hikvision NVRs cap simultaneous playback sessions/bandwidth and answer
 // "453 Not Enough Bandwidth" when exceeded. Serialize preview starts per NVR
 // and stagger them so 2x2 grids don't burst-open sessions.
+// ffprobe before preview costs one extra RTSP DESCRIBE per start — disabled
+// by default to minimize 453 Not Enough Bandwidth on session-limited NVRs.
+const PREVIEW_PROBE_ENABLED = process.env.RECORDINGS_PREVIEW_PROBE === 'true'
+
 const MAX_PREVIEW_PER_NVR = Math.max(1, parseInt(process.env.RECORDINGS_MAX_PREVIEW_PER_NVR || '1', 10) || 1)
 const PREVIEW_START_STAGGER_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVIEW_START_STAGGER_MS || '1200', 10) || 1200)
 const PREVIEW_QUEUE_WAIT_MAX_MS = 30_000
@@ -1546,7 +1550,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       urlStrategy = 'fallback_timestamps'
     }
 
-    // Probe RTSP stream to detect codec — use 5s timeout to avoid long POST delays
     const forceTranscode   = body.forceTranscode ?? false
     const canPlayHevcMp4   = body.canPlayHevcMp4 ?? false
     let detectedCodec      = 'unknown'
@@ -1563,7 +1566,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       server.log.info(`[recordings-preview] strategy_override_saved cameraId=${body.cameraId} strategy=preview_transcode_h264`)
     } else if (overrideStrategy) {
       server.log.info(`[recordings-preview] strategy_override_hit cameraId=${body.cameraId} strategy=${overrideStrategy}`)
+    } else if (!PREVIEW_PROBE_ENABLED) {
+      // No probe by default: every ffprobe costs an extra RTSP DESCRIBE
+      // against the NVR, raising the chance of 453 on session-limited
+      // Hikvision units. Without codec knowledge we always transcode —
+      // safe for any browser, no DESCRIBE spent.
+      server.log.info(`[recordings-preview] probe_skipped reason=disabled strategy=preview_transcode_h264 cameraId=${body.cameraId}`)
     } else {
+      // RECORDINGS_PREVIEW_PROBE=true — probe to allow copy strategies
       const probeStart = Date.now()
       try {
         const probeResult = await Promise.race([
@@ -1593,7 +1603,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     const strategy = overrideStrategy && !forceTranscode
       ? overrideStrategy
-      : determinePreviewStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
+      : !PREVIEW_PROBE_ENABLED && !forceTranscode
+        ? 'preview_transcode_h264'
+        : determinePreviewStrategy({ detectedCodec, canPlayHevcMp4, forceTranscode })
 
     server.log.info(
       `[recordings-time] preview_time_mapping cameraId=${body.cameraId} ch=${camera.channel}` +
