@@ -103,6 +103,10 @@ function formatSize(bytes: number) {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+// Continuity tuning — overridable at build time via Vite env
+const CONTINUITY_GAP_MS        = Number(import.meta.env.VITE_RECORDINGS_CONTINUITY_GAP_MS)        || 5_000
+const MIN_PREVIEW_DURATION_MS  = Number(import.meta.env.VITE_RECORDINGS_MIN_PREVIEW_DURATION_MS)  || 3_000
+
 const POLL_INTERVAL_MS     = 1_000
 const POLL_ABSOLUTE_MAX_MS = 15 * 60 * 1_000
 const POLL_STALL_MS        = 45_000
@@ -952,6 +956,25 @@ export function RecordingsPage() {
     const effectiveMs   = Math.max(recStartMs, Math.min(playheadMs, recEndMs - 1000))
     const effectiveStart = new Date(effectiveMs).toISOString()
 
+    // Never open a preview shorter than MIN_PREVIEW_DURATION_MS — the playhead
+    // is at the tail of this block, so jump straight to the next block instead
+    const remainingMs = recEndMs - effectiveMs
+    if (remainingMs < MIN_PREVIEW_DURATION_MS) {
+      console.info(`[recordings-ui] continuity_skip_short_clip slot=${slotIndex} durationMs=${remainingMs} recId=${rec.id}`)
+      const next = recordingsRef.current
+        .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > effectiveMs)
+        .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
+      if (next && next.id !== rec.id) {
+        startPreviewInSlotRef.current(slotIndex, next, new Date(next.startTime), opts)
+        return
+      }
+      nextRecBySlotRef.current[slotIndex] = null
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s, status: 'no_recording', sessionId: null, sessionType: null, errorMsg: null,
+      } : s))
+      return
+    }
+
     const videoEl = videoRefs.current[slotIndex] ?? document.createElement('video')
     const canPlayHevcMp4 = !forceTranscode && (
       videoEl.canPlayType('video/mp4; codecs="hvc1"') !== '' ||
@@ -1090,22 +1113,24 @@ export function RecordingsPage() {
         // Camera manually closed while playing — don't chain into the next clip
         if (closedCamerasRef.current.has(rec.cameraId)) return
 
-        // Find the next recording for this camera within 3s of where we just ended
-        const CONTINUITY_GAP_MS = 3_000
-        const allRecs = recordingsRef.current
-        const nextRec = allRecs
-          .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > endedAtMs - 500)
+        // Continuity is driven by recording METADATA, not by invented ranges:
+        // find the next block of this camera after the current one and start
+        // it from ITS OWN startTime (never from currentRecording.endTime)
+        const currentStartMs = new Date(rec.startTime).getTime()
+        const currentEndMs   = new Date(rec.endTime).getTime()
+        const nextRec = recordingsRef.current
+          .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > currentStartMs && r.id !== rec.id)
           .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
 
         if (nextRec) {
           const nextStartMs = new Date(nextRec.startTime).getTime()
-          const gap = nextStartMs - endedAtMs
+          const gap = nextStartMs - currentEndMs
           console.info(
-            `[recordings-ui] clip_ended_continuity slot=${slotIndex} endedAt=${new Date(endedAtMs).toISOString()}` +
-            ` nextRec=${nextRec.id} nextStart=${nextRec.startTime} gapMs=${gap}`
+            `[recordings-ui] continuity_next_clip slot=${slotIndex}` +
+            ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime} gapMs=${gap}`
           )
           if (gap <= CONTINUITY_GAP_MS) {
-            // Auto-load next clip seamlessly
+            // Contiguous (or near) block — play it from its own start
             startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs))
             return
           }
@@ -1113,8 +1138,8 @@ export function RecordingsPage() {
 
         // Gap too large or no next recording — show no_recording overlay with skip button
         console.info(
-          `[recordings-ui] clip_ended_no_continuity slot=${slotIndex}` +
-          ` endedAt=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
+          `[recordings-ui] no_recording_at_playhead slot=${slotIndex}` +
+          ` playhead=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
         )
         // Stash next rec so the overlay can offer a skip button
         nextRecBySlotRef.current[slotIndex] = nextRec
