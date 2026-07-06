@@ -51,11 +51,22 @@ function generateTicks(rangeStart: number, rangeEnd: number, intervalMs: number)
     ticks.push({
       time: t,
       label: spansDays
-        ? formatNvrTime(t, 'dd HH:mm')
+        ? formatNvrTime(t, 'dd/MM HH:mm')
         : formatNvrTime(t, 'HH:mm'),
     })
   }
   return ticks
+}
+
+// Midnight boundaries (NVR wall clock = UTC components) for multi-day ranges
+const DAY_MS = 24 * 3600_000
+function generateDayBoundaries(rangeStart: number, rangeEnd: number): number[] {
+  if (rangeEnd - rangeStart <= DAY_MS) return []
+  const bounds: number[] = []
+  for (let t = Math.ceil(rangeStart / DAY_MS) * DAY_MS; t < rangeEnd; t += DAY_MS) {
+    bounds.push(t)
+  }
+  return bounds
 }
 
 const LABEL_W   = 130 // px — camera label column
@@ -116,6 +127,11 @@ export function RecordingTimeline({
     if (totalMs <= 0) return []
     return generateTicks(rangeStart, rangeEnd, getTickInterval(totalMs))
   }, [rangeStart, rangeEnd, totalMs])
+
+  const dayBoundaries = useMemo(
+    () => totalMs > 0 ? generateDayBoundaries(rangeStart, rangeEnd) : [],
+    [rangeStart, rangeEnd, totalMs]
+  )
 
   // ── Drag / click on track ────────────────────────────────────────────────────
   const isDraggingRef = useRef(false)
@@ -190,6 +206,13 @@ export function RecordingTimeline({
           className={clsx('flex-1 relative overflow-hidden bg-surface-900', (onPreviewTimeChange || onCommitSeekTime) && 'cursor-crosshair')}
           onMouseDown={handleMouseDown}
         >
+          {dayBoundaries.map(t => (
+            <div
+              key={`db-${t}`}
+              className="absolute top-0 bottom-0 w-px bg-surface-500/70 pointer-events-none z-10"
+              style={{ left: pct(t) }}
+            />
+          ))}
           {ticks.map(tick => (
             <div
               key={tick.time}
@@ -248,6 +271,14 @@ export function RecordingTimeline({
                   </div>
                 )}
 
+                {dayBoundaries.map(t => (
+                  <div
+                    key={`db-${t}`}
+                    className="absolute top-0 bottom-0 w-px bg-surface-500/40 pointer-events-none"
+                    style={{ left: pct(t) }}
+                  />
+                ))}
+
                 {recs.map(rec => {
                   const recStart    = new Date(rec.startTime).getTime()
                   const recEnd      = new Date(rec.endTime).getTime()
@@ -259,7 +290,7 @@ export function RecordingTimeline({
                       key={`${rec.cameraId}-${rec.id}`}
                       onMouseDown={e => e.stopPropagation()}
                       onClick={e => { e.stopPropagation(); onSelectRecording(rec) }}
-                      title={`${formatNvrTime(recStart, 'HH:mm:ss')} – ${formatNvrTime(recEnd, 'HH:mm:ss')} (${durationMin}min)`}
+                      title={`${label}\n${formatNvrTime(recStart, 'dd/MM HH:mm:ss')} – ${formatNvrTime(recEnd, 'dd/MM HH:mm:ss')} (${durationMin} min)`}
                       className={clsx(
                         'absolute top-1 bottom-1 rounded-sm transition-colors cursor-pointer',
                         isSelected
