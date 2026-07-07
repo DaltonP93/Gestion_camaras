@@ -1399,6 +1399,7 @@ export function RecordingsPage() {
       .forEach(slot => {
         if (!slot.cameraId) return
         if (playheadMs === null) return
+        closedCamerasRef.current.delete(slot.cameraId)
 
         const camRecs   = recordingsByCamera.get(slot.cameraId) ?? []
         const covering  = camRecs.find(r =>
@@ -1415,8 +1416,6 @@ export function RecordingsPage() {
             ` recStart=${target.startTime} recEnd=${target.endTime}`
           )
           const startAt = covering ? new Date(playheadMs!) : new Date(target.startTime)
-          // Only the first started slot re-anchors the master clock — later
-          // slots follow it instead of bouncing the playhead around
           startPreviewInSlotRef.current(slot.slotIndex, target, startAt, { noClockAnchor: clockAnchored })
           clockAnchored = true
         } else {
@@ -1430,6 +1429,44 @@ export function RecordingsPage() {
           } : s))
         }
       })
+
+    // Auto-assign selected cameras not yet in any slot to empty slots
+    if (playheadMs !== null) {
+      const assignedCamIds = new Set(currentSlots.filter(s => s.cameraId).map(s => s.cameraId!))
+      const unassigned = [...selectedCameras].filter(id => !assignedCamIds.has(id))
+      const emptySlotIndices = currentSlots.filter(s => !s.cameraId).map(s => s.slotIndex)
+
+      unassigned.forEach((cameraId, idx) => {
+        if (idx >= emptySlotIndices.length) return
+        const si = emptySlotIndices[idx]
+        closedCamerasRef.current.delete(cameraId)
+
+        const camRecs = recordingsByCamera.get(cameraId) ?? []
+        const covering = camRecs.find(r =>
+          new Date(r.startTime).getTime() <= playheadMs! && new Date(r.endTime).getTime() > playheadMs!
+        )
+        const target = covering ?? camRecs
+          .filter(r => new Date(r.startTime).getTime() > playheadMs!)
+          .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
+
+        if (target) {
+          console.info(`[recordings-ui] play_auto_assign slot=${si} cameraId=${cameraId} recId=${target.id}`)
+          const startAt = covering ? new Date(playheadMs!) : new Date(target.startTime)
+          startPreviewInSlotRef.current(si, target, startAt, { noClockAnchor: clockAnchored })
+          clockAnchored = true
+        } else {
+          const cam = cameras.find(c => c.id === cameraId)
+          if (cam) {
+            const nvrObj = nvrs.find(n => n.id === cam.nvrId)
+            setSlots(prev => prev.map((s, i) => i === si ? {
+              ...emptySlot(si),
+              cameraId: cam.id, cameraName: cam.name, nvrId: cam.nvrId, nvrName: nvrObj?.name ?? '',
+              status: 'no_recording',
+            } : s))
+          }
+        }
+      })
+    }
 
     setGlobalPlaying(true)
   }
@@ -1532,7 +1569,6 @@ export function RecordingsPage() {
   const anySlotReady   = slots.some(s => s.status === 'ready')
   const assignedSlotCount = slots.filter(s => s.cameraId !== null).length
   const canGlobalPlay  = Boolean(
-    globalPlaybackTime &&
     recordings.length > 0 &&
     (assignedSlotCount > 0 || selectedCameras.size > 0)
   )
