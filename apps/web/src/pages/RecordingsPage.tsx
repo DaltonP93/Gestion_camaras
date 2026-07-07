@@ -404,6 +404,34 @@ export function RecordingsPage() {
             (a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
           )
         })
+        // Auto-start in an available slot if currently playing
+        if (globalPlayingRef.current && mapped.length > 0) {
+          setTimeout(() => {
+            if (!globalPlayingRef.current) return
+            const currentSlots = slotsRef.current
+            if (currentSlots.some(s => s.cameraId === cameraId)) return
+            const emptySi = currentSlots.findIndex(s => !s.cameraId)
+            if (emptySi < 0) return
+            const clock = masterClockRef.current
+            const playheadMs = clock
+              ? clock.playheadMs + (performance.now() - clock.wallMs) * clock.rate
+              : null
+            const sorted = [...mapped].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
+            const covering = playheadMs != null
+              ? sorted.find(r => new Date(r.startTime).getTime() <= playheadMs && new Date(r.endTime).getTime() > playheadMs)
+              : null
+            const target = covering
+              ?? sorted.find(r => playheadMs == null || new Date(r.startTime).getTime() > playheadMs)
+              ?? sorted[0]
+            if (target) {
+              console.info(`[recordings-ui] incremental_autostart slot=${emptySi} cameraId=${cameraId} recId=${target.id}`)
+              startPreviewInSlotRef.current(emptySi, target,
+                covering && playheadMs != null ? new Date(playheadMs) : new Date(target.startTime),
+                { noClockAnchor: true }
+              )
+            }
+          }, 100)
+        }
       })
       .catch(() => {
         // Allow a manual retry by re-toggling
