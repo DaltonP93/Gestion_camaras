@@ -180,6 +180,7 @@ export function RecordingsPage() {
   // re-querying the NVR when a camera is re-selected for the same range
   const searchedKeysRef       = useRef<Set<string>>(new Set())
   const searchRangeIsoRef     = useRef<{ start: string; end: string } | null>(null)
+  const continuityTimerRef    = useRef<{ [k: number]: ReturnType<typeof setTimeout> | null }>({})
 
   const deleteSessionOnce = (sessionType: string | null, sessionId: string | null | undefined) => {
     if (!sessionId) return
@@ -235,6 +236,10 @@ export function RecordingsPage() {
   // ── Cleanup on unmount ─────────────────────────────────────────────────────
   useEffect(() => () => {
     slotsRef.current.forEach(s => {
+      if (continuityTimerRef.current[s.slotIndex]) {
+        clearTimeout(continuityTimerRef.current[s.slotIndex]!)
+        continuityTimerRef.current[s.slotIndex] = null
+      }
       slotKeysRef.current[s.slotIndex] = null
       previewStartTimesRef.current[s.slotIndex] = null
       if (videoCleanupRef.current[s.slotIndex]) videoCleanupRef.current[s.slotIndex]!()
@@ -424,6 +429,10 @@ export function RecordingsPage() {
   // ── Slot helpers ───────────────────────────────────────────────────────────
 
   const stopSlot = (slotIndex: number) => {
+    if (continuityTimerRef.current[slotIndex]) {
+      clearTimeout(continuityTimerRef.current[slotIndex]!)
+      continuityTimerRef.current[slotIndex] = null
+    }
     slotKeysRef.current[slotIndex] = null
     previewStartTimesRef.current[slotIndex] = null
     if (videoCleanupRef.current[slotIndex]) {
@@ -448,7 +457,78 @@ export function RecordingsPage() {
     nextRecBySlotRef.current[slotIndex] = null
     errorCategoryBySlotRef.current[slotIndex] = null
     previewRetriedRef.current[slotIndex] = false
-    setSlots(prev => prev.map((s, i) => i === slotIndex ? emptySlot(i) : s))
+    if (cameraId) closedCamerasRef.current.add(cameraId)
+    setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+      ...s,
+      recording: null,
+      status: 'idle',
+      playbackUrl: null,
+      sessionId: null,
+      sessionType: null,
+      downloadUrl: null,
+      errorMsg: null,
+      vodProgress: null,
+      mimeType: null,
+    } : s))
+  }
+
+  // Shared continuity logic: advances a slot to the next recording block.
+  // Called by the expected-duration timer AND by ended/error-at-tail events.
+  const continueSlotToNextRecording = (slotIndex: number, reason: string) => {
+    if (continuityTimerRef.current[slotIndex]) {
+      clearTimeout(continuityTimerRef.current[slotIndex]!)
+      continuityTimerRef.current[slotIndex] = null
+    }
+    const slot = slotsRef.current[slotIndex]
+    if (!slot?.cameraId || !slot.recording) return
+    if (slot.status === 'loading') return
+
+    const cameraId = slot.cameraId
+    const rec = slot.recording
+    if (closedCamerasRef.current.has(cameraId)) return
+
+    const vid = videoRefs.current[slotIndex]
+    const previewStart = previewStartTimesRef.current[slotIndex]
+    const endedAtMs = previewStart != null && vid
+      ? previewStart + (vid.currentTime * 1000)
+      : new Date(rec.endTime).getTime()
+
+    console.info(
+      `[recordings-ui] continuity_continue slot=${slotIndex} reason=${reason}` +
+      ` endedAt=${new Date(endedAtMs).toISOString()}`
+    )
+
+    if (slot.sessionId) deleteSessionOnce(slot.sessionType, slot.sessionId)
+
+    const currentStartMs = new Date(rec.startTime).getTime()
+    const currentEndMs = new Date(rec.endTime).getTime()
+    const nextRec = recordingsRef.current
+      .filter(r => r.cameraId === cameraId && new Date(r.startTime).getTime() > currentStartMs && r.id !== rec.id)
+      .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
+
+    if (nextRec) {
+      const nextStartMs = new Date(nextRec.startTime).getTime()
+      const gap = nextStartMs - currentEndMs
+      console.info(
+        `[recordings-ui] continuity_next_clip slot=${slotIndex}` +
+        ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime} gapMs=${gap}`
+      )
+      if (gap <= CONTINUITY_GAP_MS) {
+        const otherPlaying = slotsRef.current.some((s, i) => i !== slotIndex && s.status === 'ready')
+        startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs), { noClockAnchor: otherPlaying })
+        return
+      }
+    }
+
+    console.info(
+      `[recordings-ui] ${nextRec ? 'no_recording_at_playhead' : 'continuity_no_next_clip'} slot=${slotIndex}` +
+      ` playhead=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
+    )
+    nextRecBySlotRef.current[slotIndex] = nextRec
+    setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+      ...s, status: 'no_recording', sessionId: null, sessionType: null, errorMsg: null,
+    } : s))
+    if (!nextRec) setGlobalPlaying(false)
   }
 
   const clearAllPlayback = () => {
@@ -1136,63 +1216,9 @@ export function RecordingsPage() {
         } : s))
       }
 
-      // Shared by the natural `ended` event AND stream-close-at-tail errors —
-      // both mean "clip finished", never a failure.
       const runClipContinuity = (reason: string) => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
-        // Compute wall-clock position when the clip ended
-        const previewStart = previewStartTimesRef.current[slotIndex]
-        const endedAtMs = previewStart != null
-          ? previewStart + (vid.currentTime * 1000)
-          : new Date(rec.endTime).getTime()
-        console.info(
-          `[recordings-ui] continuity_end_detected slot=${slotIndex} reason=${reason}` +
-          ` endedAt=${new Date(endedAtMs).toISOString()}`
-        )
-
-        deleteSessionOnce('preview', sessionId)
-
-        // Camera manually closed while playing — don't chain into the next clip
-        if (closedCamerasRef.current.has(rec.cameraId)) return
-
-        // Continuity is driven by recording METADATA, not by invented ranges:
-        // find the next block of this camera after the current one and start
-        // it from ITS OWN startTime (never from currentRecording.endTime)
-        const currentStartMs = new Date(rec.startTime).getTime()
-        const currentEndMs   = new Date(rec.endTime).getTime()
-        const nextRec = recordingsRef.current
-          .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > currentStartMs && r.id !== rec.id)
-          .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
-
-        if (nextRec) {
-          const nextStartMs = new Date(nextRec.startTime).getTime()
-          const gap = nextStartMs - currentEndMs
-          console.info(
-            `[recordings-ui] continuity_next_clip slot=${slotIndex}` +
-            ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime} gapMs=${gap}`
-          )
-          if (gap <= CONTINUITY_GAP_MS) {
-            // Contiguous (or near) block — play it from its own start. The
-            // clock only re-anchors if no OTHER slot is currently playing.
-            const otherPlaying = slotsRef.current.some(
-              (s, i) => i !== slotIndex && s.status === 'ready'
-            )
-            startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs), { noClockAnchor: otherPlaying })
-            return
-          }
-        }
-
-        // Gap too large or no next recording — show no_recording overlay with skip button
-        console.info(
-          `[recordings-ui] ${nextRec ? 'no_recording_at_playhead' : 'continuity_no_next_clip'} slot=${slotIndex}` +
-          ` playhead=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
-        )
-        // Stash next rec so the overlay can offer a skip button
-        nextRecBySlotRef.current[slotIndex] = nextRec
-        setSlots(prev => prev.map((s, i) => i === slotIndex ? {
-          ...s, status: 'no_recording', sessionId: null, sessionType: null, errorMsg: null,
-        } : s))
-        if (!nextRec) setGlobalPlaying(false)
+        continueSlotToNextRecording(slotIndex, reason)
       }
 
       const handleEnded = () => runClipContinuity('ended_event')
@@ -1212,6 +1238,17 @@ export function RecordingsPage() {
           .then(() => console.info(`[recordings-ui] preview_playing slot=${slotIndex} sessionId=${sessionId}`))
           .catch((e: Error) => console.warn(`[recordings-ui] preview_play_rejected slot=${slotIndex} reason=${e.message}`))
       }
+
+      // Continuity timer: clip expected duration + safety margin.
+      // Fires even if onended/onerror never arrive (fMP4 pipe can silently close).
+      if (continuityTimerRef.current[slotIndex]) clearTimeout(continuityTimerRef.current[slotIndex]!)
+      const expectedDurationMs = recEndMs - effectiveMs
+      continuityTimerRef.current[slotIndex] = setTimeout(() => {
+        const currentSlot = slotsRef.current[slotIndex]
+        if (currentSlot?.sessionId === sessionId) {
+          continueSlotToNextRecording(slotIndex, 'expected_timer')
+        }
+      }, expectedDurationMs + 1000)
 
       setSlots(prev => prev.map((s, i) => i === slotIndex ? {
         ...s,
