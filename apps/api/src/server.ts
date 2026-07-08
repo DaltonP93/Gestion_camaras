@@ -92,6 +92,35 @@ async function main() {
     }),
   })
 
+  // ─── Manejador global de errores ───────────────────────────
+  // ZodError (schema.parse en handlers) → 400 con detalle de validación en vez
+  // del 500 genérico; el resto conserva su statusCode (o 500) sin filtrar
+  // stack traces al cliente. Las respuestas de error explícitas de cada
+  // endpoint no pasan por aquí — solo los throws no manejados.
+  server.setErrorHandler((error: any, request, reply) => {
+    if (error?.name === 'ZodError' && Array.isArray(error.issues)) {
+      return reply.status(400).send({
+        code: 'VALIDATION_ERROR',
+        message: 'Datos de solicitud inválidos',
+        details: error.issues.map((i: any) => ({
+          path: Array.isArray(i.path) ? i.path.join('.') : String(i.path ?? ''),
+          message: i.message,
+        })),
+      })
+    }
+    const status = typeof error?.statusCode === 'number' && error.statusCode >= 400
+      ? error.statusCode
+      : 500
+    if (status >= 500) {
+      server.log.error({ err: error, url: request.url }, 'unhandled_error')
+      return reply.status(status).send({ code: 'INTERNAL_ERROR', message: 'Error interno del servidor' })
+    }
+    return reply.status(status).send({
+      code: error?.code ?? 'REQUEST_ERROR',
+      message: error?.message ?? 'Error en la solicitud',
+    })
+  })
+
   // ─── Plugins de infraestructura ───────────────────────────
   await server.register(prismaPlugin)
   await server.register(redisPlugin)
