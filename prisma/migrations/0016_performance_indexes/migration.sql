@@ -30,6 +30,18 @@ CREATE INDEX IF NOT EXISTS "alerts_createdAt_idx" ON "alerts" ("createdAt");
 -- alertSettings.ts /settings/deliveries: orderBy createdAt desc paginado
 CREATE INDEX IF NOT EXISTS "notification_deliveries_createdAt_idx" ON "notification_deliveries" ("createdAt");
 
+-- ── user_permissions ─────────────────────────────────────────────────────────
+-- FKs con onDelete: Cascade sin índice propio — al borrar un NVR/cámara,
+-- Postgres hace seq scan sobre user_permissions por cada fila borrada.
+-- (El @@unique([userId, nvrId, cameraId]) solo cubre lecturas por prefijo userId.)
+CREATE INDEX IF NOT EXISTS "user_permissions_nvrId_idx" ON "user_permissions" ("nvrId");
+CREATE INDEX IF NOT EXISTS "user_permissions_cameraId_idx" ON "user_permissions" ("cameraId");
+
+-- ── camera_view_access ───────────────────────────────────────────────────────
+-- views.ts: access: { some: { userId } } y cascade al borrar usuario;
+-- el unique existente es [viewId, userId] y no sirve de prefijo para userId
+CREATE INDEX IF NOT EXISTS "camera_view_access_userId_idx" ON "camera_view_access" ("userId");
+
 -- ── nvr_channel_config_backups ───────────────────────────────────────────────
 -- nvrConfig.ts restore: findFirst { nvrId, channelNo, streamType } orderBy createdAt desc
 CREATE INDEX IF NOT EXISTS "nvr_channel_config_backups_nvrId_channelNo_streamType_created" ON "nvr_channel_config_backups" ("nvrId", "channelNo", "streamType", "createdAt");

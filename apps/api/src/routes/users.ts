@@ -322,14 +322,20 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     }
 
     if (body.cameraPermissions) {
+      // Resolve all nvrIds in one query instead of one findUnique per camera
+      const camIds = body.cameraPermissions.map(p => p.cameraId)
+      const cams = await server.prisma.camera.findMany({
+        where: { id: { in: camIds } },
+        select: { id: true, nvrId: true },
+      })
+      const nvrByCamera = new Map(cams.map(c => [c.id, c.nvrId]))
       for (const p of body.cameraPermissions) {
         const { cameraId, ...fields } = p
-        // Determine nvrId from camera record for the unique constraint
-        const cam = await server.prisma.camera.findUnique({ where: { id: cameraId }, select: { nvrId: true } })
-        if (!cam) continue
+        const nvrId = nvrByCamera.get(cameraId)
+        if (!nvrId) continue
         ops.push(server.prisma.userPermission.upsert({
-          where:  { userId_nvrId_cameraId: { userId: id, nvrId: cam.nvrId, cameraId } },
-          create: { userId: id, nvrId: cam.nvrId, cameraId, ...fields },
+          where:  { userId_nvrId_cameraId: { userId: id, nvrId, cameraId } },
+          create: { userId: id, nvrId, cameraId, ...fields },
           update: fields,
         }))
       }

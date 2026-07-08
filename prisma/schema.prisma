@@ -232,6 +232,8 @@ model UserPermission {
   canReceiveAlerts Boolean @default(false)
 
   @@unique([userId, nvrId, cameraId])
+  @@index([nvrId])
+  @@index([cameraId])
   @@map("user_permissions")
 }
 
@@ -349,6 +351,7 @@ model CameraViewAccess {
   createdAt DateTime   @default(now())
 
   @@unique([viewId, userId])
+  @@index([userId])
   @@map("camera_view_access")
 }
 

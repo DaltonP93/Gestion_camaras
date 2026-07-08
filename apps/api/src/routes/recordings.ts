@@ -571,6 +571,22 @@ setInterval(() => {
   for (const [sid, info] of failedPreviewSessions.entries()) {
     if (now > info.expiresAt) failedPreviewSessions.delete(sid)
   }
+  // Prune expired cache entries and cap per-camera preference maps so the
+  // process doesn't accumulate memory across months of navigation
+  for (const [key, entry] of calendarCache.entries()) {
+    if (now > entry.expiresAt) calendarCache.delete(key)
+  }
+  for (const [key, entry] of nvrCapabilityCache.entries()) {
+    if (now > entry.expiresAt) nvrCapabilityCache.delete(key)
+  }
+  const MAX_PREF_ENTRIES = 1000
+  for (const map of [previewVariantPreferenceByCamera, cameraPreviewStrategyOverride] as Map<string, unknown>[]) {
+    while (map.size > MAX_PREF_ENTRIES) {
+      const oldest = map.keys().next().value
+      if (oldest === undefined) break
+      map.delete(oldest)
+    }
+  }
 }, 60 * 1000)
 
 // ─── RTSP URL helpers ─────────────────────────────────────────────
@@ -1488,8 +1504,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).type('text/plain').send('Token expirado')
     }
 
-    // Path-traversal guard: filename must be a plain name with no separators
-    if (path.basename(dt.filePath) !== path.basename(dt.filePath) || dt.filePath !== path.resolve(dt.filePath)) {
+    // Path-traversal guard: the resolved path must live inside one of the
+    // directories this module writes MP4s to (cache dir or temp dir)
+    const resolvedPath = path.resolve(dt.filePath)
+    const allowedDirs = [VOD_TEMP_DIR, CACHE_DIR].filter(Boolean).map(d => path.resolve(d) + path.sep)
+    if (!allowedDirs.some(dir => resolvedPath.startsWith(dir))) {
       server.log.warn(`[recordings] download_token_invalid reason=path_traversal filePath=${dt.filePath}`)
       return reply.status(403).type('text/plain').send('Acceso denegado')
     }
