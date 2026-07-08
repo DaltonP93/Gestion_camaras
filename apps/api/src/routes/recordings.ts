@@ -111,13 +111,21 @@ function determinePreviewStrategy(opts: {
   return canPlayHevcMp4 ? 'preview_copy_hevc' : 'preview_transcode_h264'
 }
 
+// Audio in preview: NVRs record G.711 (alaw/mulaw) which browsers can't play
+// in MP4 — transcode to AAC. `0:a?` makes the audio map optional so recordings
+// without an audio track keep working. RECORDINGS_PREVIEW_AUDIO=0 disables.
+const PREVIEW_AUDIO_ENABLED = process.env.RECORDINGS_PREVIEW_AUDIO !== '0'
+const PREVIEW_AUDIO_ARGS = PREVIEW_AUDIO_ENABLED
+  ? ['-map', '0:v:0', '-map', '0:a?', '-c:a', 'aac', '-b:a', '64k', '-ac', '1']
+  : ['-an']
+
 function buildPreviewCodecArgs(strategy: PreviewStrategy): string[] {
   if (strategy === 'preview_copy_h264' || strategy === 'preview_copy_hevc') {
-    return ['-an', '-c:v', 'copy']
+    return [...PREVIEW_AUDIO_ARGS, '-c:v', 'copy']
   }
   // preview_transcode_h264 — baseline profile + fixed keyframe interval for reliable fMP4 seek
   return [
-    '-an',
+    ...PREVIEW_AUDIO_ARGS,
     '-c:v',             'libx264',
     '-preset',          'ultrafast',
     '-tune',            'zerolatency',

@@ -1838,9 +1838,12 @@ export function RecordingsPage() {
                     </div>
 
                     {/* Video element — always rendered, shown only when ready */}
+                    {/* muted by default so autoplay/continuity is never blocked
+                        by the browser audio policy — unmute via controls */}
                     <video
                       ref={el => { videoRefs.current[idx] = el }}
                       controls
+                      muted
                       controlsList="nodownload"
                       className={clsx(
                         'absolute inset-0 w-full h-full bg-black',
