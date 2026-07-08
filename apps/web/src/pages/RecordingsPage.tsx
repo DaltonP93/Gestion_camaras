@@ -559,6 +559,31 @@ export function RecordingsPage() {
     if (!nextRec) setGlobalPlaying(false)
   }
 
+  // (Re)programs the continuity timer for a slot from the REMAINING clip time,
+  // adjusted by playback rate. Called on preview start, resume, rate change and
+  // manual seeks — pause clears it so a paused clip never advances.
+  const scheduleContinuityTimer = (slotIndex: number, sessionId: string) => {
+    if (continuityTimerRef.current[slotIndex]) {
+      clearTimeout(continuityTimerRef.current[slotIndex]!)
+      continuityTimerRef.current[slotIndex] = null
+    }
+    const clip = clipInfoBySlotRef.current[slotIndex]
+    const previewStart = previewStartTimesRef.current[slotIndex]
+    if (!clip || previewStart == null) return
+    const vid = videoRefs.current[slotIndex]
+    const playedMs = (vid?.currentTime ?? 0) * 1000
+    const remainingMs = clip.clipEndMs - (previewStart + playedMs)
+    const rate = globalPlaybackRateRef.current || 1
+    const fireInMs = Math.max(0, remainingMs / rate) + 1000
+    continuityTimerRef.current[slotIndex] = setTimeout(() => {
+      continuityTimerRef.current[slotIndex] = null
+      const currentSlot = slotsRef.current[slotIndex]
+      if (currentSlot?.sessionId === sessionId && globalPlayingRef.current) {
+        continueSlotToNextRecording(slotIndex, 'expected_timer')
+      }
+    }, fireInMs)
+  }
+
   const clearAllPlayback = () => {
     const count = slotsRef.current.length
     for (let i = 0; i < count; i++) stopSlot(i)
@@ -1267,16 +1292,12 @@ export function RecordingsPage() {
           .catch((e: Error) => console.warn(`[recordings-ui] preview_play_rejected slot=${slotIndex} reason=${e.message}`))
       }
 
-      // Continuity timer: clip expected duration + safety margin.
-      // Fires even if onended/onerror never arrive (fMP4 pipe can silently close).
-      if (continuityTimerRef.current[slotIndex]) clearTimeout(continuityTimerRef.current[slotIndex]!)
-      const expectedDurationMs = recEndMs - effectiveMs
-      continuityTimerRef.current[slotIndex] = setTimeout(() => {
-        const currentSlot = slotsRef.current[slotIndex]
-        if (currentSlot?.sessionId === sessionId) {
-          continueSlotToNextRecording(slotIndex, 'expected_timer')
-        }
-      }, expectedDurationMs + 1000)
+      // Continuity timer: fires at expected clip end + safety margin even if
+      // onended/onerror never arrive (fMP4 pipe can silently close). Only armed
+      // while playing — pause clears it, resume re-schedules from remaining time.
+      if (globalPlayingRef.current) {
+        scheduleContinuityTimer(slotIndex, sessionId)
+      }
 
       setSlots(prev => prev.map((s, i) => i === slotIndex ? {
         ...s,
@@ -1381,7 +1402,14 @@ export function RecordingsPage() {
 
   const syncedTogglePlayPause = () => {
     if (globalPlayingRef.current) {
-      slotsRef.current.forEach((_, i) => videoRefs.current[i]?.pause())
+      slotsRef.current.forEach((_, i) => {
+        videoRefs.current[i]?.pause()
+        // A paused clip must never advance to the next block
+        if (continuityTimerRef.current[i]) {
+          clearTimeout(continuityTimerRef.current[i]!)
+          continuityTimerRef.current[i] = null
+        }
+      })
       setGlobalPlaying(false)
       return
     }
@@ -1416,8 +1444,14 @@ export function RecordingsPage() {
       ` readySlots=${readySlots.length} assignedSlots=${assignedSlots.length}`
     )
 
-    // Play all slots that are already ready
-    readySlots.forEach(s => videoRefs.current[s.slotIndex]?.play().catch(() => {}))
+    // Play all slots that are already ready and re-arm their continuity
+    // timers from the remaining clip time
+    readySlots.forEach(s => {
+      videoRefs.current[s.slotIndex]?.play().catch(() => {})
+      if (s.sessionType === 'preview' && s.sessionId) {
+        scheduleContinuityTimer(s.slotIndex, s.sessionId)
+      }
+    })
 
     // For assigned-but-not-ready slots: start at the playhead if a recording
     // covers it, otherwise jump to that camera's NEXT block in range
@@ -1509,11 +1543,17 @@ export function RecordingsPage() {
         rate,
       }
     }
+    // globalPlaybackRateRef syncs via effect after render — set it now so the
+    // re-armed timers below already use the new rate
+    globalPlaybackRateRef.current = rate
     slotsRef.current.forEach((s, i) => {
       const vid = videoRefs.current[i]
       if (vid && s.status === 'ready') {
         vid.playbackRate = rate
         if ('preservesPitch' in vid) (vid as any).preservesPitch = false
+        if (globalPlayingRef.current && s.sessionType === 'preview' && s.sessionId) {
+          scheduleContinuityTimer(i, s.sessionId)
+        }
       }
     })
     setGlobalPlaybackRate(rate)
@@ -1524,6 +1564,9 @@ export function RecordingsPage() {
       const vid = videoRefs.current[i]
       if (vid && s.status === 'ready') {
         vid.currentTime = Math.max(0, Math.min(vid.duration || 0, vid.currentTime + seconds))
+        if (globalPlayingRef.current && s.sessionType === 'preview' && s.sessionId) {
+          scheduleContinuityTimer(i, s.sessionId)
+        }
       }
     })
   }
@@ -1534,6 +1577,11 @@ export function RecordingsPage() {
       if (vid && s.status === 'ready') {
         vid.pause()
         vid.currentTime = Math.min(vid.duration || 0, vid.currentTime + 1 / 25)
+      }
+      // Frame-step is a pause: a stepped clip must not auto-advance
+      if (continuityTimerRef.current[i]) {
+        clearTimeout(continuityTimerRef.current[i]!)
+        continuityTimerRef.current[i] = null
       }
     })
     setGlobalPlaying(false)
