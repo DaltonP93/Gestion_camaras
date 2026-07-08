@@ -1,16 +1,8 @@
 // apps/web/src/components/recordings/RecordingTimeline.tsx
 import { useMemo, useRef, useCallback } from 'react'
 import { clsx } from 'clsx'
-import { format } from 'date-fns'
 import type { RecordingWithCamera } from './types'
-
-// Display NVR timestamps in UTC — same formula as RecordingsPage.formatNvrTime
-function nvrTimeMs(epochMs: number): number {
-  return epochMs + new Date(epochMs).getTimezoneOffset() * 60_000
-}
-function formatNvrTime(epochMs: number, fmt: string): string {
-  return format(new Date(nvrTimeMs(epochMs)), fmt)
-}
+import { formatNvrTime } from './utils'
 
 interface AssignedCamera {
   cameraId:   string
