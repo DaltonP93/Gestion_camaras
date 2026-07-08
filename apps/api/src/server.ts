@@ -29,18 +29,7 @@ import { adminRoutes } from './routes/admin'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
 import { publishStream } from './services/stream'
-import CryptoJS from 'crypto-js'
-
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-
-function decryptPass(p: string): string | null {
-  try {
-    const plain = CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
-    return plain || null  // CryptoJS returns '' on wrong key — treat as failure
-  } catch {
-    return null
-  }
-}
+import { decryptNvrPasswordOrNull as decryptPass } from './services/credentials'
 
 const server = Fastify({
   logger: {

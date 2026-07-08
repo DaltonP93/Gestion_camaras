@@ -5,15 +5,13 @@ import { searchRecordings, getRecordingDailyDistribution } from '../services/hik
 import { AuditAction } from '../services/audit'
 import { probeRtspStream } from '../services/rtsp-probe'
 import { getRtspTimeoutOption } from '../services/stream'
-import CryptoJS from 'crypto-js'
 import crypto from 'crypto'
 import { spawn } from 'child_process'
 import type { ChildProcess } from 'child_process'
 import fs from 'fs'
 import path from 'path'
 
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+import { decryptNvrPassword as decryptPass } from '../services/credentials'
 
 // ─── VOD configuration ────────────────────────────────────────────
 const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000

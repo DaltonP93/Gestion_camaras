@@ -7,18 +7,7 @@ import { broadcastAlert } from '../routes/websocket'
 import { publishStream, getStreamPath, listRegisteredConfigPaths, clearRegisteredPath } from '../services/stream'
 import { sendAlertNotification } from '../services/notification.service'
 import { cleanupIdleSessions } from '../services/stream-manager'
-import CryptoJS from 'crypto-js'
-
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-
-function decryptPass(p: string): string | null {
-  try {
-    const plain = CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
-    return plain || null  // CryptoJS returns '' on wrong key — treat as failure
-  } catch {
-    return null
-  }
-}
+import { decryptNvrPasswordOrNull as decryptPass } from '../services/credentials'
 
 // Throttle DECRYPT_ERROR logs: solo una vez cada 10 minutos por NVR
 const decryptErrorLastLog = new Map<string, number>()

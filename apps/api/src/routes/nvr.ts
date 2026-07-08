@@ -12,31 +12,12 @@ import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
 import { AuditAction } from '../services/audit'
 import { checkIsapiRecordingSupport, detectProviderFromCapabilities, buildIsapiSearchXml } from '../services/recordingProvider'
-import CryptoJS from 'crypto-js'
-
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-
-const encryptPassword = (p: string) => CryptoJS.AES.encrypt(p, ENCRYPTION_KEY).toString()
-const decryptPassword = (enc: string) => CryptoJS.AES.decrypt(enc, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
-
-function safeDecrypt(enc: string): string | null {
-  try {
-    const plain = CryptoJS.AES.decrypt(enc, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
-    return plain || null
-  } catch {
-    return null
-  }
-}
-
-// Rechaza valores que claramente son máscaras/placeholders, no contraseñas reales.
-function isMaskedPassword(value: string): boolean {
-  if (!value) return false
-  // Solo puntos, bullets o asteriscos → placeholder visual
-  if (/^[•\*•]+$/.test(value)) return true
-  // 8 caracteres o menos, todos iguales → placeholder
-  if (value.length <= 12 && new Set(value.split('')).size === 1) return true
-  return false
-}
+import {
+  encryptNvrPassword as encryptPassword,
+  decryptNvrPassword as decryptPassword,
+  decryptNvrPasswordOrNull as safeDecrypt,
+  isMaskedPassword,
+} from '../services/credentials'
 
 // Strip debug/non-schema fields before passing a HikStorageDisk to Prisma
 function sanitizeDiskForDb(disk: any) {
