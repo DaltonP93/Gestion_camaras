@@ -2,7 +2,7 @@
 import { useEffect, useState, useMemo, useRef } from 'react'
 import {
   Play, Clock, AlertTriangle, RefreshCw, ExternalLink,
-  XCircle, Loader2, Info, Download, Video,
+  XCircle, Loader2, Info, Download, Video, Camera as CameraIcon,
 } from 'lucide-react'
 // Clock kept for slot overlays
 import { useCameraStore } from '@/stores/cameraStore'
@@ -469,6 +469,7 @@ export function RecordingsPage() {
     }
     const vid = videoRefs.current[slotIndex]
     if (vid) { vid.src = ''; vid.load() }
+    resetZoom(slotIndex)
     const s = slotsRef.current[slotIndex]
     if (s?.sessionId) {
       deleteSessionOnce(s.sessionType, s.sessionId)
@@ -1587,6 +1588,96 @@ export function RecordingsPage() {
     setGlobalPlaying(false)
   }
 
+  // ── Snapshot: capture the current frame of a slot to a PNG download ───────
+  const captureSnapshot = (slotIndex: number) => {
+    const vid  = videoRefs.current[slotIndex]
+    const slot = slotsRef.current[slotIndex]
+    if (!vid || !slot || vid.videoWidth === 0) {
+      toast.error('No hay video para capturar en este canal')
+      return
+    }
+    const canvas  = document.createElement('canvas')
+    canvas.width  = vid.videoWidth
+    canvas.height = vid.videoHeight
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.drawImage(vid, 0, 0)
+    const previewStart = previewStartTimesRef.current[slotIndex]
+    const posMs = previewStart != null ? previewStart + vid.currentTime * 1000 : Date.now()
+    const stamp = formatNvrTime(posMs, 'yyyyMMdd_HHmmss')
+    const name  = `${(slot.cameraName ?? 'camara').replace(/[^\w-]+/g, '_')}_${stamp}.png`
+    canvas.toBlob(blob => {
+      if (!blob) { toast.error('No se pudo generar la captura'); return }
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = name
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 5_000)
+      console.info(`[recordings-ui] snapshot_captured slot=${slotIndex} file=${name}`)
+      toast.success(`Captura guardada: ${name}`)
+    }, 'image/png')
+  }
+
+  // ── Digital zoom: wheel to zoom toward cursor, drag to pan, dblclick reset ─
+  // State lives in refs and applies as a CSS transform on the <video> —
+  // no React re-render per wheel/drag event.
+  const zoomBySlotRef = useRef<{ [k: number]: { scale: number; x: number; y: number } }>({})
+  const zoomDragRef   = useRef<{ idx: number; startX: number; startY: number; origX: number; origY: number } | null>(null)
+
+  const applyZoom = (idx: number) => {
+    const vid = videoRefs.current[idx]
+    if (!vid) return
+    const { scale = 1, x = 0, y = 0 } = zoomBySlotRef.current[idx] ?? {}
+    vid.style.transform       = scale > 1 ? `translate(${x}px, ${y}px) scale(${scale})` : ''
+    vid.style.transformOrigin = 'center center'
+    vid.style.cursor          = scale > 1 ? 'grab' : ''
+  }
+
+  const resetZoom = (idx: number) => {
+    zoomBySlotRef.current[idx] = { scale: 1, x: 0, y: 0 }
+    applyZoom(idx)
+  }
+
+  const handleSlotWheel = (idx: number, e: React.WheelEvent<HTMLDivElement>) => {
+    if (slotsRef.current[idx]?.status !== 'ready') return
+    const cur  = zoomBySlotRef.current[idx] ?? { scale: 1, x: 0, y: 0 }
+    const dir  = e.deltaY < 0 ? 1.2 : 1 / 1.2
+    const next = Math.min(8, Math.max(1, cur.scale * dir))
+    if (next === cur.scale) return
+    // Zoom toward the cursor position
+    const rect = e.currentTarget.getBoundingClientRect()
+    const cx = e.clientX - rect.left - rect.width / 2
+    const cy = e.clientY - rect.top - rect.height / 2
+    const k  = next / cur.scale
+    zoomBySlotRef.current[idx] = next === 1
+      ? { scale: 1, x: 0, y: 0 }
+      : { scale: next, x: (cur.x - cx) * k + cx, y: (cur.y - cy) * k + cy }
+    applyZoom(idx)
+  }
+
+  const handleSlotMouseDown = (idx: number, e: React.MouseEvent<HTMLDivElement>) => {
+    const z = zoomBySlotRef.current[idx]
+    if (!z || z.scale <= 1) return
+    e.preventDefault()
+    zoomDragRef.current = { idx, startX: e.clientX, startY: e.clientY, origX: z.x, origY: z.y }
+    const move = (ev: MouseEvent) => {
+      const d = zoomDragRef.current
+      if (!d) return
+      const zz = zoomBySlotRef.current[d.idx]
+      if (!zz) return
+      zoomBySlotRef.current[d.idx] = { ...zz, x: d.origX + ev.clientX - d.startX, y: d.origY + ev.clientY - d.startY }
+      applyZoom(d.idx)
+    }
+    const up = () => {
+      zoomDragRef.current = null
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+  }
+
   // ── Timeline seek handlers ────────────────────────────────────────────────
 
   const recordingsByCamera = useMemo(() => {
@@ -1798,6 +1889,9 @@ export function RecordingsPage() {
                       console.info(`[recordings-ui] slot_selected slot=${idx} cameraId=${slots[idx]?.cameraId ?? 'none'} status=${slots[idx]?.status ?? 'empty'}`)
                       setActiveSlotIndex(idx)
                     }}
+                    onWheel={e => handleSlotWheel(idx, e)}
+                    onMouseDown={e => handleSlotMouseDown(idx, e)}
+                    onDoubleClick={() => resetZoom(idx)}
                     className={clsx(
                       'relative flex flex-col overflow-hidden cursor-pointer',
                       isActive
@@ -2010,6 +2104,18 @@ export function RecordingsPage() {
             </span>
 
             <div className="flex-1" />
+
+            {/* Snapshot of the active slot's current frame */}
+            {activeSlot.status === 'ready' && (
+              <button
+                onClick={() => captureSnapshot(activeSlotIndex)}
+                title="Capturar imagen del canal activo (PNG)"
+                className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:bg-surface-600 hover:text-surface-200 transition-colors flex-shrink-0"
+              >
+                <CameraIcon size={11} />
+                Captura
+              </button>
+            )}
 
             {/* Download area — independent of preview slot state */}
             {downloadJob?.status === 'ready' && downloadJob.downloadUrl ? (
