@@ -65,7 +65,7 @@ export function startHealthWorker(server: FastifyInstance) {
                   type: 'NVR_OFFLINE',
                   severity: 'HIGH',
                   message: `NVR ${nvr.name} está offline`,
-                  detail: JSON.stringify({ ipAddress: nvr.ipAddress }),
+                  detail: { ipAddress: nvr.ipAddress },
                 },
               })
 
@@ -121,7 +121,7 @@ export function startHealthWorker(server: FastifyInstance) {
                     type: 'HDD_FULL',
                     severity: status.diskUsage >= 95 ? 'CRITICAL' : 'HIGH',
                     message: `HDD de ${nvr.name} al ${status.diskUsage}% de capacidad`,
-                    detail: JSON.stringify({ diskUsage: status.diskUsage }),
+                    detail: { diskUsage: status.diskUsage },
                   },
                 })
 
@@ -149,16 +149,27 @@ export function startHealthWorker(server: FastifyInstance) {
             for (const channel of channels) {
               const camera = nvr.cameras.find((c) => c.channel === channel.id)
               if (!camera) continue
-              // Only update onlineInNvr — never overwrite RTSP-based online field here
-              await server.prisma.camera.update({
-                where: { id: camera.id },
-                data: { onlineInNvr: channel.online, lastCheck: new Date() } as any,
-              })
               if (channel.online) {
                 onlineCameraIds.push(camera.id)
               } else {
                 offlineCameraIds.push(camera.id)
               }
+            }
+
+            // Only update onlineInNvr — never overwrite RTSP-based online field
+            // here. Batched: 2 updateMany instead of one UPDATE per channel.
+            const checkedAt = new Date()
+            if (onlineCameraIds.length > 0) {
+              await server.prisma.camera.updateMany({
+                where: { id: { in: onlineCameraIds } },
+                data: { onlineInNvr: true, lastCheck: checkedAt } as any,
+              })
+            }
+            if (offlineCameraIds.length > 0) {
+              await server.prisma.camera.updateMany({
+                where: { id: { in: offlineCameraIds } },
+                data: { onlineInNvr: false, lastCheck: checkedAt } as any,
+              })
             }
 
             // Resolver alertas para cámaras que volvieron online (batch)
@@ -268,6 +279,47 @@ export function startHealthWorker(server: FastifyInstance) {
     await server.prisma.session.deleteMany({
       where: { expiresAt: { lt: new Date() } },
     })
+  })
+
+  // Retención de datos: purga diaria (03:30) de tablas que crecen sin límite.
+  // Plazos configurables por env; 0 desactiva la purga de esa tabla.
+  const ALERTS_RETENTION_DAYS     = Number(process.env.ALERTS_RETENTION_DAYS ?? 90)
+  const DELIVERIES_RETENTION_DAYS = Number(process.env.DELIVERIES_RETENTION_DAYS ?? 90)
+  const AUDIT_RETENTION_DAYS      = Number(process.env.AUDIT_RETENTION_DAYS ?? 365)
+  const daysAgo = (d: number) => new Date(Date.now() - d * 24 * 60 * 60 * 1000)
+
+  cron.schedule('30 3 * * *', async () => {
+    try {
+      let purged = { alerts: 0, deliveries: 0, audit: 0 }
+      if (ALERTS_RETENTION_DAYS > 0) {
+        // Solo alertas ya resueltas — las activas nunca se purgan
+        const r = await server.prisma.alert.deleteMany({
+          where: { resolved: true, createdAt: { lt: daysAgo(ALERTS_RETENTION_DAYS) } },
+        })
+        purged.alerts = r.count
+      }
+      if (DELIVERIES_RETENTION_DAYS > 0) {
+        const r = await server.prisma.notificationDelivery.deleteMany({
+          where: { createdAt: { lt: daysAgo(DELIVERIES_RETENTION_DAYS) } },
+        })
+        purged.deliveries = r.count
+      }
+      if (AUDIT_RETENTION_DAYS > 0) {
+        const r = await server.prisma.auditLog.deleteMany({
+          where: { createdAt: { lt: daysAgo(AUDIT_RETENTION_DAYS) } },
+        })
+        purged.audit = r.count
+      }
+      if (purged.alerts + purged.deliveries + purged.audit > 0) {
+        server.log.info(
+          `[retention] purga diaria: alerts=${purged.alerts} (${ALERTS_RETENTION_DAYS}d)` +
+          ` deliveries=${purged.deliveries} (${DELIVERIES_RETENTION_DAYS}d)` +
+          ` auditLogs=${purged.audit} (${AUDIT_RETENTION_DAYS}d)`
+        )
+      }
+    } catch (err) {
+      server.log.error(`[retention] error en purga diaria: ${err}`)
+    }
   })
 
   server.log.info('Health worker iniciado (intervalo: 60s)')
