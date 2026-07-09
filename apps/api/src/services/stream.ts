@@ -995,7 +995,7 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
   inFlightPaths.add(streamPath)
   try {
     // ── Step 1: POST (optimistic create) ────────────────────
-    console.info(`[transcode] register_path request method=POST url=${addUrl} body=${JSON.stringify(pathConfig)}`)
+    console.info(`[transcode] register_path request method=POST url=${addUrl} body=${sanitizeRtsp(JSON.stringify(pathConfig))}`)
     try {
       const res = await mediamtxApi.post(addUrl, pathConfig)
       console.info(`[transcode] register_path response status=${res.status} body=${JSON.stringify(res.data)}`)
@@ -1029,7 +1029,7 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
       }
 
       // ── Step 3: POST after DELETE ─────────────────────────
-      console.info(`[transcode] register_path request method=POST url=${addUrl} body=${JSON.stringify(pathConfig)} (after delete)`)
+      console.info(`[transcode] register_path request method=POST url=${addUrl} body=${sanitizeRtsp(JSON.stringify(pathConfig))} (after delete)`)
       try {
         const res2 = await mediamtxApi.post(addUrl, pathConfig)
         console.info(`[transcode] register_path response status=${res2.status} body=${JSON.stringify(res2.data)}`)

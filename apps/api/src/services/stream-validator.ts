@@ -2,10 +2,7 @@
 import type { PrismaClient } from '@prisma/client'
 import type { NVR, Camera } from '@prisma/client'
 import { probeBothStreams } from './rtsp-probe'
-import CryptoJS from 'crypto-js'
-
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+import { decryptNvrPassword as decryptPass } from './credentials'
 
 // Posibles valores de streamHealthStatus
 export type StreamHealthStatus =

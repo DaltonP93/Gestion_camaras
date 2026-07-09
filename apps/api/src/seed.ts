@@ -2,14 +2,12 @@
 // Poblado inicial de la base de datos con los 4 NVRs y usuario admin
 import { PrismaClient } from '@prisma/client'
 import bcrypt from 'bcryptjs'
-import CryptoJS from 'crypto-js'
+// Usa la MISMA clave que el resto del sistema (antes omitía NVR_CREDENTIAL_KEY:
+// con esa env definida, los NVRs sembrados quedaban cifrados con otra clave y
+// eran indescifrables en runtime)
+import { encryptNvrPassword as encryptPassword } from './services/credentials'
 
 const prisma = new PrismaClient()
-const ENCRYPTION_KEY = process.env.JWT_SECRET || 'visioncore_key'
-
-function encryptPassword(password: string): string {
-  return CryptoJS.AES.encrypt(password, ENCRYPTION_KEY).toString()
-}
 
 const NVR_CONFIGS = [
   {

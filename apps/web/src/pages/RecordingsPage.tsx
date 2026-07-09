@@ -1,13 +1,14 @@
 // src/pages/RecordingsPage.tsx
 import { useEffect, useState, useMemo, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   Play, Clock, AlertTriangle, RefreshCw, ExternalLink,
-  XCircle, Loader2, Info, Download, Video,
+  XCircle, Loader2, Info, Download, Video, Camera as CameraIcon,
 } from 'lucide-react'
 // Clock kept for slot overlays
 import { useCameraStore } from '@/stores/cameraStore'
 import { apiPost, apiGet, apiDelete } from '@/lib/api'
-import { format, subHours } from 'date-fns'
+import { subHours } from 'date-fns'
 import { clsx } from 'clsx'
 import type { Recording } from '@/types'
 import toast from 'react-hot-toast'
@@ -20,6 +21,9 @@ import type {
   PlaybackSlot,
 } from '@/components/recordings/types'
 import { emptySlot } from '@/components/recordings/types'
+import {
+  toLocalDatetimeString, localInputToNvrIso, formatNvrTime, classifyError,
+} from '@/components/recordings/utils'
 
 // ─── Local interfaces ─────────────────────────────────────────────────────────
 
@@ -53,53 +57,7 @@ interface DownloadJob {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function toLocalDatetimeString(date: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
-
-// Convert a datetime-local input value into NVR wall-clock ISO (UTC components).
-// NVR timestamps carry the wall clock in the UTC fields, so the search range must
-// be sent in the same frame — NOT shifted through the browser timezone.
-function localInputToNvrIso(s: string): string {
-  if (!s) return s
-  return s.length === 16 ? `${s}:00Z` : `${s}Z`
-}
-
-// Display NVR timestamps in UTC — NVRs store wall-clock time as UTC.
-// Shifting by the local timezone offset makes date-fns render UTC components
-// correctly regardless of the browser's local timezone.
-function nvrTimeMs(epochMs: number): number {
-  return epochMs + new Date(epochMs).getTimezoneOffset() * 60_000
-}
-function formatNvrTime(isoOrMs: string | number | Date, fmt: string): string {
-  const ms = isoOrMs instanceof Date ? isoOrMs.getTime()
-    : typeof isoOrMs === 'number' ? isoOrMs
-    : new Date(isoOrMs as string).getTime()
-  return format(new Date(nvrTimeMs(ms)), fmt)
-}
-
-function classifyError(err: any): 'ISAPI_UNSUPPORTED' | 'AUTH_FAILED' | 'NVR_OFFLINE' | 'UNKNOWN' {
-  const msg = (err?.response?.data?.message || err?.message || '').toLowerCase()
-  if (msg.includes('isapi') || msg.includes('no soporta') || msg.includes('unsupported')) return 'ISAPI_UNSUPPORTED'
-  if (msg.includes('401') || msg.includes('auth') || msg.includes('credencial'))           return 'AUTH_FAILED'
-  if (msg.includes('offline') || msg.includes('unreachable') || msg.includes('econnrefused')) return 'NVR_OFFLINE'
-  return 'UNKNOWN'
-}
-
-function formatDuration(start: string, end: string) {
-  const diff = new Date(end).getTime() - new Date(start).getTime()
-  const mins = Math.floor(diff / 60000)
-  const secs = Math.floor((diff % 60000) / 1000)
-  return `${mins}:${String(secs).padStart(2, '0')}`
-}
-
-function formatSize(bytes: number) {
-  if (bytes === 0) return '—'
-  if (bytes > 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`
-  return `${(bytes / 1048576).toFixed(0)} MB`
-}
+// Pure helpers live in components/recordings/utils.ts (shared with timeline)
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -206,6 +164,36 @@ export function RecordingsPage() {
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
   useEffect(() => { loadNVRs(); loadCameras() }, [])
+
+  // ── Deep link: /recordings?cameraId=<id>&t=<ISO> (desde Analítica) ────────
+  // Busca automáticamente un rango alrededor del evento y posiciona el playhead.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const deepLinkHandledRef = useRef(false)
+  useEffect(() => {
+    if (deepLinkHandledRef.current) return
+    const camId = searchParams.get('cameraId')
+    const t     = searchParams.get('t')
+    if (!camId || !t) return
+    if (cameras.length === 0) return          // esperar a que carguen las cámaras
+    if (!cameras.some(c => c.id === camId)) return
+    const tMs = new Date(t).getTime()
+    if (isNaN(tMs)) return
+    deepLinkHandledRef.current = true
+
+    // El evento llega como instante UTC real; el NVR guarda hora de pared.
+    // Convención: el navegador está en la misma zona horaria que el NVR, así
+    // que la representación local del instante ES la hora de pared del NVR.
+    const from = toLocalDatetimeString(new Date(tMs - 2 * 60_000))
+    const to   = toLocalDatetimeString(new Date(tMs + 10 * 60_000))
+    const seekWallMs = new Date(localInputToNvrIso(toLocalDatetimeString(new Date(tMs)))).getTime()
+
+    console.info(`[recordings-ui] deep_link cameraId=${camId} t=${t} range=${from}→${to}`)
+    setStartDate(from)
+    setEndDate(to)
+    setSelectedCameras(new Set([camId]))
+    setSearchParams({}, { replace: true })
+    setTimeout(() => handleSearch({ startDate: from, endDate: to, cameraIds: [camId], seekToWallMs: seekWallMs }), 0)
+  }, [cameras])
 
   // ── Resize slots when layout changes ──────────────────────────────────────
   useEffect(() => {
@@ -469,6 +457,7 @@ export function RecordingsPage() {
     }
     const vid = videoRefs.current[slotIndex]
     if (vid) { vid.src = ''; vid.load() }
+    resetZoom(slotIndex)
     const s = slotsRef.current[slotIndex]
     if (s?.sessionId) {
       deleteSessionOnce(s.sessionType, s.sessionId)
@@ -559,6 +548,31 @@ export function RecordingsPage() {
     if (!nextRec) setGlobalPlaying(false)
   }
 
+  // (Re)programs the continuity timer for a slot from the REMAINING clip time,
+  // adjusted by playback rate. Called on preview start, resume, rate change and
+  // manual seeks — pause clears it so a paused clip never advances.
+  const scheduleContinuityTimer = (slotIndex: number, sessionId: string) => {
+    if (continuityTimerRef.current[slotIndex]) {
+      clearTimeout(continuityTimerRef.current[slotIndex]!)
+      continuityTimerRef.current[slotIndex] = null
+    }
+    const clip = clipInfoBySlotRef.current[slotIndex]
+    const previewStart = previewStartTimesRef.current[slotIndex]
+    if (!clip || previewStart == null) return
+    const vid = videoRefs.current[slotIndex]
+    const playedMs = (vid?.currentTime ?? 0) * 1000
+    const remainingMs = clip.clipEndMs - (previewStart + playedMs)
+    const rate = globalPlaybackRateRef.current || 1
+    const fireInMs = Math.max(0, remainingMs / rate) + 1000
+    continuityTimerRef.current[slotIndex] = setTimeout(() => {
+      continuityTimerRef.current[slotIndex] = null
+      const currentSlot = slotsRef.current[slotIndex]
+      if (currentSlot?.sessionId === sessionId && globalPlayingRef.current) {
+        continueSlotToNextRecording(slotIndex, 'expected_timer')
+      }
+    }, fireInMs)
+  }
+
   const clearAllPlayback = () => {
     const count = slotsRef.current.length
     for (let i = 0; i < count; i++) stopSlot(i)
@@ -634,9 +648,11 @@ export function RecordingsPage() {
   }
 
   // ── Search ─────────────────────────────────────────────────────────────────
-  const handleSearch = async (dateOverride?: { startDate: string; endDate: string }) => {
+  const handleSearch = async (dateOverride?: { startDate: string; endDate: string; cameraIds?: string[]; seekToWallMs?: number }) => {
     const assignedCameraIds = new Set(slotsRef.current.filter(s => s.cameraId).map(s => s.cameraId!))
-    const effectiveCameraIds = new Set([...selectedCameras, ...assignedCameraIds])
+    // cameraIds override: used by deep links (/recordings?cameraId=&t=) where
+    // React state hasn't committed yet when the search fires
+    const effectiveCameraIds = new Set([...(dateOverride?.cameraIds ?? [...selectedCameras]), ...assignedCameraIds])
 
     console.info(
       `[recordings-ui] search_effective_cameras selected=${selectedCameras.size}` +
@@ -728,23 +744,25 @@ export function RecordingsPage() {
     // Timeline spans exactly the searched range
     setSearchRangeMs({ start: start.getTime(), end: end.getTime() })
 
-    // Initialize playhead to earliest recording found
+    // Initialize playhead: explicit seek target (deep link) or earliest recording
     let earliest: RecordingWithCamera | null = null
+    const seekMs = dateOverride?.seekToWallMs ?? null
     if (all.length > 0) {
       earliest = all.reduce((min, r) =>
         new Date(r.startTime).getTime() < new Date(min.startTime).getTime() ? r : min
       )
-      setGlobalPlaybackTime(new Date(new Date(earliest.startTime).getTime()))
+      setGlobalPlaybackTime(new Date(seekMs ?? new Date(earliest.startTime).getTime()))
     }
 
-    // Auto-assign: if exactly 1 camera selected and no slot has a camera assigned, assign to active slot
-    if (all.length > 0 && selectedCameras.size === 1 && assignedCameraIds.size === 0) {
-      const singleCamId = [...selectedCameras][0]
+    // Auto-assign: if exactly 1 camera searched and no slot has a camera assigned, assign to active slot
+    const searchedCams = dateOverride?.cameraIds ?? [...selectedCameras]
+    if (all.length > 0 && searchedCams.length === 1 && assignedCameraIds.size === 0) {
+      const singleCamId = searchedCams[0]
       const cam = cameras.find(c => c.id === singleCamId)
       const nvrObj = cam ? nvrs.find(n => n.id === cam.nvrId) : null
       const camRecs = all.filter(r => r.cameraId === singleCamId)
       if (cam && camRecs.length > 0) {
-        console.info(`[recordings-ui] search_auto_assign cameraId=${singleCamId} slot=${activeSlotIndex}`)
+        console.info(`[recordings-ui] search_auto_assign cameraId=${singleCamId} slot=${activeSlotIndex} seek=${seekMs ?? 'none'}`)
         stopSlot(activeSlotIndex)
         setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
           ...s,
@@ -752,8 +770,15 @@ export function RecordingsPage() {
           recording: null, status: 'idle', playbackUrl: null, sessionId: null, sessionType: null,
           downloadUrl: null, errorMsg: null, vodProgress: null, mimeType: null,
         } : s))
-        const playhead = earliest ? new Date(earliest.startTime) : new Date(camRecs[0].startTime)
-        setTimeout(() => startPreviewInSlotRef.current(activeSlotIndex, camRecs[0], playhead), 0)
+        // With a seek target, start at the block covering it (or the next one)
+        const sortedRecs = [...camRecs].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
+        const target = seekMs !== null
+          ? sortedRecs.find(r => new Date(r.endTime).getTime() > seekMs) ?? sortedRecs[0]
+          : camRecs[0]
+        const playhead = seekMs !== null
+          ? new Date(Math.max(seekMs, new Date(target.startTime).getTime()))
+          : earliest ? new Date(earliest.startTime) : new Date(camRecs[0].startTime)
+        setTimeout(() => startPreviewInSlotRef.current(activeSlotIndex, target, playhead), 0)
       }
     }
 
@@ -1267,16 +1292,12 @@ export function RecordingsPage() {
           .catch((e: Error) => console.warn(`[recordings-ui] preview_play_rejected slot=${slotIndex} reason=${e.message}`))
       }
 
-      // Continuity timer: clip expected duration + safety margin.
-      // Fires even if onended/onerror never arrive (fMP4 pipe can silently close).
-      if (continuityTimerRef.current[slotIndex]) clearTimeout(continuityTimerRef.current[slotIndex]!)
-      const expectedDurationMs = recEndMs - effectiveMs
-      continuityTimerRef.current[slotIndex] = setTimeout(() => {
-        const currentSlot = slotsRef.current[slotIndex]
-        if (currentSlot?.sessionId === sessionId) {
-          continueSlotToNextRecording(slotIndex, 'expected_timer')
-        }
-      }, expectedDurationMs + 1000)
+      // Continuity timer: fires at expected clip end + safety margin even if
+      // onended/onerror never arrive (fMP4 pipe can silently close). Only armed
+      // while playing — pause clears it, resume re-schedules from remaining time.
+      if (globalPlayingRef.current) {
+        scheduleContinuityTimer(slotIndex, sessionId)
+      }
 
       setSlots(prev => prev.map((s, i) => i === slotIndex ? {
         ...s,
@@ -1381,7 +1402,14 @@ export function RecordingsPage() {
 
   const syncedTogglePlayPause = () => {
     if (globalPlayingRef.current) {
-      slotsRef.current.forEach((_, i) => videoRefs.current[i]?.pause())
+      slotsRef.current.forEach((_, i) => {
+        videoRefs.current[i]?.pause()
+        // A paused clip must never advance to the next block
+        if (continuityTimerRef.current[i]) {
+          clearTimeout(continuityTimerRef.current[i]!)
+          continuityTimerRef.current[i] = null
+        }
+      })
       setGlobalPlaying(false)
       return
     }
@@ -1416,8 +1444,14 @@ export function RecordingsPage() {
       ` readySlots=${readySlots.length} assignedSlots=${assignedSlots.length}`
     )
 
-    // Play all slots that are already ready
-    readySlots.forEach(s => videoRefs.current[s.slotIndex]?.play().catch(() => {}))
+    // Play all slots that are already ready and re-arm their continuity
+    // timers from the remaining clip time
+    readySlots.forEach(s => {
+      videoRefs.current[s.slotIndex]?.play().catch(() => {})
+      if (s.sessionType === 'preview' && s.sessionId) {
+        scheduleContinuityTimer(s.slotIndex, s.sessionId)
+      }
+    })
 
     // For assigned-but-not-ready slots: start at the playhead if a recording
     // covers it, otherwise jump to that camera's NEXT block in range
@@ -1509,11 +1543,17 @@ export function RecordingsPage() {
         rate,
       }
     }
+    // globalPlaybackRateRef syncs via effect after render — set it now so the
+    // re-armed timers below already use the new rate
+    globalPlaybackRateRef.current = rate
     slotsRef.current.forEach((s, i) => {
       const vid = videoRefs.current[i]
       if (vid && s.status === 'ready') {
         vid.playbackRate = rate
         if ('preservesPitch' in vid) (vid as any).preservesPitch = false
+        if (globalPlayingRef.current && s.sessionType === 'preview' && s.sessionId) {
+          scheduleContinuityTimer(i, s.sessionId)
+        }
       }
     })
     setGlobalPlaybackRate(rate)
@@ -1524,6 +1564,9 @@ export function RecordingsPage() {
       const vid = videoRefs.current[i]
       if (vid && s.status === 'ready') {
         vid.currentTime = Math.max(0, Math.min(vid.duration || 0, vid.currentTime + seconds))
+        if (globalPlayingRef.current && s.sessionType === 'preview' && s.sessionId) {
+          scheduleContinuityTimer(i, s.sessionId)
+        }
       }
     })
   }
@@ -1535,8 +1578,103 @@ export function RecordingsPage() {
         vid.pause()
         vid.currentTime = Math.min(vid.duration || 0, vid.currentTime + 1 / 25)
       }
+      // Frame-step is a pause: a stepped clip must not auto-advance
+      if (continuityTimerRef.current[i]) {
+        clearTimeout(continuityTimerRef.current[i]!)
+        continuityTimerRef.current[i] = null
+      }
     })
     setGlobalPlaying(false)
+  }
+
+  // ── Snapshot: capture the current frame of a slot to a PNG download ───────
+  const captureSnapshot = (slotIndex: number) => {
+    const vid  = videoRefs.current[slotIndex]
+    const slot = slotsRef.current[slotIndex]
+    if (!vid || !slot || vid.videoWidth === 0) {
+      toast.error('No hay video para capturar en este canal')
+      return
+    }
+    const canvas  = document.createElement('canvas')
+    canvas.width  = vid.videoWidth
+    canvas.height = vid.videoHeight
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.drawImage(vid, 0, 0)
+    const previewStart = previewStartTimesRef.current[slotIndex]
+    const posMs = previewStart != null ? previewStart + vid.currentTime * 1000 : Date.now()
+    const stamp = formatNvrTime(posMs, 'yyyyMMdd_HHmmss')
+    const name  = `${(slot.cameraName ?? 'camara').replace(/[^\w-]+/g, '_')}_${stamp}.png`
+    canvas.toBlob(blob => {
+      if (!blob) { toast.error('No se pudo generar la captura'); return }
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = name
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 5_000)
+      console.info(`[recordings-ui] snapshot_captured slot=${slotIndex} file=${name}`)
+      toast.success(`Captura guardada: ${name}`)
+    }, 'image/png')
+  }
+
+  // ── Digital zoom: wheel to zoom toward cursor, drag to pan, dblclick reset ─
+  // State lives in refs and applies as a CSS transform on the <video> —
+  // no React re-render per wheel/drag event.
+  const zoomBySlotRef = useRef<{ [k: number]: { scale: number; x: number; y: number } }>({})
+  const zoomDragRef   = useRef<{ idx: number; startX: number; startY: number; origX: number; origY: number } | null>(null)
+
+  const applyZoom = (idx: number) => {
+    const vid = videoRefs.current[idx]
+    if (!vid) return
+    const { scale = 1, x = 0, y = 0 } = zoomBySlotRef.current[idx] ?? {}
+    vid.style.transform       = scale > 1 ? `translate(${x}px, ${y}px) scale(${scale})` : ''
+    vid.style.transformOrigin = 'center center'
+    vid.style.cursor          = scale > 1 ? 'grab' : ''
+  }
+
+  const resetZoom = (idx: number) => {
+    zoomBySlotRef.current[idx] = { scale: 1, x: 0, y: 0 }
+    applyZoom(idx)
+  }
+
+  const handleSlotWheel = (idx: number, e: React.WheelEvent<HTMLDivElement>) => {
+    if (slotsRef.current[idx]?.status !== 'ready') return
+    const cur  = zoomBySlotRef.current[idx] ?? { scale: 1, x: 0, y: 0 }
+    const dir  = e.deltaY < 0 ? 1.2 : 1 / 1.2
+    const next = Math.min(8, Math.max(1, cur.scale * dir))
+    if (next === cur.scale) return
+    // Zoom toward the cursor position
+    const rect = e.currentTarget.getBoundingClientRect()
+    const cx = e.clientX - rect.left - rect.width / 2
+    const cy = e.clientY - rect.top - rect.height / 2
+    const k  = next / cur.scale
+    zoomBySlotRef.current[idx] = next === 1
+      ? { scale: 1, x: 0, y: 0 }
+      : { scale: next, x: (cur.x - cx) * k + cx, y: (cur.y - cy) * k + cy }
+    applyZoom(idx)
+  }
+
+  const handleSlotMouseDown = (idx: number, e: React.MouseEvent<HTMLDivElement>) => {
+    const z = zoomBySlotRef.current[idx]
+    if (!z || z.scale <= 1) return
+    e.preventDefault()
+    zoomDragRef.current = { idx, startX: e.clientX, startY: e.clientY, origX: z.x, origY: z.y }
+    const move = (ev: MouseEvent) => {
+      const d = zoomDragRef.current
+      if (!d) return
+      const zz = zoomBySlotRef.current[d.idx]
+      if (!zz) return
+      zoomBySlotRef.current[d.idx] = { ...zz, x: d.origX + ev.clientX - d.startX, y: d.origY + ev.clientY - d.startY }
+      applyZoom(d.idx)
+    }
+    const up = () => {
+      zoomDragRef.current = null
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
   }
 
   // ── Timeline seek handlers ────────────────────────────────────────────────
@@ -1750,6 +1888,9 @@ export function RecordingsPage() {
                       console.info(`[recordings-ui] slot_selected slot=${idx} cameraId=${slots[idx]?.cameraId ?? 'none'} status=${slots[idx]?.status ?? 'empty'}`)
                       setActiveSlotIndex(idx)
                     }}
+                    onWheel={e => handleSlotWheel(idx, e)}
+                    onMouseDown={e => handleSlotMouseDown(idx, e)}
+                    onDoubleClick={() => resetZoom(idx)}
                     className={clsx(
                       'relative flex flex-col overflow-hidden cursor-pointer',
                       isActive
@@ -1790,9 +1931,12 @@ export function RecordingsPage() {
                     </div>
 
                     {/* Video element — always rendered, shown only when ready */}
+                    {/* muted by default so autoplay/continuity is never blocked
+                        by the browser audio policy — unmute via controls */}
                     <video
                       ref={el => { videoRefs.current[idx] = el }}
                       controls
+                      muted
                       controlsList="nodownload"
                       className={clsx(
                         'absolute inset-0 w-full h-full bg-black',
@@ -1959,6 +2103,18 @@ export function RecordingsPage() {
             </span>
 
             <div className="flex-1" />
+
+            {/* Snapshot of the active slot's current frame */}
+            {activeSlot.status === 'ready' && (
+              <button
+                onClick={() => captureSnapshot(activeSlotIndex)}
+                title="Capturar imagen del canal activo (PNG)"
+                className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-surface-700 text-surface-400 hover:bg-surface-600 hover:text-surface-200 transition-colors flex-shrink-0"
+              >
+                <CameraIcon size={11} />
+                Captura
+              </button>
+            )}
 
             {/* Download area — independent of preview slot state */}
             {downloadJob?.status === 'ready' && downloadJob.downloadUrl ? (

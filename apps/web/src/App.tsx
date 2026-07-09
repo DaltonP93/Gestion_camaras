@@ -8,6 +8,7 @@ import { LoginPage } from '@/pages/LoginPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { LiveViewPage } from '@/pages/LiveViewPage'
 import { RecordingsPage } from '@/pages/RecordingsPage'
+import { AnalyticsPage } from '@/pages/AnalyticsPage'
 import { UsersPage } from '@/pages/UsersPage'
 import { NVRsPage } from '@/pages/NVRsPage'
 import { NVRDetailPage } from '@/pages/NVRDetailPage'
@@ -64,6 +65,11 @@ export default function App() {
             </ProtectedRoute>
           } />
           <Route path="alerts" element={<AlertsPage />} />
+          <Route path="analytics" element={
+            <ProtectedRoute roles={['ADMIN', 'SUPERVISOR']}>
+              <AnalyticsPage />
+            </ProtectedRoute>
+          } />
           <Route path="nvrs" element={
             <ProtectedRoute roles={['ADMIN', 'SUPERVISOR']}>
               <NVRsPage />

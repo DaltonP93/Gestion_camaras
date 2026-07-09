@@ -1,0 +1,10 @@
+# VisionCore Analytics — todas las dependencias con licencias permisivas
+# (MIT / Apache-2.0 / BSD). Sin AGPL: NO usar ultralytics.
+fastapi==0.115.*           # MIT
+uvicorn[standard]==0.32.*  # BSD-3
+supervision==0.25.*        # MIT (Roboflow)
+onnxruntime==1.20.*        # MIT
+opencv-python-headless==4.10.*  # Apache-2.0
+numpy>=1.26,<3             # BSD-3
+httpx==0.28.*              # BSD-3
+pydantic-settings==2.*     # MIT

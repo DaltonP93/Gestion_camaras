@@ -26,21 +26,11 @@ import { liveViewRoutes } from './routes/liveView'
 import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
 import { adminRoutes } from './routes/admin'
+import { analyticsRoutes } from './routes/analytics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
 import { publishStream } from './services/stream'
-import CryptoJS from 'crypto-js'
-
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-
-function decryptPass(p: string): string | null {
-  try {
-    const plain = CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
-    return plain || null  // CryptoJS returns '' on wrong key — treat as failure
-  } catch {
-    return null
-  }
-}
+import { decryptNvrPasswordOrNull as decryptPass } from './services/credentials'
 
 const server = Fastify({
   logger: {
@@ -103,6 +93,35 @@ async function main() {
     }),
   })
 
+  // ─── Manejador global de errores ───────────────────────────
+  // ZodError (schema.parse en handlers) → 400 con detalle de validación en vez
+  // del 500 genérico; el resto conserva su statusCode (o 500) sin filtrar
+  // stack traces al cliente. Las respuestas de error explícitas de cada
+  // endpoint no pasan por aquí — solo los throws no manejados.
+  server.setErrorHandler((error: any, request, reply) => {
+    if (error?.name === 'ZodError' && Array.isArray(error.issues)) {
+      return reply.status(400).send({
+        code: 'VALIDATION_ERROR',
+        message: 'Datos de solicitud inválidos',
+        details: error.issues.map((i: any) => ({
+          path: Array.isArray(i.path) ? i.path.join('.') : String(i.path ?? ''),
+          message: i.message,
+        })),
+      })
+    }
+    const status = typeof error?.statusCode === 'number' && error.statusCode >= 400
+      ? error.statusCode
+      : 500
+    if (status >= 500) {
+      server.log.error({ err: error, url: request.url }, 'unhandled_error')
+      return reply.status(status).send({ code: 'INTERNAL_ERROR', message: 'Error interno del servidor' })
+    }
+    return reply.status(status).send({
+      code: error?.code ?? 'REQUEST_ERROR',
+      message: error?.message ?? 'Error en la solicitud',
+    })
+  })
+
   // ─── Plugins de infraestructura ───────────────────────────
   await server.register(prismaPlugin)
   await server.register(redisPlugin)
@@ -138,6 +157,7 @@ async function main() {
   await server.register(searchRoutes, { prefix: '/api/search' })
   await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
   await server.register(adminRoutes, { prefix: '/api/admin' })
+  await server.register(analyticsRoutes, { prefix: '/api/analytics' })
   await server.register(wsHandler, { prefix: '/ws' })
 
   const COMMIT_SHA = process.env.COMMIT_SHA || 'development'

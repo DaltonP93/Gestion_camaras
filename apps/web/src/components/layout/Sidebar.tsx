@@ -4,7 +4,7 @@ import { useRef, useState, useEffect } from 'react'
 import {
   LayoutDashboard, Video, Clock, Bell, Server, Users,
   Activity, Shield, Settings, LayoutGrid, Palette,
-  LogOut, UserCircle, ChevronUp, ChevronRight, Menu, X,
+  LogOut, UserCircle, ChevronUp, ChevronRight, Menu, X, Radar,
 } from 'lucide-react'
 import { useAuthStore } from '@/stores/authStore'
 import { useAlertStore } from '@/stores/alertStore'
@@ -152,6 +152,7 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
         {navItem('/views', <LayoutGrid size={14} />, 'Visores')}
         {navItem('/recordings', <Clock size={14} />, 'Grabaciones', undefined, ['ADMIN', 'SUPERVISOR', 'AUDITOR'])}
         {navItem('/alerts', <Bell size={14} />, 'Alertas', unreadCount)}
+        {navItem('/analytics', <Radar size={14} />, 'Analítica', undefined, ['ADMIN', 'SUPERVISOR'])}
 
         {/* NVRs individuales — solo cuando expandido */}
         {!collapsed && nvrs.length > 0 && (

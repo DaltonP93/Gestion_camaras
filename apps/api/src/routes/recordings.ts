@@ -5,15 +5,13 @@ import { searchRecordings, getRecordingDailyDistribution } from '../services/hik
 import { AuditAction } from '../services/audit'
 import { probeRtspStream } from '../services/rtsp-probe'
 import { getRtspTimeoutOption } from '../services/stream'
-import CryptoJS from 'crypto-js'
 import crypto from 'crypto'
 import { spawn } from 'child_process'
 import type { ChildProcess } from 'child_process'
 import fs from 'fs'
 import path from 'path'
 
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+import { decryptNvrPassword as decryptPass } from '../services/credentials'
 
 // ─── VOD configuration ────────────────────────────────────────────
 const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000
@@ -111,13 +109,21 @@ function determinePreviewStrategy(opts: {
   return canPlayHevcMp4 ? 'preview_copy_hevc' : 'preview_transcode_h264'
 }
 
+// Audio in preview: NVRs record G.711 (alaw/mulaw) which browsers can't play
+// in MP4 — transcode to AAC. `0:a?` makes the audio map optional so recordings
+// without an audio track keep working. RECORDINGS_PREVIEW_AUDIO=0 disables.
+const PREVIEW_AUDIO_ENABLED = process.env.RECORDINGS_PREVIEW_AUDIO !== '0'
+const PREVIEW_AUDIO_ARGS = PREVIEW_AUDIO_ENABLED
+  ? ['-map', '0:v:0', '-map', '0:a?', '-c:a', 'aac', '-b:a', '64k', '-ac', '1']
+  : ['-an']
+
 function buildPreviewCodecArgs(strategy: PreviewStrategy): string[] {
   if (strategy === 'preview_copy_h264' || strategy === 'preview_copy_hevc') {
-    return ['-an', '-c:v', 'copy']
+    return [...PREVIEW_AUDIO_ARGS, '-c:v', 'copy']
   }
   // preview_transcode_h264 — baseline profile + fixed keyframe interval for reliable fMP4 seek
   return [
-    '-an',
+    ...PREVIEW_AUDIO_ARGS,
     '-c:v',             'libx264',
     '-preset',          'ultrafast',
     '-tune',            'zerolatency',
@@ -570,6 +576,22 @@ setInterval(() => {
   }
   for (const [sid, info] of failedPreviewSessions.entries()) {
     if (now > info.expiresAt) failedPreviewSessions.delete(sid)
+  }
+  // Prune expired cache entries and cap per-camera preference maps so the
+  // process doesn't accumulate memory across months of navigation
+  for (const [key, entry] of calendarCache.entries()) {
+    if (now > entry.expiresAt) calendarCache.delete(key)
+  }
+  for (const [key, entry] of nvrCapabilityCache.entries()) {
+    if (now > entry.expiresAt) nvrCapabilityCache.delete(key)
+  }
+  const MAX_PREF_ENTRIES = 1000
+  for (const map of [previewVariantPreferenceByCamera, cameraPreviewStrategyOverride] as Map<string, unknown>[]) {
+    while (map.size > MAX_PREF_ENTRIES) {
+      const oldest = map.keys().next().value
+      if (oldest === undefined) break
+      map.delete(oldest)
+    }
   }
 }, 60 * 1000)
 
@@ -1488,8 +1510,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).type('text/plain').send('Token expirado')
     }
 
-    // Path-traversal guard: filename must be a plain name with no separators
-    if (path.basename(dt.filePath) !== path.basename(dt.filePath) || dt.filePath !== path.resolve(dt.filePath)) {
+    // Path-traversal guard: the resolved path must live inside one of the
+    // directories this module writes MP4s to (cache dir or temp dir)
+    const resolvedPath = path.resolve(dt.filePath)
+    const allowedDirs = [VOD_TEMP_DIR, CACHE_DIR].filter(Boolean).map(d => path.resolve(d) + path.sep)
+    if (!allowedDirs.some(dir => resolvedPath.startsWith(dir))) {
       server.log.warn(`[recordings] download_token_invalid reason=path_traversal filePath=${dt.filePath}`)
       return reply.status(403).type('text/plain').send('Acceso denegado')
     }

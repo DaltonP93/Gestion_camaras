@@ -105,6 +105,10 @@ services:
       RECORDINGS_TRANSCODE_BUFSIZE: 4000k
       RECORDINGS_TRANSCODE_MAX_WIDTH: "1280"
       RECORDINGS_FORCE_TRANSCODE: "false"
+      # ── Analítica de video ───────────────────────────────────
+      # Secreto compartido con el servicio analytics (openssl rand -hex 32).
+      # Vacío = endpoints de analítica deshabilitados.
+      ANALYTICS_SECRET: ${ANALYTICS_SECRET:-}
     volumes:
       - uploads_data:/app/uploads
       - recordings_cache:/var/lib/visioncore/recordings-cache
@@ -139,6 +143,30 @@ services:
       - api
     networks:
       - visioncore_net
+
+  # ─── Analítica de video (Supervision + YOLOX/ONNX) ─────────
+  # CPU por defecto. Para GPU NVIDIA ver apps/analytics/README.md.
+  analytics:
+    build:
+      context: ./apps/analytics
+      dockerfile: Dockerfile
+    container_name: visioncore_analytics
+    restart: unless-stopped
+    environment:
+      API_BASE_URL: http://api:4000
+      ANALYTICS_SECRET: ${ANALYTICS_SECRET:-}
+      MODEL_PATH: /models/yolox_s.onnx
+      INPUT_SIZE: "640"
+    volumes:
+      - analytics_models:/models
+    depends_on:
+      - api
+    networks:
+      - visioncore_net
+    # El modelo se descarga de GitHub al primer arranque
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
 
   # ─── Nginx (reverse proxy + SSL) ───────────────────────────
   nginx:
@@ -176,6 +204,7 @@ volumes:
   certbot_www:
   uploads_data:
   recordings_cache:
+  analytics_models:
 
 networks:
   visioncore_net:
