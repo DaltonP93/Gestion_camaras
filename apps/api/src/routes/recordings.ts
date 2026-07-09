@@ -12,6 +12,7 @@ import fs from 'fs'
 import path from 'path'
 
 import { decryptNvrPassword as decryptPass } from '../services/credentials'
+import { MemorySessionStore, RedisSessionStore, type SessionStore } from '../services/session-store'
 
 // ─── VOD configuration ────────────────────────────────────────────
 const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000
@@ -261,7 +262,10 @@ interface DownloadToken {
   sessionId: string
   issuedAt:  number
 }
-const downloadTokens = new Map<string, DownloadToken>()
+// Store con TTL: Redis cuando está disponible (los links de descarga
+// sobreviven reinicios del API y funcionan con múltiples workers), memoria
+// como fallback. Se promociona a Redis al registrar el plugin.
+let downloadTokenStore: SessionStore<DownloadToken> = new MemorySessionStore<DownloadToken>()
 
 // ─── In-memory recording playback sessions ────────────────────────
 interface RecordingSession {
@@ -303,12 +307,12 @@ function issueDownloadToken(opts: {
 }): string {
   const token    = crypto.randomBytes(24).toString('hex')
   const issuedAt = Date.now()
-  downloadTokens.set(token, {
+  void downloadTokenStore.set(token, {
     token, filePath: opts.filePath, filename: opts.filename,
     expiresAt: issuedAt + DOWNLOAD_TOKEN_TTL_MS,
     sessionId: opts.sessionId,
     issuedAt,
-  })
+  }, DOWNLOAD_TOKEN_TTL_MS)
   const sess = recordingSessions.get(opts.sessionId)
   if (sess) {
     sess.downloadToken = token
@@ -336,9 +340,7 @@ setInterval(() => {
       }
     }
   }
-  for (const [tok, dt] of downloadTokens.entries()) {
-    if (now > dt.expiresAt) downloadTokens.delete(tok)
-  }
+  // downloadTokenStore expira solo (TTL de Redis / sweep interno en memoria)
 }, 5 * 60 * 1000)
 
 // ─── Preview sessions (instant streaming — fMP4 over HTTP) ───────
@@ -988,6 +990,15 @@ const previewStartSchema = z.object({
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
+  // Promocionar los download tokens a Redis: los links de "Descargar MP4"
+  // sobreviven reinicios del API (los archivos viven en el volumen de cache)
+  if ((server as any).redis) {
+    downloadTokenStore = new RedisSessionStore((server as any).redis, 'vc:dltoken:')
+    server.log.info('[recordings] download_token_store backend=redis')
+  } else {
+    server.log.info('[recordings] download_token_store backend=memory')
+  }
+
   // GET /api/recordings/search
   server.get('/search', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user  = request.user
@@ -1499,13 +1510,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).type('text/plain').send('Acceso denegado')
     }
 
-    const dt = downloadTokens.get(t)
+    const dt = await downloadTokenStore.get(t)
     if (!dt) {
       server.log.warn(`[recordings] download_token_invalid reason=not_found token=${t.slice(0, 8)}…`)
       return reply.status(403).type('text/plain').send('Acceso denegado')
     }
     if (Date.now() > dt.expiresAt) {
-      downloadTokens.delete(t)
+      void downloadTokenStore.delete(t)
       server.log.warn(`[recordings] download_token_invalid reason=expired filename=${dt.filename}`)
       return reply.status(403).type('text/plain').send('Token expirado')
     }
