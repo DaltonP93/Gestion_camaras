@@ -424,6 +424,8 @@ model CameraAnalyticsConfig {
   sampleFps     Float    @default(2)
   // Zonas de intrusión: [{ name, points: [[x,y]...] normalizados 0-1, classes? }]
   zones         Json?
+  // Líneas de conteo: [{ name, start: [x,y], end: [x,y] normalizados 0-1, classes? }]
+  lines         Json?
   // Segundos mínimos entre alertas repetidas de la misma clase/zona
   cooldownSec   Int      @default(60)
   createdAt     DateTime @default(now())
@@ -439,7 +441,8 @@ model AnalyticsEvent {
   className   String // clase COCO detectada
   confidence  Float
   trackId     Int?
-  zoneName    String?
+  zoneName    String? // nombre de zona o de línea de conteo
+  direction   String? // in | out (solo line_crossing)
   // Cajas detectadas: [[x1,y1,x2,y2,conf,"clase"], ...] en píxeles del frame
   bboxes      Json?
   snapshotUrl String?

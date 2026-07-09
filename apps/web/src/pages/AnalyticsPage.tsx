@@ -16,6 +16,13 @@ interface AnalyticsZone {
   classes?: string[]
 }
 
+interface AnalyticsLine {
+  name: string
+  start: [number, number]
+  end: [number, number]
+  classes?: string[]
+}
+
 interface AnalyticsConfig {
   cameraId: string
   enabled: boolean
@@ -24,6 +31,7 @@ interface AnalyticsConfig {
   sampleFps: number
   cooldownSec: number
   zones: AnalyticsZone[] | null
+  lines: AnalyticsLine[] | null
 }
 
 interface AnalyticsEvent {
@@ -35,6 +43,7 @@ interface AnalyticsEvent {
   className: string
   confidence: number
   zoneName: string | null
+  direction: string | null
   snapshotUrl: string | null
   occurredAt: string
 }
@@ -43,6 +52,7 @@ interface Summary {
   totalEvents: number
   byType: { type: string; count: number }[]
   byCamera: { cameraId: string; cameraName: string; count: number }[]
+  lineCounts: { cameraId: string; cameraName: string; lineName: string; direction: string; count: number }[]
 }
 
 const CLASS_LABELS: Record<string, string> = {
@@ -56,7 +66,7 @@ const TYPE_LABELS: Record<string, string> = {
 
 const DEFAULT_CONFIG = (cameraId: string): AnalyticsConfig => ({
   cameraId, enabled: false, classes: ['person'],
-  minConfidence: 0.5, sampleFps: 2, cooldownSec: 60, zones: null,
+  minConfidence: 0.5, sampleFps: 2, cooldownSec: 60, zones: null, lines: null,
 })
 
 export function AnalyticsPage() {
@@ -70,9 +80,10 @@ export function AnalyticsPage() {
   const [draft, setDraft] = useState<AnalyticsConfig | null>(null)
   const [saving, setSaving] = useState(false)
 
-  // Zone editor
+  // Zone/line editor
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null)
   const [snapshotLoading, setSnapshotLoading] = useState(false)
+  const [drawMode, setDrawMode] = useState<'zone' | 'line'>('zone')
   const [draftPoints, setDraftPoints] = useState<[number, number][]>([])
   const snapshotObjectUrlRef = useRef<string | null>(null)
 
@@ -92,6 +103,7 @@ export function AnalyticsPage() {
         classes: (c.classes as string[]) ?? ['person'],
         minConfidence: c.minConfidence, sampleFps: c.sampleFps,
         cooldownSec: c.cooldownSec, zones: (c.zones as AnalyticsZone[] | null) ?? null,
+        lines: (c.lines as AnalyticsLine[] | null) ?? null,
       }])))
       setSupportedClasses(res.supportedClasses)
       setServiceConfigured(res.serviceConfigured)
@@ -153,6 +165,7 @@ export function AnalyticsPage() {
         sampleFps: draft.sampleFps,
         cooldownSec: draft.cooldownSec,
         zones: draft.zones && draft.zones.length > 0 ? draft.zones : null,
+        lines: draft.lines && draft.lines.length > 0 ? draft.lines : null,
       })
       setConfigs(prev => new Map(prev).set(draft.cameraId, draft))
       toast.success('Configuración de analítica guardada')
@@ -164,7 +177,19 @@ export function AnalyticsPage() {
     const rect = e.currentTarget.getBoundingClientRect()
     const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width))
     const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height))
-    setDraftPoints(prev => prev.length >= 30 ? prev : [...prev, [Number(x.toFixed(4)), Number(y.toFixed(4))]])
+    const pt: [number, number] = [Number(x.toFixed(4)), Number(y.toFixed(4))]
+
+    if (drawMode === 'line') {
+      // Una línea son exactamente 2 puntos — al segundo clic se cierra sola
+      if (!draft) return
+      if (draftPoints.length === 0) { setDraftPoints([pt]); return }
+      const name = window.prompt('Nombre de la línea de conteo:', `Línea ${(draft.lines?.length ?? 0) + 1}`)
+      if (!name) { setDraftPoints([]); return }
+      setDraft({ ...draft, lines: [...(draft.lines ?? []), { name: name.slice(0, 60), start: draftPoints[0], end: pt }] })
+      setDraftPoints([])
+      return
+    }
+    setDraftPoints(prev => prev.length >= 30 ? prev : [...prev, pt])
   }
 
   const finishZone = () => {
@@ -178,6 +203,11 @@ export function AnalyticsPage() {
   const removeZone = (idx: number) => {
     if (!draft?.zones) return
     setDraft({ ...draft, zones: draft.zones.filter((_, i) => i !== idx) })
+  }
+
+  const removeLine = (idx: number) => {
+    if (!draft?.lines) return
+    setDraft({ ...draft, lines: draft.lines.filter((_, i) => i !== idx) })
   }
 
   const camerasByNvr = useMemo(() => {
@@ -204,6 +234,11 @@ export function AnalyticsPage() {
             {summary.byType.map(t => (
               <span key={t.type} className="text-xs px-2 py-0.5 rounded bg-surface-800 text-surface-400">
                 {TYPE_LABELS[t.type] ?? t.type}: {t.count}
+              </span>
+            ))}
+            {(summary.lineCounts ?? []).map((l, i) => (
+              <span key={`lc${i}`} className="text-xs px-2 py-0.5 rounded bg-amber-900/30 text-amber-300">
+                {l.cameraName} · {l.lineName} {l.direction === 'in' ? '↓in' : '↑out'}: {l.count}
               </span>
             ))}
           </div>
@@ -301,12 +336,28 @@ export function AnalyticsPage() {
 
               {/* ── Editor de zonas ────────────────────────────────────── */}
               <div>
-                <div className="flex items-center gap-2 mb-1.5">
+                <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                   <p className="text-[10px] text-surface-500 uppercase tracking-wide">
-                    Zonas de intrusión (clic sobre la imagen para dibujar)
+                    Zonas y líneas (clic sobre la imagen)
                   </p>
+                  <div className="flex rounded overflow-hidden border border-surface-700">
+                    <button
+                      onClick={() => { setDrawMode('zone'); setDraftPoints([]) }}
+                      className={clsx('text-[10px] px-2 py-0.5 transition-colors',
+                        drawMode === 'zone' ? 'bg-red-800/60 text-red-200' : 'bg-surface-800 text-surface-500')}
+                    >
+                      Zona
+                    </button>
+                    <button
+                      onClick={() => { setDrawMode('line'); setDraftPoints([]) }}
+                      className={clsx('text-[10px] px-2 py-0.5 transition-colors',
+                        drawMode === 'line' ? 'bg-amber-800/60 text-amber-200' : 'bg-surface-800 text-surface-500')}
+                    >
+                      Línea de conteo
+                    </button>
+                  </div>
                   <div className="flex-1" />
-                  {draftPoints.length > 0 && (
+                  {drawMode === 'zone' && draftPoints.length > 0 && (
                     <>
                       <button onClick={finishZone}
                         className="text-[10px] px-2 py-0.5 rounded bg-brand-700/60 text-brand-200 flex items-center gap-1">
@@ -317,6 +368,9 @@ export function AnalyticsPage() {
                         Cancelar
                       </button>
                     </>
+                  )}
+                  {drawMode === 'line' && draftPoints.length === 1 && (
+                    <span className="text-[10px] text-amber-400">clic en el segundo punto…</span>
                   )}
                 </div>
 
@@ -342,6 +396,12 @@ export function AnalyticsPage() {
                         points={z.points.map(([x, y]) => `${x * 100},${y * 100}`).join(' ')}
                         fill="rgba(220,38,38,0.18)" stroke="#dc2626" strokeWidth="0.4" />
                     ))}
+                    {(draft.lines ?? []).map((l, i) => (
+                      <line key={`l${i}`}
+                        x1={l.start[0] * 100} y1={l.start[1] * 100}
+                        x2={l.end[0] * 100} y2={l.end[1] * 100}
+                        stroke="#f59e0b" strokeWidth="0.6" />
+                    ))}
                     {draftPoints.length > 0 && (
                       <polyline
                         points={draftPoints.map(([x, y]) => `${x * 100},${y * 100}`).join(' ')}
@@ -353,13 +413,22 @@ export function AnalyticsPage() {
                   </svg>
                 </div>
 
-                {(draft.zones ?? []).length > 0 && (
+                {((draft.zones ?? []).length > 0 || (draft.lines ?? []).length > 0) && (
                   <div className="mt-2 space-y-1">
                     {(draft.zones ?? []).map((z, i) => (
                       <div key={i} className="flex items-center gap-2 text-xs text-surface-300 bg-surface-800 rounded px-2 py-1">
                         <span className="w-2 h-2 rounded-full bg-red-500 flex-shrink-0" />
-                        <span className="flex-1 truncate">{z.name} · {z.points.length} puntos</span>
+                        <span className="flex-1 truncate">{z.name} · zona · {z.points.length} puntos</span>
                         <button onClick={() => removeZone(i)} className="text-surface-500 hover:text-red-400">
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
+                    {(draft.lines ?? []).map((l, i) => (
+                      <div key={`l${i}`} className="flex items-center gap-2 text-xs text-surface-300 bg-surface-800 rounded px-2 py-1">
+                        <span className="w-2 h-2 rounded-full bg-amber-500 flex-shrink-0" />
+                        <span className="flex-1 truncate">{l.name} · línea de conteo</span>
+                        <button onClick={() => removeLine(i)} className="text-surface-500 hover:text-red-400">
                           <Trash2 size={12} />
                         </button>
                       </div>
@@ -428,7 +497,8 @@ export function AnalyticsPage() {
                     </p>
                     <p className="text-[10px] text-surface-500 mt-0.5">
                       {CLASS_LABELS[ev.className] ?? ev.className} · {(ev.confidence * 100).toFixed(0)}%
-                      {ev.zoneName ? ` · zona "${ev.zoneName}"` : ''}
+                      {ev.zoneName ? ` · ${ev.type === 'line_crossing' ? 'línea' : 'zona'} "${ev.zoneName}"` : ''}
+                      {ev.direction ? ` · ${ev.direction === 'in' ? 'entrada' : 'salida'}` : ''}
                     </p>
                     <p className="text-[10px] text-surface-500 font-mono">
                       {new Date(ev.occurredAt).toLocaleString('es')}
