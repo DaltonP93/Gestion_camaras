@@ -275,6 +275,7 @@ export function startHealthWorker(server: FastifyInstance) {
   const ALERTS_RETENTION_DAYS     = Number(process.env.ALERTS_RETENTION_DAYS ?? 90)
   const DELIVERIES_RETENTION_DAYS = Number(process.env.DELIVERIES_RETENTION_DAYS ?? 90)
   const AUDIT_RETENTION_DAYS      = Number(process.env.AUDIT_RETENTION_DAYS ?? 365)
+  const ANALYTICS_RETENTION_DAYS  = Number(process.env.ANALYTICS_RETENTION_DAYS ?? 30)
   const daysAgo = (d: number) => new Date(Date.now() - d * 24 * 60 * 60 * 1000)
 
   cron.schedule('30 3 * * *', async () => {
@@ -299,11 +300,19 @@ export function startHealthWorker(server: FastifyInstance) {
         })
         purged.audit = r.count
       }
-      if (purged.alerts + purged.deliveries + purged.audit > 0) {
+      let purgedAnalytics = 0
+      if (ANALYTICS_RETENTION_DAYS > 0) {
+        const r = await server.prisma.analyticsEvent.deleteMany({
+          where: { occurredAt: { lt: daysAgo(ANALYTICS_RETENTION_DAYS) } },
+        })
+        purgedAnalytics = r.count
+      }
+      if (purged.alerts + purged.deliveries + purged.audit + purgedAnalytics > 0) {
         server.log.info(
           `[retention] purga diaria: alerts=${purged.alerts} (${ALERTS_RETENTION_DAYS}d)` +
           ` deliveries=${purged.deliveries} (${DELIVERIES_RETENTION_DAYS}d)` +
-          ` auditLogs=${purged.audit} (${AUDIT_RETENTION_DAYS}d)`
+          ` auditLogs=${purged.audit} (${AUDIT_RETENTION_DAYS}d)` +
+          ` analyticsEvents=${purgedAnalytics} (${ANALYTICS_RETENTION_DAYS}d)`
         )
       }
     } catch (err) {

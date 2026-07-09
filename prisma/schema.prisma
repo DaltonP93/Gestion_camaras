@@ -314,6 +314,10 @@ enum AlertType {
   MOTION_DETECTED
   RECORDING_ERROR
   AUTH_FAILED
+  PERSON_DETECTED
+  VEHICLE_DETECTED
+  ZONE_INTRUSION
+  LINE_CROSSING
 }
 
 enum AlertSeverity {
@@ -407,6 +411,46 @@ model NvrChannelConfigBackup {
 
   @@index([nvrId, channelNo, streamType, createdAt])
   @@map("nvr_channel_config_backups")
+}
+
+// ─── Analítica de video (Roboflow Supervision) ───────────────
+model CameraAnalyticsConfig {
+  id            String   @id @default(cuid())
+  cameraId      String   @unique
+  enabled       Boolean  @default(false)
+  // Clases COCO a detectar: ["person","car","truck","bus","motorcycle","bicycle"]
+  classes       Json     @default("[\"person\"]")
+  minConfidence Float    @default(0.5)
+  sampleFps     Float    @default(2)
+  // Zonas de intrusión: [{ name, points: [[x,y]...] normalizados 0-1, classes? }]
+  zones         Json?
+  // Segundos mínimos entre alertas repetidas de la misma clase/zona
+  cooldownSec   Int      @default(60)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("camera_analytics_configs")
+}
+
+model AnalyticsEvent {
+  id          String   @id @default(cuid())
+  cameraId    String
+  type        String // person | vehicle | zone_intrusion | line_crossing
+  className   String // clase COCO detectada
+  confidence  Float
+  trackId     Int?
+  zoneName    String?
+  // Cajas detectadas: [[x1,y1,x2,y2,conf,"clase"], ...] en píxeles del frame
+  bboxes      Json?
+  snapshotUrl String?
+  alertId     String?
+  occurredAt  DateTime
+  createdAt   DateTime @default(now())
+
+  @@index([cameraId, occurredAt])
+  @@index([type, occurredAt])
+  @@index([occurredAt])
+  @@map("analytics_events")
 }
 
 // ─── Configuración de alertas y correo ───────────────────────
