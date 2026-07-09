@@ -32,6 +32,12 @@ const configSchema = z.object({
     points:  z.array(z.tuple([z.number().min(0).max(1), z.number().min(0).max(1)])).min(3).max(30),
     classes: z.array(z.enum(SUPPORTED_CLASSES)).optional(),
   })).max(10).nullable().optional(),
+  lines: z.array(z.object({
+    name:    z.string().min(1).max(60),
+    start:   z.tuple([z.number().min(0).max(1), z.number().min(0).max(1)]),
+    end:     z.tuple([z.number().min(0).max(1), z.number().min(0).max(1)]),
+    classes: z.array(z.enum(SUPPORTED_CLASSES)).optional(),
+  })).max(10).nullable().optional(),
 })
 
 const eventSchema = z.object({
@@ -41,6 +47,7 @@ const eventSchema = z.object({
   confidence: z.number().min(0).max(1),
   trackId:    z.number().int().optional(),
   zoneName:   z.string().max(60).optional(),
+  direction:  z.enum(['in', 'out']).optional(),
   bboxes:     z.array(z.array(z.union([z.number(), z.string()]))).max(64).optional(),
   occurredAt: z.string().datetime(),
   // JPEG anotado (cajas dibujadas por supervision), base64 sin prefijo data:
@@ -111,6 +118,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         minConfidence: cfg.minConfidence,
         sampleFps:     cfg.sampleFps,
         zones:         cfg.zones,
+        lines:         cfg.lines,
         cooldownSec:   cfg.cooldownSec,
         updatedAt:     cfg.updatedAt.toISOString(),
       }]
@@ -151,29 +159,50 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    const alertType = ALERT_TYPE_BY_EVENT[body.type]
-    const classLabel = CLASS_LABEL_ES[body.className] ?? body.className
-    const message = body.type === 'zone_intrusion'
-      ? `Intrusión en zona "${body.zoneName ?? 'zona'}": ${classLabel.toLowerCase()} en ${camera.name}`
-      : `${classLabel} detectada en ${camera.name} (${camera.nvr.name})`
+    // line_crossing es CONTEO, no alarma: se registra el evento para el
+    // dashboard/forense pero NO crea alerta (el tráfico saturaría la campana).
+    let alertId: string | null = null
+    if (body.type !== 'line_crossing') {
+      const alertType = ALERT_TYPE_BY_EVENT[body.type]
+      const classLabel = CLASS_LABEL_ES[body.className] ?? body.className
+      const message = body.type === 'zone_intrusion'
+        ? `Intrusión en zona "${body.zoneName ?? 'zona'}": ${classLabel.toLowerCase()} en ${camera.name}`
+        : `${classLabel} detectada en ${camera.name} (${camera.nvr.name})`
 
-    // ZONE_INTRUSION es HIGH (dispara email con la config por defecto);
-    // detecciones sueltas son LOW para no saturar el correo — se ven en la campana.
-    const severity = body.type === 'zone_intrusion' ? 'HIGH' : 'LOW'
+      // ZONE_INTRUSION es HIGH (dispara email con la config por defecto);
+      // detecciones sueltas son LOW para no saturar el correo — van a la campana.
+      const severity = body.type === 'zone_intrusion' ? 'HIGH' : 'LOW'
 
-    const alert = await server.prisma.alert.create({
-      data: {
-        cameraId: camera.id,
-        nvrId:    camera.nvrId,
-        type:     alertType,
-        severity,
-        message,
-        detail: {
-          className: body.className, confidence: body.confidence,
-          zoneName: body.zoneName ?? null, snapshotUrl, trackId: body.trackId ?? null,
+      const alert = await server.prisma.alert.create({
+        data: {
+          cameraId: camera.id,
+          nvrId:    camera.nvrId,
+          type:     alertType,
+          severity,
+          message,
+          detail: {
+            className: body.className, confidence: body.confidence,
+            zoneName: body.zoneName ?? null, snapshotUrl, trackId: body.trackId ?? null,
+          },
         },
-      },
-    })
+      })
+      alertId = alert.id
+
+      broadcastAlert({
+        type: 'alert',
+        alert: {
+          id: alert.id, type: alert.type, severity: alert.severity,
+          message: alert.message, nvrName: camera.nvr.name,
+          cameraName: camera.name, snapshotUrl, createdAt: alert.createdAt,
+        },
+      })
+
+      sendAlertNotification(server.prisma, {
+        id: alert.id, type: alert.type, severity: alert.severity,
+        message: alert.message, detail: alert.detail,
+        cameraId: alert.cameraId, nvrId: alert.nvrId,
+      }).catch((e) => server.log.error(`[analytics] email_failed: ${e}`))
+    }
 
     const event = await server.prisma.analyticsEvent.create({
       data: {
@@ -183,33 +212,20 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         confidence: body.confidence,
         trackId:    body.trackId ?? null,
         zoneName:   body.zoneName ?? null,
+        direction:  body.direction ?? null,
         bboxes:     body.bboxes ?? undefined,
         snapshotUrl,
-        alertId:    alert.id,
+        alertId,
         occurredAt: new Date(body.occurredAt),
       },
     })
 
-    broadcastAlert({
-      type: 'alert',
-      alert: {
-        id: alert.id, type: alert.type, severity: alert.severity,
-        message: alert.message, nvrName: camera.nvr.name,
-        cameraName: camera.name, snapshotUrl, createdAt: alert.createdAt,
-      },
-    })
-
-    sendAlertNotification(server.prisma, {
-      id: alert.id, type: alert.type, severity: alert.severity,
-      message: alert.message, detail: alert.detail,
-      cameraId: alert.cameraId, nvrId: alert.nvrId,
-    }).catch((e) => server.log.error(`[analytics] email_failed: ${e}`))
-
     server.log.info(
       `[analytics] event_received cameraId=${camera.id} type=${body.type}` +
-      ` class=${body.className} conf=${body.confidence.toFixed(2)} zone=${body.zoneName ?? 'none'}`
+      ` class=${body.className} conf=${body.confidence.toFixed(2)}` +
+      ` zone=${body.zoneName ?? 'none'} direction=${body.direction ?? 'none'}`
     )
-    return reply.send({ ok: true, eventId: event.id, alertId: alert.id })
+    return reply.send({ ok: true, eventId: event.id, alertId })
   })
 
   // ── Configuración por cámara (usuarios) ──────────────────────────────────
@@ -239,6 +255,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       sampleFps:     body.sampleFps,
       cooldownSec:   body.cooldownSec,
       zones:         body.zones ?? undefined,
+      lines:         body.lines ?? undefined,
     }
     const config = await server.prisma.cameraAnalyticsConfig.upsert({
       where:  { cameraId },
@@ -307,10 +324,15 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     const to   = q.to   ? new Date(q.to)   : new Date()
     const where = { occurredAt: { gte: from, lte: to } }
 
-    const [byType, byCamera, totalEvents] = await Promise.all([
+    const [byType, byCamera, totalEvents, lineCrossings] = await Promise.all([
       server.prisma.analyticsEvent.groupBy({ by: ['type'], where, _count: { _all: true } }),
       server.prisma.analyticsEvent.groupBy({ by: ['cameraId'], where, _count: { _all: true } }),
       server.prisma.analyticsEvent.count({ where }),
+      server.prisma.analyticsEvent.groupBy({
+        by: ['cameraId', 'zoneName', 'direction'],
+        where: { ...where, type: 'line_crossing' },
+        _count: { _all: true },
+      }),
     ])
 
     const camIds = byCamera.map(c => c.cameraId)
@@ -325,6 +347,14 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       byCamera: byCamera
         .map(c => ({ cameraId: c.cameraId, cameraName: nameById.get(c.cameraId) ?? 'Desconocida', count: c._count._all }))
         .sort((a, b) => b.count - a.count),
+      // Conteos por línea de cruce: [{cameraName, lineName, direction, count}]
+      lineCounts: lineCrossings.map(l => ({
+        cameraId:   l.cameraId,
+        cameraName: nameById.get(l.cameraId) ?? 'Desconocida',
+        lineName:   l.zoneName ?? 'línea',
+        direction:  l.direction ?? '—',
+        count:      l._count._all,
+      })),
     })
   })
 }

@@ -1,0 +1,146 @@
+// apps/api/src/services/recordings/rtsp-url.ts
+// Helpers PUROS de URLs RTSP de reproducción y clasificación de errores.
+// Extraídos de routes/recordings.ts — sin estado ni efectos: todo testeable.
+
+export type PlaybackVariant = 'main_full' | 'main_no_name_size' | 'sub_full' | 'sub_no_name_size'
+export type PlaybackStreamMode = 'main' | 'sub' | 'auto'
+
+// Mask credentials in any rtsp:// or http(s):// URL embedded in log text.
+// FFmpeg stderr echoes the full input URL including the password — never
+// store or log it in clear.
+export function maskUrlCredentials(text: string): string {
+  return text.replace(/(rtsps?|https?):\/\/([^:\/\s@]+):([^@\/\s]+)@/gi, '$1://$2:***@')
+}
+
+// Classify RTSP/FFmpeg failures into actionable categories so the frontend
+// can show the real cause instead of a generic "retry with H.264".
+export function classifyRtspError(text: string): string {
+  const t = text.toLowerCase()
+  // 453 first — its stderr also contains "4XX Client Error" and "DESCRIBE
+  // failed", which would otherwise mismatch as auth/open errors
+  if (/453|not enough bandwidth/.test(t))                             return 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
+  if (/401|unauthorized|credenciales/.test(t))                        return 'RTSP_AUTH_OR_TRACK_DENIED'
+  if (/404|not found|no encontrado/.test(t))                          return 'RTSP_TRACK_NOT_FOUND'
+  if (/connection refused|conexi.n rechazada|timed? ?out|timeout/.test(t)) return 'NVR_OFFLINE_OR_TIMEOUT'
+  if (/no supported streams|invalid data found|could not find codec/.test(t)) return 'CODEC_UNSUPPORTED'
+  if (/could not open|open context|error opening input/.test(t))      return 'RTSP_OPEN_FAILED'
+  return 'UNKNOWN'
+}
+
+// Strip name/size params from a playback RTSP URL — some NVR firmwares
+// reject the full variant under load but accept the plain time-range form.
+export function stripNameSizeParams(url: string): string {
+  return url
+    .replace(/([?&])name=[^&]*&?/i, '$1')
+    .replace(/([?&])size=[^&]*&?/i, '$1')
+    .replace(/[?&]$/, '')
+}
+
+// tracks/401 → tracks/402 (main → substream). Returns null when the URL has
+// no main-track id to transform.
+export function toSubstreamTrackUrl(url: string): string | null {
+  const m = url.match(/\/Streaming\/tracks\/(\d+)/i)
+  if (!m) return null
+  const id = parseInt(m[1], 10)
+  if (id % 100 !== 1) return null
+  return url.replace(/\/Streaming\/tracks\/\d+/i, `/Streaming/tracks/${id + 1}`)
+}
+
+export function buildVariantUrl(baseUrl: string, variant: PlaybackVariant): string | null {
+  let u: string | null = baseUrl
+  if (variant.startsWith('sub')) {
+    u = toSubstreamTrackUrl(u)
+    if (!u) return null
+  }
+  if (variant.endsWith('no_name_size')) {
+    // Without name/size params this variant is identical to its *_full twin
+    if (!/[?&](name|size)=/i.test(u)) return null
+    u = stripNameSizeParams(u)
+  }
+  return u
+}
+
+/** Ordered attempt chain for a preview, honoring mode and preferred variant
+ *  (the last one that worked for this camera). Deduped by URL (e.g.
+ *  fallback_timestamps URLs have no name/size so *_no_name_size collapses
+ *  into *_full). */
+export function buildVariantChain(
+  baseUrl: string,
+  opts: { mode: PlaybackStreamMode; preferred?: PlaybackVariant | undefined },
+): Array<{ variant: PlaybackVariant; url: string }> {
+  const order: PlaybackVariant[] =
+    opts.mode === 'main' ? ['main_full', 'main_no_name_size']
+    : opts.mode === 'sub' ? ['sub_full', 'sub_no_name_size']
+    : ['main_full', 'main_no_name_size', 'sub_full', 'sub_no_name_size']
+
+  // Preferred variant (last one that worked) goes first
+  if (opts.preferred && order.includes(opts.preferred)) {
+    order.splice(order.indexOf(opts.preferred), 1)
+    order.unshift(opts.preferred)
+  }
+
+  const chain: Array<{ variant: PlaybackVariant; url: string }> = []
+  const seenUrls = new Set<string>()
+  for (const variant of order) {
+    const url = buildVariantUrl(baseUrl, variant)
+    if (!url || seenUrls.has(url)) continue
+    seenUrls.add(url)
+    chain.push({ variant, url })
+  }
+  return chain
+}
+
+export function injectCredentialsIntoPlaybackUri(opts: {
+  playbackURI: string
+  username:    string
+  password:    string
+  ipAddress:   string
+  rtspPort:    number
+}): { url: string; masked: string } {
+  const { playbackURI, username, password, ipAddress, rtspPort } = opts
+  const encodedPass = encodeURIComponent(password)
+  const pathQuery   = playbackURI.startsWith('/') ? playbackURI : `/${playbackURI}`
+  return {
+    url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
+    masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
+  }
+}
+
+// Rewrite the starttime in an NVR playbackURI so preview begins at the
+// requested playhead instead of the start of the recorded block. The NVR's
+// playbackURI carries starttime/endtime as YYYYMMDDTHHmmssZ query params.
+export function rewritePlaybackUriStart(playbackURI: string, effectiveStart: Date): {
+  uri: string; rewritten: boolean; originalStart: string | null
+} {
+  const fmtTs = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const m = playbackURI.match(/([?&]starttime=)(\d{8}T\d{6}Z)/i)
+  if (!m) return { uri: playbackURI, rewritten: false, originalStart: null }
+  const newTs = fmtTs(effectiveStart)
+  if (m[2] === newTs) return { uri: playbackURI, rewritten: false, originalStart: m[2] }
+  return {
+    uri: playbackURI.replace(m[0], `${m[1]}${newTs}`),
+    rewritten: true,
+    originalStart: m[2],
+  }
+}
+
+export function buildFallbackRecordingRtspUrl(opts: {
+  username:  string
+  password:  string
+  ipAddress: string
+  rtspPort:  number
+  channel:   number
+  start:     Date
+  end:       Date
+}): { url: string; masked: string; trackId: number } {
+  const { username, password, ipAddress, rtspPort, channel, start, end } = opts
+  const trackId     = channel * 100 + 1
+  const encodedPass = encodeURIComponent(password)
+  const fmtTs       = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
+  const pathQuery   = `/Streaming/tracks/${trackId}?starttime=${fmtTs(start)}&endtime=${fmtTs(end)}`
+  return {
+    url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
+    masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
+    trackId,
+  }
+}

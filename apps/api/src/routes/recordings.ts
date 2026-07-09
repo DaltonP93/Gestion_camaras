@@ -12,6 +12,14 @@ import fs from 'fs'
 import path from 'path'
 
 import { decryptNvrPassword as decryptPass } from '../services/credentials'
+import { MemorySessionStore, RedisSessionStore, type SessionStore } from '../services/session-store'
+import {
+  maskUrlCredentials, classifyRtspError,
+  buildVariantChain as buildVariantChainPure,
+  injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
+  buildFallbackRecordingRtspUrl,
+  type PlaybackVariant,
+} from '../services/recordings/rtsp-url'
 
 // ─── VOD configuration ────────────────────────────────────────────
 const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000
@@ -261,7 +269,10 @@ interface DownloadToken {
   sessionId: string
   issuedAt:  number
 }
-const downloadTokens = new Map<string, DownloadToken>()
+// Store con TTL: Redis cuando está disponible (los links de descarga
+// sobreviven reinicios del API y funcionan con múltiples workers), memoria
+// como fallback. Se promociona a Redis al registrar el plugin.
+let downloadTokenStore: SessionStore<DownloadToken> = new MemorySessionStore<DownloadToken>()
 
 // ─── In-memory recording playback sessions ────────────────────────
 interface RecordingSession {
@@ -303,12 +314,12 @@ function issueDownloadToken(opts: {
 }): string {
   const token    = crypto.randomBytes(24).toString('hex')
   const issuedAt = Date.now()
-  downloadTokens.set(token, {
+  void downloadTokenStore.set(token, {
     token, filePath: opts.filePath, filename: opts.filename,
     expiresAt: issuedAt + DOWNLOAD_TOKEN_TTL_MS,
     sessionId: opts.sessionId,
     issuedAt,
-  })
+  }, DOWNLOAD_TOKEN_TTL_MS)
   const sess = recordingSessions.get(opts.sessionId)
   if (sess) {
     sess.downloadToken = token
@@ -336,9 +347,7 @@ setInterval(() => {
       }
     }
   }
-  for (const [tok, dt] of downloadTokens.entries()) {
-    if (now > dt.expiresAt) downloadTokens.delete(tok)
-  }
+  // downloadTokenStore expira solo (TTL de Redis / sweep interno en memoria)
 }, 5 * 60 * 1000)
 
 // ─── Preview sessions (instant streaming — fMP4 over HTTP) ───────
@@ -396,27 +405,7 @@ function retainFailedPreview(sessionId: string, session: PreviewSession, log: (m
   log(`[recordings-preview] failed_session_retained sessionId=${sessionId} ttlMs=${FAILED_PREVIEW_TTL_MS} category=${session.errorCategory}`)
 }
 
-// Mask credentials in any rtsp:// or http(s):// URL embedded in log text.
-// FFmpeg stderr echoes the full input URL including the password — never
-// store or log it in clear.
-function maskUrlCredentials(text: string): string {
-  return text.replace(/(rtsps?|https?):\/\/([^:\/\s@]+):([^@\/\s]+)@/gi, '$1://$2:***@')
-}
-
-// Classify RTSP/FFmpeg failures into actionable categories so the frontend
-// can show the real cause instead of a generic "retry with H.264".
-function classifyRtspError(text: string): string {
-  const t = text.toLowerCase()
-  // 453 first — its stderr also contains "4XX Client Error" and "DESCRIBE
-  // failed", which would otherwise mismatch as auth/open errors
-  if (/453|not enough bandwidth/.test(t))                             return 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
-  if (/401|unauthorized|credenciales/.test(t))                        return 'RTSP_AUTH_OR_TRACK_DENIED'
-  if (/404|not found|no encontrado/.test(t))                          return 'RTSP_TRACK_NOT_FOUND'
-  if (/connection refused|conexi.n rechazada|timed? ?out|timeout/.test(t)) return 'NVR_OFFLINE_OR_TIMEOUT'
-  if (/no supported streams|invalid data found|could not find codec/.test(t)) return 'CODEC_UNSUPPORTED'
-  if (/could not open|open context|error opening input/.test(t))      return 'RTSP_OPEN_FAILED'
-  return 'UNKNOWN'
-}
+// maskUrlCredentials y classifyRtspError viven en services/recordings/rtsp-url.ts
 
 const previewSessions = new Map<string, PreviewSession>()
 
@@ -489,7 +478,7 @@ async function acquireNvrPreviewSlot(
 // Hikvision playback tracks: channel N main = N*100+1 (401, 501…),
 // substream = N*100+2 (402, 502…). Substream playback uses far less NVR
 // bandwidth, so it's worth trying before declaring 453.
-type PlaybackVariant = 'main_full' | 'main_no_name_size' | 'sub_full' | 'sub_no_name_size'
+// (PlaybackVariant se importa desde services/recordings/rtsp-url.ts)
 
 const PLAYBACK_STREAM_MODE = (['main', 'sub', 'auto'].includes(process.env.RECORDINGS_PLAYBACK_STREAM || '')
   ? process.env.RECORDINGS_PLAYBACK_STREAM
@@ -499,64 +488,13 @@ const PLAYBACK_STREAM_MODE = (['main', 'sub', 'auto'].includes(process.env.RECOR
 // directly with it (no failed RTSP attempts spent re-discovering).
 const previewVariantPreferenceByCamera = new Map<string, PlaybackVariant>()
 
-// Strip name/size params from a playback RTSP URL — some NVR firmwares
-// reject the full variant under load but accept the plain time-range form.
-function stripNameSizeParams(url: string): string {
-  return url
-    .replace(/([?&])name=[^&]*&?/i, '$1')
-    .replace(/([?&])size=[^&]*&?/i, '$1')
-    .replace(/[?&]$/, '')
-}
-
-// tracks/401 → tracks/402 (main → substream). Returns null when the URL has
-// no main-track id to transform.
-function toSubstreamTrackUrl(url: string): string | null {
-  const m = url.match(/\/Streaming\/tracks\/(\d+)/i)
-  if (!m) return null
-  const id = parseInt(m[1], 10)
-  if (id % 100 !== 1) return null
-  return url.replace(/\/Streaming\/tracks\/\d+/i, `/Streaming/tracks/${id + 1}`)
-}
-
-function buildVariantUrl(baseUrl: string, variant: PlaybackVariant): string | null {
-  let u: string | null = baseUrl
-  if (variant.startsWith('sub')) {
-    u = toSubstreamTrackUrl(u)
-    if (!u) return null
-  }
-  if (variant.endsWith('no_name_size')) {
-    // Without name/size params this variant is identical to its *_full twin
-    if (!/[?&](name|size)=/i.test(u)) return null
-    u = stripNameSizeParams(u)
-  }
-  return u
-}
-
-/** Ordered attempt chain for a preview, honoring mode and per-camera
- *  preference. Deduped by URL (e.g. fallback_timestamps URLs have no
- *  name/size so *_no_name_size collapses into *_full). */
+// Wrapper: la versión pura vive en services/recordings/rtsp-url.ts; aquí solo
+// se resuelven el modo (env) y la preferencia por cámara (estado del módulo)
 function buildVariantChain(baseUrl: string, cameraId: string): Array<{ variant: PlaybackVariant; url: string }> {
-  const order: PlaybackVariant[] =
-    PLAYBACK_STREAM_MODE === 'main' ? ['main_full', 'main_no_name_size']
-    : PLAYBACK_STREAM_MODE === 'sub' ? ['sub_full', 'sub_no_name_size']
-    : ['main_full', 'main_no_name_size', 'sub_full', 'sub_no_name_size']
-
-  // Preferred variant (last one that worked) goes first
-  const preferred = previewVariantPreferenceByCamera.get(cameraId)
-  if (preferred && order.includes(preferred)) {
-    order.splice(order.indexOf(preferred), 1)
-    order.unshift(preferred)
-  }
-
-  const chain: Array<{ variant: PlaybackVariant; url: string }> = []
-  const seenUrls = new Set<string>()
-  for (const variant of order) {
-    const url = buildVariantUrl(baseUrl, variant)
-    if (!url || seenUrls.has(url)) continue
-    seenUrls.add(url)
-    chain.push({ variant, url })
-  }
-  return chain
+  return buildVariantChainPure(baseUrl, {
+    mode: PLAYBACK_STREAM_MODE,
+    preferred: previewVariantPreferenceByCamera.get(cameraId),
+  })
 }
 
 // Per-camera override: when forceTranscode=true succeeds, persist transcode requirement
@@ -595,62 +533,7 @@ setInterval(() => {
   }
 }, 60 * 1000)
 
-// ─── RTSP URL helpers ─────────────────────────────────────────────
-
-function injectCredentialsIntoPlaybackUri(opts: {
-  playbackURI: string
-  username:    string
-  password:    string
-  ipAddress:   string
-  rtspPort:    number
-}): { url: string; masked: string } {
-  const { playbackURI, username, password, ipAddress, rtspPort } = opts
-  const encodedPass = encodeURIComponent(password)
-  const pathQuery   = playbackURI.startsWith('/') ? playbackURI : `/${playbackURI}`
-  return {
-    url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
-    masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
-  }
-}
-
-// Rewrite the starttime in an NVR playbackURI so preview begins at the
-// requested playhead instead of the start of the recorded block. The NVR's
-// playbackURI carries starttime/endtime as YYYYMMDDTHHmmssZ query params.
-function rewritePlaybackUriStart(playbackURI: string, effectiveStart: Date): {
-  uri: string; rewritten: boolean; originalStart: string | null
-} {
-  const fmtTs = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
-  const m = playbackURI.match(/([?&]starttime=)(\d{8}T\d{6}Z)/i)
-  if (!m) return { uri: playbackURI, rewritten: false, originalStart: null }
-  const newTs = fmtTs(effectiveStart)
-  if (m[2] === newTs) return { uri: playbackURI, rewritten: false, originalStart: m[2] }
-  return {
-    uri: playbackURI.replace(m[0], `${m[1]}${newTs}`),
-    rewritten: true,
-    originalStart: m[2],
-  }
-}
-
-function buildFallbackRecordingRtspUrl(opts: {
-  username:  string
-  password:  string
-  ipAddress: string
-  rtspPort:  number
-  channel:   number
-  start:     Date
-  end:       Date
-}): { url: string; masked: string; trackId: number } {
-  const { username, password, ipAddress, rtspPort, channel, start, end } = opts
-  const trackId     = channel * 100 + 1
-  const encodedPass = encodeURIComponent(password)
-  const fmtTs       = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
-  const pathQuery   = `/Streaming/tracks/${trackId}?starttime=${fmtTs(start)}&endtime=${fmtTs(end)}`
-  return {
-    url:    `rtsp://${username}:${encodedPass}@${ipAddress}:${rtspPort}${pathQuery}`,
-    masked: `rtsp://${username}:***@${ipAddress}:${rtspPort}${pathQuery}`,
-    trackId,
-  }
-}
+// ─── RTSP URL helpers → services/recordings/rtsp-url.ts ──────────
 
 // ─── VOD generation ───────────────────────────────────────────────
 
@@ -988,6 +871,15 @@ const previewStartSchema = z.object({
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
+  // Promocionar los download tokens a Redis: los links de "Descargar MP4"
+  // sobreviven reinicios del API (los archivos viven en el volumen de cache)
+  if ((server as any).redis) {
+    downloadTokenStore = new RedisSessionStore((server as any).redis, 'vc:dltoken:')
+    server.log.info('[recordings] download_token_store backend=redis')
+  } else {
+    server.log.info('[recordings] download_token_store backend=memory')
+  }
+
   // GET /api/recordings/search
   server.get('/search', { preHandler: [server.authenticate] }, async (request, reply) => {
     const user  = request.user
@@ -1499,13 +1391,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(403).type('text/plain').send('Acceso denegado')
     }
 
-    const dt = downloadTokens.get(t)
+    const dt = await downloadTokenStore.get(t)
     if (!dt) {
       server.log.warn(`[recordings] download_token_invalid reason=not_found token=${t.slice(0, 8)}…`)
       return reply.status(403).type('text/plain').send('Acceso denegado')
     }
     if (Date.now() > dt.expiresAt) {
-      downloadTokens.delete(t)
+      void downloadTokenStore.delete(t)
       server.log.warn(`[recordings] download_token_invalid reason=expired filename=${dt.filename}`)
       return reply.status(403).type('text/plain').send('Token expirado')
     }

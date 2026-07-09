@@ -34,6 +34,8 @@ class CameraWorker(threading.Thread):
         self.reported_tracks: set[int] = set()
         self.zones: list[dict[str, Any]] = []
         self.zone_objects: list[sv.PolygonZone] = []
+        self.lines: list[dict[str, Any]] = []
+        self.line_objects: list[sv.LineZone] = []
         self.frame_size: tuple[int, int] | None = None
         self.status = "starting"
         self.frames_processed = 0
@@ -48,8 +50,16 @@ class CameraWorker(threading.Thread):
         for z in self.zones:
             pts = np.array([[int(px * w), int(py * h)] for px, py in z["points"]], dtype=np.int32)
             self.zone_objects.append(sv.PolygonZone(polygon=pts))
-        if self.zones:
-            log.info("[%s] %d zonas materializadas (%dx%d)", self.cam["cameraName"], len(self.zones), w, h)
+        # Líneas de conteo por cruce (normalizadas 0-1 → píxeles)
+        self.lines = list(self.cam.get("lines") or [])
+        self.line_objects = []
+        for ln in self.lines:
+            start = sv.Point(int(ln["start"][0] * w), int(ln["start"][1] * h))
+            end = sv.Point(int(ln["end"][0] * w), int(ln["end"][1] * h))
+            self.line_objects.append(sv.LineZone(start=start, end=end))
+        if self.zones or self.lines:
+            log.info("[%s] %d zonas + %d líneas materializadas (%dx%d)",
+                     self.cam["cameraName"], len(self.zones), len(self.lines), w, h)
 
     def _watched_class_ids(self) -> set[int]:
         return {COCO_CLASS_IDS[c] for c in self.cam["classes"] if c in COCO_CLASS_IDS}
@@ -63,7 +73,8 @@ class CameraWorker(threading.Thread):
 
     def _post_event(self, ev_type: str, class_name: str, confidence: float,
                     frame: np.ndarray, detections: sv.Detections,
-                    track_id: int | None = None, zone_name: str | None = None) -> None:
+                    track_id: int | None = None, zone_name: str | None = None,
+                    direction: str | None = None) -> None:
         annotated = frame.copy()
         labels = [
             f"{CLASS_NAME_BY_ID.get(int(c), str(c))} {conf:.0%}"
@@ -75,6 +86,14 @@ class CameraWorker(threading.Thread):
             cv2.polylines(annotated, [zobj.polygon], True, (0, 0, 255), 2)
             cv2.putText(annotated, z["name"], tuple(zobj.polygon[0]),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        for ln, lobj in zip(self.lines, self.line_objects):
+            p1 = (int(lobj.vector.start.x), int(lobj.vector.start.y))
+            p2 = (int(lobj.vector.end.x), int(lobj.vector.end.y))
+            cv2.line(annotated, p1, p2, (255, 180, 0), 2)
+            cv2.putText(annotated,
+                        f"{ln['name']} in:{lobj.in_count} out:{lobj.out_count}",
+                        (p1[0], max(20, p1[1] - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 0), 2)
 
         if annotated.shape[1] > settings.snapshot_max_width:
             scale = settings.snapshot_max_width / annotated.shape[1]
@@ -97,6 +116,7 @@ class CameraWorker(threading.Thread):
             "confidence": round(float(confidence), 3),
             "trackId": int(track_id) if track_id is not None else None,
             "zoneName": zone_name,
+            "direction": direction,
             "bboxes": bboxes,
             "occurredAt": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z",
             "snapshotJpegBase64": snapshot_b64,
@@ -142,7 +162,25 @@ class CameraWorker(threading.Thread):
                     self._post_event(ev_type, cname, float(detections.confidence[i]),
                                      frame, detections, track_id=int(tid))
 
-        # 2) Zonas de intrusión
+        # 2) Líneas de conteo por cruce — cada cruce es un evento (sin cooldown:
+        # el objetivo es CONTAR; el API no genera alertas para line_crossing)
+        for ln, lobj in zip(self.lines, self.line_objects):
+            line_classes = set(ln.get("classes") or self.cam["classes"])
+            crossed_in, crossed_out = lobj.trigger(detections)
+            for i in range(len(detections)):
+                direction = "in" if crossed_in[i] else ("out" if crossed_out[i] else None)
+                if direction is None:
+                    continue
+                cname = CLASS_NAME_BY_ID.get(int(detections.class_id[i]), "")
+                if cname not in line_classes:
+                    continue
+                tid = detections.tracker_id[i] if detections.tracker_id is not None else None
+                self._post_event("line_crossing", cname, float(detections.confidence[i]),
+                                 frame, detections,
+                                 track_id=int(tid) if tid is not None else None,
+                                 zone_name=ln["name"], direction=direction)
+
+        # 3) Zonas de intrusión
         for z, zobj in zip(self.zones, self.zone_objects):
             zone_classes = set(z.get("classes") or self.cam["classes"])
             inside = zobj.trigger(detections)
