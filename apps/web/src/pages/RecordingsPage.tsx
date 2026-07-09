@@ -1,5 +1,6 @@
 // src/pages/RecordingsPage.tsx
 import { useEffect, useState, useMemo, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   Play, Clock, AlertTriangle, RefreshCw, ExternalLink,
   XCircle, Loader2, Info, Download, Video, Camera as CameraIcon,
@@ -163,6 +164,36 @@ export function RecordingsPage() {
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
   useEffect(() => { loadNVRs(); loadCameras() }, [])
+
+  // ── Deep link: /recordings?cameraId=<id>&t=<ISO> (desde Analítica) ────────
+  // Busca automáticamente un rango alrededor del evento y posiciona el playhead.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const deepLinkHandledRef = useRef(false)
+  useEffect(() => {
+    if (deepLinkHandledRef.current) return
+    const camId = searchParams.get('cameraId')
+    const t     = searchParams.get('t')
+    if (!camId || !t) return
+    if (cameras.length === 0) return          // esperar a que carguen las cámaras
+    if (!cameras.some(c => c.id === camId)) return
+    const tMs = new Date(t).getTime()
+    if (isNaN(tMs)) return
+    deepLinkHandledRef.current = true
+
+    // El evento llega como instante UTC real; el NVR guarda hora de pared.
+    // Convención: el navegador está en la misma zona horaria que el NVR, así
+    // que la representación local del instante ES la hora de pared del NVR.
+    const from = toLocalDatetimeString(new Date(tMs - 2 * 60_000))
+    const to   = toLocalDatetimeString(new Date(tMs + 10 * 60_000))
+    const seekWallMs = new Date(localInputToNvrIso(toLocalDatetimeString(new Date(tMs)))).getTime()
+
+    console.info(`[recordings-ui] deep_link cameraId=${camId} t=${t} range=${from}→${to}`)
+    setStartDate(from)
+    setEndDate(to)
+    setSelectedCameras(new Set([camId]))
+    setSearchParams({}, { replace: true })
+    setTimeout(() => handleSearch({ startDate: from, endDate: to, cameraIds: [camId], seekToWallMs: seekWallMs }), 0)
+  }, [cameras])
 
   // ── Resize slots when layout changes ──────────────────────────────────────
   useEffect(() => {
@@ -617,9 +648,11 @@ export function RecordingsPage() {
   }
 
   // ── Search ─────────────────────────────────────────────────────────────────
-  const handleSearch = async (dateOverride?: { startDate: string; endDate: string }) => {
+  const handleSearch = async (dateOverride?: { startDate: string; endDate: string; cameraIds?: string[]; seekToWallMs?: number }) => {
     const assignedCameraIds = new Set(slotsRef.current.filter(s => s.cameraId).map(s => s.cameraId!))
-    const effectiveCameraIds = new Set([...selectedCameras, ...assignedCameraIds])
+    // cameraIds override: used by deep links (/recordings?cameraId=&t=) where
+    // React state hasn't committed yet when the search fires
+    const effectiveCameraIds = new Set([...(dateOverride?.cameraIds ?? [...selectedCameras]), ...assignedCameraIds])
 
     console.info(
       `[recordings-ui] search_effective_cameras selected=${selectedCameras.size}` +
@@ -711,23 +744,25 @@ export function RecordingsPage() {
     // Timeline spans exactly the searched range
     setSearchRangeMs({ start: start.getTime(), end: end.getTime() })
 
-    // Initialize playhead to earliest recording found
+    // Initialize playhead: explicit seek target (deep link) or earliest recording
     let earliest: RecordingWithCamera | null = null
+    const seekMs = dateOverride?.seekToWallMs ?? null
     if (all.length > 0) {
       earliest = all.reduce((min, r) =>
         new Date(r.startTime).getTime() < new Date(min.startTime).getTime() ? r : min
       )
-      setGlobalPlaybackTime(new Date(new Date(earliest.startTime).getTime()))
+      setGlobalPlaybackTime(new Date(seekMs ?? new Date(earliest.startTime).getTime()))
     }
 
-    // Auto-assign: if exactly 1 camera selected and no slot has a camera assigned, assign to active slot
-    if (all.length > 0 && selectedCameras.size === 1 && assignedCameraIds.size === 0) {
-      const singleCamId = [...selectedCameras][0]
+    // Auto-assign: if exactly 1 camera searched and no slot has a camera assigned, assign to active slot
+    const searchedCams = dateOverride?.cameraIds ?? [...selectedCameras]
+    if (all.length > 0 && searchedCams.length === 1 && assignedCameraIds.size === 0) {
+      const singleCamId = searchedCams[0]
       const cam = cameras.find(c => c.id === singleCamId)
       const nvrObj = cam ? nvrs.find(n => n.id === cam.nvrId) : null
       const camRecs = all.filter(r => r.cameraId === singleCamId)
       if (cam && camRecs.length > 0) {
-        console.info(`[recordings-ui] search_auto_assign cameraId=${singleCamId} slot=${activeSlotIndex}`)
+        console.info(`[recordings-ui] search_auto_assign cameraId=${singleCamId} slot=${activeSlotIndex} seek=${seekMs ?? 'none'}`)
         stopSlot(activeSlotIndex)
         setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
           ...s,
@@ -735,8 +770,15 @@ export function RecordingsPage() {
           recording: null, status: 'idle', playbackUrl: null, sessionId: null, sessionType: null,
           downloadUrl: null, errorMsg: null, vodProgress: null, mimeType: null,
         } : s))
-        const playhead = earliest ? new Date(earliest.startTime) : new Date(camRecs[0].startTime)
-        setTimeout(() => startPreviewInSlotRef.current(activeSlotIndex, camRecs[0], playhead), 0)
+        // With a seek target, start at the block covering it (or the next one)
+        const sortedRecs = [...camRecs].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
+        const target = seekMs !== null
+          ? sortedRecs.find(r => new Date(r.endTime).getTime() > seekMs) ?? sortedRecs[0]
+          : camRecs[0]
+        const playhead = seekMs !== null
+          ? new Date(Math.max(seekMs, new Date(target.startTime).getTime()))
+          : earliest ? new Date(earliest.startTime) : new Date(camRecs[0].startTime)
+        setTimeout(() => startPreviewInSlotRef.current(activeSlotIndex, target, playhead), 0)
       }
     }
 
