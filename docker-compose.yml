@@ -109,6 +109,9 @@ services:
       # Secreto compartido con el servicio analytics (openssl rand -hex 32).
       # Vacío = endpoints de analítica deshabilitados.
       ANALYTICS_SECRET: ${ANALYTICS_SECRET:-}
+      ANALYTICS_URL: http://analytics:8500
+      ANALYTICS_MEDIAMTX_RTSP: rtsp://mediamtx:8554
+      ANALYTICS_ALPR_ENABLED: ${ANALYTICS_ALPR_ENABLED:-false}
     volumes:
       - uploads_data:/app/uploads
       - recordings_cache:/var/lib/visioncore/recordings-cache
