@@ -15,6 +15,15 @@ class Settings(BaseSettings):
     )
     input_size: int = 640  # 640 para yolox_s/m, 416 para yolox_tiny/nano
 
+    # Reintento de descarga/carga del modelo cuando falla (no reinicia el proceso)
+    model_retry_sec: int = 300
+
+    # Backoff por cámara cuando el stream falla: 10s → 30s → 60s → 5min.
+    # Tras 5 fallos consecutivos el worker queda disabled_due_errors hasta
+    # que cambie la config de esa cámara.
+    rtsp_backoff_schedule: tuple = (10, 30, 60, 300)
+    rtsp_max_consecutive_failures: int = 5
+
     # Ejecución
     refresh_interval_sec: int = 60      # relee configs de cámaras del API
     snapshot_max_width: int = 1280      # ancho máx del JPEG anotado enviado al API
