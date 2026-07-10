@@ -3,8 +3,10 @@
 # usar base nvidia/cuda y correr con `--gpus all` (ver README.md).
 FROM python:3.11-slim
 
+# libglib2.0-0 + libxcb1: requeridas por opencv-python-headless en Debian slim
+# libgomp1: requerida por onnxruntime (OpenMP)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libglib2.0-0 curl \
+      libglib2.0-0 libxcb1 libgomp1 curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
