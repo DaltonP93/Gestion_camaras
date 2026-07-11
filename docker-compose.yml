@@ -112,6 +112,9 @@ services:
       ANALYTICS_URL: http://analytics:8500
       ANALYTICS_MEDIAMTX_RTSP: rtsp://mediamtx:8554
       ANALYTICS_ALPR_ENABLED: ${ANALYTICS_ALPR_ENABLED:-false}
+      # false = analytics SOLO usa el restream de MediaMTX (recomendado, no
+      # tumba live view). true = permite fallback RTSP directo al NVR.
+      ANALYTICS_ALLOW_DIRECT_RTSP: ${ANALYTICS_ALLOW_DIRECT_RTSP:-false}
     volumes:
       - uploads_data:/app/uploads
       - recordings_cache:/var/lib/visioncore/recordings-cache
