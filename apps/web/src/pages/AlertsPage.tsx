@@ -45,6 +45,15 @@ export function AlertsPage() {
       const data = await apiGet<Alert[]>('/alerts?limit=200')
       setAlerts(data)
       setSelected(new Set())
+    } catch (err: any) {
+      // Un 401 lo maneja el interceptor de axios: refresca el token y
+      // reintenta; si la sesión venció de verdad, dispara auth-expired y
+      // redirige al login. No lo tratamos como error acá — solo evitamos
+      // la promesa rechazada sin manejar (spam en consola). Otros errores sí
+      // se informan.
+      if (err?.response?.status !== 401) {
+        toast.error('No se pudieron cargar las alertas')
+      }
     } finally {
       setIsLoading(false)
     }
