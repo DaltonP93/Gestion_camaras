@@ -24,6 +24,33 @@ const registeredPaths = new Map<string, string>()
 // Evita solicitudes concurrentes duplicadas para el mismo path
 const inFlightPaths   = new Set<string>()
 
+// ─── Refcount de consumidores por path (Analytics ⇄ Live View) ──────
+// MediaMTX ya cuenta lectores para el pull RTSP (sourceOnDemand), pero el
+// stream-manager de Node puede BORRAR el path (removeStream) cuando el último
+// viewer de live sale — eso rompería a Analytics si está leyendo el mismo
+// restream. Este registro marca qué paths tiene "tomados" Analytics con un TTL;
+// removeStream respeta esa marca y no borra el path mientras esté vigente.
+// Clave: streamPath → epoch (ms) de expiración.
+const analyticsPathConsumers = new Map<string, number>()
+
+/** Analytics declara que está consumiendo este path (se refresca en cada poll). */
+export function markAnalyticsConsumer(streamPath: string, ttlMs: number): void {
+  analyticsPathConsumers.set(streamPath, Date.now() + ttlMs)
+}
+
+/** Libera explícitamente la marca de Analytics sobre un path. */
+export function clearAnalyticsConsumer(streamPath: string): void {
+  analyticsPathConsumers.delete(streamPath)
+}
+
+/** ¿Analytics está consumiendo este path ahora mismo (marca no vencida)? */
+export function hasAnalyticsConsumer(streamPath: string): boolean {
+  const exp = analyticsPathConsumers.get(streamPath)
+  if (exp === undefined) return false
+  if (Date.now() > exp) { analyticsPathConsumers.delete(streamPath); return false }
+  return true
+}
+
 // Transcoding config — read once at module load, no runtime overhead
 // Accept both ENABLE_HEVC_TRANSCODING and the legacy alias ENABLE_HEVC_TRANSCODE
 const ENABLE_HEVC_TRANSCODING  = process.env.ENABLE_HEVC_TRANSCODING === 'true' || process.env.ENABLE_HEVC_TRANSCODE === 'true'
@@ -1057,6 +1084,12 @@ export async function removeStream(nvr: NVR, camera: Camera, streamType?: 'sub' 
   for (const t of typesToRemove) {
     try {
       const streamPath = getStreamPath(nvr, camera, t)
+      // Refcount: si Analytics está leyendo este path, NO lo borres — solo
+      // se fue el último viewer de live, pero analytics sigue activo.
+      if (hasAnalyticsConsumer(streamPath)) {
+        console.info(`[stream] mediamtx_shared_path_keep path=${streamPath} reason=analytics_active`)
+        continue
+      }
       registeredPaths.delete(streamPath)
       await mediamtxApi.delete('/v3/config/paths/delete/' + streamPath)
     } catch {

@@ -6,17 +6,27 @@
 # eventos al API con snapshot anotado.
 import base64
 import logging
+import os
 import threading
 import time
 from typing import Any
 
-import cv2
-import numpy as np
-import httpx
-import supervision as sv
-
 from .config import settings, COCO_CLASS_IDS, CLASS_NAME_BY_ID, VEHICLE_CLASSES
-from .detector import YoloxDetector
+
+# Forzar transporte RTSP (TCP) y timeout ANTES de importar/usar cv2 — OpenCV
+# lee OPENCV_FFMPEG_CAPTURE_OPTIONS al construir cada VideoCapture. Sin esto,
+# FFmpeg intenta UDP y MediaMTX (TCP-only) no entrega frames → sin eventos.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    f"rtsp_transport;{settings.rtsp_transport}|stimeout;{settings.rtsp_stimeout_us}",
+)
+
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+import httpx  # noqa: E402
+import supervision as sv  # noqa: E402
+
+from .detector import YoloxDetector  # noqa: E402
 
 log = logging.getLogger("analytics.pipeline")
 
@@ -270,23 +280,30 @@ class CameraWorker(threading.Thread):
 
     # ── Loop principal con backoff ────────────────────────────────────────
     def _open_capture(self) -> "cv2.VideoCapture | None":
-        """MediaMTX primero (sesión compartida con live view); RTSP directo
-        al NVR SOLO como fallback explícito — nunca debe competir con live."""
+        """MediaMTX primero (sesión compartida con live view, TCP). El RTSP
+        directo al NVR solo se usa si el API lo envía explícitamente
+        (directRtspUrl, con ANALYTICS_ALLOW_DIRECT_RTSP=true) — por defecto
+        MediaMTX es el ÚNICO consumidor RTSP del NVR y no compite con live."""
         primary = self.cam.get("analyticsRtspUrl")
-        fallback = self.cam.get("directRtspUrl") or self.cam.get("rtspUrl")
+        fallback = self.cam.get("directRtspUrl")  # None salvo opt-in explícito
         for url, is_fallback in ((primary, False), (fallback, True)):
             if not url:
                 continue
             cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
             if cap.isOpened():
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # baja latencia
+                except Exception:  # noqa: BLE001
+                    pass
                 self.using_fallback = is_fallback
                 if is_fallback:
                     log.warning("analytics_rtsp_fallback_direct camera=%s (MediaMTX no disponible)",
                                 self.cam["cameraName"])
                 return cap
             cap.release()
-            log.warning("analytics_rtsp_open_failed camera=%s source=%s",
-                        self.cam["cameraName"], "mediamtx" if not is_fallback else "direct")
+            log.warning("analytics_rtsp_open_failed camera=%s source=%s transport=%s",
+                        self.cam["cameraName"],
+                        "mediamtx" if not is_fallback else "direct", settings.rtsp_transport)
         return None
 
     def run(self) -> None:

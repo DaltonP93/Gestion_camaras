@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     rtsp_reconnect_sec: int = 10        # espera antes de reintentar un RTSP caído
     nms_threshold: float = 0.45
 
+    # Transporte RTSP para OpenCV/FFmpeg. MediaMTX corre TCP-only
+    # (MTX_PROTOCOLS=tcp) → si OpenCV intenta UDP no llegan frames y no se
+    # generan eventos. TCP es obligatorio para leer el restream compartido.
+    rtsp_transport: str = "tcp"
+    # Timeout de apertura/lectura RTSP en microsegundos (5 s)
+    rtsp_stimeout_us: int = 5_000_000
+
     class Config:
         env_prefix = ""  # variables planas: API_BASE_URL, ANALYTICS_SECRET, MODEL_PATH...
 

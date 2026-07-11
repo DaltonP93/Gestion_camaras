@@ -11,7 +11,7 @@ import { broadcastAlert } from './websocket'
 import { sendAlertNotification } from '../services/notification.service'
 import { decryptNvrPasswordOrNull } from '../services/credentials'
 import { buildRtspUrl, buildRtspUrlMasked } from '../services/hikvision'
-import { getStreamPath, publishStream } from '../services/stream'
+import { getStreamPath, publishStream, markAnalyticsConsumer } from '../services/stream'
 import { AuditAction } from '../services/audit'
 
 const ANALYTICS_SECRET = process.env.ANALYTICS_SECRET || ''
@@ -21,6 +21,13 @@ const UPLOADS_DIR      = process.env.UPLOADS_DIR || '/app/uploads'
 const ANALYTICS_URL          = process.env.ANALYTICS_URL || 'http://analytics:8500'
 const ANALYTICS_MEDIAMTX_RTSP = process.env.ANALYTICS_MEDIAMTX_RTSP || 'rtsp://mediamtx:8554'
 const ALPR_ENABLED = process.env.ANALYTICS_ALPR_ENABLED === 'true'
+// Por defecto analytics SOLO consume el restream de MediaMTX (una sesión RTSP
+// contra el NVR, compartida con live view). El fallback directo al NVR abre
+// una segunda sesión que puede tumbar live view — solo con opt-in explícito.
+const ALLOW_DIRECT_RTSP = process.env.ANALYTICS_ALLOW_DIRECT_RTSP === 'true'
+// TTL del "consumidor analytics" de un path (refrescado en cada poll ~60s).
+// Mientras esté vigente, removeStream NO borra el path aunque live view salga.
+const ANALYTICS_CONSUMER_TTL_MS = 180_000
 
 // COCO classes the pipeline supports (kept in sync with apps/analytics)
 const SUPPORTED_CLASSES = ['person', 'car', 'truck', 'bus', 'motorcycle', 'bicycle'] as const
@@ -156,17 +163,20 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         server.log.warn(`[analytics] mediamtx_shared_path_error path=${streamPath}: ${err}`)
       }
 
+      // Marcar el path como consumido por analytics: mientras esté vigente,
+      // removeStream (cleanup de live view) NO lo borra — evita que al salir
+      // de live view se caiga el stream que analytics está usando.
+      markAnalyticsConsumer(streamPath, ANALYTICS_CONSUMER_TTL_MS)
+
       result.push({
         cameraId:         cam.id,
         cameraName:       cam.name,
         nvrName:          cam.nvr.name,
         streamPath,
-        // Primario: restream compartido de MediaMTX
+        // Primario: restream compartido de MediaMTX (una sesión contra el NVR)
         analyticsRtspUrl: `${ANALYTICS_MEDIAMTX_RTSP}/${streamPath}`,
-        // Fallback explícito (solo si MediaMTX no responde) — mismo formato
-        // legado `rtspUrl` para compatibilidad con workers viejos
-        directRtspUrl:    buildRtspUrl(nvrPlain, cam.channel, true),
-        rtspUrl:          buildRtspUrl(nvrPlain, cam.channel, true),
+        // Fallback directo al NVR: null salvo opt-in explícito (abre 2ª sesión)
+        directRtspUrl:    ALLOW_DIRECT_RTSP ? buildRtspUrl(nvrPlain, cam.channel, true) : null,
         rtspMasked:       buildRtspUrlMasked(nvrPlain, cam.channel, true),
         classes:          cfg.classes,
         minConfidence:    cfg.minConfidence,
