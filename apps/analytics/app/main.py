@@ -67,11 +67,21 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="VisionCore Analytics", lifespan=lifespan)
 
 
+def _model_loaded() -> bool:
+    mgr = STATE["manager"]
+    return bool(mgr and mgr.detector is not None)
+
+
 @app.get("/health")
 def health():
-    # Siempre 200: el healthcheck de Docker no debe reiniciar el contenedor
-    # por un modelo caído — eso se diagnostica vía /status.
-    return {"ok": True, "serviceStatus": STATE["serviceStatus"]}
+    # Siempre 200 mientras FastAPI viva: el healthcheck de Docker no debe
+    # reiniciar el contenedor por un modelo caído — eso se ve en /status.
+    svc = STATE["serviceStatus"]
+    return {
+        "status": "ok" if svc == "running" else "degraded",
+        "serviceStatus": svc,
+        "modelLoaded": _model_loaded(),
+    }
 
 
 @app.get("/status")
@@ -81,6 +91,7 @@ def status():
         "serviceStatus": STATE["serviceStatus"],
         "modelLoaded": False,
         "modelError": STATE["modelError"] or STATE["importError"],
+        "lastRefresh": None,
         "lastRefreshError": None,
         "workers": [],
     }
