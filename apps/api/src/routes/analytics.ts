@@ -452,13 +452,45 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
 
   // ── Observabilidad: proxy al servicio Python ─────────────────────────────
 
-  // GET /api/analytics/service-status — estado del contenedor analytics
+  // GET /api/analytics/service-status — estado agregado del contenedor
+  // analytics. Devuelve SOLO campos seguros (nunca secretos ni URLs RTSP).
   server.get('/service-status', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (_request, reply) => {
     try {
       const res = await fetch(`${ANALYTICS_URL}/status`, { signal: AbortSignal.timeout(4000) })
-      if (!res.ok) return reply.send({ connected: false, error: `HTTP ${res.status}` })
-      const status = (await res.json()) as Record<string, unknown>
-      return reply.send({ connected: true, ...status })
+      if (!res.ok) {
+        return reply.send({ connected: false, error: `HTTP ${res.status}` })
+      }
+      const s = (await res.json()) as {
+        serviceStatus?: string; modelLoaded?: boolean; modelError?: string | null
+        lastRefreshError?: string | null
+        workers?: Array<{ status: string; framesProcessed?: number; eventsSent?: number }>
+      }
+      const workers = Array.isArray(s.workers) ? s.workers : []
+      const workersRunning = workers.filter(w => w.status === 'running').length
+      const workersError = workers.filter(w =>
+        w.status === 'disabled_due_errors' || w.status === 'rtsp_down' || w.status === 'reconnecting'
+      ).length
+      const framesProcessed = workers.reduce((n, w) => n + (w.framesProcessed ?? 0), 0)
+      const eventsSent = workers.reduce((n, w) => n + (w.eventsSent ?? 0), 0)
+      // Lista por worker sin datos sensibles (nombre y estado ya son seguros)
+      const workerSummaries = workers.map((w: any) => ({
+        cameraId: w.cameraId, cameraName: w.cameraName, status: w.status,
+        fpsActual: w.fpsActual, framesProcessed: w.framesProcessed, eventsSent: w.eventsSent,
+        usingFallback: w.usingFallback, lastError: w.lastError,
+        zoneOccupancy: w.zoneOccupancy, lineCounts: w.lineCounts,
+      }))
+      return reply.send({
+        connected: true,
+        serviceStatus: s.serviceStatus ?? 'unknown',
+        modelLoaded: Boolean(s.modelLoaded),
+        modelError: s.modelError ?? null,
+        lastRefreshError: s.lastRefreshError ?? null,
+        workersRunning,
+        workersError,
+        framesProcessed,
+        eventsSent,
+        workers: workerSummaries,
+      })
     } catch (err: any) {
       return reply.send({ connected: false, error: err?.message ?? 'sin conexión al servicio analytics' })
     }
