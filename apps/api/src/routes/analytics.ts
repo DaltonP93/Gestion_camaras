@@ -11,10 +11,23 @@ import { broadcastAlert } from './websocket'
 import { sendAlertNotification } from '../services/notification.service'
 import { decryptNvrPasswordOrNull } from '../services/credentials'
 import { buildRtspUrl, buildRtspUrlMasked } from '../services/hikvision'
+import { getStreamPath, publishStream, markAnalyticsConsumer } from '../services/stream'
 import { AuditAction } from '../services/audit'
 
 const ANALYTICS_SECRET = process.env.ANALYTICS_SECRET || ''
 const UPLOADS_DIR      = process.env.UPLOADS_DIR || '/app/uploads'
+// URL del servicio analytics (para proxy de status/frames) y del RTSP de
+// MediaMTX visto DESDE el contenedor analytics (red interna de docker)
+const ANALYTICS_URL          = process.env.ANALYTICS_URL || 'http://analytics:8500'
+const ANALYTICS_MEDIAMTX_RTSP = process.env.ANALYTICS_MEDIAMTX_RTSP || 'rtsp://mediamtx:8554'
+const ALPR_ENABLED = process.env.ANALYTICS_ALPR_ENABLED === 'true'
+// Por defecto analytics SOLO consume el restream de MediaMTX (una sesión RTSP
+// contra el NVR, compartida con live view). El fallback directo al NVR abre
+// una segunda sesión que puede tumbar live view — solo con opt-in explícito.
+const ALLOW_DIRECT_RTSP = process.env.ANALYTICS_ALLOW_DIRECT_RTSP === 'true'
+// TTL del "consumidor analytics" de un path (refrescado en cada poll ~60s).
+// Mientras esté vigente, removeStream NO borra el path aunque live view salga.
+const ANALYTICS_CONSUMER_TTL_MS = 180_000
 
 // COCO classes the pipeline supports (kept in sync with apps/analytics)
 const SUPPORTED_CLASSES = ['person', 'car', 'truck', 'bus', 'motorcycle', 'bicycle'] as const
@@ -31,7 +44,21 @@ const configSchema = z.object({
     name:    z.string().min(1).max(60),
     points:  z.array(z.tuple([z.number().min(0).max(1), z.number().min(0).max(1)])).min(3).max(30),
     classes: z.array(z.enum(SUPPORTED_CLASSES)).optional(),
+    // Permanencia: segundos dentro de la zona para disparar LOITERING
+    loiteringSec:   z.number().int().min(5).max(3600).optional(),
+    // Aforo: más de N objetos dentro dispara OCCUPANCY_LIMIT
+    occupancyLimit: z.number().int().min(1).max(500).optional(),
   })).max(10).nullable().optional(),
+  // Config de alertas por tipo de evento
+  alertConfig: z.record(
+    z.enum(['person', 'vehicle', 'zone_intrusion', 'line_crossing', 'loitering', 'occupancy_limit']),
+    z.object({
+      generateAlert: z.boolean().optional(),
+      sendEmail:     z.boolean().optional(),
+      severity:      z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).optional(),
+      cooldownSec:   z.number().int().min(5).max(3600).optional(),
+    })
+  ).nullable().optional(),
   lines: z.array(z.object({
     name:    z.string().min(1).max(60),
     start:   z.tuple([z.number().min(0).max(1), z.number().min(0).max(1)]),
@@ -42,7 +69,7 @@ const configSchema = z.object({
 
 const eventSchema = z.object({
   cameraId:   z.string().min(1),
-  type:       z.enum(['person', 'vehicle', 'zone_intrusion', 'line_crossing']),
+  type:       z.enum(['person', 'vehicle', 'zone_intrusion', 'line_crossing', 'loitering', 'occupancy_limit']),
   className:  z.string().min(1).max(40),
   confidence: z.number().min(0).max(1),
   trackId:    z.number().int().optional(),
@@ -54,11 +81,23 @@ const eventSchema = z.object({
   snapshotJpegBase64: z.string().max(4_000_000).optional(),
 })
 
-const ALERT_TYPE_BY_EVENT: Record<string, 'PERSON_DETECTED' | 'VEHICLE_DETECTED' | 'ZONE_INTRUSION' | 'LINE_CROSSING'> = {
-  person:         'PERSON_DETECTED',
-  vehicle:        'VEHICLE_DETECTED',
-  zone_intrusion: 'ZONE_INTRUSION',
-  line_crossing:  'LINE_CROSSING',
+const ALERT_TYPE_BY_EVENT: Record<string, 'PERSON_DETECTED' | 'VEHICLE_DETECTED' | 'ZONE_INTRUSION' | 'LINE_CROSSING' | 'LOITERING' | 'OCCUPANCY_LIMIT'> = {
+  person:          'PERSON_DETECTED',
+  vehicle:         'VEHICLE_DETECTED',
+  zone_intrusion:  'ZONE_INTRUSION',
+  line_crossing:   'LINE_CROSSING',
+  loitering:       'LOITERING',
+  occupancy_limit: 'OCCUPANCY_LIMIT',
+}
+
+// Defaults cuando la cámara no tiene alertConfig para ese tipo de evento
+const ALERT_DEFAULTS: Record<string, { generateAlert: boolean; sendEmail: boolean; severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' }> = {
+  person:          { generateAlert: true,  sendEmail: false, severity: 'LOW' },
+  vehicle:         { generateAlert: true,  sendEmail: false, severity: 'LOW' },
+  zone_intrusion:  { generateAlert: true,  sendEmail: true,  severity: 'HIGH' },
+  line_crossing:   { generateAlert: false, sendEmail: false, severity: 'LOW' },
+  loitering:       { generateAlert: true,  sendEmail: true,  severity: 'HIGH' },
+  occupancy_limit: { generateAlert: true,  sendEmail: true,  severity: 'HIGH' },
 }
 
 const CLASS_LABEL_ES: Record<string, string> = {
@@ -99,30 +138,56 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     })
     const byId = new Map(cameras.map(c => [c.id, c]))
 
-    const result = configs.flatMap(cfg => {
+    const result = []
+    for (const cfg of configs) {
       const cam = byId.get(cfg.cameraId)
-      if (!cam || !cam.nvr.active) return []
+      if (!cam || !cam.nvr.active) continue
       const plainPass = decryptNvrPasswordOrNull(cam.nvr.password)
       if (!plainPass) {
         server.log.warn(`[analytics] decrypt_failed cameraId=${cam.id} nvrId=${cam.nvrId}`)
-        return []
+        continue
       }
-      const nvrPlain = { ipAddress: cam.nvr.ipAddress, rtspPort: cam.nvr.rtspPort, username: cam.nvr.username, password: plainPass }
-      return [{
-        cameraId:      cam.id,
-        cameraName:    cam.name,
-        nvrName:       cam.nvr.name,
-        rtspUrl:       buildRtspUrl(nvrPlain, cam.channel, true), // substream
-        rtspMasked:    buildRtspUrlMasked(nvrPlain, cam.channel, true),
-        classes:       cfg.classes,
-        minConfidence: cfg.minConfidence,
-        sampleFps:     cfg.sampleFps,
-        zones:         cfg.zones,
-        lines:         cfg.lines,
-        cooldownSec:   cfg.cooldownSec,
-        updatedAt:     cfg.updatedAt.toISOString(),
-      }]
-    })
+      const nvrPlain = { ...cam.nvr, password: plainPass }
+
+      // Regla de arquitectura: analytics consume el RESTREAM de MediaMTX
+      // (misma sesión RTSP contra el NVR que la vista en vivo, sourceOnDemand)
+      // — nunca una segunda sesión directa que le robe el cupo a live view.
+      const streamPath = getStreamPath(nvrPlain as any, cam as any, 'sub')
+      try {
+        const ok = await publishStream(nvrPlain as any, cam as any, 'sub')
+        server.log.info(
+          `[analytics] mediamtx_shared_path_${ok ? 'reused' : 'create_failed'} ` +
+          `path=${streamPath} cameraId=${cam.id}`
+        )
+      } catch (err) {
+        server.log.warn(`[analytics] mediamtx_shared_path_error path=${streamPath}: ${err}`)
+      }
+
+      // Marcar el path como consumido por analytics: mientras esté vigente,
+      // removeStream (cleanup de live view) NO lo borra — evita que al salir
+      // de live view se caiga el stream que analytics está usando.
+      markAnalyticsConsumer(streamPath, ANALYTICS_CONSUMER_TTL_MS)
+
+      result.push({
+        cameraId:         cam.id,
+        cameraName:       cam.name,
+        nvrName:          cam.nvr.name,
+        streamPath,
+        // Primario: restream compartido de MediaMTX (una sesión contra el NVR)
+        analyticsRtspUrl: `${ANALYTICS_MEDIAMTX_RTSP}/${streamPath}`,
+        // Fallback directo al NVR: null salvo opt-in explícito (abre 2ª sesión)
+        directRtspUrl:    ALLOW_DIRECT_RTSP ? buildRtspUrl(nvrPlain, cam.channel, true) : null,
+        rtspMasked:       buildRtspUrlMasked(nvrPlain, cam.channel, true),
+        classes:          cfg.classes,
+        minConfidence:    cfg.minConfidence,
+        sampleFps:        cfg.sampleFps,
+        zones:            cfg.zones,
+        lines:            cfg.lines,
+        alertConfig:      cfg.alertConfig,
+        cooldownSec:      cfg.cooldownSec,
+        updatedAt:        cfg.updatedAt.toISOString(),
+      })
+    }
 
     return reply.send({ cameras: result })
   })
@@ -159,19 +224,33 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    // line_crossing es CONTEO, no alarma: se registra el evento para el
-    // dashboard/forense pero NO crea alerta (el tráfico saturaría la campana).
+    // Decisión de alerta según la config por cámara/tipo (con defaults:
+    // line_crossing es conteo puro, intrusión/loitering/aforo alertan + email)
+    const camCfg = await server.prisma.cameraAnalyticsConfig.findUnique({
+      where: { cameraId: camera.id },
+      select: { alertConfig: true },
+    })
+    const typeCfg = {
+      ...ALERT_DEFAULTS[body.type],
+      ...(((camCfg?.alertConfig as any) ?? {})[body.type] ?? {}),
+    }
+
     let alertId: string | null = null
-    if (body.type !== 'line_crossing') {
+    if (typeCfg.generateAlert) {
       const alertType = ALERT_TYPE_BY_EVENT[body.type]
       const classLabel = CLASS_LABEL_ES[body.className] ?? body.className
-      const message = body.type === 'zone_intrusion'
-        ? `Intrusión en zona "${body.zoneName ?? 'zona'}": ${classLabel.toLowerCase()} en ${camera.name}`
-        : `${classLabel} detectada en ${camera.name} (${camera.nvr.name})`
+      const message =
+        body.type === 'zone_intrusion'
+          ? `Intrusión en zona "${body.zoneName ?? 'zona'}": ${classLabel.toLowerCase()} en ${camera.name}`
+        : body.type === 'loitering'
+          ? `Permanencia prolongada en zona "${body.zoneName ?? 'zona'}" de ${camera.name}`
+        : body.type === 'occupancy_limit'
+          ? `Aforo superado en zona "${body.zoneName ?? 'zona'}" de ${camera.name}`
+        : body.type === 'line_crossing'
+          ? `Cruce de línea "${body.zoneName ?? 'línea'}" (${body.direction === 'in' ? 'entrada' : 'salida'}) en ${camera.name}`
+          : `${classLabel} detectada en ${camera.name} (${camera.nvr.name})`
 
-      // ZONE_INTRUSION es HIGH (dispara email con la config por defecto);
-      // detecciones sueltas son LOW para no saturar el correo — van a la campana.
-      const severity = body.type === 'zone_intrusion' ? 'HIGH' : 'LOW'
+      const severity = typeCfg.severity
 
       const alert = await server.prisma.alert.create({
         data: {
@@ -197,11 +276,13 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         },
       })
 
-      sendAlertNotification(server.prisma, {
-        id: alert.id, type: alert.type, severity: alert.severity,
-        message: alert.message, detail: alert.detail,
-        cameraId: alert.cameraId, nvrId: alert.nvrId,
-      }).catch((e) => server.log.error(`[analytics] email_failed: ${e}`))
+      if (typeCfg.sendEmail) {
+        sendAlertNotification(server.prisma, {
+          id: alert.id, type: alert.type, severity: alert.severity,
+          message: alert.message, detail: alert.detail,
+          cameraId: alert.cameraId, nvrId: alert.nvrId,
+        }).catch((e) => server.log.error(`[analytics] email_failed: ${e}`))
+      }
     }
 
     const event = await server.prisma.analyticsEvent.create({
@@ -256,6 +337,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       cooldownSec:   body.cooldownSec,
       zones:         body.zones ?? undefined,
       lines:         body.lines ?? undefined,
+      alertConfig:   body.alertConfig ?? undefined,
     }
     const config = await server.prisma.cameraAnalyticsConfig.upsert({
       where:  { cameraId },
@@ -275,12 +357,15 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
   server.get('/events', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR', 'AUDITOR'])] }, async (request, reply) => {
     const q = request.query as {
       cameraId?: string; type?: string; className?: string
+      zoneName?: string; direction?: string
       from?: string; to?: string; page?: string; limit?: string
     }
     const where: any = {}
     if (q.cameraId) where.cameraId = q.cameraId
     if (q.type) where.type = q.type
     if (q.className) where.className = q.className
+    if (q.zoneName) where.zoneName = { contains: q.zoneName, mode: 'insensitive' }
+    if (q.direction) where.direction = q.direction
     if (q.from || q.to) {
       where.occurredAt = {}
       if (q.from) where.occurredAt.gte = new Date(q.from)
@@ -355,6 +440,115 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         direction:  l.direction ?? '—',
         count:      l._count._all,
       })),
+      // Eventos por hora (para el dashboard)
+      byHour: await server.prisma.$queryRaw<{ hour: Date; count: bigint }[]>`
+        SELECT date_trunc('hour', "occurredAt") AS hour, COUNT(*) AS count
+        FROM "analytics_events"
+        WHERE "occurredAt" >= ${from} AND "occurredAt" <= ${to}
+        GROUP BY 1 ORDER BY 1
+      `.then(rows => rows.map(r => ({ hour: r.hour.toISOString(), count: Number(r.count) }))),
     })
+  })
+
+  // ── Observabilidad: proxy al servicio Python ─────────────────────────────
+
+  // GET /api/analytics/service-status — estado agregado del contenedor
+  // analytics. Devuelve SOLO campos seguros (nunca secretos ni URLs RTSP).
+  server.get('/service-status', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (_request, reply) => {
+    try {
+      const res = await fetch(`${ANALYTICS_URL}/status`, { signal: AbortSignal.timeout(4000) })
+      if (!res.ok) {
+        return reply.send({ connected: false, error: `HTTP ${res.status}` })
+      }
+      const s = (await res.json()) as {
+        serviceStatus?: string; modelLoaded?: boolean; modelError?: string | null
+        lastRefreshError?: string | null
+        workers?: Array<{ status: string; framesProcessed?: number; eventsSent?: number }>
+      }
+      const workers = Array.isArray(s.workers) ? s.workers : []
+      const workersRunning = workers.filter(w => w.status === 'running').length
+      const workersError = workers.filter(w =>
+        w.status === 'disabled_due_errors' || w.status === 'rtsp_down' || w.status === 'reconnecting'
+      ).length
+      const framesProcessed = workers.reduce((n, w) => n + (w.framesProcessed ?? 0), 0)
+      const eventsSent = workers.reduce((n, w) => n + (w.eventsSent ?? 0), 0)
+      // Lista por worker sin datos sensibles (nombre y estado ya son seguros)
+      const workerSummaries = workers.map((w: any) => ({
+        cameraId: w.cameraId, cameraName: w.cameraName, status: w.status,
+        fpsActual: w.fpsActual, framesProcessed: w.framesProcessed, eventsSent: w.eventsSent,
+        usingFallback: w.usingFallback, lastError: w.lastError,
+        zoneOccupancy: w.zoneOccupancy, lineCounts: w.lineCounts,
+      }))
+      return reply.send({
+        connected: true,
+        serviceStatus: s.serviceStatus ?? 'unknown',
+        modelLoaded: Boolean(s.modelLoaded),
+        modelError: s.modelError ?? null,
+        lastRefreshError: s.lastRefreshError ?? null,
+        workersRunning,
+        workersError,
+        framesProcessed,
+        eventsSent,
+        workers: workerSummaries,
+      })
+    } catch (err: any) {
+      return reply.send({ connected: false, error: err?.message ?? 'sin conexión al servicio analytics' })
+    }
+  })
+
+  // GET /api/analytics/live-frame/:cameraId — último frame anotado (JPEG)
+  server.get('/live-frame/:cameraId', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const { cameraId } = request.params as { cameraId: string }
+    try {
+      const res = await fetch(`${ANALYTICS_URL}/frame/${encodeURIComponent(cameraId)}`, {
+        signal: AbortSignal.timeout(4000),
+      })
+      if (!res.ok) return reply.status(404).send({ message: 'Sin frame disponible' })
+      const buf = Buffer.from(await res.arrayBuffer())
+      return reply.header('Content-Type', 'image/jpeg').header('Cache-Control', 'no-store').send(buf)
+    } catch {
+      return reply.status(503).send({ message: 'Servicio de analítica no disponible' })
+    }
+  })
+
+  // ── ALPR (matrículas) — scaffold detrás de feature flag ─────────────────
+  // El detector COCO NO lee chapas: esto queda preparado para un módulo ALPR
+  // dedicado (modelo ONNX con licencia permisiva) cuando se habilite.
+
+  server.post('/internal/plates', {
+    preHandler: [requireAnalyticsSecret],
+    bodyLimit: 6 * 1024 * 1024,
+  }, async (request, reply) => {
+    if (!ALPR_ENABLED) return reply.status(503).send({ message: 'ALPR deshabilitado (ANALYTICS_ALPR_ENABLED=false)' })
+    const body = z.object({
+      cameraId:        z.string().min(1),
+      plateText:       z.string().min(2).max(16),
+      plateConfidence: z.number().min(0).max(1),
+      occurredAt:      z.string().datetime(),
+      plateCropSnapshotUrl: z.string().max(300).optional(),
+      fullSnapshotUrl:      z.string().max(300).optional(),
+    }).parse(request.body)
+    const event = await server.prisma.licensePlateEvent.create({
+      data: { ...body, occurredAt: new Date(body.occurredAt) },
+    })
+    return reply.send({ ok: true, id: event.id })
+  })
+
+  // Búsqueda por chapa parcial (case-insensitive)
+  server.get('/plates', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
+    const q = request.query as { q?: string; cameraId?: string; from?: string; to?: string; limit?: string }
+    const where: any = {}
+    if (q.q) where.plateText = { contains: q.q.toUpperCase(), mode: 'insensitive' }
+    if (q.cameraId) where.cameraId = q.cameraId
+    if (q.from || q.to) {
+      where.occurredAt = {}
+      if (q.from) where.occurredAt.gte = new Date(q.from)
+      if (q.to)   where.occurredAt.lte = new Date(q.to)
+    }
+    const plates = await server.prisma.licensePlateEvent.findMany({
+      where, orderBy: { occurredAt: 'desc' },
+      take: Math.min(200, parseInt(q.limit ?? '50')),
+    })
+    return reply.send({ plates, alprEnabled: ALPR_ENABLED })
   })
 }

@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { Outlet } from 'react-router-dom'
 import { Sidebar, HamburgerButton } from './Sidebar'
 import { Topbar } from './Topbar'
+import { HelpCenter } from '@/components/help/HelpCenter'
 import { useAppearance } from '@/hooks/useAppearance'
 
 export function Layout() {
@@ -21,6 +22,7 @@ export function Layout() {
           <Outlet />
         </main>
       </div>
+      <HelpCenter />
     </div>
   )
 }

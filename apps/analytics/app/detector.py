@@ -4,6 +4,7 @@
 # normalización, decode por grillas (strides 8/16/32) + NMS de supervision.
 import logging
 import os
+import socket
 import urllib.request
 
 import cv2
@@ -17,12 +18,32 @@ log = logging.getLogger("analytics.detector")
 
 
 def _download_model(url: str, dest: str) -> None:
+    """Descarga con timeout — nunca cuelga el hilo del modelo para siempre.
+    Deja archivo .part si falla y lo limpia; el _model_loop reintenta."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + ".part"
     log.info("descargando modelo %s → %s", url, dest)
-    urllib.request.urlretrieve(url, tmp)  # noqa: S310 — URL controlada por env
-    os.replace(tmp, dest)
-    log.info("modelo descargado (%.1f MB)", os.path.getsize(dest) / 1e6)
+    try:
+        # timeout de socket para connect/read; total acotado por reintento externo
+        req = urllib.request.Request(url, headers={"User-Agent": "visioncore-analytics"})
+        with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as f:  # noqa: S310
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+        size = os.path.getsize(tmp)
+        if size < 1_000_000:  # un ONNX válido pesa MB, no KB → descarga corrupta
+            raise RuntimeError(f"descarga incompleta ({size} bytes)")
+        os.replace(tmp, dest)
+        log.info("modelo descargado (%.1f MB)", size / 1e6)
+    except (OSError, socket.timeout, RuntimeError):
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class YoloxDetector:

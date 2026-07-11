@@ -318,6 +318,8 @@ enum AlertType {
   VEHICLE_DETECTED
   ZONE_INTRUSION
   LINE_CROSSING
+  LOITERING
+  OCCUPANCY_LIMIT
 }
 
 enum AlertSeverity {
@@ -426,6 +428,9 @@ model CameraAnalyticsConfig {
   zones         Json?
   // Líneas de conteo: [{ name, start: [x,y], end: [x,y] normalizados 0-1, classes? }]
   lines         Json?
+  // Config de alertas por tipo de evento:
+  // { person: { generateAlert, sendEmail, severity, cooldownSec }, ... }
+  alertConfig   Json?
   // Segundos mínimos entre alertas repetidas de la misma clase/zona
   cooldownSec   Int      @default(60)
   createdAt     DateTime @default(now())
@@ -454,6 +459,23 @@ model AnalyticsEvent {
   @@index([type, occurredAt])
   @@index([occurredAt])
   @@map("analytics_events")
+}
+
+// ─── ALPR: lecturas de matrículas (feature flag ANALYTICS_ALPR_ENABLED) ──
+model LicensePlateEvent {
+  id                   String   @id @default(cuid())
+  cameraId             String
+  plateText            String
+  plateConfidence      Float
+  plateCropSnapshotUrl String?
+  fullSnapshotUrl      String?
+  occurredAt           DateTime
+  createdAt            DateTime @default(now())
+
+  @@index([plateText])
+  @@index([cameraId, occurredAt])
+  @@index([occurredAt])
+  @@map("license_plate_events")
 }
 
 // ─── Configuración de alertas y correo ───────────────────────
