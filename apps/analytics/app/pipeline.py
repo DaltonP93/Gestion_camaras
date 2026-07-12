@@ -1,9 +1,11 @@
 # apps/analytics/app/pipeline.py
-# Un worker (hilo) por cámara. Consume el RESTREAM de MediaMTX (una sola
-# sesión RTSP contra el NVR, compartida con la vista en vivo) y solo cae al
-# RTSP directo del NVR como último recurso. Detecta con YOLOX, trackea con
-# ByteTrack (supervision), evalúa zonas/líneas/permanencia/aforo y publica
-# eventos al API con snapshot anotado.
+# Un worker (hilo) por cámara. Consume el RESTREAM de MediaMTX (una sola sesión
+# RTSP contra el NVR, compartida con la vista en vivo) y solo cae al RTSP directo
+# si el API lo permite explícitamente. Responsabilidades separadas:
+#   captura → muestreo → inferencia (DetectionProvider) → tracking (ByteTrack)
+#   → reglas (zonas/líneas/loitering/aforo) → eventos → snapshots → publicación.
+# La lógica de detección está desacoplada del modelo vía DetectionProvider; las
+# reglas puras (cooldown/dedup/horario/backoff/circuit-breaker) viven en rules.py.
 import base64
 import logging
 import os
@@ -12,10 +14,13 @@ import time
 from typing import Any
 
 from .config import settings, COCO_CLASS_IDS, CLASS_NAME_BY_ID, VEHICLE_CLASSES
+from .providers.base import Detection, DetectionProvider
+from .providers.factory import create_detection_provider
+from .rules import CooldownTracker, TrackDedup, CircuitBreaker, within_schedule, backoff_delay
 
-# Forzar transporte RTSP (TCP) y timeout ANTES de importar/usar cv2 — OpenCV
-# lee OPENCV_FFMPEG_CAPTURE_OPTIONS al construir cada VideoCapture. Sin esto,
-# FFmpeg intenta UDP y MediaMTX (TCP-only) no entrega frames → sin eventos.
+# Forzar transporte RTSP (TCP) y timeout ANTES de importar/usar cv2 — OpenCV lee
+# OPENCV_FFMPEG_CAPTURE_OPTIONS al construir cada VideoCapture. Sin esto FFmpeg
+# intenta UDP y MediaMTX (TCP-only) no entrega frames → sin eventos.
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     f"rtsp_transport;{settings.rtsp_transport}|stimeout;{settings.rtsp_stimeout_us}",
@@ -26,28 +31,44 @@ import numpy as np  # noqa: E402
 import httpx  # noqa: E402
 import supervision as sv  # noqa: E402
 
-from .detector import YoloxDetector  # noqa: E402
-
 log = logging.getLogger("analytics.pipeline")
 
 
+def to_sv_detections(dets: list[Detection]) -> sv.Detections:
+    """Convierte Detection neutrales del provider a sv.Detections para tracking."""
+    if not dets:
+        return sv.Detections.empty()
+    xyxy = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32)
+    conf = np.array([d.confidence for d in dets], dtype=np.float32)
+    cls = np.array([d.class_id for d in dets], dtype=int)
+    return sv.Detections(xyxy=xyxy, confidence=conf, class_id=cls)
+
+
 class CameraWorker(threading.Thread):
-    def __init__(self, cam: dict[str, Any], detector: YoloxDetector):
+    def __init__(self, cam: dict[str, Any], provider: DetectionProvider):
         super().__init__(daemon=True, name=f"cam-{cam['cameraId'][:8]}")
         self.cam = cam
-        self.detector = detector
+        self.provider = provider
         self.stop_event = threading.Event()
         self.tracker = sv.ByteTrack()
         self.box_annotator = sv.BoxAnnotator(thickness=2)
         self.label_annotator = sv.LabelAnnotator(text_scale=0.5)
-        # cooldowns: clave (tipo, clase|zona) → epoch del último evento enviado
-        self.last_event_at: dict[tuple[str, str], float] = {}
-        self.reported_tracks: set[int] = set()
+        try:
+            self.trace_annotator: Any = sv.TraceAnnotator(thickness=2, trace_length=30)
+        except Exception:  # noqa: BLE001 — versiones viejas de supervision
+            self.trace_annotator = None
+        # Reglas puras
+        self.cooldowns = CooldownTracker()
+        self.dedup = TrackDedup()
+        self.breaker = CircuitBreaker(max_failures=settings.rtsp_max_consecutive_failures)
+        # Zonas / líneas materializadas al conocer el tamaño del frame
         self.zones: list[dict[str, Any]] = []
         self.zone_objects: list[sv.PolygonZone] = []
+        self.zone_annotators: list[Any] = []
         self.lines: list[dict[str, Any]] = []
         self.line_objects: list[sv.LineZone] = []
-        # Permanencia (loitering): (zona_idx, track_id) → epoch de entrada
+        self.line_annotator: Any = None
+        # Loitering: (zona_idx, track_id) → epoch de entrada
         self.zone_entry_at: dict[tuple[int, int], float] = {}
         self.loitering_reported: set[tuple[int, int]] = set()
         self.frame_size: tuple[int, int] | None = None
@@ -55,11 +76,13 @@ class CameraWorker(threading.Thread):
         self.status = "starting"
         self.frames_processed = 0
         self.events_sent = 0
+        self.detections_total = 0
         self.last_error: str | None = None
         self.last_detection_at: float | None = None
-        self.consecutive_failures = 0
+        self.last_frame_at: float | None = None
         self.using_fallback = False
         self.fps_actual = 0.0
+        self.last_inference_ms = 0.0
         self.last_annotated_jpeg: bytes | None = None
         self.zone_occupancy: dict[str, int] = {}
         self.line_counts: dict[str, dict[str, int]] = {}
@@ -67,16 +90,25 @@ class CameraWorker(threading.Thread):
     # ── Config materialization ────────────────────────────────────────────
     def _build_zones(self, w: int, h: int) -> None:
         self.zones = list(self.cam.get("zones") or [])
-        self.zone_objects = []
+        self.zone_objects, self.zone_annotators = [], []
         for z in self.zones:
             pts = np.array([[int(px * w), int(py * h)] for px, py in z["points"]], dtype=np.int32)
-            self.zone_objects.append(sv.PolygonZone(polygon=pts))
+            zone = sv.PolygonZone(polygon=pts)
+            self.zone_objects.append(zone)
+            try:
+                self.zone_annotators.append(sv.PolygonZoneAnnotator(zone=zone, color=sv.Color.RED, thickness=2))
+            except Exception:  # noqa: BLE001
+                self.zone_annotators.append(None)
         self.lines = list(self.cam.get("lines") or [])
         self.line_objects = []
         for ln in self.lines:
             start = sv.Point(int(ln["start"][0] * w), int(ln["start"][1] * h))
             end = sv.Point(int(ln["end"][0] * w), int(ln["end"][1] * h))
             self.line_objects.append(sv.LineZone(start=start, end=end))
+        try:
+            self.line_annotator = sv.LineZoneAnnotator(thickness=2, text_scale=0.5)
+        except Exception:  # noqa: BLE001
+            self.line_annotator = None
         if self.zones or self.lines:
             log.info("[%s] %d zonas + %d líneas materializadas (%dx%d)",
                      self.cam["cameraName"], len(self.zones), len(self.lines), w, h)
@@ -84,15 +116,17 @@ class CameraWorker(threading.Thread):
     def _watched_class_ids(self) -> set[int]:
         return {COCO_CLASS_IDS[c] for c in self.cam["classes"] if c in COCO_CLASS_IDS}
 
-    def _cooldown_ok(self, key: tuple[str, str], ev_type: str) -> bool:
-        # cooldown por tipo de evento si está configurado, si no el global
+    def _min_conf_for(self, class_name: str) -> float:
+        by_class = self.cam.get("confidenceByClass") or {}
+        return float(by_class.get(class_name, self.cam.get("minConfidence", 0.5)))
+
+    def _cooldown_ok(self, key: str, ev_type: str) -> bool:
         alert_cfg = (self.cam.get("alertConfig") or {}).get(ev_type) or {}
         cooldown = alert_cfg.get("cooldownSec") or self.cam.get("cooldownSec", 60)
-        now = time.time()
-        if now - self.last_event_at.get(key, 0) < cooldown:
-            return False
-        self.last_event_at[key] = now
-        return True
+        return self.cooldowns.should_emit(key, cooldown)
+
+    def _schedule_ok(self) -> bool:
+        return within_schedule(self.cam.get("schedule"))
 
     # ── Snapshot anotado ──────────────────────────────────────────────────
     def _annotate(self, frame: np.ndarray, detections: sv.Detections) -> np.ndarray:
@@ -104,28 +138,47 @@ class CameraWorker(threading.Thread):
                 tid = detections.tracker_id[i] if detections.tracker_id is not None else None
                 tid_s = f"#{int(tid)} " if tid is not None else ""
                 labels.append(f"{tid_s}{cname} {detections.confidence[i]:.0%}")
+            if self.trace_annotator is not None:
+                try:
+                    annotated = self.trace_annotator.annotate(annotated, detections)
+                except Exception:  # noqa: BLE001
+                    pass
             annotated = self.box_annotator.annotate(annotated, detections)
             annotated = self.label_annotator.annotate(annotated, detections, labels=labels)
-        for z, zobj in zip(self.zones, self.zone_objects):
+        for zi, (z, zobj) in enumerate(zip(self.zones, self.zone_objects)):
+            zann = self.zone_annotators[zi] if zi < len(self.zone_annotators) else None
+            if zann is not None:
+                try:
+                    annotated = zann.annotate(scene=annotated)
+                except Exception:  # noqa: BLE001
+                    cv2.polylines(annotated, [zobj.polygon], True, (0, 0, 255), 2)
+            else:
+                cv2.polylines(annotated, [zobj.polygon], True, (0, 0, 255), 2)
             occ = self.zone_occupancy.get(z["name"], 0)
-            cv2.polylines(annotated, [zobj.polygon], True, (0, 0, 255), 2)
             cv2.putText(annotated, f"{z['name']} ({occ})", tuple(zobj.polygon[0]),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         for ln, lobj in zip(self.lines, self.line_objects):
+            if self.line_annotator is not None:
+                try:
+                    annotated = self.line_annotator.annotate(annotated, line_counter=lobj)
+                    continue
+                except Exception:  # noqa: BLE001
+                    pass
             p1 = (int(lobj.vector.start.x), int(lobj.vector.start.y))
             p2 = (int(lobj.vector.end.x), int(lobj.vector.end.y))
             cv2.line(annotated, p1, p2, (255, 180, 0), 2)
             cv2.putText(annotated, f"{ln['name']} in:{lobj.in_count} out:{lobj.out_count}",
-                        (p1[0], max(20, p1[1] - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 0), 2)
+                        (p1[0], max(20, p1[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 0), 2)
         return annotated
 
-    def _store_live_frame(self, annotated: np.ndarray) -> None:
-        img = annotated
+    def _resize_for_jpeg(self, img: np.ndarray) -> np.ndarray:
         if img.shape[1] > settings.snapshot_max_width:
             scale = settings.snapshot_max_width / img.shape[1]
-            img = cv2.resize(img, None, fx=scale, fy=scale)
-        ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            return cv2.resize(img, None, fx=scale, fy=scale)
+        return img
+
+    def _store_live_frame(self, annotated: np.ndarray) -> None:
+        ok, jpeg = cv2.imencode(".jpg", self._resize_for_jpeg(annotated), [cv2.IMWRITE_JPEG_QUALITY, 70])
         if ok:
             self.last_annotated_jpeg = jpeg.tobytes()
 
@@ -134,11 +187,8 @@ class CameraWorker(threading.Thread):
                     annotated: np.ndarray, detections: sv.Detections,
                     track_id: int | None = None, zone_name: str | None = None,
                     direction: str | None = None) -> None:
-        img = annotated
-        if img.shape[1] > settings.snapshot_max_width:
-            scale = settings.snapshot_max_width / img.shape[1]
-            img = cv2.resize(img, None, fx=scale, fy=scale)
-        ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, settings.snapshot_jpeg_quality])
+        ok, jpeg = cv2.imencode(".jpg", self._resize_for_jpeg(annotated),
+                                [cv2.IMWRITE_JPEG_QUALITY, settings.snapshot_jpeg_quality])
         snapshot_b64 = base64.b64encode(jpeg.tobytes()).decode() if ok else None
 
         bboxes = [
@@ -149,25 +199,18 @@ class CameraWorker(threading.Thread):
         ][:64]
 
         payload = {
-            "cameraId": self.cam["cameraId"],
-            "type": ev_type,
-            "className": class_name,
+            "cameraId": self.cam["cameraId"], "type": ev_type, "className": class_name,
             "confidence": round(float(confidence), 3),
             "trackId": int(track_id) if track_id is not None else None,
-            "zoneName": zone_name,
-            "direction": direction,
-            "bboxes": bboxes,
+            "zoneName": zone_name, "direction": direction, "bboxes": bboxes,
             "occurredAt": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z",
             "snapshotJpegBase64": snapshot_b64,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
         try:
-            r = httpx.post(
-                f"{settings.api_base_url}/api/analytics/internal/events",
-                json=payload,
-                headers={"x-analytics-secret": settings.analytics_secret},
-                timeout=15,
-            )
+            r = httpx.post(f"{settings.api_base_url}/api/analytics/internal/events",
+                           json=payload, headers={"x-analytics-secret": settings.analytics_secret},
+                           timeout=15)
             r.raise_for_status()
             self.events_sent += 1
             log.info("analytics_event_sent camera=%s type=%s class=%s conf=%.2f zone=%s dir=%s",
@@ -178,19 +221,22 @@ class CameraWorker(threading.Thread):
 
     # ── Procesamiento de un frame ─────────────────────────────────────────
     def _process(self, frame: np.ndarray) -> None:
-        detections = self.detector.infer(frame, self.cam["minConfidence"])
-        watched = self._watched_class_ids()
-        if len(detections) > 0:
-            mask = np.isin(detections.class_id, list(watched))
-            detections = detections[mask]
+        t0 = time.time()
+        raw = self.provider.infer(frame, self.cam.get("minConfidence", 0.5))
+        self.last_inference_ms = round((time.time() - t0) * 1000, 1)
 
+        watched = self._watched_class_ids()
+        # filtro por clase vigilada + umbral por clase
+        raw = [d for d in raw if d.class_id in watched and d.confidence >= self._min_conf_for(d.class_name)]
+        detections = to_sv_detections(raw)
         detections = self.tracker.update_with_detections(detections)
         self.frames_processed += 1
+        self.detections_total += len(detections)
         if len(detections) > 0:
             self.last_detection_at = time.time()
 
-        # Ocupación por zona (para overlay + evento occupancy_limit)
-        zone_inside: list[np.ndarray] = []
+        # Ocupación por zona
+        zone_inside: list[Any] = []
         for z, zobj in zip(self.zones, self.zone_objects):
             inside = zobj.trigger(detections) if len(detections) > 0 else np.array([], dtype=bool)
             zone_inside.append(inside)
@@ -201,25 +247,26 @@ class CameraWorker(threading.Thread):
         if len(detections) == 0:
             return
 
-        # 1) Detección de objeto nuevo (track_id nuevo) → person / vehicle
-        if detections.tracker_id is not None:
+        schedule_ok = self._schedule_ok()
+
+        # 1) Detección de objeto nuevo (track nuevo) → person / vehicle
+        if detections.tracker_id is not None and schedule_ok:
             for i, tid in enumerate(detections.tracker_id):
-                if tid is None or int(tid) in self.reported_tracks:
+                if tid is None or not self.dedup.is_new(int(tid)):
                     continue
-                self.reported_tracks.add(int(tid))
-                if len(self.reported_tracks) > 5000:
-                    self.reported_tracks.clear()
                 cname = CLASS_NAME_BY_ID.get(int(detections.class_id[i]), "")
                 ev_type = "person" if cname == "person" else ("vehicle" if cname in VEHICLE_CLASSES else None)
-                if ev_type and self._cooldown_ok((ev_type, cname), ev_type):
+                if ev_type and self._cooldown_ok(f"{ev_type}|{cname}", ev_type):
                     self._post_event(ev_type, cname, float(detections.confidence[i]),
                                      annotated, detections, track_id=int(tid))
 
-        # 2) Líneas de conteo por cruce
+        # 2) Líneas de conteo por cruce (el conteo se hace siempre; el evento respeta horario)
         for ln, lobj in zip(self.lines, self.line_objects):
             line_classes = set(ln.get("classes") or self.cam["classes"])
             crossed_in, crossed_out = lobj.trigger(detections)
             self.line_counts[ln["name"]] = {"in": int(lobj.in_count), "out": int(lobj.out_count)}
+            if not schedule_ok:
+                continue
             for i in range(len(detections)):
                 direction = "in" if crossed_in[i] else ("out" if crossed_out[i] else None)
                 if direction is None:
@@ -247,13 +294,11 @@ class CameraWorker(threading.Thread):
                     continue
                 tid = detections.tracker_id[i] if detections.tracker_id is not None else None
 
-                if self._cooldown_ok(("zone", f"{z['name']}|{cname}"), "zone_intrusion"):
+                if schedule_ok and self._cooldown_ok(f"zone|{z['name']}|{cname}", "zone_intrusion"):
                     self._post_event("zone_intrusion", cname, float(detections.confidence[i]),
                                      annotated, detections,
-                                     track_id=int(tid) if tid is not None else None,
-                                     zone_name=z["name"])
+                                     track_id=int(tid) if tid is not None else None, zone_name=z["name"])
 
-                # Loitering: track dentro de la zona más de loiteringSec
                 loitering_sec = z.get("loiteringSec")
                 if loitering_sec and tid is not None:
                     tkey = (zi, int(tid))
@@ -261,29 +306,23 @@ class CameraWorker(threading.Thread):
                     entered = self.zone_entry_at.setdefault(tkey, now)
                     if now - entered >= loitering_sec and tkey not in self.loitering_reported:
                         self.loitering_reported.add(tkey)
-                        self._post_event("loitering", cname, float(detections.confidence[i]),
-                                         annotated, detections,
-                                         track_id=int(tid), zone_name=z["name"])
+                        if schedule_ok:
+                            self._post_event("loitering", cname, float(detections.confidence[i]),
+                                             annotated, detections, track_id=int(tid), zone_name=z["name"])
 
-            # limpiar tracks que salieron de la zona
             for tkey in [k for k in self.zone_entry_at if k[0] == zi and k[1] not in inside_tids]:
                 self.zone_entry_at.pop(tkey, None)
                 self.loitering_reported.discard(tkey)
 
-            # Aforo: más objetos dentro que el límite configurado
             occupancy_limit = z.get("occupancyLimit")
             occ = self.zone_occupancy.get(z["name"], 0)
-            if occupancy_limit and occ > occupancy_limit:
-                if self._cooldown_ok(("occupancy", z["name"]), "occupancy_limit"):
+            if occupancy_limit and occ > occupancy_limit and schedule_ok:
+                if self._cooldown_ok(f"occupancy|{z['name']}", "occupancy_limit"):
                     self._post_event("occupancy_limit", "person", 1.0,
                                      annotated, detections, zone_name=z["name"])
 
-    # ── Loop principal con backoff ────────────────────────────────────────
+    # ── Apertura de captura ───────────────────────────────────────────────
     def _open_capture(self) -> "cv2.VideoCapture | None":
-        """MediaMTX primero (sesión compartida con live view, TCP). El RTSP
-        directo al NVR solo se usa si el API lo envía explícitamente
-        (directRtspUrl, con ANALYTICS_ALLOW_DIRECT_RTSP=true) — por defecto
-        MediaMTX es el ÚNICO consumidor RTSP del NVR y no compite con live."""
         primary = self.cam.get("analyticsRtspUrl")
         fallback = self.cam.get("directRtspUrl")  # None salvo opt-in explícito
         for url, is_fallback in ((primary, False), (fallback, True)):
@@ -292,18 +331,19 @@ class CameraWorker(threading.Thread):
             cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
             if cap.isOpened():
                 try:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # baja latencia
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except Exception:  # noqa: BLE001
                     pass
                 self.using_fallback = is_fallback
                 if is_fallback:
-                    log.warning("analytics_rtsp_fallback_direct camera=%s (MediaMTX no disponible)",
-                                self.cam["cameraName"])
+                    log.warning("analytics_rtsp_fallback_direct camera=%s", self.cam["cameraName"])
+                else:
+                    log.info("analytics_rtsp_connected camera=%s", self.cam["cameraName"])
                 return cap
             cap.release()
             log.warning("analytics_rtsp_open_failed camera=%s source=%s transport=%s",
-                        self.cam["cameraName"],
-                        "mediamtx" if not is_fallback else "direct", settings.rtsp_transport)
+                        self.cam["cameraName"], "mediamtx" if not is_fallback else "direct",
+                        settings.rtsp_transport)
         return None
 
     def run(self) -> None:
@@ -315,25 +355,21 @@ class CameraWorker(threading.Thread):
         while not self.stop_event.is_set():
             cap = self._open_capture()
             if cap is None:
-                self.consecutive_failures += 1
-                self.last_error = "no se pudo abrir el stream (MediaMTX ni directo)"
-                if self.consecutive_failures >= settings.rtsp_max_consecutive_failures:
+                if self.breaker.record_failure():
                     self.status = "disabled_due_errors"
-                    log.error("analytics_worker_disabled camera=%s tras %d fallos — "
-                              "requiere cambio de config para reintentar",
-                              self.cam["cameraName"], self.consecutive_failures)
+                    log.error("analytics_worker_disabled camera=%s tras %d fallos",
+                              self.cam["cameraName"], self.breaker.failures)
                     return
-                idx = min(self.consecutive_failures - 1, len(settings.rtsp_backoff_schedule) - 1)
-                wait = settings.rtsp_backoff_schedule[idx]
+                wait = backoff_delay(self.breaker.failures, settings.rtsp_backoff_schedule)
                 self.status = "rtsp_down"
                 log.warning("analytics_rtsp_backoff camera=%s intento=%d espera=%ds",
-                            self.cam["cameraName"], self.consecutive_failures, wait)
+                            self.cam["cameraName"], self.breaker.failures, wait)
                 if self.stop_event.wait(wait):
                     break
                 continue
 
             self.status = "running"
-            self.consecutive_failures = 0
+            self.breaker.record_success()
             last_sample = 0.0
             fps_window_start, fps_frames = time.time(), 0
             while not self.stop_event.is_set():
@@ -348,6 +384,7 @@ class CameraWorker(threading.Thread):
                 ok, frame = cap.retrieve()
                 if not ok or frame is None:
                     continue
+                self.last_frame_at = now
                 if self.frame_size != (frame.shape[1], frame.shape[0]):
                     self.frame_size = (frame.shape[1], frame.shape[0])
                     self._build_zones(*self.frame_size)
@@ -363,15 +400,13 @@ class CameraWorker(threading.Thread):
 
             cap.release()
             if not self.stop_event.is_set():
-                self.consecutive_failures += 1
-                if self.consecutive_failures >= settings.rtsp_max_consecutive_failures:
+                if self.breaker.record_failure():
                     self.status = "disabled_due_errors"
                     log.error("analytics_worker_disabled camera=%s tras %d cortes",
-                              self.cam["cameraName"], self.consecutive_failures)
+                              self.cam["cameraName"], self.breaker.failures)
                     return
-                idx = min(self.consecutive_failures - 1, len(settings.rtsp_backoff_schedule) - 1)
                 self.status = "reconnecting"
-                self.stop_event.wait(settings.rtsp_backoff_schedule[idx])
+                self.stop_event.wait(backoff_delay(self.breaker.failures, settings.rtsp_backoff_schedule))
 
         self.status = "stopped"
         log.info("analytics_worker_stopped camera=%s", self.cam["cameraName"])
@@ -381,46 +416,51 @@ class CameraWorker(threading.Thread):
 
 
 class PipelineManager:
-    """Sincroniza los workers con la configuración del API. El modelo se
-    carga acá con reintentos — un modelo caído deja el servicio en
-    model_error pero el proceso sigue vivo."""
+    """Sincroniza los workers con la config del API. El provider de detección se
+    carga con reintentos — un modelo caído deja el servicio en model_error pero
+    el proceso sigue vivo."""
 
     def __init__(self) -> None:
-        self.detector: YoloxDetector | None = None
+        self.provider: DetectionProvider | None = None
         self.model_error: str | None = None
         self.workers: dict[str, CameraWorker] = {}
         self.lock = threading.Lock()
         self.last_refresh: float | None = None
         self.last_refresh_error: str | None = None
 
+    # compat: el resto del código consultaba manager.detector para saber si el
+    # modelo está cargado; exponemos un alias de solo lectura.
+    @property
+    def detector(self) -> DetectionProvider | None:
+        return self.provider
+
     def start(self) -> None:
         threading.Thread(target=self._model_loop, daemon=True, name="model").start()
         threading.Thread(target=self._refresh_loop, daemon=True, name="refresh").start()
 
     def _model_loop(self) -> None:
-        while self.detector is None:
+        while self.provider is None:
             try:
-                self.detector = YoloxDetector()
+                provider = create_detection_provider(settings.provider)
+                provider.load()
+                self.provider = provider
                 self.model_error = None
-                log.info("analytics_model_loaded")
+                log.info("analytics_model_loaded provider=%s", settings.provider)
             except Exception as exc:  # noqa: BLE001
                 self.model_error = str(exc)
-                log.error("analytics_model_error err=%s — reintento en %ds",
-                          exc, settings.model_retry_sec)
+                log.error("analytics_model_error provider=%s err=%s — reintento en %ds",
+                          settings.provider, exc, settings.model_retry_sec)
                 time.sleep(settings.model_retry_sec)
 
     def _fetch_cameras(self) -> list[dict[str, Any]]:
-        r = httpx.get(
-            f"{settings.api_base_url}/api/analytics/internal/cameras",
-            headers={"x-analytics-secret": settings.analytics_secret},
-            timeout=15,
-        )
+        r = httpx.get(f"{settings.api_base_url}/api/analytics/internal/cameras",
+                      headers={"x-analytics-secret": settings.analytics_secret}, timeout=15)
         r.raise_for_status()
         return r.json().get("cameras", [])
 
     def _refresh_loop(self) -> None:
         while True:
-            if self.detector is not None:
+            if self.provider is not None:
                 try:
                     cams = self._fetch_cameras()
                     self._reconcile(cams)
@@ -432,23 +472,42 @@ class PipelineManager:
             time.sleep(settings.refresh_interval_sec)
 
     def _reconcile(self, cams: list[dict[str, Any]]) -> None:
-        assert self.detector is not None
+        assert self.provider is not None
         with self.lock:
             desired = {c["cameraId"]: c for c in cams}
+            # límite de workers para proteger CPU/memoria
+            if len(desired) > settings.max_workers:
+                allowed = dict(list(desired.items())[: settings.max_workers])
+                log.warning("límite de workers (%d) — %d cámaras ignoradas",
+                            settings.max_workers, len(desired) - settings.max_workers)
+                desired = allowed
             for cam_id in list(self.workers):
                 w = self.workers[cam_id]
                 cfg = desired.get(cam_id)
                 if cfg is None or cfg.get("updatedAt") != w.cam.get("updatedAt"):
-                    # disabled_due_errors solo se rearma si la config CAMBIÓ
                     w.stop()
                     del self.workers[cam_id]
                     if cfg is not None:
                         log.info("[%s] config cambió — reiniciando worker", cfg["cameraName"])
             for cam_id, cfg in desired.items():
                 if cam_id not in self.workers:
-                    worker = CameraWorker(cfg, self.detector)
+                    worker = CameraWorker(cfg, self.provider)
                     self.workers[cam_id] = worker
                     worker.start()
+
+    def restart_worker(self, camera_id: str) -> bool:
+        """Reinicia manualmente un worker (p.ej. tras disabled_due_errors)."""
+        with self.lock:
+            w = self.workers.pop(camera_id, None)
+            if not w:
+                return False
+            cfg = w.cam
+            w.stop()
+            if self.provider is not None:
+                nw = CameraWorker(cfg, self.provider)
+                self.workers[camera_id] = nw
+                nw.start()
+            return True
 
     def get_last_frame(self, camera_id: str) -> bytes | None:
         w = self.workers.get(camera_id)
@@ -456,26 +515,25 @@ class PipelineManager:
 
     def status(self) -> dict[str, Any]:
         with self.lock:
+            meta = self.provider.metadata() if self.provider else None
             workers = [
                 {
-                    "cameraId": w.cam["cameraId"],
-                    "cameraName": w.cam["cameraName"],
-                    "status": w.status,
-                    "framesProcessed": w.frames_processed,
-                    "eventsSent": w.events_sent,
-                    "fpsActual": w.fps_actual,
-                    "usingFallback": w.using_fallback,
-                    "lastError": w.last_error,
-                    "lastDetectionAt": w.last_detection_at,
-                    "zoneOccupancy": w.zone_occupancy,
-                    "lineCounts": w.line_counts,
+                    "cameraId": w.cam["cameraId"], "cameraName": w.cam["cameraName"],
+                    "status": w.status, "framesProcessed": w.frames_processed,
+                    "eventsSent": w.events_sent, "detectionsTotal": w.detections_total,
+                    "fpsActual": w.fps_actual, "inferenceMs": w.last_inference_ms,
+                    "usingFallback": w.using_fallback, "lastError": w.last_error,
+                    "lastDetectionAt": w.last_detection_at, "lastFrameAt": w.last_frame_at,
+                    "zoneOccupancy": w.zone_occupancy, "lineCounts": w.line_counts,
                 }
                 for w in self.workers.values()
             ]
             return {
-                "serviceStatus": "model_error" if self.detector is None else "running",
-                "modelLoaded": self.detector is not None,
+                "serviceStatus": "model_error" if self.provider is None else "running",
+                "modelLoaded": self.provider is not None,
                 "modelError": self.model_error,
+                "provider": meta.name if meta else settings.provider,
+                "providers": meta.providers if meta else [],
                 "lastRefresh": self.last_refresh,
                 "lastRefreshError": self.last_refresh_error,
                 "workers": workers,
