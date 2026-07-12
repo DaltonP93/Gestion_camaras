@@ -27,6 +27,7 @@ import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
 import { adminRoutes } from './routes/admin'
 import { analyticsRoutes } from './routes/analytics'
+import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
 import { publishStream } from './services/stream'
@@ -158,6 +159,7 @@ async function main() {
   await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
   await server.register(adminRoutes, { prefix: '/api/admin' })
   await server.register(analyticsRoutes, { prefix: '/api/analytics' })
+  await server.register(metricsRoutes)  // /metrics (Prometheus), sin prefijo /api
   await server.register(wsHandler, { prefix: '/ws' })
 
   const COMMIT_SHA = process.env.COMMIT_SHA || 'development'

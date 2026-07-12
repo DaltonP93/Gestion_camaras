@@ -13,6 +13,7 @@ import { decryptNvrPasswordOrNull } from '../services/credentials'
 import { buildRtspUrl, buildRtspUrlMasked } from '../services/hikvision'
 import { getStreamPath, publishStream, markAnalyticsConsumer } from '../services/stream'
 import { configureStreamConsumerRegistry, setStreamConsumerLogger } from '../services/stream-consumer-registry'
+import { analyticsEventsTotal, analyticsEventsRejectedTotal, analyticsAlertsCreatedTotal } from '../services/metrics'
 import { AuditAction } from '../services/audit'
 
 const ANALYTICS_SECRET = process.env.ANALYTICS_SECRET || ''
@@ -206,11 +207,15 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     bodyLimit: 6 * 1024 * 1024,
   }, async (request, reply) => {
     const body = eventSchema.parse(request.body)
+    analyticsEventsTotal.inc({ type: body.type })
 
     const camera = await server.prisma.camera.findUnique({
       where: { id: body.cameraId }, include: { nvr: true },
     })
-    if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
+    if (!camera) {
+      analyticsEventsRejectedTotal.inc({ reason: 'camera_not_found' })
+      return reply.status(404).send({ message: 'Cámara no encontrada' })
+    }
 
     // Snapshot → /uploads/analytics/YYYYMM/<eventId>.jpg
     let snapshotUrl: string | null = null
@@ -272,6 +277,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         },
       })
       alertId = alert.id
+      analyticsAlertsCreatedTotal.inc({ type: body.type })
 
       broadcastAlert({
         type: 'alert',
