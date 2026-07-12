@@ -12,6 +12,7 @@ import { sendAlertNotification } from '../services/notification.service'
 import { decryptNvrPasswordOrNull } from '../services/credentials'
 import { buildRtspUrl, buildRtspUrlMasked } from '../services/hikvision'
 import { getStreamPath, publishStream, markAnalyticsConsumer } from '../services/stream'
+import { configureStreamConsumerRegistry, setStreamConsumerLogger } from '../services/stream-consumer-registry'
 import { AuditAction } from '../services/audit'
 
 const ANALYTICS_SECRET = process.env.ANALYTICS_SECRET || ''
@@ -113,6 +114,11 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 
 export const analyticsRoutes: FastifyPluginAsync = async (server) => {
+  // Promover el registry de consumidores a Redis (sobrevive reinicios y sirve
+  // con múltiples workers); memoria como fallback si Redis no está disponible.
+  configureStreamConsumerRegistry((server as any).redis ?? null)
+  setStreamConsumerLogger({ info: (m) => server.log.info(m) })
+  server.log.info(`[analytics] stream_consumer_registry backend=${(server as any).redis ? 'redis' : 'memory'}`)
 
   // Guard for the internal (service-to-service) endpoints
   const requireAnalyticsSecret = async (request: any, reply: any) => {
@@ -166,7 +172,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       // Marcar el path como consumido por analytics: mientras esté vigente,
       // removeStream (cleanup de live view) NO lo borra — evita que al salir
       // de live view se caiga el stream que analytics está usando.
-      markAnalyticsConsumer(streamPath, ANALYTICS_CONSUMER_TTL_MS)
+      await markAnalyticsConsumer(streamPath, ANALYTICS_CONSUMER_TTL_MS)
 
       result.push({
         cameraId:         cam.id,
