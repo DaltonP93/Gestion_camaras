@@ -45,7 +45,8 @@ class Settings(BaseSettings):
     rtsp_stimeout_us: int = 5_000_000
 
     # Límite de workers concurrentes (protección de CPU/memoria)
-    max_workers: int = 16
+    max_workers: int = Field(default=16,
+                             validation_alias=AliasChoices("ANALYTICS_MAX_WORKERS", "MAX_WORKERS"))
 
     # Feature flags de módulos que requieren modelo externo (scaffold).
     fall_detection_enabled: bool = Field(
