@@ -458,6 +458,9 @@ model AnalyticsEvent {
   @@index([cameraId, occurredAt])
   @@index([type, occurredAt])
   @@index([occurredAt])
+  @@index([className, occurredAt])
+  @@index([zoneName, occurredAt])
+  @@index([direction, occurredAt])
   @@map("analytics_events")
 }
 
