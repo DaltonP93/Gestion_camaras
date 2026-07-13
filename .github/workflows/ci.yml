@@ -55,16 +55,27 @@ jobs:
         run: npm run build
 
   analytics:
-    name: Analytics (syntax + deps)
+    name: Analytics (syntax + tests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Syntax check
+      - name: Syntax check (compileall)
         working-directory: apps/analytics
-        run: python -m py_compile app/*.py
+        run: python -m compileall -q app
+      - name: Pure tests (stdlib, sin cv2/onnx)
+        working-directory: apps/analytics
+        run: python -m unittest discover -s tests -v
+
+  compose:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validar docker-compose.yml
+        run: docker compose -f docker-compose.yml config -q
 
   licenses:
     name: Licencias (sin GPL/AGPL)

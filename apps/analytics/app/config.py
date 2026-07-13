@@ -1,4 +1,5 @@
 # apps/analytics/app/config.py
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -7,6 +8,11 @@ class Settings(BaseSettings):
     api_base_url: str = "http://api:4000"
     # Secreto compartido con el API — mismo valor que ANALYTICS_SECRET del API
     analytics_secret: str = ""
+
+    # Provider de detección: "yolox_onnx" (real) o "mock" (sin modelo, para
+    # validar el flujo o correr sin pesos). Se resuelve en providers/factory.py.
+    provider: str = Field(default="yolox_onnx",
+                          validation_alias=AliasChoices("ANALYTICS_PROVIDER", "PROVIDER"))
 
     # Modelo de detección ONNX (Apache-2.0). YOLOX de Megvii — NO ultralytics (AGPL).
     model_path: str = "/models/yolox_s.onnx"
@@ -37,6 +43,16 @@ class Settings(BaseSettings):
     rtsp_transport: str = "tcp"
     # Timeout de apertura/lectura RTSP en microsegundos (5 s)
     rtsp_stimeout_us: int = 5_000_000
+
+    # Límite de workers concurrentes (protección de CPU/memoria)
+    max_workers: int = Field(default=16,
+                             validation_alias=AliasChoices("ANALYTICS_MAX_WORKERS", "MAX_WORKERS"))
+
+    # Feature flags de módulos que requieren modelo externo (scaffold).
+    fall_detection_enabled: bool = Field(
+        default=False, validation_alias=AliasChoices("ANALYTICS_FALL_DETECTION_ENABLED", "FALL_DETECTION_ENABLED"))
+    alpr_enabled: bool = Field(
+        default=False, validation_alias=AliasChoices("ANALYTICS_ALPR_ENABLED", "ALPR_ENABLED"))
 
     class Config:
         env_prefix = ""  # variables planas: API_BASE_URL, ANALYTICS_SECRET, MODEL_PATH...

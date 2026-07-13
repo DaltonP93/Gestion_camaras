@@ -1,0 +1,3 @@
+# Dependencias de desarrollo/CI para el servicio de analítica.
+-r requirements.txt
+pytest==8.*   # MIT

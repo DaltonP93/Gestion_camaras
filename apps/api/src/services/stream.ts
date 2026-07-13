@@ -28,27 +28,27 @@ const inFlightPaths   = new Set<string>()
 // MediaMTX ya cuenta lectores para el pull RTSP (sourceOnDemand), pero el
 // stream-manager de Node puede BORRAR el path (removeStream) cuando el último
 // viewer de live sale — eso rompería a Analytics si está leyendo el mismo
-// restream. Este registro marca qué paths tiene "tomados" Analytics con un TTL;
-// removeStream respeta esa marca y no borra el path mientras esté vigente.
-// Clave: streamPath → epoch (ms) de expiración.
-const analyticsPathConsumers = new Map<string, number>()
+// restream. El StreamConsumerRegistry (Redis + memoria) lleva la cuenta de
+// consumidores por path/tipo con leases TTL; removeStream lo consulta y no
+// borra un path que aún tenga consumidores vigentes.
+import { getStreamConsumerRegistry } from './stream-consumer-registry'
 
-/** Analytics declara que está consumiendo este path (se refresca en cada poll). */
-export function markAnalyticsConsumer(streamPath: string, ttlMs: number): void {
-  analyticsPathConsumers.set(streamPath, Date.now() + ttlMs)
+// Un solo consumidor analytics por path → id estable derivado del path.
+const analyticsConsumerId = (streamPath: string) => `analytics:${streamPath}`
+
+/** Analytics declara/renueva que está consumiendo este path (poll ~60s). */
+export async function markAnalyticsConsumer(streamPath: string, ttlMs: number): Promise<void> {
+  await getStreamConsumerRegistry().acquire(streamPath, 'analytics', analyticsConsumerId(streamPath), ttlMs)
 }
 
-/** Libera explícitamente la marca de Analytics sobre un path. */
-export function clearAnalyticsConsumer(streamPath: string): void {
-  analyticsPathConsumers.delete(streamPath)
+/** Libera explícitamente el lease de Analytics sobre un path. */
+export async function clearAnalyticsConsumer(streamPath: string): Promise<void> {
+  await getStreamConsumerRegistry().release(streamPath, analyticsConsumerId(streamPath))
 }
 
-/** ¿Analytics está consumiendo este path ahora mismo (marca no vencida)? */
-export function hasAnalyticsConsumer(streamPath: string): boolean {
-  const exp = analyticsPathConsumers.get(streamPath)
-  if (exp === undefined) return false
-  if (Date.now() > exp) { analyticsPathConsumers.delete(streamPath); return false }
-  return true
+/** ¿Hay algún consumidor vigente sobre este path (cualquier tipo)? */
+export async function hasActiveConsumers(streamPath: string): Promise<boolean> {
+  return (await getStreamConsumerRegistry().count(streamPath)) > 0
 }
 
 // Transcoding config — read once at module load, no runtime overhead
@@ -1084,10 +1084,10 @@ export async function removeStream(nvr: NVR, camera: Camera, streamType?: 'sub' 
   for (const t of typesToRemove) {
     try {
       const streamPath = getStreamPath(nvr, camera, t)
-      // Refcount: si Analytics está leyendo este path, NO lo borres — solo
-      // se fue el último viewer de live, pero analytics sigue activo.
-      if (hasAnalyticsConsumer(streamPath)) {
-        console.info(`[stream] mediamtx_shared_path_keep path=${streamPath} reason=analytics_active`)
+      // Refcount: no borrar el path si aún tiene consumidores vigentes
+      // (analytics/recording/diagnostic). Solo se fue el viewer de live.
+      if (await hasActiveConsumers(streamPath)) {
+        console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=active_consumers`)
         continue
       }
       registeredPaths.delete(streamPath)

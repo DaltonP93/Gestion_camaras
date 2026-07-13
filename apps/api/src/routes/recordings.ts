@@ -409,6 +409,11 @@ function retainFailedPreview(sessionId: string, session: PreviewSession, log: (m
 
 const previewSessions = new Map<string, PreviewSession>()
 
+// Métricas para /metrics (Prometheus) — solo conteos, sin datos sensibles.
+export function getRecordingsMetrics(): { previewSessions: number; vodSessions: number } {
+  return { previewSessions: previewSessions.size, vodSessions: recordingSessions.size }
+}
+
 // ─── Per-NVR preview concurrency ──────────────────────────────────
 // Hikvision NVRs cap simultaneous playback sessions/bandwidth and answer
 // "453 Not Enough Bandwidth" when exceeded. Serialize preview starts per NVR

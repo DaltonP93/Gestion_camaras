@@ -115,6 +115,8 @@ services:
       # false = analytics SOLO usa el restream de MediaMTX (recomendado, no
       # tumba live view). true = permite fallback RTSP directo al NVR.
       ANALYTICS_ALLOW_DIRECT_RTSP: ${ANALYTICS_ALLOW_DIRECT_RTSP:-false}
+      # Token opcional para /metrics (Prometheus). Vacío = red interna.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     volumes:
       - uploads_data:/app/uploads
       - recordings_cache:/var/lib/visioncore/recordings-cache
@@ -161,8 +163,12 @@ services:
     environment:
       API_BASE_URL: http://api:4000
       ANALYTICS_SECRET: ${ANALYTICS_SECRET:-}
+      ANALYTICS_PROVIDER: ${ANALYTICS_PROVIDER:-yolox_onnx}
       MODEL_PATH: /models/yolox_s.onnx
       INPUT_SIZE: "640"
+      ANALYTICS_MAX_WORKERS: ${ANALYTICS_MAX_WORKERS:-16}
+      ANALYTICS_FALL_DETECTION_ENABLED: ${ANALYTICS_FALL_DETECTION_ENABLED:-false}
+      ANALYTICS_ALPR_ENABLED: ${ANALYTICS_ALPR_ENABLED:-false}
     volumes:
       - analytics_models:/models
     depends_on:

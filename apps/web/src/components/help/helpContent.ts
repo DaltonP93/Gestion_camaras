@@ -203,6 +203,30 @@ export const HELP_SECTIONS: HelpSection[] = [
           'Lectura de matrículas (ALPR): preparado pero deshabilitado — el detector actual no lee chapas; requiere un modelo dedicado (ANALYTICS_ALPR_ENABLED).',
         ],
       },
+      {
+        title: 'Estados del servicio y de los workers',
+        steps: [
+          'El chip del encabezado indica si el servicio está conectado y el modelo cargado. Estados del servicio: running (operativo), degraded/model_error (el modelo no cargó — el servicio sigue vivo y reintenta), api_error.',
+          'Cada cámara tiene un worker con estado: running, reconnecting, rtsp_down (no pudo abrir el stream), disabled_due_errors (falló 5 veces seguidas — se rearma al cambiar su configuración) y stopped.',
+          'Si un worker queda "deshabilitado por errores", revisá que la cámara esté online y volvé a guardar su configuración para reintentar.',
+          'El panel de workers muestra FPS real, frames procesados, eventos enviados y el último error por cámara.',
+        ],
+      },
+      {
+        title: 'Modelo, provider y uso de CPU',
+        steps: [
+          'La detección usa un provider intercambiable (por defecto YOLOX ONNX). Se puede correr en modo "mock" para validar el flujo sin un modelo real.',
+          'Para bajar el uso de CPU: reducí el fps de muestreo (2 fps alcanza), limitá las clases a las necesarias y subí la confianza mínima.',
+          'Hay un límite de workers simultáneos para proteger CPU/memoria; si tenés muchas cámaras conviene GPU.',
+        ],
+      },
+      {
+        title: 'Detección de caídas (preparada, requiere modelo)',
+        steps: [
+          'La arquitectura de caídas está preparada (pose + reglas temporales, no una simple caja inclinada) pero deshabilitada por defecto.',
+          'Requiere instalar un modelo de pose con licencia compatible y activar ANALYTICS_FALL_DETECTION_ENABLED. Hasta entonces figura como "modelo no instalado".',
+        ],
+      },
     ],
   },
   {
@@ -306,6 +330,8 @@ export const HELP_SECTIONS: HelpSection[] = [
           '"Servicio degradado: modelo no cargado": el contenedor no pudo descargar el modelo (necesita internet la primera vez). Reintenta solo cada 5 minutos.',
           'Worker "Deshabilitado por errores": esa cámara falló 5 veces seguidas — corregí el problema (¿cámara offline?) y guardá de nuevo su configuración para rearmarlo.',
           'Sin eventos: verificá que la cámara esté habilitada, que las clases correctas estén marcadas y que la confianza no esté demasiado alta (probá 40-50%).',
+          'Errores RTSP en analítica: la analítica lee el mismo restream de MediaMTX que la Vista en vivo (no abre una segunda sesión al NVR). Si el worker queda en "rtsp_down", probá abrir esa cámara en Vista en vivo — si tampoco carga, el problema es del NVR/red, no de la analítica.',
+          'Activar analítica no debe tumbar la Vista en vivo: ambas comparten el stream. Si notás lo contrario, revisá los logs del API por "mediamtx_path_kept" (el path no debe borrarse mientras haya consumidores).',
         ],
       },
       {
