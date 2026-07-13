@@ -60,9 +60,10 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // GET /api/live-view/sessions
-  // Diagnóstico de sesiones de streaming activas (sin credenciales). Purga las
-  // vencidas antes de listar para reflejar el estado real de MAX_STREAMS_GLOBAL.
-  server.get('/sessions', { preHandler: [server.authenticate] }, async (_request, reply) => {
+  // Diagnóstico de sesiones de streaming activas (sin credenciales). Devuelve
+  // datos de TODOS los usuarios (cameraId/userId/viewId), por eso es solo ADMIN
+  // — igual que /api/cameras/stream-sessions. Purga las vencidas antes de listar.
+  server.get('/sessions', { preHandler: [server.authorize(['ADMIN'])] }, async (_request, reply) => {
     return reply.send(getSessionsDiagnostic())
   })
 
