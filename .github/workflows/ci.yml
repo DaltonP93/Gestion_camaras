@@ -77,6 +77,21 @@ jobs:
       - name: Validar docker-compose.yml
         run: docker compose -f docker-compose.yml config -q
 
+  analytics-image:
+    name: Analytics image (native deps smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # El build ejecuta el smoke test `import cv2, onnxruntime, supervision`
+      # en su última capa (ver apps/analytics/Dockerfile). Si falta libGL u
+      # otra librería nativa, el build falla acá y no llega a producción.
+      - name: Build analytics image (falla si cv2/onnxruntime/supervision no importan)
+        run: docker build -t visioncore-analytics:ci apps/analytics
+      - name: Verificar imports nativos en el contenedor
+        run: |
+          docker run --rm visioncore-analytics:ci \
+            python -c "import cv2, onnxruntime, supervision; print('imports OK')"
+
   licenses:
     name: Licencias (sin GPL/AGPL)
     runs-on: ubuntu-latest

@@ -368,6 +368,11 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
           data: { rtspSubOk: false, streamHealthStatus: 'RTSP_SUB_NOT_FOUND' } as any,
         }).catch(() => {})
       }
+      // Límites de stream → 429 + Retry-After para que el frontend aplique backoff
+      // en vez de reintentar el mismo stream en cada heartbeat.
+      if (isLimitError || result.error.code === 'TRANSCODE_LIMIT_REACHED') {
+        return reply.status(429).header('Retry-After', '10').send(result.error)
+      }
       return reply.status(400).send(result.error)
     }
 

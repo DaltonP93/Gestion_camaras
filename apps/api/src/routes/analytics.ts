@@ -475,6 +475,9 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       const s = (await res.json()) as {
         serviceStatus?: string; modelLoaded?: boolean; modelError?: string | null
         lastRefreshError?: string | null
+        dependenciesLoaded?: boolean; importError?: string | null; configError?: string | null
+        provider?: string | null; hint?: string | null
+        bootStartedAt?: string | null; lastBootAt?: string | null
         workers?: Array<{ status: string; framesProcessed?: number; eventsSent?: number }>
       }
       const workers = Array.isArray(s.workers) ? s.workers : []
@@ -496,6 +499,15 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         serviceStatus: s.serviceStatus ?? 'unknown',
         modelLoaded: Boolean(s.modelLoaded),
         modelError: s.modelError ?? null,
+        // Diagnóstico granular (nunca secretos): permite a la UI distinguir
+        // servicio conectado / dependencias / modelo / workers.
+        dependenciesLoaded: s.dependenciesLoaded ?? null,
+        importError: s.importError ?? null,
+        configError: s.configError ?? null,
+        provider: s.provider ?? null,
+        hint: s.hint ?? null,
+        bootStartedAt: s.bootStartedAt ?? null,
+        lastBootAt: s.lastBootAt ?? null,
         lastRefreshError: s.lastRefreshError ?? null,
         workersRunning,
         workersError,

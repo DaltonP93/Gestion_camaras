@@ -12,6 +12,8 @@ import {
 import toast from 'react-hot-toast'
 import { clsx } from 'clsx'
 import { api, apiGet, apiPut, resolveAssetUrl } from '@/lib/api'
+import { usePolling } from '@/hooks/usePolling'
+import { SearchableCombobox, type ComboOption } from '@/components/ui/SearchableCombobox'
 import { useCameraStore } from '@/stores/cameraStore'
 
 // ─── Tipos ────────────────────────────────────────────────────────────────
@@ -85,6 +87,16 @@ interface ServiceStatus {
   modelLoaded?: boolean
   modelError?: string | null
   lastRefreshError?: string | null
+  // Diagnóstico granular del servicio analytics
+  dependenciesLoaded?: boolean | null
+  importError?: string | null
+  configError?: string | null
+  provider?: string | null
+  hint?: string | null
+  bootStartedAt?: string | null
+  lastBootAt?: string | null
+  workersRunning?: number
+  workersError?: number
   workers?: WorkerStatus[]
   error?: string
 }
@@ -112,6 +124,20 @@ const DEFAULT_CONFIG = (cameraId: string): AnalyticsConfig => ({
 })
 
 type Tab = 'config' | 'live' | 'events' | 'dashboard' | 'forensic'
+
+// Ítem de una capa del diagnóstico del servicio: ✓ ok, ✗ fallo, — desconocido.
+function StatusItem({ ok, label }: { ok?: boolean; label: string }) {
+  return (
+    <span className="flex items-center gap-1">
+      {ok === true
+        ? <CheckCircle2 size={11} className="text-green-400 flex-shrink-0" />
+        : ok === false
+          ? <XCircle size={11} className="text-red-400 flex-shrink-0" />
+          : <span className="text-surface-500">—</span>}
+      <span className="text-surface-300 truncate">{label}</span>
+    </span>
+  )
+}
 
 export function AnalyticsPage() {
   const navigate = useNavigate()
@@ -167,19 +193,19 @@ export function AnalyticsPage() {
     } catch { /* toast global */ }
   }
 
-  const loadServiceStatus = async () => {
-    try { setService(await apiGet<ServiceStatus>('/analytics/service-status')) }
-    catch { setService({ connected: false, error: 'sin conexión' }) }
+  const loadServiceStatus = async (signal?: AbortSignal) => {
+    try { setService((await api.get<ServiceStatus>('/analytics/service-status', { signal })).data) }
+    catch (e: any) { if (e?.code !== 'ERR_CANCELED') setService({ connected: false, error: 'sin conexión' }) }
   }
 
-  const loadEvents = async () => {
+  const loadEvents = async (signal?: AbortSignal) => {
     setEventsLoading(true)
     try {
-      const res = await apiGet<{ events: AnalyticsEvent[] }>('/analytics/events', {
-        limit: 50,
-        ...(eventFilterType ? { type: eventFilterType } : {}),
+      const res = await api.get<{ events: AnalyticsEvent[] }>('/analytics/events', {
+        params: { limit: 50, ...(eventFilterType ? { type: eventFilterType } : {}) },
+        signal,
       })
-      setEvents(res.events)
+      setEvents(res.data.events)
     } catch { /* noop */ } finally { setEventsLoading(false) }
   }
 
@@ -206,41 +232,29 @@ export function AnalyticsPage() {
   useEffect(() => { loadConfigs(); loadServiceStatus() }, [])
   useEffect(() => { if (tab === 'dashboard') loadSummary() }, [tab])
 
-  // Eventos: auto-refresh cada 10 s mientras la pestaña está activa
-  useEffect(() => {
-    if (tab !== 'events') return
-    loadEvents()
-    const t = setInterval(loadEvents, 10_000)
-    return () => clearInterval(t)
-  }, [tab, eventFilterType])
+  // Eventos: polling secuencial (10 s) sólo en la pestaña activa. Pausa oculto,
+  // backoff en 429, sin solapamiento. Reemplaza setInterval fijo.
+  usePolling(loadEvents, { intervalMs: 10_000, enabled: tab === 'events' })
+  // Refetch inmediato al cambiar el filtro (el polling maneja la recurrencia).
+  useEffect(() => { if (tab === 'events') loadEvents() }, [eventFilterType]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Estado del servicio: refresh cada 10 s en las pestañas que lo muestran
-  useEffect(() => {
-    if (tab !== 'live' && tab !== 'config') return
-    const t = setInterval(loadServiceStatus, 10_000)
-    return () => clearInterval(t)
-  }, [tab])
+  // Estado del servicio: polling secuencial (10 s) en pestañas que lo muestran.
+  usePolling(loadServiceStatus, { intervalMs: 10_000, enabled: tab === 'live' || tab === 'config' })
 
-  // Vista en vivo: frame anotado cada 2 s (fetch con auth → objectURL)
-  useEffect(() => {
-    if (tab !== 'live' || !liveCameraId) return
-    let cancelled = false
-    const fetchFrame = async () => {
-      try {
-        const res = await api.get(`/analytics/live-frame/${liveCameraId}`, {
-          responseType: 'blob', timeout: 6_000,
-        })
-        if (cancelled) return
-        const url = URL.createObjectURL(res.data)
-        if (liveFrameObjectUrlRef.current) URL.revokeObjectURL(liveFrameObjectUrlRef.current)
-        liveFrameObjectUrlRef.current = url
-        setLiveFrameUrl(url)
-      } catch { /* frame aún no disponible */ }
-    }
-    fetchFrame()
-    const t = setInterval(fetchFrame, 2_000)
-    return () => { cancelled = true; clearInterval(t) }
-  }, [tab, liveCameraId])
+  // Vista en vivo: frame anotado cada 2 s (fetch con auth → objectURL).
+  const fetchFrame = async (signal?: AbortSignal) => {
+    if (!liveCameraId) return
+    try {
+      const res = await api.get(`/analytics/live-frame/${liveCameraId}`, {
+        responseType: 'blob', timeout: 6_000, signal,
+      })
+      const url = URL.createObjectURL(res.data)
+      if (liveFrameObjectUrlRef.current) URL.revokeObjectURL(liveFrameObjectUrlRef.current)
+      liveFrameObjectUrlRef.current = url
+      setLiveFrameUrl(url)
+    } catch { /* frame aún no disponible / cancelado */ }
+  }
+  usePolling(fetchFrame, { intervalMs: 2_000, enabled: tab === 'live' && !!liveCameraId })
 
   useEffect(() => () => {
     if (snapshotObjectUrlRef.current) URL.revokeObjectURL(snapshotObjectUrlRef.current)
@@ -337,20 +351,29 @@ export function AnalyticsPage() {
       .map(c => ({ id: c.cameraId, name: cameras.find(x => x.id === c.cameraId)?.name ?? c.cameraId })),
     [configs, cameras])
 
+  // Opciones para el combobox buscable de cámaras (agrupadas por NVR, con canal
+  // y estado como texto buscable). Reemplaza el <select> nativo, inusable con 144.
+  const cameraOptions: ComboOption[] = useMemo(() =>
+    camerasByNvr.flatMap(({ nvr, cams }) => cams.map(c => ({
+      value: c.id,
+      label: c.name,
+      group: nvr.name,
+      sublabel: [c.channel != null ? `ch ${c.channel}` : '', c.online === false ? 'offline' : 'online']
+        .filter(Boolean).join(' · '),
+      badge: configs.get(c.id)?.enabled ? '● analítica activa' : undefined,
+      keywords: `${nvr.name} ${c.channel ?? ''}`,
+    }))),
+    [camerasByNvr, configs])
+
   const cameraSelect = (value: string, onChange: (v: string) => void, emptyLabel: string) => (
-    <select value={value} onChange={e => onChange(e.target.value)}
-      className="text-sm bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-surface-200">
-      <option value="">{emptyLabel}</option>
-      {camerasByNvr.map(({ nvr, cams }) => (
-        <optgroup key={nvr.id} label={nvr.name}>
-          {cams.map(c => (
-            <option key={c.id} value={c.id}>
-              {c.name}{configs.get(c.id)?.enabled ? ' ● analítica activa' : ''}
-            </option>
-          ))}
-        </optgroup>
-      ))}
-    </select>
+    <SearchableCombobox
+      value={value}
+      onChange={onChange}
+      options={cameraOptions}
+      emptyLabel={emptyLabel}
+      placeholder={emptyLabel}
+      searchPlaceholder="Buscar por cámara, NVR o canal…"
+    />
   )
 
   const eventCard = (ev: AnalyticsEvent) => (
@@ -411,9 +434,13 @@ export function AnalyticsPage() {
                 ? 'border-amber-700/50 bg-amber-900/20 text-amber-400'
                 : 'border-red-700/50 bg-red-900/20 text-red-400')}>
             {service.connected && service.modelLoaded ? <CheckCircle2 size={10} /> : service.connected ? <AlertTriangle size={10} /> : <XCircle size={10} />}
-            {service.connected
-              ? service.modelLoaded ? `Servicio activo · ${service.workers?.length ?? 0} worker(s)` : `Servicio degradado: ${service.modelError ?? 'modelo no cargado'}`
-              : `Servicio desconectado${service.error ? `: ${service.error}` : ''}`}
+            {!service.connected
+              ? `Servicio desconectado${service.error ? `: ${service.error}` : ''}`
+              : service.modelLoaded
+                ? `Servicio activo · ${service.workersRunning ?? service.workers?.length ?? 0} worker(s)`
+                : service.dependenciesLoaded === false
+                  ? 'Degradado: dependencias no cargadas'
+                  : `Degradado: ${service.modelError ?? 'modelo no cargado'}`}
           </span>
         )}
         <div className="flex-1" />
@@ -431,6 +458,36 @@ export function AnalyticsPage() {
       {!serviceConfigured && (
         <div className="px-3 py-2 rounded-lg bg-amber-900/20 border border-amber-700/40 text-amber-300 text-xs">
           Define <code className="font-mono">ANALYTICS_SECRET</code> en el API y en el contenedor analytics.
+        </div>
+      )}
+
+      {/* Panel de diagnóstico: se muestra sólo cuando el servicio está conectado
+          pero degradado (dependencias/modelo). Diferencia capas y sugiere acción,
+          sin toasts repetidos (el estado se refleja aquí, no en un toast por ciclo). */}
+      {service?.connected && !service.modelLoaded && (
+        <div className="px-3 py-2.5 rounded-lg bg-amber-900/15 border border-amber-700/40 text-xs space-y-1.5">
+          <div className="flex items-center gap-2 text-amber-300 font-medium">
+            <AlertTriangle size={13} /> Servicio analítico degradado
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-1 text-[11px]">
+            <StatusItem ok={service.connected} label="Servicio conectado" />
+            <StatusItem ok={service.dependenciesLoaded ?? undefined} label="Dependencias (cv2/onnx)" />
+            <StatusItem ok={service.modelLoaded} label="Modelo cargado" />
+            <StatusItem ok={(service.workersRunning ?? 0) > 0}
+              label={`Workers (${service.workersRunning ?? 0} ok / ${service.workersError ?? 0} err)`} />
+          </div>
+          {service.provider && <p className="text-surface-400">Provider: <span className="text-surface-200">{service.provider}</span></p>}
+          {(service.importError || service.modelError || service.configError) && (
+            <p className="text-red-400 break-words">
+              Último error: {service.importError || service.modelError || service.configError}
+            </p>
+          )}
+          {service.hint && (
+            <p className="text-amber-200 bg-amber-950/40 rounded px-2 py-1">💡 {service.hint}</p>
+          )}
+          {service.lastBootAt && (
+            <p className="text-surface-500 text-[10px]">Último intento de arranque: {new Date(service.lastBootAt).toLocaleString()}</p>
+          )}
         </div>
       )}
 
@@ -638,11 +695,15 @@ export function AnalyticsPage() {
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-semibold text-surface-200">Vista analítica en vivo</h2>
               <div className="flex-1" />
-              <select value={liveCameraId} onChange={e => setLiveCameraId(e.target.value)}
-                className="text-xs bg-surface-800 border border-surface-700 rounded px-2 py-1 text-surface-300">
-                <option value="">Elegir cámara con analítica…</option>
-                {enabledCameras.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
+              <SearchableCombobox
+                value={liveCameraId}
+                onChange={setLiveCameraId}
+                options={enabledCameras.map(c => ({ value: c.id, label: c.name }))}
+                emptyLabel="Elegir cámara con analítica…"
+                placeholder="Elegir cámara con analítica…"
+                searchPlaceholder="Buscar cámara…"
+                className="w-64"
+              />
             </div>
             <div className="rounded-lg overflow-hidden bg-black border border-surface-700 aspect-video flex items-center justify-center">
               {liveFrameUrl
@@ -705,7 +766,7 @@ export function AnalyticsPage() {
               <option value="">Todos los tipos</option>
               {Object.entries(TYPE_LABELS).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
             </select>
-            <button onClick={loadEvents} className="p-1.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300">
+            <button onClick={() => loadEvents()} className="p-1.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300">
               <RefreshCw size={12} className={clsx(eventsLoading && 'animate-spin')} />
             </button>
           </div>

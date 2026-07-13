@@ -149,6 +149,9 @@ export function LiveViewPage() {
   const hiddenSince    = useRef<number | null>(null)
   // Rate-limit per-camera 401 auto-restarts: timestamp of last restart per cameraId
   const lastRestartAt  = useRef<Record<string, number>>({})
+  // Backoff cuando se recibe STREAM_LIMIT_*: no reintentar esa cámara hasta este
+  // timestamp (ms). Evita que el heartbeat golpee el límite en cada ciclo.
+  const limitBackoffUntil = useRef<Record<string, number>>({})
   // Ref mirror of filteredCameras to avoid stale closures in heartbeat interval
   const filteredCamerasRef = useRef<Camera[]>([])
   // Coalescing queue for HLS_SESSION_EXPIRED: collects simultaneous 401s
@@ -422,6 +425,9 @@ export function LiveViewPage() {
   // Also reconciles state if any camera was stopped by backend idle cleanup.
   useEffect(() => {
     const interval = setInterval(() => {
+      // No enviar heartbeat con la pestaña oculta — evita polling en background
+      // que contribuye a la acumulación de sesiones y a los 429.
+      if (document.visibilityState === 'hidden') return
       const ids = filteredCamerasRef.current.map(c => c.id)
       sendHeartbeat(ids)
     }, 30_000)
@@ -483,6 +489,10 @@ export function LiveViewPage() {
   const loadStream = useCallback(async (camera: Camera): Promise<void> => {
     if (pendingStarts.current.has(camera.id)) return
 
+    // Backoff activo por límite de streams: no reintentar hasta que expire.
+    const backoffUntil = limitBackoffUntil.current[camera.id]
+    if (backoffUntil && Date.now() < backoffUntil) return
+
     // Block cameras with known bad health
     if (isBlockedByHealth(camera)) {
       const blockError: CameraPlaybackError =
@@ -510,8 +520,11 @@ export function LiveViewPage() {
       })
     } catch (err: any) {
       const body = err?.response?.data || {}
-      const code: string = body.error || ''
-      const rawMsg: string = body.message || body.error || ''
+      // El backend envía el error como { code, message } — antes se leía body.error
+      // (siempre undefined), por eso STREAM_LIMIT_GLOBAL caía en "Error desconocido"
+      // y el frontend seguía reintentando en cada heartbeat.
+      const code: string = body.code || body.error || ''
+      const rawMsg: string = body.message || body.code || body.error || ''
 
       if (code === 'STREAM_LIMIT_REACHED' || code === 'STREAM_LIMIT_GLOBAL') {
         await handleLimitHit(camera, body.current as number | undefined, body.max as number | undefined)
@@ -555,21 +568,26 @@ export function LiveViewPage() {
     const nonVisible = Array.from(activeSessions.current).filter(id => !visibleIds.has(id))
 
     if (nonVisible.length > 0) {
+      // Liberar sesiones no visibles resuelve el límite — limpiar backoff y reintentar
       await stopSessions(nonVisible)
       setStreams(prev => {
         const next = { ...prev }
         nonVisible.forEach(id => delete next[id])
         return next
       })
+      delete limitBackoffUntil.current[camera.id]
       pendingStarts.current.delete(camera.id)
       await loadStream(camera)
     } else {
+      // Nada que liberar: mostrar un error claro (no "desconocido") y aplicar
+      // backoff para no reintentar en cada heartbeat mientras persista el límite.
       const limitMsg = current !== undefined && max !== undefined
         ? `Límite de streams alcanzado (${current}/${max} activos)`
         : `Límite de streams alcanzado`
+      limitBackoffUntil.current[camera.id] = Date.now() + 15_000
       setStreamErrors(prev => ({
         ...prev,
-        [camera.id]: { code: 'UNKNOWN', message: limitMsg },
+        [camera.id]: { code: 'STREAM_LIMIT_REACHED', message: limitMsg },
       }))
       setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
     }

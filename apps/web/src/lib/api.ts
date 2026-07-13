@@ -45,6 +45,35 @@ export function dispatchAuthExpired() {
   window.dispatchEvent(new CustomEvent('visioncore:auth-expired'))
 }
 
+// ─── Deduplicación de toasts de error ─────────────────────────
+// Sin esto, una tormenta de requests fallidas (varias cámaras + heartbeat +
+// polling de analytics) genera decenas de toasts idénticos. Se muestra como
+// máximo un toast equivalente (mismo status+mensaje) cada TOAST_DEDUP_MS.
+const TOAST_DEDUP_MS = 30_000
+const lastToastAt = new Map<string, number>()
+
+function errorToastOnce(key: string, message: string) {
+  const now = Date.now()
+  const prev = lastToastAt.get(key) ?? 0
+  if (now - prev < TOAST_DEDUP_MS) return
+  lastToastAt.set(key, now)
+  // Limitar el tamaño del mapa (defensivo — claves acotadas por status+msg)
+  if (lastToastAt.size > 100) {
+    for (const [k, t] of lastToastAt.entries()) {
+      if (now - t > TOAST_DEDUP_MS) lastToastAt.delete(k)
+    }
+  }
+  toast.error(message, { id: key })
+}
+
+// Retry-After en segundos (o backoff por defecto) — usado por callers que
+// deciden reintentar (heartbeat de live view, polling). Se expone en el error.
+export function getRetryAfterMs(error: AxiosError, fallbackMs = 10_000): number {
+  const h = error.response?.headers?.['retry-after']
+  const sec = h ? Number(h) : NaN
+  return Number.isFinite(sec) && sec > 0 ? sec * 1000 : fallbackMs
+}
+
 // ─── Response interceptor: manejo de errores y refresh ───────
 api.interceptors.response.use(
   (response) => response,
@@ -78,9 +107,16 @@ api.interceptors.response.use(
       }
     }
 
-    if (error.response?.status !== 401 && !(error.response?.status === 429 && isAuthEndpoint) && !isToastSuppressed) {
+    const status = error.response?.status
+    // 429 en endpoints de streaming/polling: el caller aplica backoff con
+    // Retry-After; no mostrar toast (o a lo sumo uno deduplicado) para no inundar.
+    const isStreamLimit = url.includes('/start-stream') || url.includes('/live-view') || url.includes('/analytics')
+    const suppress429 = status === 429 && (isAuthEndpoint || isStreamLimit)
+
+    if (status !== 401 && !suppress429 && !isToastSuppressed) {
       const msg = error.response?.data?.message || 'Error de conexión'
-      toast.error(msg)
+      // Clave de deduplicación: status + mensaje (los toasts idénticos se colapsan)
+      errorToastOnce(`${status ?? 'net'}:${msg}`, msg)
     }
 
     return Promise.reject(error)

@@ -111,6 +111,101 @@ export function getSessionsForUser(userId: string): StreamSession[] {
   return Array.from(sessions.values()).filter(s => s.userId === userId)
 }
 
+// ─── Test seams ───────────────────────────────────────────────────────────────
+// Exclusivos para tests unitarios del ciclo de vida de sesiones (poblar el mapa
+// sin prisma/MediaMTX). No usar en runtime.
+export function __seedSessionForTest(s: {
+  cameraId: string; userId: string; viewId: string
+  streamType: 'sub' | 'main' | 'main_h264'; streamPath: string
+  startedAt: Date; lastHeartbeat: Date
+}): void {
+  sessions.set(sessionKey(s.userId, s.cameraId, s.streamType), { ...s })
+  if (s.streamType === 'sub') {
+    const vk = vKey(s.userId, s.viewId)
+    if (!viewCameras.has(vk)) viewCameras.set(vk, new Set())
+    viewCameras.get(vk)!.add(s.cameraId)
+  }
+}
+export function __setViewHeartbeatForTest(userId: string, viewId: string, at: Date): void {
+  viewHeartbeat.set(vKey(userId, viewId), at)
+}
+export function __resetSessionsForTest(): void {
+  sessions.clear()
+  viewCameras.clear()
+  viewHeartbeat.clear()
+}
+
+// ─── Purga liviana de sesiones vencidas ──────────────────────────────────────
+// El límite global (MAX_STREAMS_GLOBAL) se rechazaba contando TODAS las sesiones
+// en memoria, incluidas las que quedaron huérfanas por pestañas cerradas, recargas,
+// errores HLS o cambios de vista cuyo heartbeat ya venció. Eso hacía que sessions.size
+// llegara al tope sin que hubiera esa cantidad de cámaras realmente visibles.
+//
+// Esta función elimina de forma síncrona (sin tocar MediaMTX — de eso se encarga el
+// cron cleanupIdleSessions) las sesiones cuyo view o cuyo lastHeartbeat expiró, y se
+// llama ANTES de evaluar el límite global. Conserva sesiones main_h264 cuyo FFmpeg
+// siga vivo o con actividad reciente para no cortar transcodificaciones en curso.
+export function pruneStaleSessions(): number {
+  const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
+  let pruned = 0
+
+  for (const [key, session] of sessions.entries()) {
+    const vk = vKey(session.userId, session.viewId)
+    const hb = viewHeartbeat.get(vk)
+    const viewExpired    = !hb || hb < cutoff
+    const sessionExpired = session.lastHeartbeat < cutoff
+    if (!viewExpired && !sessionExpired) continue
+
+    if (session.streamType === 'main_h264') {
+      const ffmpegAlive    = isTranscodeProcessAlive(session.streamPath)
+      const lastActivity   = transcodeLastActivity.get(session.streamPath) ?? 0
+      const recentActivity = (Date.now() - lastActivity) < SUPERVISOR_GRACE_MS
+      // No cortar transcodificaciones vivas / recién usadas por heartbeats atrasados
+      if (ffmpegAlive || recentActivity) continue
+      stopTranscodeProcess(session.streamPath)
+      transcodeInFlight.delete(session.streamPath)
+      transcodeRestarts.delete(session.streamPath)
+      transcodeSourceInfo.delete(session.streamPath)
+      transcodeLastActivity.delete(session.streamPath)
+    }
+    if (session.streamType === 'sub') {
+      viewCameras.get(vk)?.delete(session.cameraId)
+    }
+    sessions.delete(key)
+    pruned++
+  }
+
+  // Limpiar mapas de views vencidos
+  for (const [vk, hb] of viewHeartbeat.entries()) {
+    if (hb < cutoff) {
+      viewCameras.delete(vk)
+      viewHeartbeat.delete(vk)
+    }
+  }
+
+  if (pruned > 0) console.info(`[stream-manager] pruned_stale_sessions count=${pruned}`)
+  return pruned
+}
+
+// Conteos actuales de streams — expuestos al frontend para que muestre "X/Y" en el
+// error de límite en vez de un mensaje genérico, y para el endpoint de diagnóstico.
+export interface StreamCounts {
+  currentGlobalStreams: number
+  maxGlobalStreams:     number
+  currentUserStreams:   number
+  maxUserStreams:       number
+}
+
+export function getStreamCounts(userId: string): StreamCounts {
+  const all = Array.from(sessions.values())
+  return {
+    currentGlobalStreams: all.length,
+    maxGlobalStreams:     MAX_STREAMS_GLOBAL,
+    currentUserStreams:   all.filter(s => s.userId === userId && s.streamType === 'sub').length,
+    maxUserStreams:       MAX_STREAMS_PER_USER,
+  }
+}
+
 // Tocar una sola sesión (backward compat para touch-stream endpoint individual)
 export function touchSession(userId: string, cameraId: string, streamType: 'sub' | 'main' | 'main_h264' = 'sub') {
   const key = sessionKey(userId, cameraId, streamType)
@@ -420,8 +515,10 @@ export async function startStream(
       return { hlsUrl: '', webrtcUrl: '', streamPath: '',
         error: { code: 'TRANSCODE_LIMIT_REACHED', message: `Límite de transcodificaciones alcanzado (máx ${MAX_TRANSCODE_SESSIONS})` } }
     }
+    if (sessions.size >= MAX_STREAMS_GLOBAL) pruneStaleSessions()
     if (sessions.size >= MAX_STREAMS_GLOBAL) {
-      return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado' } }
+      return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado', current: sessions.size, max: MAX_STREAMS_GLOBAL } as any }
     }
 
     // ── 4. Start new transcode with in-flight guard ──────────
@@ -574,8 +671,10 @@ export async function startStream(
     console.info(`[userLimit] reject reason=limit cameraId=${cameraId} current=${userSubSessions.length} max=${MAX_STREAMS_PER_USER}`)
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_REACHED', message: 'Límite de streams por usuario alcanzado', current: userSubSessions.length, max: MAX_STREAMS_PER_USER } as any }
   }
+  if (sessions.size >= MAX_STREAMS_GLOBAL) pruneStaleSessions()
   if (sessions.size >= MAX_STREAMS_GLOBAL) {
-    return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado' } }
+    return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+      error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado', current: sessions.size, max: MAX_STREAMS_GLOBAL } as any }
   }
 
   // ── Publish to MediaMTX ───────────────────────────────────────────────
@@ -933,6 +1032,40 @@ export function getAdminSessionsSummary(): Array<{
     startedAt:     s.startedAt,
     lastHeartbeat: s.lastHeartbeat,
   }))
+}
+
+// Diagnóstico de sesiones de streaming (para panel de diagnóstico del frontend).
+// Sin credenciales — solo identificadores y tiempos. Purga vencidas antes de listar
+// para reflejar el estado real (no las huérfanas ya expiradas).
+export function getSessionsDiagnostic(): {
+  counts: { total: number; maxGlobal: number; bySub: number; byMain: number; byMainH264: number }
+  sessions: Array<{
+    cameraId: string; userId: string; viewId: string; streamType: string
+    startedAt: Date; lastHeartbeat: Date; ageSec: number; idleSec: number
+  }>
+} {
+  pruneStaleSessions()
+  const now = Date.now()
+  const all = Array.from(sessions.values())
+  return {
+    counts: {
+      total:       all.length,
+      maxGlobal:   MAX_STREAMS_GLOBAL,
+      bySub:       all.filter(s => s.streamType === 'sub').length,
+      byMain:      all.filter(s => s.streamType === 'main').length,
+      byMainH264:  all.filter(s => s.streamType === 'main_h264').length,
+    },
+    sessions: all.map(s => ({
+      cameraId:      s.cameraId,
+      userId:        s.userId,
+      viewId:        s.viewId,
+      streamType:    s.streamType,
+      startedAt:     s.startedAt,
+      lastHeartbeat: s.lastHeartbeat,
+      ageSec:        Math.round((now - s.startedAt.getTime()) / 1000),
+      idleSec:       Math.round((now - s.lastHeartbeat.getTime()) / 1000),
+    })),
+  }
 }
 
 // Enhanced diagnostic for /api/live-view/transcodes — one entry per active FFmpeg process
