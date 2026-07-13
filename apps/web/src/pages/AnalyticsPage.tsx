@@ -87,6 +87,16 @@ interface ServiceStatus {
   modelLoaded?: boolean
   modelError?: string | null
   lastRefreshError?: string | null
+  // Diagnóstico granular del servicio analytics
+  dependenciesLoaded?: boolean | null
+  importError?: string | null
+  configError?: string | null
+  provider?: string | null
+  hint?: string | null
+  bootStartedAt?: string | null
+  lastBootAt?: string | null
+  workersRunning?: number
+  workersError?: number
   workers?: WorkerStatus[]
   error?: string
 }
@@ -114,6 +124,20 @@ const DEFAULT_CONFIG = (cameraId: string): AnalyticsConfig => ({
 })
 
 type Tab = 'config' | 'live' | 'events' | 'dashboard' | 'forensic'
+
+// Ítem de una capa del diagnóstico del servicio: ✓ ok, ✗ fallo, — desconocido.
+function StatusItem({ ok, label }: { ok?: boolean; label: string }) {
+  return (
+    <span className="flex items-center gap-1">
+      {ok === true
+        ? <CheckCircle2 size={11} className="text-green-400 flex-shrink-0" />
+        : ok === false
+          ? <XCircle size={11} className="text-red-400 flex-shrink-0" />
+          : <span className="text-surface-500">—</span>}
+      <span className="text-surface-300 truncate">{label}</span>
+    </span>
+  )
+}
 
 export function AnalyticsPage() {
   const navigate = useNavigate()
@@ -410,9 +434,13 @@ export function AnalyticsPage() {
                 ? 'border-amber-700/50 bg-amber-900/20 text-amber-400'
                 : 'border-red-700/50 bg-red-900/20 text-red-400')}>
             {service.connected && service.modelLoaded ? <CheckCircle2 size={10} /> : service.connected ? <AlertTriangle size={10} /> : <XCircle size={10} />}
-            {service.connected
-              ? service.modelLoaded ? `Servicio activo · ${service.workers?.length ?? 0} worker(s)` : `Servicio degradado: ${service.modelError ?? 'modelo no cargado'}`
-              : `Servicio desconectado${service.error ? `: ${service.error}` : ''}`}
+            {!service.connected
+              ? `Servicio desconectado${service.error ? `: ${service.error}` : ''}`
+              : service.modelLoaded
+                ? `Servicio activo · ${service.workersRunning ?? service.workers?.length ?? 0} worker(s)`
+                : service.dependenciesLoaded === false
+                  ? 'Degradado: dependencias no cargadas'
+                  : `Degradado: ${service.modelError ?? 'modelo no cargado'}`}
           </span>
         )}
         <div className="flex-1" />
@@ -430,6 +458,36 @@ export function AnalyticsPage() {
       {!serviceConfigured && (
         <div className="px-3 py-2 rounded-lg bg-amber-900/20 border border-amber-700/40 text-amber-300 text-xs">
           Define <code className="font-mono">ANALYTICS_SECRET</code> en el API y en el contenedor analytics.
+        </div>
+      )}
+
+      {/* Panel de diagnóstico: se muestra sólo cuando el servicio está conectado
+          pero degradado (dependencias/modelo). Diferencia capas y sugiere acción,
+          sin toasts repetidos (el estado se refleja aquí, no en un toast por ciclo). */}
+      {service?.connected && !service.modelLoaded && (
+        <div className="px-3 py-2.5 rounded-lg bg-amber-900/15 border border-amber-700/40 text-xs space-y-1.5">
+          <div className="flex items-center gap-2 text-amber-300 font-medium">
+            <AlertTriangle size={13} /> Servicio analítico degradado
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-1 text-[11px]">
+            <StatusItem ok={service.connected} label="Servicio conectado" />
+            <StatusItem ok={service.dependenciesLoaded ?? undefined} label="Dependencias (cv2/onnx)" />
+            <StatusItem ok={service.modelLoaded} label="Modelo cargado" />
+            <StatusItem ok={(service.workersRunning ?? 0) > 0}
+              label={`Workers (${service.workersRunning ?? 0} ok / ${service.workersError ?? 0} err)`} />
+          </div>
+          {service.provider && <p className="text-surface-400">Provider: <span className="text-surface-200">{service.provider}</span></p>}
+          {(service.importError || service.modelError || service.configError) && (
+            <p className="text-red-400 break-words">
+              Último error: {service.importError || service.modelError || service.configError}
+            </p>
+          )}
+          {service.hint && (
+            <p className="text-amber-200 bg-amber-950/40 rounded px-2 py-1">💡 {service.hint}</p>
+          )}
+          {service.lastBootAt && (
+            <p className="text-surface-500 text-[10px]">Último intento de arranque: {new Date(service.lastBootAt).toLocaleString()}</p>
+          )}
         </div>
       )}
 
