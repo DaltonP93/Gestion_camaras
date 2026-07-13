@@ -13,6 +13,7 @@ import toast from 'react-hot-toast'
 import { clsx } from 'clsx'
 import { api, apiGet, apiPut, resolveAssetUrl } from '@/lib/api'
 import { usePolling } from '@/hooks/usePolling'
+import { SearchableCombobox, type ComboOption } from '@/components/ui/SearchableCombobox'
 import { useCameraStore } from '@/stores/cameraStore'
 
 // ─── Tipos ────────────────────────────────────────────────────────────────
@@ -326,20 +327,29 @@ export function AnalyticsPage() {
       .map(c => ({ id: c.cameraId, name: cameras.find(x => x.id === c.cameraId)?.name ?? c.cameraId })),
     [configs, cameras])
 
+  // Opciones para el combobox buscable de cámaras (agrupadas por NVR, con canal
+  // y estado como texto buscable). Reemplaza el <select> nativo, inusable con 144.
+  const cameraOptions: ComboOption[] = useMemo(() =>
+    camerasByNvr.flatMap(({ nvr, cams }) => cams.map(c => ({
+      value: c.id,
+      label: c.name,
+      group: nvr.name,
+      sublabel: [c.channel != null ? `ch ${c.channel}` : '', c.online === false ? 'offline' : 'online']
+        .filter(Boolean).join(' · '),
+      badge: configs.get(c.id)?.enabled ? '● analítica activa' : undefined,
+      keywords: `${nvr.name} ${c.channel ?? ''}`,
+    }))),
+    [camerasByNvr, configs])
+
   const cameraSelect = (value: string, onChange: (v: string) => void, emptyLabel: string) => (
-    <select value={value} onChange={e => onChange(e.target.value)}
-      className="text-sm bg-surface-800 border border-surface-700 rounded-lg px-3 py-2 text-surface-200">
-      <option value="">{emptyLabel}</option>
-      {camerasByNvr.map(({ nvr, cams }) => (
-        <optgroup key={nvr.id} label={nvr.name}>
-          {cams.map(c => (
-            <option key={c.id} value={c.id}>
-              {c.name}{configs.get(c.id)?.enabled ? ' ● analítica activa' : ''}
-            </option>
-          ))}
-        </optgroup>
-      ))}
-    </select>
+    <SearchableCombobox
+      value={value}
+      onChange={onChange}
+      options={cameraOptions}
+      emptyLabel={emptyLabel}
+      placeholder={emptyLabel}
+      searchPlaceholder="Buscar por cámara, NVR o canal…"
+    />
   )
 
   const eventCard = (ev: AnalyticsEvent) => (
@@ -627,11 +637,15 @@ export function AnalyticsPage() {
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-semibold text-surface-200">Vista analítica en vivo</h2>
               <div className="flex-1" />
-              <select value={liveCameraId} onChange={e => setLiveCameraId(e.target.value)}
-                className="text-xs bg-surface-800 border border-surface-700 rounded px-2 py-1 text-surface-300">
-                <option value="">Elegir cámara con analítica…</option>
-                {enabledCameras.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
+              <SearchableCombobox
+                value={liveCameraId}
+                onChange={setLiveCameraId}
+                options={enabledCameras.map(c => ({ value: c.id, label: c.name }))}
+                emptyLabel="Elegir cámara con analítica…"
+                placeholder="Elegir cámara con analítica…"
+                searchPlaceholder="Buscar cámara…"
+                className="w-64"
+              />
             </div>
             <div className="rounded-lg overflow-hidden bg-black border border-surface-700 aspect-video flex items-center justify-center">
               {liveFrameUrl
