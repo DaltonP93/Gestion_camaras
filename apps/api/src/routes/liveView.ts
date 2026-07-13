@@ -2,7 +2,7 @@
 // Endpoint de viewport heartbeat: reconcilia cámaras visibles sin N llamadas individuales
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTranscodesDiagnostic } from '../services/stream-manager'
+import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTranscodesDiagnostic, getStreamCounts, getSessionsDiagnostic } from '../services/stream-manager'
 import { getFfmpegCapabilities, isTranscodingEnabled } from '../services/stream'
 
 const heartbeatSchema = z.object({
@@ -54,7 +54,16 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
     }
     server.log.info(logParts.join(' '))
 
-    return reply.send(result)
+    // Conteos actuales de streams — el frontend los usa para mostrar "X/Y" en el
+    // banner de límite alcanzado y decidir el backoff antes de reintentar.
+    return reply.send({ ...result, streamCounts: getStreamCounts(user.sub) })
+  })
+
+  // GET /api/live-view/sessions
+  // Diagnóstico de sesiones de streaming activas (sin credenciales). Purga las
+  // vencidas antes de listar para reflejar el estado real de MAX_STREAMS_GLOBAL.
+  server.get('/sessions', { preHandler: [server.authenticate] }, async (_request, reply) => {
+    return reply.send(getSessionsDiagnostic())
   })
 
   // GET /api/live-view/capabilities
