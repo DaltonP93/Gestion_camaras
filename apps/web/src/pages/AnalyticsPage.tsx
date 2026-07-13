@@ -195,7 +195,11 @@ export function AnalyticsPage() {
 
   const loadServiceStatus = async (signal?: AbortSignal) => {
     try { setService((await api.get<ServiceStatus>('/analytics/service-status', { signal })).data) }
-    catch (e: any) { if (e?.code !== 'ERR_CANCELED') setService({ connected: false, error: 'sin conexión' }) }
+    catch (e: any) {
+      if (e?.code === 'ERR_CANCELED') return
+      if (e?.response?.status === 429) throw e   // deja que usePolling aplique backoff
+      setService({ connected: false, error: 'sin conexión' })
+    }
   }
 
   const loadEvents = async (signal?: AbortSignal) => {
@@ -206,7 +210,13 @@ export function AnalyticsPage() {
         signal,
       })
       setEvents(res.data.events)
-    } catch { /* noop */ } finally { setEventsLoading(false) }
+    } catch (e: any) {
+      if (e?.code === 'ERR_CANCELED') return
+      // Re-lanzar 429 para que el poller respete Retry-After (si no, la tormenta
+      // seguiría en silencio porque el interceptor suprime el toast de /analytics).
+      if (e?.response?.status === 429) throw e
+      /* otros errores: silencioso */
+    } finally { setEventsLoading(false) }
   }
 
   const loadSummary = async () => {
@@ -229,14 +239,14 @@ export function AnalyticsPage() {
     } catch { /* noop */ } finally { setForensicLoading(false) }
   }
 
-  useEffect(() => { loadConfigs(); loadServiceStatus() }, [])
+  useEffect(() => { loadConfigs(); loadServiceStatus().catch(() => {}) }, [])
   useEffect(() => { if (tab === 'dashboard') loadSummary() }, [tab])
 
   // Eventos: polling secuencial (10 s) sólo en la pestaña activa. Pausa oculto,
   // backoff en 429, sin solapamiento. Reemplaza setInterval fijo.
   usePolling(loadEvents, { intervalMs: 10_000, enabled: tab === 'events' })
   // Refetch inmediato al cambiar el filtro (el polling maneja la recurrencia).
-  useEffect(() => { if (tab === 'events') loadEvents() }, [eventFilterType]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (tab === 'events') loadEvents().catch(() => {}) }, [eventFilterType]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Estado del servicio: polling secuencial (10 s) en pestañas que lo muestran.
   usePolling(loadServiceStatus, { intervalMs: 10_000, enabled: tab === 'live' || tab === 'config' })
@@ -252,7 +262,11 @@ export function AnalyticsPage() {
       if (liveFrameObjectUrlRef.current) URL.revokeObjectURL(liveFrameObjectUrlRef.current)
       liveFrameObjectUrlRef.current = url
       setLiveFrameUrl(url)
-    } catch { /* frame aún no disponible / cancelado */ }
+    } catch (e: any) {
+      if (e?.code === 'ERR_CANCELED') return
+      if (e?.response?.status === 429) throw e   // backoff en el poller
+      /* frame aún no disponible */
+    }
   }
   usePolling(fetchFrame, { intervalMs: 2_000, enabled: tab === 'live' && !!liveCameraId })
 
@@ -766,7 +780,7 @@ export function AnalyticsPage() {
               <option value="">Todos los tipos</option>
               {Object.entries(TYPE_LABELS).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
             </select>
-            <button onClick={() => loadEvents()} className="p-1.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300">
+            <button onClick={() => loadEvents().catch(() => {})} className="p-1.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300">
               <RefreshCw size={12} className={clsx(eventsLoading && 'animate-spin')} />
             </button>
           </div>
