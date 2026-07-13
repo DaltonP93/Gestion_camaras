@@ -12,6 +12,7 @@ import {
 import toast from 'react-hot-toast'
 import { clsx } from 'clsx'
 import { api, apiGet, apiPut, resolveAssetUrl } from '@/lib/api'
+import { usePolling } from '@/hooks/usePolling'
 import { useCameraStore } from '@/stores/cameraStore'
 
 // ─── Tipos ────────────────────────────────────────────────────────────────
@@ -167,19 +168,19 @@ export function AnalyticsPage() {
     } catch { /* toast global */ }
   }
 
-  const loadServiceStatus = async () => {
-    try { setService(await apiGet<ServiceStatus>('/analytics/service-status')) }
-    catch { setService({ connected: false, error: 'sin conexión' }) }
+  const loadServiceStatus = async (signal?: AbortSignal) => {
+    try { setService((await api.get<ServiceStatus>('/analytics/service-status', { signal })).data) }
+    catch (e: any) { if (e?.code !== 'ERR_CANCELED') setService({ connected: false, error: 'sin conexión' }) }
   }
 
-  const loadEvents = async () => {
+  const loadEvents = async (signal?: AbortSignal) => {
     setEventsLoading(true)
     try {
-      const res = await apiGet<{ events: AnalyticsEvent[] }>('/analytics/events', {
-        limit: 50,
-        ...(eventFilterType ? { type: eventFilterType } : {}),
+      const res = await api.get<{ events: AnalyticsEvent[] }>('/analytics/events', {
+        params: { limit: 50, ...(eventFilterType ? { type: eventFilterType } : {}) },
+        signal,
       })
-      setEvents(res.events)
+      setEvents(res.data.events)
     } catch { /* noop */ } finally { setEventsLoading(false) }
   }
 
@@ -206,41 +207,29 @@ export function AnalyticsPage() {
   useEffect(() => { loadConfigs(); loadServiceStatus() }, [])
   useEffect(() => { if (tab === 'dashboard') loadSummary() }, [tab])
 
-  // Eventos: auto-refresh cada 10 s mientras la pestaña está activa
-  useEffect(() => {
-    if (tab !== 'events') return
-    loadEvents()
-    const t = setInterval(loadEvents, 10_000)
-    return () => clearInterval(t)
-  }, [tab, eventFilterType])
+  // Eventos: polling secuencial (10 s) sólo en la pestaña activa. Pausa oculto,
+  // backoff en 429, sin solapamiento. Reemplaza setInterval fijo.
+  usePolling(loadEvents, { intervalMs: 10_000, enabled: tab === 'events' })
+  // Refetch inmediato al cambiar el filtro (el polling maneja la recurrencia).
+  useEffect(() => { if (tab === 'events') loadEvents() }, [eventFilterType]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Estado del servicio: refresh cada 10 s en las pestañas que lo muestran
-  useEffect(() => {
-    if (tab !== 'live' && tab !== 'config') return
-    const t = setInterval(loadServiceStatus, 10_000)
-    return () => clearInterval(t)
-  }, [tab])
+  // Estado del servicio: polling secuencial (10 s) en pestañas que lo muestran.
+  usePolling(loadServiceStatus, { intervalMs: 10_000, enabled: tab === 'live' || tab === 'config' })
 
-  // Vista en vivo: frame anotado cada 2 s (fetch con auth → objectURL)
-  useEffect(() => {
-    if (tab !== 'live' || !liveCameraId) return
-    let cancelled = false
-    const fetchFrame = async () => {
-      try {
-        const res = await api.get(`/analytics/live-frame/${liveCameraId}`, {
-          responseType: 'blob', timeout: 6_000,
-        })
-        if (cancelled) return
-        const url = URL.createObjectURL(res.data)
-        if (liveFrameObjectUrlRef.current) URL.revokeObjectURL(liveFrameObjectUrlRef.current)
-        liveFrameObjectUrlRef.current = url
-        setLiveFrameUrl(url)
-      } catch { /* frame aún no disponible */ }
-    }
-    fetchFrame()
-    const t = setInterval(fetchFrame, 2_000)
-    return () => { cancelled = true; clearInterval(t) }
-  }, [tab, liveCameraId])
+  // Vista en vivo: frame anotado cada 2 s (fetch con auth → objectURL).
+  const fetchFrame = async (signal?: AbortSignal) => {
+    if (!liveCameraId) return
+    try {
+      const res = await api.get(`/analytics/live-frame/${liveCameraId}`, {
+        responseType: 'blob', timeout: 6_000, signal,
+      })
+      const url = URL.createObjectURL(res.data)
+      if (liveFrameObjectUrlRef.current) URL.revokeObjectURL(liveFrameObjectUrlRef.current)
+      liveFrameObjectUrlRef.current = url
+      setLiveFrameUrl(url)
+    } catch { /* frame aún no disponible / cancelado */ }
+  }
+  usePolling(fetchFrame, { intervalMs: 2_000, enabled: tab === 'live' && !!liveCameraId })
 
   useEffect(() => () => {
     if (snapshotObjectUrlRef.current) URL.revokeObjectURL(snapshotObjectUrlRef.current)
@@ -705,7 +694,7 @@ export function AnalyticsPage() {
               <option value="">Todos los tipos</option>
               {Object.entries(TYPE_LABELS).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
             </select>
-            <button onClick={loadEvents} className="p-1.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300">
+            <button onClick={() => loadEvents()} className="p-1.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300">
               <RefreshCw size={12} className={clsx(eventsLoading && 'animate-spin')} />
             </button>
           </div>
