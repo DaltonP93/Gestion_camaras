@@ -533,13 +533,30 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // GET /api/analytics/live-frame/:cameraId — último frame anotado (JPEG)
+  // Contrato de estados (para que el frontend no trate "aún sin frame" como error):
+  //   200 image/jpeg  frame disponible
+  //   204 No Content  worker activo pero sin frame anotado todavía
+  //   404             cámara sin config de analítica / sin worker
+  //   409             analítica deshabilitada para esa cámara
+  //   503             servicio Analytics desconectado o arrancando
   server.get('/live-frame/:cameraId', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
     const { cameraId } = request.params as { cameraId: string }
+    // 409 si la analítica está deshabilitada para la cámara (evita polling inútil)
+    const cfg = await server.prisma.cameraAnalyticsConfig.findUnique({
+      where: { cameraId }, select: { enabled: true },
+    })
+    if (cfg && cfg.enabled === false) {
+      return reply.status(409).send({ message: 'Analítica deshabilitada para esta cámara' })
+    }
     try {
       const res = await fetch(`${ANALYTICS_URL}/frame/${encodeURIComponent(cameraId)}`, {
         signal: AbortSignal.timeout(4000),
       })
-      if (!res.ok) return reply.status(404).send({ message: 'Sin frame disponible' })
+      // Propagar el contrato del servicio Python tal cual (204/404/503)
+      if (res.status === 204) return reply.status(204).send()
+      if (res.status === 404) return reply.status(404).send({ message: 'Sin worker para esta cámara' })
+      if (res.status === 503) return reply.status(503).send({ message: 'Servicio de analítica arrancando' })
+      if (!res.ok) return reply.status(503).send({ message: 'Servicio de analítica no disponible' })
       const buf = Buffer.from(await res.arrayBuffer())
       return reply.header('Content-Type', 'image/jpeg').header('Cache-Control', 'no-store').send(buf)
     } catch {

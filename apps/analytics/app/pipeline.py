@@ -528,6 +528,9 @@ class PipelineManager:
         w = self.workers.get(camera_id)
         return w.last_annotated_jpeg if w else None
 
+    def has_worker(self, camera_id: str) -> bool:
+        return camera_id in self.workers
+
     def status(self) -> dict[str, Any]:
         with self.lock:
             meta = self.provider.metadata() if self.provider else None

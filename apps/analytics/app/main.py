@@ -156,10 +156,21 @@ def status():
 @app.get("/frame/{camera_id}")
 def frame(camera_id: str):
     """Último frame anotado (JPEG) del worker de esa cámara — alimenta la
-    'Vista analítica en vivo' del frontend vía proxy del API."""
+    'Vista analítica en vivo' del frontend vía proxy del API.
+
+    Contrato de estados (para no tratar 'aún sin frame' como error):
+      200 + image/jpeg  frame disponible
+      204 No Content    worker activo pero todavía sin frame anotado
+      404 Not Found     no hay worker para esa cámara (config deshabilitada, etc.)
+      503               el servicio aún no terminó de arrancar (sin manager)
+    """
     manager = STATE["manager"]
-    jpeg = manager.get_last_frame(camera_id) if manager else None
-    if not jpeg:
+    if manager is None:
+        return Response(status_code=503)
+    if not manager.has_worker(camera_id):
         return Response(status_code=404)
+    jpeg = manager.get_last_frame(camera_id)
+    if not jpeg:
+        return Response(status_code=204)  # worker activo, sin frame todavía
     return Response(content=jpeg, media_type="image/jpeg",
                     headers={"Cache-Control": "no-store"})

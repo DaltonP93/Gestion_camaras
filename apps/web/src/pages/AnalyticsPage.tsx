@@ -162,6 +162,7 @@ export function AnalyticsPage() {
   const [service, setService] = useState<ServiceStatus | null>(null)
   const [liveCameraId, setLiveCameraId] = useState<string>('')
   const [liveFrameUrl, setLiveFrameUrl] = useState<string | null>(null)
+  const [liveFrameMsg, setLiveFrameMsg] = useState<string | null>(null)
   const liveFrameObjectUrlRef = useRef<string | null>(null)
   // Guards de "una sola llamada en vuelo por recurso" — evitan que el botón
   // manual y el polling automático disparen la misma request en paralelo.
@@ -261,23 +262,41 @@ export function AnalyticsPage() {
   usePolling(loadServiceStatus, { intervalMs: 10_000, enabled: tab === 'live' || tab === 'config' })
 
   // Vista en vivo: frame anotado cada 2 s (fetch con auth → objectURL).
+  // Contrato: 200 jpeg · 204 esperando frame · 404 sin worker · 409 deshabilitada
+  // · 503 servicio arrancando. 204 NO es error → no ensucia la consola.
   const fetchFrame = async (signal?: AbortSignal) => {
     if (!liveCameraId) return
     try {
       const res = await api.get(`/analytics/live-frame/${liveCameraId}`, {
         responseType: 'blob', timeout: 6_000, signal,
+        // 2xx y 4xx/503 esperados se resuelven (no throw) para manejar el contrato
+        validateStatus: (s) => s === 200 || s === 204 || s === 404 || s === 409 || s === 503,
       })
-      const url = URL.createObjectURL(res.data)
-      if (liveFrameObjectUrlRef.current) URL.revokeObjectURL(liveFrameObjectUrlRef.current)
-      liveFrameObjectUrlRef.current = url
-      setLiveFrameUrl(url)
+      if (res.status === 200) {
+        const url = URL.createObjectURL(res.data)
+        if (liveFrameObjectUrlRef.current) URL.revokeObjectURL(liveFrameObjectUrlRef.current)
+        liveFrameObjectUrlRef.current = url
+        setLiveFrameUrl(url)
+        setLiveFrameMsg(null)
+        return
+      }
+      // Sin imagen aún: mostrar estado, sin marcar error rojo
+      setLiveFrameMsg(
+        res.status === 204 ? 'Esperando el primer frame anotado del worker…'
+        : res.status === 404 ? 'Sin worker de analítica para esta cámara todavía.'
+        : res.status === 409 ? 'La analítica está deshabilitada para esta cámara.'
+        : 'Servicio de analítica arrancando…')
     } catch (e: any) {
       if (e?.code === 'ERR_CANCELED') return
       if (e?.response?.status === 429) throw e   // backoff en el poller
-      /* frame aún no disponible */
+      setLiveFrameMsg('No se pudo obtener el frame.')
     }
   }
+  // Polling sólo en la pestaña En vivo, con una cámara seleccionada y worker
+  // no deshabilitado. Una sola request en vuelo (garantizado por usePolling).
   usePolling(fetchFrame, { intervalMs: 2_000, enabled: tab === 'live' && !!liveCameraId })
+  // Al cambiar de cámara: limpiar el frame anterior y el mensaje de estado.
+  useEffect(() => { setLiveFrameUrl(null); setLiveFrameMsg(null) }, [liveCameraId])
 
   useEffect(() => () => {
     if (snapshotObjectUrlRef.current) URL.revokeObjectURL(snapshotObjectUrlRef.current)
@@ -732,7 +751,7 @@ export function AnalyticsPage() {
               {liveFrameUrl
                 ? <img src={liveFrameUrl} alt="frame anotado" className="w-full h-full object-contain" />
                 : <p className="text-xs text-surface-600 px-4 text-center">
-                    {liveCameraId ? 'Esperando el primer frame anotado del worker…' : 'Selecciona una cámara con analítica habilitada'}
+                    {liveCameraId ? (liveFrameMsg ?? 'Esperando el primer frame anotado del worker…') : 'Selecciona una cámara con analítica habilitada'}
                   </p>}
             </div>
             <p className="text-[10px] text-surface-600">
