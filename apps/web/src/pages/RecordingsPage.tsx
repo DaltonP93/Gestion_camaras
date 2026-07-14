@@ -778,6 +778,16 @@ export function RecordingsPage() {
         const playhead = seekMs !== null
           ? new Date(Math.max(seekMs, new Date(target.startTime).getTime()))
           : earliest ? new Date(earliest.startTime) : new Date(camRecs[0].startTime)
+        // Deep link (Ver grabación desde un evento): activar el estado global de
+        // reproducción ANTES de iniciar el preview. Sin esto, startPreviewInSlot ve
+        // globalPlayingRef.current=false y nunca ejecuta play() → el video queda en
+        // 0:00. Se setea el ref de forma síncrona (no depender de que React confirme
+        // el estado) además de setGlobalPlaying para la UI.
+        if (seekMs !== null) {
+          globalPlayingRef.current = true
+          setGlobalPlaying(true)
+          console.info('[recordings-ui] recordings_deep_link_autoplay_armed')
+        }
         setTimeout(() => startPreviewInSlotRef.current(activeSlotIndex, target, playhead), 0)
       }
     }
@@ -1287,9 +1297,20 @@ export function RecordingsPage() {
       vid.src = streamUrl
       vid.playbackRate = globalPlaybackRateRef.current
       if (globalPlayingRef.current) {
-        vid.play()
-          .then(() => console.info(`[recordings-ui] preview_playing slot=${slotIndex} sessionId=${sessionId}`))
-          .catch((e: Error) => console.warn(`[recordings-ui] preview_play_rejected slot=${slotIndex} reason=${e.message}`))
+        // Intentar reproducir; si el media aún no está listo el play puede
+        // rechazar → reintentar una vez cuando dispare 'canplay'. Así el deep-link
+        // no queda en 0:00 esperando a que el estado global "arranque" solo.
+        const tryPlay = (phase: string) =>
+          vid.play()
+            .then(() => console.info(`[recordings-ui] recordings_deep_link_playing slot=${slotIndex} phase=${phase} sessionId=${sessionId}`))
+            .catch((e: Error) => {
+              console.warn(`[recordings-ui] recordings_deep_link_play_failed slot=${slotIndex} phase=${phase} reason=${e.message}`)
+              if (phase === 'immediate') {
+                const onCanPlay = () => { vid.removeEventListener('canplay', onCanPlay); if (globalPlayingRef.current) tryPlay('canplay') }
+                vid.addEventListener('canplay', onCanPlay)
+              }
+            })
+        tryPlay('immediate')
       }
 
       // Continuity timer: fires at expected clip end + safety margin even if
