@@ -71,13 +71,15 @@ const configSchema = z.object({
 
 const eventSchema = z.object({
   cameraId:   z.string().min(1),
-  type:       z.enum(['person', 'vehicle', 'zone_intrusion', 'line_crossing', 'loitering', 'occupancy_limit']),
+  type:       z.enum(['person', 'vehicle', 'zone_intrusion', 'line_crossing', 'loitering', 'occupancy_limit', 'zone_exit', 'zone_reminder']),
   className:  z.string().min(1).max(40),
   confidence: z.number().min(0).max(1),
   trackId:    z.number().int().optional(),
   zoneName:   z.string().max(60).optional(),
   direction:  z.enum(['in', 'out']).optional(),
   bboxes:     z.array(z.array(z.union([z.number(), z.string()]))).max(64).optional(),
+  // Correlaciona entrada/permanencia/salida de un mismo incidente de zona
+  incidentId: z.string().max(120).optional(),
   occurredAt: z.string().datetime(),
   // JPEG anotado (cajas dibujadas por supervision), base64 sin prefijo data:
   snapshotJpegBase64: z.string().max(4_000_000).optional(),
@@ -90,6 +92,9 @@ const ALERT_TYPE_BY_EVENT: Record<string, 'PERSON_DETECTED' | 'VEHICLE_DETECTED'
   line_crossing:   'LINE_CROSSING',
   loitering:       'LOITERING',
   occupancy_limit: 'OCCUPANCY_LIMIT',
+  // zone_reminder reutiliza el tipo de alerta de intrusión (marcado como recordatorio)
+  zone_reminder:   'ZONE_INTRUSION',
+  zone_exit:       'ZONE_INTRUSION',
 }
 
 // Defaults cuando la cámara no tiene alertConfig para ese tipo de evento
@@ -100,6 +105,10 @@ const ALERT_DEFAULTS: Record<string, { generateAlert: boolean; sendEmail: boolea
   line_crossing:   { generateAlert: false, sendEmail: false, severity: 'LOW' },
   loitering:       { generateAlert: true,  sendEmail: true,  severity: 'HIGH' },
   occupancy_limit: { generateAlert: true,  sendEmail: true,  severity: 'HIGH' },
+  // zone_exit: sólo traza, sin alerta. zone_reminder: alerta de recordatorio
+  // (por defecto sin email para no saturar; configurable por cámara).
+  zone_exit:       { generateAlert: false, sendEmail: false, severity: 'LOW' },
+  zone_reminder:   { generateAlert: true,  sendEmail: false, severity: 'MEDIUM' },
 }
 
 const CLASS_LABEL_ES: Record<string, string> = {
@@ -257,6 +266,8 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
           ? `Permanencia prolongada en zona "${body.zoneName ?? 'zona'}" de ${camera.name}`
         : body.type === 'occupancy_limit'
           ? `Aforo superado en zona "${body.zoneName ?? 'zona'}" de ${camera.name}`
+        : body.type === 'zone_reminder'
+          ? `Recordatorio: ${classLabel.toLowerCase()} sigue en zona "${body.zoneName ?? 'zona'}" de ${camera.name}`
         : body.type === 'line_crossing'
           ? `Cruce de línea "${body.zoneName ?? 'línea'}" (${body.direction === 'in' ? 'entrada' : 'salida'}) en ${camera.name}`
           : `${classLabel} detectada en ${camera.name} (${camera.nvr.name})`
@@ -306,6 +317,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         trackId:    body.trackId ?? null,
         zoneName:   body.zoneName ?? null,
         direction:  body.direction ?? null,
+        incidentId: body.incidentId ?? null,
         bboxes:     body.bboxes ?? undefined,
         snapshotUrl,
         alertId,
