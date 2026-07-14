@@ -183,6 +183,17 @@ class CameraWorker(threading.Thread):
         if ok:
             self.last_annotated_jpeg = jpeg.tobytes()
 
+    def _emit_zone_exits(self, now: float, schedule_ok: bool,
+                         annotated: np.ndarray, detections: sv.Detections) -> None:
+        """Barre salidas de zona (tracks ausentes > lost_grace) y emite zone_exit,
+        re-armando el incidente. Se llama tanto en frames con detecciones como
+        vacíos (si no, el último objeto que se va nunca cerraría su incidente)."""
+        for ev in self.zone_tracker.sweep_exits(now):
+            if schedule_ok:
+                self._post_event(ev["type"], "object", 0.0, annotated, detections,
+                                 track_id=int(ev["track_id"]), zone_name=ev["zone_name"],
+                                 incident_id=ev["incident_id"])
+
     # ── Publicación de eventos ────────────────────────────────────────────
     def _post_event(self, ev_type: str, class_name: str, confidence: float,
                     annotated: np.ndarray, detections: sv.Detections,
@@ -247,6 +258,11 @@ class CameraWorker(threading.Thread):
         annotated = self._annotate(frame, detections)
         self._store_live_frame(annotated)
         if len(detections) == 0:
+            # Aun sin detecciones hay que barrer salidas: si el último objeto se
+            # fue y los frames siguientes están vacíos, sin esto zone_exit nunca se
+            # emitiría y el incidente quedaría activo → una reaparición con el mismo
+            # tracker id se tomaría como el mismo ocupante en vez de una re-entrada.
+            self._emit_zone_exits(time.time(), self._schedule_ok(), annotated, detections)
             return
 
         schedule_ok = self._schedule_ok()
@@ -330,11 +346,7 @@ class CameraWorker(threading.Thread):
 
         # Salidas: tracks que dejaron de verse dentro de cualquier zona (con
         # tolerancia lost_grace) → zone_exit, re-armando para futuras entradas.
-        for ev in self.zone_tracker.sweep_exits(now):
-            if schedule_ok:
-                self._post_event(ev["type"], "object", 0.0, annotated, detections,
-                                 track_id=int(ev["track_id"]), zone_name=ev["zone_name"],
-                                 incident_id=ev["incident_id"])
+        self._emit_zone_exits(now, schedule_ok, annotated, detections)
 
     # ── Apertura de captura ───────────────────────────────────────────────
     def _open_capture(self) -> "cv2.VideoCapture | None":

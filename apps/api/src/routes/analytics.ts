@@ -466,32 +466,49 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     const zoneNames   = toArr(raw.zoneNames)
     const directions  = toArr(raw.directions).filter(d => d === 'in' || d === 'out')
 
-    // nvrIds → cameraIds (los eventos no guardan nvrId). Se une con cameraIds.
-    let cameraFilter = [...cameraIds]
+    // nvrIds → cameraIds (los eventos no guardan nvrId). NVR y cámara se
+    // INTERSECAN: elegir un NVR y luego una cámara dentro debe acotar a esa
+    // cámara, no devolver todo el NVR. (unión daría el NVR completo.)
+    let cameraFilter: string[] = []
     if (nvrIds.length > 0) {
       const nvrCams = await server.prisma.camera.findMany({
         where: { nvrId: { in: nvrIds } }, select: { id: true },
       })
-      cameraFilter = Array.from(new Set([...cameraFilter, ...nvrCams.map(c => c.id)]))
+      const nvrCamIds = nvrCams.map(c => c.id)
+      cameraFilter = cameraIds.length > 0
+        ? nvrCamIds.filter(id => cameraIds.includes(id))   // intersección
+        : nvrCamIds
+    } else {
+      cameraFilter = [...cameraIds]
     }
 
+    // Si se pidió filtro de cámara/NVR pero la intersección quedó vacía, el filtro
+    // sigue "activo": debe devolver 0 resultados, no todo (cameraId IN []).
+    const cameraFilterActive = nvrIds.length > 0 || cameraIds.length > 0
+
     const where: any = { occurredAt: { gte: from, lte: to } }
-    if (cameraFilter.length) where.cameraId = { in: cameraFilter }
-    if (types.length)        where.type      = { in: types }
-    if (classNames.length)   where.className = { in: classNames }
-    if (zoneNames.length)    where.zoneName  = { in: zoneNames }
-    if (directions.length)   where.direction = { in: directions }
+    if (cameraFilterActive) where.cameraId = { in: cameraFilter }
+    if (types.length)       where.type      = { in: types }
+    if (classNames.length)  where.className = { in: classNames }
+    if (zoneNames.length)   where.zoneName  = { in: zoneNames }
+    if (directions.length)  where.direction = { in: directions }
+
+    // Line counts: sólo si el filtro de tipo lo permite (sin filtro o incluye
+    // line_crossing). Si el usuario filtró por otro tipo, no filtrar líneas de él.
+    const includeLines = types.length === 0 || types.includes('line_crossing')
 
     const [byType, byCamera, byClass, totalEvents, lineCrossings] = await Promise.all([
       server.prisma.analyticsEvent.groupBy({ by: ['type'], where, _count: { _all: true } }),
       server.prisma.analyticsEvent.groupBy({ by: ['cameraId'], where, _count: { _all: true } }),
       server.prisma.analyticsEvent.groupBy({ by: ['className'], where, _count: { _all: true } }),
       server.prisma.analyticsEvent.count({ where }),
-      server.prisma.analyticsEvent.groupBy({
-        by: ['cameraId', 'zoneName', 'direction'],
-        where: { ...where, type: 'line_crossing' },
-        _count: { _all: true },
-      }),
+      includeLines
+        ? server.prisma.analyticsEvent.groupBy({
+            by: ['cameraId', 'zoneName', 'direction'],
+            where: { ...where, type: 'line_crossing' },
+            _count: { _all: true },
+          })
+        : Promise.resolve([] as any[]),
     ])
 
     const camIds = byCamera.map(c => c.cameraId)
@@ -518,7 +535,12 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     // (parametrizados — sin concatenar strings). date_trunc admite el nombre como
     // parámetro; 5min se calcula por epoch.
     const conds: Prisma.Sql[] = [Prisma.sql`"occurredAt" >= ${from}`, Prisma.sql`"occurredAt" <= ${to}`]
-    if (cameraFilter.length) conds.push(Prisma.sql`"cameraId" IN (${Prisma.join(cameraFilter)})`)
+    // Filtro de cámara activo con intersección vacía → FALSE (0 filas), no IN ()
+    if (cameraFilterActive) {
+      conds.push(cameraFilter.length
+        ? Prisma.sql`"cameraId" IN (${Prisma.join(cameraFilter)})`
+        : Prisma.sql`FALSE`)
+    }
     if (types.length)        conds.push(Prisma.sql`"type" IN (${Prisma.join(types)})`)
     if (classNames.length)   conds.push(Prisma.sql`"className" IN (${Prisma.join(classNames)})`)
     if (zoneNames.length)    conds.push(Prisma.sql`"zoneName" IN (${Prisma.join(zoneNames)})`)

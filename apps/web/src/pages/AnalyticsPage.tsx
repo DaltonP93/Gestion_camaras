@@ -338,7 +338,11 @@ export function AnalyticsPage() {
         setLiveFrameMsg(null)
         return
       }
-      // Sin imagen aún: mostrar estado, sin marcar error rojo
+      // Sin imagen (204/404/409/503): limpiar el frame anterior para que el
+      // render muestre el mensaje de estado y no una imagen vieja congelada
+      // (el render prioriza liveFrameUrl sobre el mensaje).
+      if (liveFrameObjectUrlRef.current) { URL.revokeObjectURL(liveFrameObjectUrlRef.current); liveFrameObjectUrlRef.current = null }
+      setLiveFrameUrl(null)
       setLiveFrameMsg(
         res.status === 204 ? 'Esperando el primer frame anotado del worker…'
         : res.status === 404 ? 'Sin worker de analítica para esta cámara todavía.'

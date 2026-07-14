@@ -76,6 +76,22 @@ class TestZoneIntrusionTracker(unittest.TestCase):
         self.assertEqual(self._types(evs), ["zone_reminder"])
         self.assertTrue(evs[0]["reminder"])
 
+    def test_sweep_cierra_incidente_sin_marcar_dentro(self):
+        # Simula el caso del frame vacío: tras entrar, no se vuelve a llamar
+        # mark_inside (no hay detecciones) → sweep_exits debe cerrar el incidente
+        # igual, y una reaparición posterior debe ser una NUEVA intrusión.
+        z = ZoneIntrusionTracker(lost_grace_sec=5)
+        e1 = z.mark_inside("cam1", "Zona1", 7, now=0.0)
+        inc1 = e1[0]["incident_id"]
+        # frames vacíos: sólo sweep, sin mark_inside
+        self.assertEqual(z.sweep_exits(now=3.0), [])       # dentro de tolerancia
+        exits = z.sweep_exits(now=6.0)                      # supera lost_grace
+        self.assertEqual(self._types(exits), ["zone_exit"])
+        self.assertEqual(z.active_incidents(), 0)
+        e2 = z.mark_inside("cam1", "Zona1", 7, now=10.0)   # reaparece
+        self.assertEqual(self._types(e2), ["zone_intrusion"])
+        self.assertNotEqual(e2[0]["incident_id"], inc1)
+
     def test_tracks_distintos_son_incidentes_independientes(self):
         z = ZoneIntrusionTracker(lost_grace_sec=5)
         a = z.mark_inside("cam1", "Zona1", 1, now=0.0)
