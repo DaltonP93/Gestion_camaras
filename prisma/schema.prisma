@@ -448,6 +448,7 @@ model AnalyticsEvent {
   trackId     Int?
   zoneName    String? // nombre de zona o de línea de conteo
   direction   String? // in | out (solo line_crossing)
+  incidentId  String? // correlaciona entrada/permanencia/salida de un incidente de zona
   // Cajas detectadas: [[x1,y1,x2,y2,conf,"clase"], ...] en píxeles del frame
   bboxes      Json?
   snapshotUrl String?
@@ -461,6 +462,7 @@ model AnalyticsEvent {
   @@index([className, occurredAt])
   @@index([zoneName, occurredAt])
   @@index([direction, occurredAt])
+  @@index([incidentId])
   @@map("analytics_events")
 }
 

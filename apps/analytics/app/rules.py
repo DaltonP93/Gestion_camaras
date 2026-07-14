@@ -82,6 +82,110 @@ def backoff_delay(failure_count: int, schedule: tuple[int, ...]) -> int:
 
 
 @dataclass
+class _ZoneOccupant:
+    incident_id: str
+    entered_at: float
+    last_seen: float
+    loitering_emitted: bool = False
+    last_reminder_at: float = 0.0
+
+
+class ZoneIntrusionTracker:
+    """Máquina de estado para deduplicar intrusiones de zona.
+
+    Clave: (camera_id, zone_name, track_id). Un objeto que ENTRA a una zona
+    genera UNA sola ``zone_intrusion`` (con incident_id). Mientras permanezca
+    dentro NO se repite; opcionalmente emite ``loitering`` tras ``loitering_sec``
+    y ``zone_reminder`` cada ``reminder_sec`` (marcado como recordatorio, no como
+    nueva intrusión). Sólo se re-arma después de SALIR.
+
+    La salida se detecta por ausencia: si un track deja de verse dentro de la zona
+    durante más de ``lost_grace_sec`` se considera que salió (tolerancia ante
+    pérdida momentánea del tracker para no reabrir el mismo incidente al instante).
+
+    Uso por frame:
+      for (zone, track) inside this frame: mark_inside(...)
+      events += sweep_exits(now)                 # una vez por frame
+    """
+
+    def __init__(self, lost_grace_sec: float = 5.0) -> None:
+        self._occ: dict[tuple[str, str, int], _ZoneOccupant] = {}
+        self._lost_grace = lost_grace_sec
+
+    @staticmethod
+    def _incident_id(camera_id: str, zone_name: str, track_id: int, entered_at: float) -> str:
+        return f"{camera_id}:{zone_name}:{track_id}:{int(entered_at * 1000)}"
+
+    def mark_inside(
+        self,
+        camera_id: str,
+        zone_name: str,
+        track_id: int,
+        now: float,
+        *,
+        loitering_sec: float | None = None,
+        reminder_sec: float | None = None,
+    ) -> list[dict]:
+        """Registra que (track) está dentro de (zone) en este frame.
+        Devuelve los eventos a emitir (0..2)."""
+        key = (camera_id, zone_name, track_id)
+        events: list[dict] = []
+        occ = self._occ.get(key)
+
+        if occ is None:
+            # outside → inside: nueva intrusión
+            incident_id = self._incident_id(camera_id, zone_name, track_id, now)
+            occ = _ZoneOccupant(incident_id=incident_id, entered_at=now, last_seen=now)
+            self._occ[key] = occ
+            events.append({
+                "type": "zone_intrusion", "camera_id": camera_id, "zone_name": zone_name,
+                "track_id": track_id, "incident_id": incident_id, "reminder": False,
+            })
+            return events
+
+        # Ya estaba dentro: refrescar last_seen, sin nueva intrusión
+        occ.last_seen = now
+        dwell = now - occ.entered_at
+
+        if loitering_sec is not None and not occ.loitering_emitted and dwell >= loitering_sec:
+            occ.loitering_emitted = True
+            events.append({
+                "type": "loitering", "camera_id": camera_id, "zone_name": zone_name,
+                "track_id": track_id, "incident_id": occ.incident_id, "reminder": False,
+                "dwell_sec": dwell,
+            })
+
+        if reminder_sec is not None and reminder_sec > 0:
+            base = occ.last_reminder_at or occ.entered_at
+            if now - base >= reminder_sec:
+                occ.last_reminder_at = now
+                events.append({
+                    "type": "zone_reminder", "camera_id": camera_id, "zone_name": zone_name,
+                    "track_id": track_id, "incident_id": occ.incident_id, "reminder": True,
+                    "dwell_sec": dwell,
+                })
+        return events
+
+    def sweep_exits(self, now: float) -> list[dict]:
+        """Emite ``zone_exit`` para ocupantes que no se vieron dentro de la zona
+        en más de ``lost_grace_sec`` y los remueve (re-arma para futuras entradas)."""
+        events: list[dict] = []
+        expired = [k for k, o in self._occ.items() if (now - o.last_seen) > self._lost_grace]
+        for key in expired:
+            occ = self._occ.pop(key)
+            camera_id, zone_name, track_id = key
+            events.append({
+                "type": "zone_exit", "camera_id": camera_id, "zone_name": zone_name,
+                "track_id": track_id, "incident_id": occ.incident_id, "reminder": False,
+                "dwell_sec": occ.last_seen - occ.entered_at,
+            })
+        return events
+
+    def active_incidents(self) -> int:
+        return len(self._occ)
+
+
+@dataclass
 class CircuitBreaker:
     """Circuit breaker por worker: tras `max_failures` fallos consecutivos se
     abre (disabled_due_errors). Un éxito lo resetea."""

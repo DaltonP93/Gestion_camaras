@@ -4,6 +4,7 @@
 // y endpoints de usuario para configuración por cámara y consulta de eventos.
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
+import { Prisma } from '@prisma/client'
 import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
@@ -71,13 +72,15 @@ const configSchema = z.object({
 
 const eventSchema = z.object({
   cameraId:   z.string().min(1),
-  type:       z.enum(['person', 'vehicle', 'zone_intrusion', 'line_crossing', 'loitering', 'occupancy_limit']),
+  type:       z.enum(['person', 'vehicle', 'zone_intrusion', 'line_crossing', 'loitering', 'occupancy_limit', 'zone_exit', 'zone_reminder']),
   className:  z.string().min(1).max(40),
   confidence: z.number().min(0).max(1),
   trackId:    z.number().int().optional(),
   zoneName:   z.string().max(60).optional(),
   direction:  z.enum(['in', 'out']).optional(),
   bboxes:     z.array(z.array(z.union([z.number(), z.string()]))).max(64).optional(),
+  // Correlaciona entrada/permanencia/salida de un mismo incidente de zona
+  incidentId: z.string().max(120).optional(),
   occurredAt: z.string().datetime(),
   // JPEG anotado (cajas dibujadas por supervision), base64 sin prefijo data:
   snapshotJpegBase64: z.string().max(4_000_000).optional(),
@@ -90,6 +93,9 @@ const ALERT_TYPE_BY_EVENT: Record<string, 'PERSON_DETECTED' | 'VEHICLE_DETECTED'
   line_crossing:   'LINE_CROSSING',
   loitering:       'LOITERING',
   occupancy_limit: 'OCCUPANCY_LIMIT',
+  // zone_reminder reutiliza el tipo de alerta de intrusión (marcado como recordatorio)
+  zone_reminder:   'ZONE_INTRUSION',
+  zone_exit:       'ZONE_INTRUSION',
 }
 
 // Defaults cuando la cámara no tiene alertConfig para ese tipo de evento
@@ -100,6 +106,10 @@ const ALERT_DEFAULTS: Record<string, { generateAlert: boolean; sendEmail: boolea
   line_crossing:   { generateAlert: false, sendEmail: false, severity: 'LOW' },
   loitering:       { generateAlert: true,  sendEmail: true,  severity: 'HIGH' },
   occupancy_limit: { generateAlert: true,  sendEmail: true,  severity: 'HIGH' },
+  // zone_exit: sólo traza, sin alerta. zone_reminder: alerta de recordatorio
+  // (por defecto sin email para no saturar; configurable por cámara).
+  zone_exit:       { generateAlert: false, sendEmail: false, severity: 'LOW' },
+  zone_reminder:   { generateAlert: true,  sendEmail: false, severity: 'MEDIUM' },
 }
 
 const CLASS_LABEL_ES: Record<string, string> = {
@@ -257,6 +267,8 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
           ? `Permanencia prolongada en zona "${body.zoneName ?? 'zona'}" de ${camera.name}`
         : body.type === 'occupancy_limit'
           ? `Aforo superado en zona "${body.zoneName ?? 'zona'}" de ${camera.name}`
+        : body.type === 'zone_reminder'
+          ? `Recordatorio: ${classLabel.toLowerCase()} sigue en zona "${body.zoneName ?? 'zona'}" de ${camera.name}`
         : body.type === 'line_crossing'
           ? `Cruce de línea "${body.zoneName ?? 'línea'}" (${body.direction === 'in' ? 'entrada' : 'salida'}) en ${camera.name}`
           : `${classLabel} detectada en ${camera.name} (${camera.nvr.name})`
@@ -306,6 +318,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         trackId:    body.trackId ?? null,
         zoneName:   body.zoneName ?? null,
         direction:  body.direction ?? null,
+        incidentId: body.incidentId ?? null,
         bboxes:     body.bboxes ?? undefined,
         snapshotUrl,
         alertId,
@@ -369,7 +382,8 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
   server.get('/events', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR', 'AUDITOR'])] }, async (request, reply) => {
     const q = request.query as {
       cameraId?: string; type?: string; className?: string
-      zoneName?: string; direction?: string
+      zoneName?: string; direction?: string; incidentId?: string
+      hasSnapshot?: string; order?: string; minConfidence?: string
       from?: string; to?: string; page?: string; limit?: string
     }
     const where: any = {}
@@ -378,6 +392,13 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     if (q.className) where.className = q.className
     if (q.zoneName) where.zoneName = { contains: q.zoneName, mode: 'insensitive' }
     if (q.direction) where.direction = q.direction
+    if (q.incidentId) where.incidentId = q.incidentId
+    // hasSnapshot=true → sólo eventos con imagen (para el módulo Snapshots)
+    if (q.hasSnapshot === 'true') where.snapshotUrl = { not: null }
+    if (q.minConfidence) {
+      const mc = parseFloat(q.minConfidence)
+      if (!isNaN(mc)) where.confidence = { gte: mc }
+    }
     if (q.from || q.to) {
       where.occurredAt = {}
       if (q.from) where.occurredAt.gte = new Date(q.from)
@@ -385,10 +406,11 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     }
     const page  = Math.max(1, parseInt(q.page ?? '1'))
     const limit = Math.min(200, Math.max(1, parseInt(q.limit ?? '50')))
+    const order: 'asc' | 'desc' = q.order === 'asc' ? 'asc' : 'desc'
 
     const [events, total] = await Promise.all([
       server.prisma.analyticsEvent.findMany({
-        where, orderBy: { occurredAt: 'desc' },
+        where, orderBy: { occurredAt: order },
         skip: (page - 1) * limit, take: limit,
       }),
       server.prisma.analyticsEvent.count({ where }),
@@ -414,22 +436,79 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     })
   })
 
-  // Resumen para dashboard: conteos por tipo y por cámara en un rango
+  // Resumen para dashboard GLOBAL, filtrable por múltiples dimensiones.
+  // Acepta arrays (repetidos ?x=a&x=b o separados por coma) validados con Zod.
+  // NO construye SQL con strings: usa where de Prisma y Prisma.sql/Prisma.join
+  // (todo parametrizado) para la serie temporal con granularidad + timezone.
   server.get('/summary', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
-    const q = request.query as { from?: string; to?: string }
-    const from = q.from ? new Date(q.from) : new Date(Date.now() - 24 * 60 * 60 * 1000)
-    const to   = q.to   ? new Date(q.to)   : new Date()
-    const where = { occurredAt: { gte: from, lte: to } }
+    const raw = request.query as Record<string, unknown>
+    const toArr = (v: unknown): string[] =>
+      v == null ? []
+      : (Array.isArray(v) ? v : [v]).flatMap(x => String(x).split(',')).map(s => s.trim()).filter(Boolean)
 
-    const [byType, byCamera, totalEvents, lineCrossings] = await Promise.all([
+    const opts = z.object({
+      from:        z.string().optional(),
+      to:          z.string().optional(),
+      granularity: z.enum(['5min', 'hour', 'day', 'week']).default('hour'),
+      timezone:    z.string().max(64).default('America/Asuncion'),
+    }).parse(raw)
+
+    const from = opts.from ? new Date(opts.from) : new Date(Date.now() - 24 * 60 * 60 * 1000)
+    const to   = opts.to   ? new Date(opts.to)   : new Date()
+    if (isNaN(from.getTime()) || isNaN(to.getTime()) || from >= to) {
+      return reply.status(400).send({ code: 'INVALID_RANGE', message: 'Rango de fechas inválido' })
+    }
+
+    const nvrIds      = toArr(raw.nvrIds)
+    const cameraIds   = toArr(raw.cameraIds)
+    const types       = toArr(raw.types)
+    const classNames  = toArr(raw.classNames)
+    const zoneNames   = toArr(raw.zoneNames)
+    const directions  = toArr(raw.directions).filter(d => d === 'in' || d === 'out')
+
+    // nvrIds → cameraIds (los eventos no guardan nvrId). NVR y cámara se
+    // INTERSECAN: elegir un NVR y luego una cámara dentro debe acotar a esa
+    // cámara, no devolver todo el NVR. (unión daría el NVR completo.)
+    let cameraFilter: string[] = []
+    if (nvrIds.length > 0) {
+      const nvrCams = await server.prisma.camera.findMany({
+        where: { nvrId: { in: nvrIds } }, select: { id: true },
+      })
+      const nvrCamIds = nvrCams.map(c => c.id)
+      cameraFilter = cameraIds.length > 0
+        ? nvrCamIds.filter(id => cameraIds.includes(id))   // intersección
+        : nvrCamIds
+    } else {
+      cameraFilter = [...cameraIds]
+    }
+
+    // Si se pidió filtro de cámara/NVR pero la intersección quedó vacía, el filtro
+    // sigue "activo": debe devolver 0 resultados, no todo (cameraId IN []).
+    const cameraFilterActive = nvrIds.length > 0 || cameraIds.length > 0
+
+    const where: any = { occurredAt: { gte: from, lte: to } }
+    if (cameraFilterActive) where.cameraId = { in: cameraFilter }
+    if (types.length)       where.type      = { in: types }
+    if (classNames.length)  where.className = { in: classNames }
+    if (zoneNames.length)   where.zoneName  = { in: zoneNames }
+    if (directions.length)  where.direction = { in: directions }
+
+    // Line counts: sólo si el filtro de tipo lo permite (sin filtro o incluye
+    // line_crossing). Si el usuario filtró por otro tipo, no filtrar líneas de él.
+    const includeLines = types.length === 0 || types.includes('line_crossing')
+
+    const [byType, byCamera, byClass, totalEvents, lineCrossings] = await Promise.all([
       server.prisma.analyticsEvent.groupBy({ by: ['type'], where, _count: { _all: true } }),
       server.prisma.analyticsEvent.groupBy({ by: ['cameraId'], where, _count: { _all: true } }),
+      server.prisma.analyticsEvent.groupBy({ by: ['className'], where, _count: { _all: true } }),
       server.prisma.analyticsEvent.count({ where }),
-      server.prisma.analyticsEvent.groupBy({
-        by: ['cameraId', 'zoneName', 'direction'],
-        where: { ...where, type: 'line_crossing' },
-        _count: { _all: true },
-      }),
+      includeLines
+        ? server.prisma.analyticsEvent.groupBy({
+            by: ['cameraId', 'zoneName', 'direction'],
+            where: { ...where, type: 'line_crossing' },
+            _count: { _all: true },
+          })
+        : Promise.resolve([] as any[]),
     ])
 
     const camIds = byCamera.map(c => c.cameraId)
@@ -437,14 +516,54 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       ? await server.prisma.camera.findMany({ where: { id: { in: camIds } }, select: { id: true, name: true } })
       : []
     const nameById = new Map(cams.map(c => [c.id, c.name]))
+    const countByType = new Map(byType.map(t => [t.type, t._count._all]))
+    const sum = (...keys: string[]) => keys.reduce((n, k) => n + (countByType.get(k) ?? 0), 0)
+
+    // KPIs derivados
+    const kpis = {
+      totalEvents,
+      persons:     sum('person'),
+      vehicles:    sum('vehicle'),
+      intrusions:  sum('zone_intrusion'),
+      loitering:   sum('loitering'),
+      occupancy:   sum('occupancy_limit'),
+      lineCrossings: sum('line_crossing'),
+      activeCameras: byCamera.length,
+    }
+
+    // Serie temporal con granularidad + timezone. Bucket y filtros vía Prisma.sql
+    // (parametrizados — sin concatenar strings). date_trunc admite el nombre como
+    // parámetro; 5min se calcula por epoch.
+    const conds: Prisma.Sql[] = [Prisma.sql`"occurredAt" >= ${from}`, Prisma.sql`"occurredAt" <= ${to}`]
+    // Filtro de cámara activo con intersección vacía → FALSE (0 filas), no IN ()
+    if (cameraFilterActive) {
+      conds.push(cameraFilter.length
+        ? Prisma.sql`"cameraId" IN (${Prisma.join(cameraFilter)})`
+        : Prisma.sql`FALSE`)
+    }
+    if (types.length)        conds.push(Prisma.sql`"type" IN (${Prisma.join(types)})`)
+    if (classNames.length)   conds.push(Prisma.sql`"className" IN (${Prisma.join(classNames)})`)
+    if (zoneNames.length)    conds.push(Prisma.sql`"zoneName" IN (${Prisma.join(zoneNames)})`)
+    if (directions.length)   conds.push(Prisma.sql`"direction" IN (${Prisma.join(directions)})`)
+    const whereSql = Prisma.join(conds, ' AND ')
+    const bucketExpr = opts.granularity === '5min'
+      ? Prisma.sql`to_timestamp(floor(extract(epoch from "occurredAt") / 300) * 300)`
+      : Prisma.sql`date_trunc(${opts.granularity}, "occurredAt" AT TIME ZONE ${opts.timezone})`
+    const series = await server.prisma.$queryRaw<{ bucket: Date; count: bigint }[]>(
+      Prisma.sql`SELECT ${bucketExpr} AS bucket, COUNT(*)::bigint AS count
+                 FROM "analytics_events" WHERE ${whereSql} GROUP BY 1 ORDER BY 1`
+    )
 
     return reply.send({
-      from: from.toISOString(), to: to.toISOString(), totalEvents,
+      from: from.toISOString(), to: to.toISOString(),
+      granularity: opts.granularity, timezone: opts.timezone,
+      filters: { nvrIds, cameraIds, types, classNames, zoneNames, directions },
+      kpis, totalEvents,
       byType:   byType.map(t => ({ type: t.type, count: t._count._all })),
+      byClass:  byClass.map(c => ({ className: c.className, count: c._count._all })).sort((a, b) => b.count - a.count),
       byCamera: byCamera
         .map(c => ({ cameraId: c.cameraId, cameraName: nameById.get(c.cameraId) ?? 'Desconocida', count: c._count._all }))
         .sort((a, b) => b.count - a.count),
-      // Conteos por línea de cruce: [{cameraName, lineName, direction, count}]
       lineCounts: lineCrossings.map(l => ({
         cameraId:   l.cameraId,
         cameraName: nameById.get(l.cameraId) ?? 'Desconocida',
@@ -452,13 +571,8 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
         direction:  l.direction ?? '—',
         count:      l._count._all,
       })),
-      // Eventos por hora (para el dashboard)
-      byHour: await server.prisma.$queryRaw<{ hour: Date; count: bigint }[]>`
-        SELECT date_trunc('hour', "occurredAt") AS hour, COUNT(*) AS count
-        FROM "analytics_events"
-        WHERE "occurredAt" >= ${from} AND "occurredAt" <= ${to}
-        GROUP BY 1 ORDER BY 1
-      `.then(rows => rows.map(r => ({ hour: r.hour.toISOString(), count: Number(r.count) }))),
+      // Serie temporal (reemplaza byHour; el frontend agrupa según granularity)
+      series: series.map(r => ({ bucket: r.bucket.toISOString(), count: Number(r.count) })),
     })
   })
 
@@ -521,13 +635,30 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // GET /api/analytics/live-frame/:cameraId — último frame anotado (JPEG)
+  // Contrato de estados (para que el frontend no trate "aún sin frame" como error):
+  //   200 image/jpeg  frame disponible
+  //   204 No Content  worker activo pero sin frame anotado todavía
+  //   404             cámara sin config de analítica / sin worker
+  //   409             analítica deshabilitada para esa cámara
+  //   503             servicio Analytics desconectado o arrancando
   server.get('/live-frame/:cameraId', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
     const { cameraId } = request.params as { cameraId: string }
+    // 409 si la analítica está deshabilitada para la cámara (evita polling inútil)
+    const cfg = await server.prisma.cameraAnalyticsConfig.findUnique({
+      where: { cameraId }, select: { enabled: true },
+    })
+    if (cfg && cfg.enabled === false) {
+      return reply.status(409).send({ message: 'Analítica deshabilitada para esta cámara' })
+    }
     try {
       const res = await fetch(`${ANALYTICS_URL}/frame/${encodeURIComponent(cameraId)}`, {
         signal: AbortSignal.timeout(4000),
       })
-      if (!res.ok) return reply.status(404).send({ message: 'Sin frame disponible' })
+      // Propagar el contrato del servicio Python tal cual (204/404/503)
+      if (res.status === 204) return reply.status(204).send()
+      if (res.status === 404) return reply.status(404).send({ message: 'Sin worker para esta cámara' })
+      if (res.status === 503) return reply.status(503).send({ message: 'Servicio de analítica arrancando' })
+      if (!res.ok) return reply.status(503).send({ message: 'Servicio de analítica no disponible' })
       const buf = Buffer.from(await res.arrayBuffer())
       return reply.header('Content-Type', 'image/jpeg').header('Cache-Control', 'no-store').send(buf)
     } catch {

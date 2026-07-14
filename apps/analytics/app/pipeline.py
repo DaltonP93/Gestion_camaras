@@ -16,7 +16,7 @@ from typing import Any
 from .config import settings, COCO_CLASS_IDS, CLASS_NAME_BY_ID, VEHICLE_CLASSES
 from .providers.base import Detection, DetectionProvider
 from .providers.factory import create_detection_provider
-from .rules import CooldownTracker, TrackDedup, CircuitBreaker, within_schedule, backoff_delay
+from .rules import CooldownTracker, TrackDedup, CircuitBreaker, ZoneIntrusionTracker, within_schedule, backoff_delay
 
 # Forzar transporte RTSP (TCP) y timeout ANTES de importar/usar cv2 — OpenCV lee
 # OPENCV_FFMPEG_CAPTURE_OPTIONS al construir cada VideoCapture. Sin esto FFmpeg
@@ -61,6 +61,10 @@ class CameraWorker(threading.Thread):
         self.cooldowns = CooldownTracker()
         self.dedup = TrackDedup()
         self.breaker = CircuitBreaker(max_failures=settings.rtsp_max_consecutive_failures)
+        # Deduplicación de intrusiones por (cameraId+zona+track): una intrusión al
+        # entrar, sin repetir mientras permanezca dentro; se re-arma al salir.
+        self.zone_tracker = ZoneIntrusionTracker(
+            lost_grace_sec=float(self.cam.get("zoneLostGraceSec", 5)))
         # Zonas / líneas materializadas al conocer el tamaño del frame
         self.zones: list[dict[str, Any]] = []
         self.zone_objects: list[sv.PolygonZone] = []
@@ -68,9 +72,6 @@ class CameraWorker(threading.Thread):
         self.lines: list[dict[str, Any]] = []
         self.line_objects: list[sv.LineZone] = []
         self.line_annotator: Any = None
-        # Loitering: (zona_idx, track_id) → epoch de entrada
-        self.zone_entry_at: dict[tuple[int, int], float] = {}
-        self.loitering_reported: set[tuple[int, int]] = set()
         self.frame_size: tuple[int, int] | None = None
         # Estado observable
         self.status = "starting"
@@ -182,11 +183,22 @@ class CameraWorker(threading.Thread):
         if ok:
             self.last_annotated_jpeg = jpeg.tobytes()
 
+    def _emit_zone_exits(self, now: float, schedule_ok: bool,
+                         annotated: np.ndarray, detections: sv.Detections) -> None:
+        """Barre salidas de zona (tracks ausentes > lost_grace) y emite zone_exit,
+        re-armando el incidente. Se llama tanto en frames con detecciones como
+        vacíos (si no, el último objeto que se va nunca cerraría su incidente)."""
+        for ev in self.zone_tracker.sweep_exits(now):
+            if schedule_ok:
+                self._post_event(ev["type"], "object", 0.0, annotated, detections,
+                                 track_id=int(ev["track_id"]), zone_name=ev["zone_name"],
+                                 incident_id=ev["incident_id"])
+
     # ── Publicación de eventos ────────────────────────────────────────────
     def _post_event(self, ev_type: str, class_name: str, confidence: float,
                     annotated: np.ndarray, detections: sv.Detections,
                     track_id: int | None = None, zone_name: str | None = None,
-                    direction: str | None = None) -> None:
+                    direction: str | None = None, incident_id: str | None = None) -> None:
         ok, jpeg = cv2.imencode(".jpg", self._resize_for_jpeg(annotated),
                                 [cv2.IMWRITE_JPEG_QUALITY, settings.snapshot_jpeg_quality])
         snapshot_b64 = base64.b64encode(jpeg.tobytes()).decode() if ok else None
@@ -203,6 +215,7 @@ class CameraWorker(threading.Thread):
             "confidence": round(float(confidence), 3),
             "trackId": int(track_id) if track_id is not None else None,
             "zoneName": zone_name, "direction": direction, "bboxes": bboxes,
+            "incidentId": incident_id,
             "occurredAt": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z",
             "snapshotJpegBase64": snapshot_b64,
         }
@@ -245,6 +258,11 @@ class CameraWorker(threading.Thread):
         annotated = self._annotate(frame, detections)
         self._store_live_frame(annotated)
         if len(detections) == 0:
+            # Aun sin detecciones hay que barrer salidas: si el último objeto se
+            # fue y los frames siguientes están vacíos, sin esto zone_exit nunca se
+            # emitiría y el incidente quedaría activo → una reaparición con el mismo
+            # tracker id se tomaría como el mismo ocupante en vez de una re-entrada.
+            self._emit_zone_exits(time.time(), self._schedule_ok(), annotated, detections)
             return
 
         schedule_ok = self._schedule_ok()
@@ -280,12 +298,16 @@ class CameraWorker(threading.Thread):
                                  track_id=int(tid) if tid is not None else None,
                                  zone_name=ln["name"], direction=direction)
 
-        # 3) Zonas: intrusión + permanencia (loitering) + aforo (occupancy)
+        # 3) Zonas: intrusión (deduplicada por máquina de estado) + permanencia +
+        #    salida + aforo. Un objeto que permanece dentro NO repite intrusión;
+        #    sólo se re-arma tras salir (sweep_exits por ausencia del track).
         now = time.time()
+        camera_id = str(self.cam["cameraId"])
         for zi, (z, zobj) in enumerate(zip(self.zones, self.zone_objects)):
             zone_classes = set(z.get("classes") or self.cam["classes"])
             inside = zone_inside[zi]
-            inside_tids: set[int] = set()
+            loitering_sec = z.get("loiteringSec")
+            reminder_sec = z.get("reminderSec")
             for i, is_in in enumerate(inside):
                 if not is_in:
                     continue
@@ -293,26 +315,27 @@ class CameraWorker(threading.Thread):
                 if cname not in zone_classes:
                     continue
                 tid = detections.tracker_id[i] if detections.tracker_id is not None else None
+                conf = float(detections.confidence[i])
 
-                if schedule_ok and self._cooldown_ok(f"zone|{z['name']}|{cname}", "zone_intrusion"):
-                    self._post_event("zone_intrusion", cname, float(detections.confidence[i]),
-                                     annotated, detections,
-                                     track_id=int(tid) if tid is not None else None, zone_name=z["name"])
+                if tid is None:
+                    # Sin tracker: no se puede deduplicar por objeto → cooldown clásico
+                    if schedule_ok and self._cooldown_ok(f"zone|{z['name']}|{cname}", "zone_intrusion"):
+                        self._post_event("zone_intrusion", cname, conf, annotated, detections,
+                                         zone_name=z["name"])
+                    continue
 
-                loitering_sec = z.get("loiteringSec")
-                if loitering_sec and tid is not None:
-                    tkey = (zi, int(tid))
-                    inside_tids.add(int(tid))
-                    entered = self.zone_entry_at.setdefault(tkey, now)
-                    if now - entered >= loitering_sec and tkey not in self.loitering_reported:
-                        self.loitering_reported.add(tkey)
-                        if schedule_ok:
-                            self._post_event("loitering", cname, float(detections.confidence[i]),
-                                             annotated, detections, track_id=int(tid), zone_name=z["name"])
-
-            for tkey in [k for k in self.zone_entry_at if k[0] == zi and k[1] not in inside_tids]:
-                self.zone_entry_at.pop(tkey, None)
-                self.loitering_reported.discard(tkey)
+                zone_events = self.zone_tracker.mark_inside(
+                    camera_id, z["name"], int(tid), now,
+                    loitering_sec=float(loitering_sec) if loitering_sec else None,
+                    reminder_sec=float(reminder_sec) if reminder_sec else None,
+                )
+                for ev in zone_events:
+                    # loitering/reminder respetan horario; la traza de intrusión también
+                    if not schedule_ok:
+                        continue
+                    self._post_event(ev["type"], cname, conf, annotated, detections,
+                                     track_id=int(tid), zone_name=z["name"],
+                                     incident_id=ev["incident_id"])
 
             occupancy_limit = z.get("occupancyLimit")
             occ = self.zone_occupancy.get(z["name"], 0)
@@ -320,6 +343,10 @@ class CameraWorker(threading.Thread):
                 if self._cooldown_ok(f"occupancy|{z['name']}", "occupancy_limit"):
                     self._post_event("occupancy_limit", "person", 1.0,
                                      annotated, detections, zone_name=z["name"])
+
+        # Salidas: tracks que dejaron de verse dentro de cualquier zona (con
+        # tolerancia lost_grace) → zone_exit, re-armando para futuras entradas.
+        self._emit_zone_exits(now, schedule_ok, annotated, detections)
 
     # ── Apertura de captura ───────────────────────────────────────────────
     def _open_capture(self) -> "cv2.VideoCapture | None":
@@ -512,6 +539,9 @@ class PipelineManager:
     def get_last_frame(self, camera_id: str) -> bytes | None:
         w = self.workers.get(camera_id)
         return w.last_annotated_jpeg if w else None
+
+    def has_worker(self, camera_id: str) -> bool:
+        return camera_id in self.workers
 
     def status(self) -> dict[str, Any]:
         with self.lock:

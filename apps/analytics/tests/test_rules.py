@@ -8,8 +8,98 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # apps/analytics
 
 from app.rules import (  # noqa: E402
-    CooldownTracker, TrackDedup, CircuitBreaker, within_schedule, backoff_delay,
+    CooldownTracker, TrackDedup, CircuitBreaker, ZoneIntrusionTracker,
+    within_schedule, backoff_delay,
 )
+
+
+class TestZoneIntrusionTracker(unittest.TestCase):
+    def _types(self, events):
+        return [e["type"] for e in events]
+
+    def test_una_sola_intrusion_mientras_permanece_dentro(self):
+        # Un auto entra y permanece 5 minutos → UNA intrusión, no una por frame.
+        z = ZoneIntrusionTracker(lost_grace_sec=5)
+        first = z.mark_inside("cam1", "Zona1", 7, now=0.0)
+        self.assertEqual(self._types(first), ["zone_intrusion"])
+        incident = first[0]["incident_id"]
+        # 300 s adentro, un frame por segundo → sin nuevas intrusiones
+        for t in range(1, 301):
+            evs = z.mark_inside("cam1", "Zona1", 7, now=float(t))
+            self.assertEqual(evs, [])
+        self.assertEqual(z.active_incidents(), 1)
+        # mismo incidente durante toda la permanencia
+        self.assertEqual(incident, "cam1:Zona1:7:0")
+
+    def test_salida_y_reentrada_generan_incidentes_distintos(self):
+        z = ZoneIntrusionTracker(lost_grace_sec=5)
+        e1 = z.mark_inside("cam1", "Zona1", 7, now=0.0)
+        inc1 = e1[0]["incident_id"]
+        # deja de verse → tras lost_grace se emite zone_exit
+        exits = z.sweep_exits(now=6.0)
+        self.assertEqual(self._types(exits), ["zone_exit"])
+        self.assertEqual(exits[0]["incident_id"], inc1)
+        self.assertEqual(z.active_incidents(), 0)
+        # vuelve a entrar → NUEVA intrusión con incidente distinto
+        e2 = z.mark_inside("cam1", "Zona1", 7, now=100.0)
+        self.assertEqual(self._types(e2), ["zone_intrusion"])
+        self.assertNotEqual(e2[0]["incident_id"], inc1)
+
+    def test_no_sale_por_perdida_breve_del_track(self):
+        # El track desaparece 3 s (< lost_grace=5) y vuelve → NO se re-arma:
+        # sigue siendo el mismo incidente, sin nueva intrusión.
+        z = ZoneIntrusionTracker(lost_grace_sec=5)
+        e1 = z.mark_inside("cam1", "Zona1", 7, now=0.0)
+        inc1 = e1[0]["incident_id"]
+        self.assertEqual(z.sweep_exits(now=3.0), [])   # aún dentro de la tolerancia
+        again = z.mark_inside("cam1", "Zona1", 7, now=3.5)
+        self.assertEqual(again, [])                     # sin nueva intrusión
+        self.assertEqual(z.active_incidents(), 1)
+        # y el incidente sigue siendo el mismo
+        self.assertEqual(inc1, "cam1:Zona1:7:0")
+
+    def test_loitering_una_vez_tras_dwell(self):
+        z = ZoneIntrusionTracker(lost_grace_sec=5)
+        z.mark_inside("cam1", "Zona1", 7, now=0.0, loitering_sec=60)
+        # antes de 60 s: nada
+        self.assertEqual(z.mark_inside("cam1", "Zona1", 7, now=30.0, loitering_sec=60), [])
+        # a los 60 s: loitering una sola vez
+        evs = z.mark_inside("cam1", "Zona1", 7, now=60.0, loitering_sec=60)
+        self.assertEqual(self._types(evs), ["loitering"])
+        self.assertEqual(z.mark_inside("cam1", "Zona1", 7, now=90.0, loitering_sec=60), [])
+
+    def test_recordatorio_periodico_marcado_como_reminder(self):
+        z = ZoneIntrusionTracker(lost_grace_sec=5)
+        z.mark_inside("cam1", "Zona1", 7, now=0.0, reminder_sec=120)
+        self.assertEqual(z.mark_inside("cam1", "Zona1", 7, now=60.0, reminder_sec=120), [])
+        evs = z.mark_inside("cam1", "Zona1", 7, now=120.0, reminder_sec=120)
+        self.assertEqual(self._types(evs), ["zone_reminder"])
+        self.assertTrue(evs[0]["reminder"])
+
+    def test_sweep_cierra_incidente_sin_marcar_dentro(self):
+        # Simula el caso del frame vacío: tras entrar, no se vuelve a llamar
+        # mark_inside (no hay detecciones) → sweep_exits debe cerrar el incidente
+        # igual, y una reaparición posterior debe ser una NUEVA intrusión.
+        z = ZoneIntrusionTracker(lost_grace_sec=5)
+        e1 = z.mark_inside("cam1", "Zona1", 7, now=0.0)
+        inc1 = e1[0]["incident_id"]
+        # frames vacíos: sólo sweep, sin mark_inside
+        self.assertEqual(z.sweep_exits(now=3.0), [])       # dentro de tolerancia
+        exits = z.sweep_exits(now=6.0)                      # supera lost_grace
+        self.assertEqual(self._types(exits), ["zone_exit"])
+        self.assertEqual(z.active_incidents(), 0)
+        e2 = z.mark_inside("cam1", "Zona1", 7, now=10.0)   # reaparece
+        self.assertEqual(self._types(e2), ["zone_intrusion"])
+        self.assertNotEqual(e2[0]["incident_id"], inc1)
+
+    def test_tracks_distintos_son_incidentes_independientes(self):
+        z = ZoneIntrusionTracker(lost_grace_sec=5)
+        a = z.mark_inside("cam1", "Zona1", 1, now=0.0)
+        b = z.mark_inside("cam1", "Zona1", 2, now=0.0)
+        self.assertEqual(self._types(a), ["zone_intrusion"])
+        self.assertEqual(self._types(b), ["zone_intrusion"])
+        self.assertNotEqual(a[0]["incident_id"], b[0]["incident_id"])
+        self.assertEqual(z.active_incidents(), 2)
 
 
 class TestCooldown(unittest.TestCase):
