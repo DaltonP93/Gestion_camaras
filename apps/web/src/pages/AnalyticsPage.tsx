@@ -7,7 +7,8 @@ import { useNavigate } from 'react-router-dom'
 import {
   Activity, Loader2, Save, Trash2, Play, RefreshCw, Plus,
   Settings, MonitorPlay, ListVideo, BarChart3, SearchCode,
-  CheckCircle2, XCircle, AlertTriangle,
+  CheckCircle2, XCircle, AlertTriangle, Image as ImageIcon,
+  ChevronLeft, ChevronRight, X, Download, Film,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { clsx } from 'clsx'
@@ -58,15 +59,23 @@ interface AnalyticsEvent {
   confidence: number
   zoneName: string | null
   direction: string | null
+  trackId: number | null
+  incidentId: string | null
   snapshotUrl: string | null
   occurredAt: string
 }
 interface Summary {
   totalEvents: number
+  granularity: string
+  kpis: {
+    totalEvents: number; persons: number; vehicles: number; intrusions: number
+    loitering: number; occupancy: number; lineCrossings: number; activeCameras: number
+  }
   byType: { type: string; count: number }[]
+  byClass: { className: string; count: number }[]
   byCamera: { cameraId: string; cameraName: string; count: number }[]
   lineCounts: { cameraId: string; cameraName: string; lineName: string; direction: string; count: number }[]
-  byHour: { hour: string; count: number }[]
+  series: { bucket: string; count: number }[]
 }
 interface WorkerStatus {
   cameraId: string
@@ -109,8 +118,19 @@ const TYPE_LABELS: Record<string, string> = {
   person: 'Persona', vehicle: 'Vehículo',
   zone_intrusion: 'Intrusión en zona', line_crossing: 'Cruce de línea',
   loitering: 'Permanencia', occupancy_limit: 'Aforo superado',
+  zone_exit: 'Salida de zona', zone_reminder: 'Recordatorio de zona',
 }
-const EVENT_TYPES = Object.keys(TYPE_LABELS)
+// Tipos que el usuario puede configurar como alerta (excluye los derivados de la
+// máquina de estado de zona, que se emiten automáticamente).
+const EVENT_TYPES = ['person', 'vehicle', 'zone_intrusion', 'line_crossing', 'loitering', 'occupancy_limit']
+
+// Presets de rango temporal para el Dashboard (desde ahora hacia atrás).
+const RANGE_PRESETS: { key: string; label: string; ms: number }[] = [
+  { key: '1h',  label: 'Última hora', ms: 60 * 60 * 1000 },
+  { key: '24h', label: 'Últimas 24 h', ms: 24 * 60 * 60 * 1000 },
+  { key: '7d',  label: '7 días',  ms: 7 * 24 * 60 * 60 * 1000 },
+  { key: '30d', label: '30 días', ms: 30 * 24 * 60 * 60 * 1000 },
+]
 const WORKER_STATUS_LABELS: Record<string, string> = {
   running: 'En ejecución', starting: 'Iniciando', rtsp_down: 'Stream caído',
   reconnecting: 'Reconectando', disabled_due_errors: 'Deshabilitado por errores',
@@ -123,7 +143,7 @@ const DEFAULT_CONFIG = (cameraId: string): AnalyticsConfig => ({
   zones: null, lines: null, alertConfig: null,
 })
 
-type Tab = 'config' | 'live' | 'events' | 'dashboard' | 'forensic'
+type Tab = 'config' | 'live' | 'events' | 'dashboard' | 'snapshots' | 'forensic'
 
 // Ítem de una capa del diagnóstico del servicio: ✓ ok, ✗ fallo, — desconocido.
 function StatusItem({ ok, label }: { ok?: boolean; label: string }) {
@@ -173,9 +193,19 @@ export function AnalyticsPage() {
   const [eventsLoading, setEventsLoading] = useState(false)
   const [eventFilterType, setEventFilterType] = useState('')
   const [summary, setSummary] = useState<Summary | null>(null)
+  const [summaryLoading, setSummaryLoading] = useState(false)
+  // Filtros del Dashboard (global, desacoplado de la pestaña Eventos)
+  const [dash, setDash] = useState({ range: '24h', granularity: 'hour', nvrId: '', cameraId: '', type: '' })
   const [forensic, setForensic] = useState<AnalyticsEvent[]>([])
   const [forensicLoading, setForensicLoading] = useState(false)
   const [ff, setFf] = useState({ cameraId: '', type: '', className: '', zoneName: '', direction: '', from: '', to: '' })
+  // Snapshots (módulo independiente)
+  const [snaps, setSnaps] = useState<AnalyticsEvent[]>([])
+  const [snapsLoading, setSnapsLoading] = useState(false)
+  const [snapsPage, setSnapsPage] = useState(1)
+  const [snapsTotal, setSnapsTotal] = useState(0)
+  const [snapFilter, setSnapFilter] = useState({ cameraId: '', type: '', order: 'desc' })
+  const [snapModal, setSnapModal] = useState<AnalyticsEvent | null>(null)
 
   useEffect(() => { loadCameras(); loadNVRs() }, [])
 
@@ -227,7 +257,32 @@ export function AnalyticsPage() {
   }
 
   const loadSummary = async () => {
-    try { setSummary(await apiGet<Summary>('/analytics/summary')) } catch { /* noop */ }
+    setSummaryLoading(true)
+    try {
+      const preset = RANGE_PRESETS.find(p => p.key === dash.range) ?? RANGE_PRESETS[1]
+      const params: Record<string, string> = {
+        from: new Date(Date.now() - preset.ms).toISOString(),
+        to: new Date().toISOString(),
+        granularity: dash.granularity,
+      }
+      if (dash.nvrId) params.nvrIds = dash.nvrId
+      if (dash.cameraId) params.cameraIds = dash.cameraId
+      if (dash.type) params.types = dash.type
+      setSummary(await apiGet<Summary>('/analytics/summary', params))
+    } catch { /* noop */ } finally { setSummaryLoading(false) }
+  }
+
+  const loadSnapshots = async (page = snapsPage) => {
+    setSnapsLoading(true)
+    try {
+      const params: Record<string, string | number> = { hasSnapshot: 'true', page, limit: 24, order: snapFilter.order }
+      if (snapFilter.cameraId) params.cameraId = snapFilter.cameraId
+      if (snapFilter.type) params.type = snapFilter.type
+      const res = await apiGet<{ events: AnalyticsEvent[]; total: number }>('/analytics/events', params)
+      setSnaps(res.events)
+      setSnapsTotal(res.total)
+      setSnapsPage(page)
+    } catch { /* noop */ } finally { setSnapsLoading(false) }
   }
 
   const runForensic = async () => {
@@ -250,7 +305,10 @@ export function AnalyticsPage() {
   // (tab inicial 'config' ya lo tiene habilitado) — no llamarlo acá también,
   // evitaría la doble request inicial simultánea.
   useEffect(() => { loadConfigs() }, [])
-  useEffect(() => { if (tab === 'dashboard') loadSummary() }, [tab])
+  // Dashboard: recarga al entrar y al cambiar cualquier filtro.
+  useEffect(() => { if (tab === 'dashboard') loadSummary() }, [tab, dash]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Snapshots: recarga al entrar y al cambiar filtros (vuelve a la página 1).
+  useEffect(() => { if (tab === 'snapshots') loadSnapshots(1) }, [tab, snapFilter]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Eventos: polling secuencial (10 s) sólo en la pestaña activa. Pausa oculto,
   // backoff en 429, sin solapamiento. Reemplaza setInterval fijo.
@@ -407,6 +465,9 @@ export function AnalyticsPage() {
     }))),
     [camerasByNvr, configs])
 
+  const nvrOptions: ComboOption[] = useMemo(() =>
+    nvrs.map(n => ({ value: n.id, label: n.name })), [nvrs])
+
   const cameraSelect = (value: string, onChange: (v: string) => void, emptyLabel: string) => (
     <SearchableCombobox
       value={value}
@@ -455,10 +516,11 @@ export function AnalyticsPage() {
     { key: 'live',      label: 'En vivo',       icon: <MonitorPlay size={13} /> },
     { key: 'events',    label: 'Eventos',       icon: <ListVideo size={13} /> },
     { key: 'dashboard', label: 'Dashboard',     icon: <BarChart3 size={13} /> },
+    { key: 'snapshots', label: 'Snapshots',     icon: <ImageIcon size={13} /> },
     { key: 'forensic',  label: 'Forense',       icon: <SearchCode size={13} /> },
   ]
 
-  const maxHour = Math.max(1, ...(summary?.byHour ?? []).map(h => h.count))
+  const maxSeries = Math.max(1, ...(summary?.series ?? []).map(h => h.count))
 
   return (
     <div className="p-4 space-y-3 overflow-y-auto h-full">
@@ -819,47 +881,121 @@ export function AnalyticsPage() {
       )}
 
       {/* ══ DASHBOARD ══════════════════════════════════════════════════ */}
+      {/* Global y filtrable — desacoplado de la pestaña Eventos (carga propia). */}
       {tab === 'dashboard' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-4 space-y-2">
-            <h2 className="text-sm font-semibold text-surface-200">Últimas 24 horas</h2>
-            <p className="text-2xl font-bold text-surface-100">{summary?.totalEvents ?? 0} <span className="text-xs font-normal text-surface-500">eventos</span></p>
-            <div className="flex flex-wrap gap-2">
-              {(summary?.byType ?? []).map(t => (
-                <span key={t.type} className="text-xs px-2 py-0.5 rounded bg-surface-800 text-surface-400 border border-surface-700">
-                  {TYPE_LABELS[t.type] ?? t.type}: <b className="text-surface-200">{t.count}</b>
-                </span>
+        <div className="space-y-4">
+          {/* Barra de filtros */}
+          <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-3 flex flex-wrap items-center gap-2">
+            <div className="flex rounded-lg overflow-hidden border border-surface-700">
+              {RANGE_PRESETS.map(p => (
+                <button key={p.key} onClick={() => setDash(d => ({ ...d, range: p.key }))}
+                  className={clsx('text-xs px-2.5 py-1.5', dash.range === p.key ? 'bg-brand-800/60 text-brand-200' : 'bg-surface-800 text-surface-400 hover:text-surface-200')}>
+                  {p.label}
+                </button>
               ))}
             </div>
-            {/* Eventos por hora — barras simples */}
-            <div className="pt-2 space-y-0.5">
-              {(summary?.byHour ?? []).map(h => (
-                <div key={h.hour} className="flex items-center gap-2">
-                  <span className="text-[9px] text-surface-500 font-mono w-10 flex-shrink-0">
-                    {new Date(h.hour).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })}
-                  </span>
-                  <div className="flex-1 bg-surface-800 rounded h-3 overflow-hidden">
-                    <div className="h-full bg-brand-600/70 rounded" style={{ width: `${(h.count / maxHour) * 100}%` }} />
-                  </div>
-                  <span className="text-[9px] text-surface-400 w-8 text-right">{h.count}</span>
-                </div>
-              ))}
-              {(summary?.byHour ?? []).length === 0 && <p className="text-xs text-surface-600">Sin datos.</p>}
-            </div>
+            <select value={dash.granularity} onChange={e => setDash(d => ({ ...d, granularity: e.target.value }))}
+              className="text-xs bg-surface-800 border border-surface-700 rounded px-2 py-1.5 text-surface-300">
+              <option value="5min">5 min</option>
+              <option value="hour">Hora</option>
+              <option value="day">Día</option>
+              <option value="week">Semana</option>
+            </select>
+            <div className="w-48"><SearchableCombobox value={dash.nvrId} onChange={v => setDash(d => ({ ...d, nvrId: v }))}
+              options={nvrOptions} emptyLabel="Todos los NVRs" placeholder="Todos los NVRs" searchPlaceholder="Buscar NVR…" /></div>
+            <div className="w-56"><SearchableCombobox value={dash.cameraId} onChange={v => setDash(d => ({ ...d, cameraId: v }))}
+              options={cameraOptions} emptyLabel="Todas las cámaras" placeholder="Todas las cámaras" searchPlaceholder="Buscar cámara…" /></div>
+            <select value={dash.type} onChange={e => setDash(d => ({ ...d, type: e.target.value }))}
+              className="text-xs bg-surface-800 border border-surface-700 rounded px-2 py-1.5 text-surface-300">
+              <option value="">Todos los eventos</option>
+              {EVENT_TYPES.map(t => <option key={t} value={t}>{TYPE_LABELS[t]}</option>)}
+            </select>
+            <div className="flex-1" />
+            <button onClick={() => loadSummary()} className="p-1.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300">
+              <RefreshCw size={12} className={clsx(summaryLoading && 'animate-spin')} />
+            </button>
           </div>
 
-          <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-4 space-y-3">
-            <div>
+          {/* KPIs */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+            {([
+              ['Eventos', summary?.kpis.totalEvents], ['Personas', summary?.kpis.persons],
+              ['Vehículos', summary?.kpis.vehicles], ['Intrusiones', summary?.kpis.intrusions],
+              ['Permanencias', summary?.kpis.loitering], ['Aforo', summary?.kpis.occupancy],
+              ['Cruces', summary?.kpis.lineCrossings], ['Cámaras', summary?.kpis.activeCameras],
+            ] as const).map(([label, val]) => (
+              <div key={label} className="rounded-xl border border-surface-700 bg-surface-800/50 p-3">
+                <p className="text-[10px] text-surface-500 uppercase tracking-wide">{label}</p>
+                <p className="text-xl font-bold text-surface-100">{val ?? 0}</p>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {/* Serie temporal */}
+            <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-4 space-y-1 lg:col-span-2">
+              <h2 className="text-sm font-semibold text-surface-200 mb-2">Evolución temporal ({dash.granularity})</h2>
+              <div className="flex items-end gap-0.5 h-40">
+                {(summary?.series ?? []).map(s => (
+                  <div key={s.bucket} title={`${new Date(s.bucket).toLocaleString('es')}: ${s.count}`}
+                    className="flex-1 min-w-[2px] bg-brand-600/70 rounded-t hover:bg-brand-500"
+                    style={{ height: `${Math.max(2, (s.count / maxSeries) * 100)}%` }} />
+                ))}
+              </div>
+              {(summary?.series ?? []).length === 0 && <p className="text-xs text-surface-600">Sin datos en el rango.</p>}
+            </div>
+
+            {/* Distribución por tipo */}
+            <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-4 space-y-1">
+              <h2 className="text-sm font-semibold text-surface-200 mb-1">Distribución por tipo</h2>
+              {(summary?.byType ?? []).map(t => {
+                const max = Math.max(1, ...(summary?.byType ?? []).map(x => x.count))
+                return (
+                  <div key={t.type} className="flex items-center gap-2 text-xs py-0.5">
+                    <span className="text-surface-300 w-28 truncate">{TYPE_LABELS[t.type] ?? t.type}</span>
+                    <div className="flex-1 bg-surface-800 rounded h-3 overflow-hidden">
+                      <div className="h-full bg-brand-600/70" style={{ width: `${(t.count / max) * 100}%` }} />
+                    </div>
+                    <span className="text-surface-200 font-mono w-10 text-right">{t.count}</span>
+                  </div>
+                )
+              })}
+              {(summary?.byType ?? []).length === 0 && <p className="text-xs text-surface-600">Sin datos.</p>}
+            </div>
+
+            {/* Distribución por clase */}
+            <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-4 space-y-1">
+              <h2 className="text-sm font-semibold text-surface-200 mb-1">Distribución por clase</h2>
+              {(summary?.byClass ?? []).map(c => {
+                const max = Math.max(1, ...(summary?.byClass ?? []).map(x => x.count))
+                return (
+                  <div key={c.className} className="flex items-center gap-2 text-xs py-0.5">
+                    <span className="text-surface-300 w-28 truncate">{CLASS_LABELS[c.className] ?? c.className}</span>
+                    <div className="flex-1 bg-surface-800 rounded h-3 overflow-hidden">
+                      <div className="h-full bg-emerald-600/70" style={{ width: `${(c.count / max) * 100}%` }} />
+                    </div>
+                    <span className="text-surface-200 font-mono w-10 text-right">{c.count}</span>
+                  </div>
+                )
+              })}
+              {(summary?.byClass ?? []).length === 0 && <p className="text-xs text-surface-600">Sin datos.</p>}
+            </div>
+
+            {/* Cámaras con más actividad */}
+            <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-4">
               <h2 className="text-sm font-semibold text-surface-200 mb-1">Cámaras con más actividad</h2>
-              {(summary?.byCamera ?? []).slice(0, 8).map((c, i) => (
+              {(summary?.byCamera ?? []).slice(0, 10).map((c, i) => (
                 <div key={c.cameraId} className="flex items-center gap-2 text-xs py-0.5">
                   <span className="text-surface-600 w-4">{i + 1}.</span>
                   <span className="text-surface-300 flex-1 truncate">{c.cameraName}</span>
                   <span className="text-surface-200 font-mono">{c.count}</span>
                 </div>
               ))}
+              {(summary?.byCamera ?? []).length === 0 && <p className="text-xs text-surface-600">Sin datos.</p>}
             </div>
-            <div>
+
+            {/* Conteos por línea */}
+            <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-4">
               <h2 className="text-sm font-semibold text-surface-200 mb-1">Conteos por línea (in/out)</h2>
               {(summary?.lineCounts ?? []).map((l, i) => (
                 <div key={i} className="flex items-center gap-2 text-xs py-0.5">
@@ -872,24 +1008,87 @@ export function AnalyticsPage() {
               {(summary?.lineCounts ?? []).length === 0 && <p className="text-xs text-surface-600">Sin cruces registrados.</p>}
             </div>
           </div>
+        </div>
+      )}
 
-          <div className="lg:col-span-2 rounded-xl border border-surface-700 bg-surface-800/50 p-4">
-            <h2 className="text-sm font-semibold text-surface-200 mb-2">Últimos snapshots</h2>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {events.filter(e => e.snapshotUrl).slice(0, 8).map(e => (
-                <button key={e.id} onClick={() => navigate(`/recordings?cameraId=${e.cameraId}&t=${encodeURIComponent(e.occurredAt)}`)}
-                  className="relative rounded-lg overflow-hidden border border-surface-700 group">
-                  <img src={resolveAssetUrl(e.snapshotUrl!) ?? undefined} alt="" className="w-full aspect-video object-cover" />
-                  <span className="absolute bottom-0 inset-x-0 bg-black/70 text-[9px] text-surface-300 px-1 py-0.5 truncate">
-                    {e.cameraName} · {TYPE_LABELS[e.type] ?? e.type}
-                  </span>
-                </button>
-              ))}
-            </div>
-            {events.filter(e => e.snapshotUrl).length === 0 && (
-              <p className="text-xs text-surface-600">Todavía no hay snapshots. (Este panel usa los eventos de la pestaña Eventos — abrila primero si está vacío.)</p>
-            )}
+      {/* ══ SNAPSHOTS ══════════════════════════════════════════════════ */}
+      {/* Módulo independiente: no depende de la pestaña Eventos (carga propia). */}
+      {tab === 'snapshots' && (
+        <div className="space-y-3">
+          <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-3 flex flex-wrap items-center gap-2">
+            {/* La cámara se busca por nombre o NVR en el combobox (agrupado por NVR). */}
+            <div className="w-64"><SearchableCombobox value={snapFilter.cameraId} onChange={v => setSnapFilter(f => ({ ...f, cameraId: v }))}
+              options={cameraOptions} emptyLabel="Todas las cámaras" placeholder="Todas las cámaras" searchPlaceholder="Buscar cámara o NVR…" /></div>
+            <select value={snapFilter.type} onChange={e => setSnapFilter(f => ({ ...f, type: e.target.value }))}
+              className="text-xs bg-surface-800 border border-surface-700 rounded px-2 py-1.5 text-surface-300">
+              <option value="">Todos los eventos</option>
+              {Object.entries(TYPE_LABELS).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+            <select value={snapFilter.order} onChange={e => setSnapFilter(f => ({ ...f, order: e.target.value }))}
+              className="text-xs bg-surface-800 border border-surface-700 rounded px-2 py-1.5 text-surface-300">
+              <option value="desc">Más recientes</option>
+              <option value="asc">Más antiguos</option>
+            </select>
+            <div className="flex-1" />
+            <span className="text-[10px] text-surface-500">{snapsTotal} snapshots</span>
+            <button onClick={() => loadSnapshots(snapsPage)} className="p-1.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300">
+              <RefreshCw size={12} className={clsx(snapsLoading && 'animate-spin')} />
+            </button>
           </div>
+
+          {snaps.length === 0
+            ? <p className="text-xs text-surface-600 py-10 text-center">{snapsLoading ? 'Cargando…' : 'Sin snapshots para estos filtros.'}</p>
+            : <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-2">
+                {snaps.map(e => (
+                  <button key={e.id} onClick={() => setSnapModal(e)}
+                    className="relative rounded-lg overflow-hidden border border-surface-700 group text-left">
+                    <img src={resolveAssetUrl(e.snapshotUrl!) ?? undefined} alt="" loading="lazy"
+                      className="w-full aspect-video object-cover bg-black" />
+                    <span className="absolute bottom-0 inset-x-0 bg-black/70 text-[9px] text-surface-300 px-1 py-0.5 truncate">
+                      {e.cameraName} · {TYPE_LABELS[e.type] ?? e.type}
+                    </span>
+                  </button>
+                ))}
+              </div>}
+
+          {/* Paginación */}
+          {snapsTotal > 24 && (
+            <div className="flex items-center justify-center gap-3 text-xs text-surface-400">
+              <button disabled={snapsPage <= 1} onClick={() => loadSnapshots(snapsPage - 1)}
+                className="p-1.5 rounded bg-surface-800 disabled:opacity-40 hover:bg-surface-700"><ChevronLeft size={14} /></button>
+              <span>Página {snapsPage} / {Math.max(1, Math.ceil(snapsTotal / 24))}</span>
+              <button disabled={snapsPage >= Math.ceil(snapsTotal / 24)} onClick={() => loadSnapshots(snapsPage + 1)}
+                className="p-1.5 rounded bg-surface-800 disabled:opacity-40 hover:bg-surface-700"><ChevronRight size={14} /></button>
+            </div>
+          )}
+
+          {/* Modal de imagen grande */}
+          {snapModal && (
+            <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setSnapModal(null)}>
+              <div className="bg-surface-900 border border-surface-700 rounded-xl max-w-4xl w-full overflow-hidden" onClick={e => e.stopPropagation()}>
+                <div className="flex items-center gap-2 px-4 py-2 border-b border-surface-800">
+                  <span className="text-sm text-surface-200 font-medium">{snapModal.cameraName}</span>
+                  <span className="text-xs text-surface-500">{snapModal.nvrName}</span>
+                  <div className="flex-1" />
+                  <button onClick={() => setSnapModal(null)} className="text-surface-400 hover:text-surface-200"><X size={16} /></button>
+                </div>
+                <img src={resolveAssetUrl(snapModal.snapshotUrl!) ?? undefined} alt="" className="w-full max-h-[60vh] object-contain bg-black" />
+                <div className="px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-surface-400">
+                  <span>{TYPE_LABELS[snapModal.type] ?? snapModal.type}</span>
+                  <span>Clase: {CLASS_LABELS[snapModal.className] ?? snapModal.className}</span>
+                  <span>Conf: {Math.round((snapModal.confidence ?? 0) * 100)}%</span>
+                  {snapModal.zoneName && <span>Zona: {snapModal.zoneName}</span>}
+                  {snapModal.trackId != null && <span>Track: {snapModal.trackId}</span>}
+                  <span>{new Date(snapModal.occurredAt).toLocaleString('es')}</span>
+                  <div className="flex-1" />
+                  <a href={resolveAssetUrl(snapModal.snapshotUrl!) ?? '#'} download
+                    className="flex items-center gap-1 text-brand-300 hover:text-brand-200"><Download size={12} /> Descargar</a>
+                  <button onClick={() => navigate(`/recordings?cameraId=${snapModal.cameraId}&t=${encodeURIComponent(snapModal.occurredAt)}`)}
+                    className="flex items-center gap-1 text-brand-300 hover:text-brand-200"><Film size={12} /> Ver grabación</button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
