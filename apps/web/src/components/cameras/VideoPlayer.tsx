@@ -8,6 +8,7 @@ import {
   WifiOff, Lock, Clock, Film, Server, Cpu,
 } from 'lucide-react'
 import { clsx } from 'clsx'
+import { hlsRetryDecision } from './hlsRetryPolicy'
 
 export type CameraPlaybackErrorCode =
   | 'NVR_OFFLINE'
@@ -262,27 +263,20 @@ export function VideoPlayer({
             const is404 = statusCode === 404
             const isTranscodedStream = streamTypeRef.current === 'main_h264'
             if (is500) console.warn('[VideoPlayer] HLS 500', { cameraId, isTranscoded: isTranscodedStream, details: data.details })
-            // Transcoded 500: retry 40×800ms ≈ 32s grace period while FFmpeg starts.
-            // Show "Preparando transcodificación..." in loading overlay during wait.
-            // Normal 500: fail immediately (source/muxer error, not a startup delay).
-            // Transcoded 404: retry 20×1000ms = 20s (publisher may still be connecting).
-            // Normal 404: 1 retry.
-            const maxRetries = is500
-              ? (isTranscodedStream ? 40 : 0)
-              : is404
-                ? (isTranscodedStream ? 20 : 1)
-                : 5
+            // Un 500 del substream normal suele ser MediaMTX iniciando la fuente
+            // (transitorio), NO un fallo definitivo. La política (pura, testeada en
+            // hlsRetryPolicy.ts) concede una ventana de preparación con backoff antes
+            // de declarar el fallo — evita el fallback prematuro a main_h264.
             setRetryCount((r) => {
-              if (r === 0 && is500 && isTranscodedStream) {
+              const decision = hlsRetryDecision(statusCode, isTranscodedStream, r)
+              if (decision.preparing) {
                 setTranscodeStartMsg(
-                  hasPlayedOnce.current
-                    ? 'Reconectando transcodificación...'
-                    : 'Preparando transcodificación...'
+                  isTranscodedStream
+                    ? (hasPlayedOnce.current ? 'Reconectando transcodificación...' : 'Preparando transcodificación...')
+                    : (hasPlayedOnce.current ? 'Reconectando stream…' : 'Preparando stream…')
                 )
-              } else if (r >= 5 && is500 && isTranscodedStream) {
-                setTranscodeStartMsg('Reconectando transcodificación...')
               }
-              if (r >= maxRetries) {
+              if (!decision.shouldRetry) {
                 setTranscodeStartMsg(null)
                 const err: CameraPlaybackError = {
                   code: errorCode,
@@ -298,11 +292,7 @@ export function VideoPlayer({
                 if (cameraId) onStreamError?.(cameraId, err)
                 return r
               }
-              const delay = is500 && isTranscodedStream ? 800
-                : is404 && isTranscodedStream ? 1000
-                : is404 ? 4000
-                : 3000 * (r + 1)
-              setTimeout(() => { if (hlsRef.current === hls) hls.startLoad() }, delay)
+              setTimeout(() => { if (hlsRef.current === hls) hls.startLoad() }, decision.delayMs)
               return r + 1
             })
           } else {
