@@ -163,6 +163,9 @@ export function AnalyticsPage() {
   const [liveCameraId, setLiveCameraId] = useState<string>('')
   const [liveFrameUrl, setLiveFrameUrl] = useState<string | null>(null)
   const liveFrameObjectUrlRef = useRef<string | null>(null)
+  // Guards de "una sola llamada en vuelo por recurso" — evitan que el botón
+  // manual y el polling automático disparen la misma request en paralelo.
+  const eventsInFlight = useRef(false)
 
   // Eventos / forense
   const [events, setEvents] = useState<AnalyticsEvent[]>([])
@@ -203,6 +206,9 @@ export function AnalyticsPage() {
   }
 
   const loadEvents = async (signal?: AbortSignal) => {
+    // Una sola carga de eventos en vuelo (botón manual + polling no se solapan).
+    if (eventsInFlight.current) return
+    eventsInFlight.current = true
     setEventsLoading(true)
     try {
       const res = await api.get<{ events: AnalyticsEvent[] }>('/analytics/events', {
@@ -216,7 +222,7 @@ export function AnalyticsPage() {
       // seguiría en silencio porque el interceptor suprime el toast de /analytics).
       if (e?.response?.status === 429) throw e
       /* otros errores: silencioso */
-    } finally { setEventsLoading(false) }
+    } finally { setEventsLoading(false); eventsInFlight.current = false }
   }
 
   const loadSummary = async () => {
@@ -239,7 +245,10 @@ export function AnalyticsPage() {
     } catch { /* noop */ } finally { setForensicLoading(false) }
   }
 
-  useEffect(() => { loadConfigs(); loadServiceStatus().catch(() => {}) }, [])
+  // Sólo cargar configs al montar. El estado del servicio lo trae usePolling
+  // (tab inicial 'config' ya lo tiene habilitado) — no llamarlo acá también,
+  // evitaría la doble request inicial simultánea.
+  useEffect(() => { loadConfigs() }, [])
   useEffect(() => { if (tab === 'dashboard') loadSummary() }, [tab])
 
   // Eventos: polling secuencial (10 s) sólo en la pestaña activa. Pausa oculto,

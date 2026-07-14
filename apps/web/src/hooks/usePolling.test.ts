@@ -75,6 +75,39 @@ describe('createSequentialPoller', () => {
     p.stop()
   })
 
+  // Contrato con los callbacks (punto D del review): el backoff SÓLO ocurre si el
+  // callback deja propagar el 429. Un callback que se lo traga (como hacían antes
+  // loadEvents/loadServiceStatus/fetchFrame) hace que el poller lo vea como éxito
+  // y siga en el intervalo normal — la tormenta continuaría en silencio.
+  it('callback que RE-LANZA 429 → el poller aplica backoff', async () => {
+    const err = { response: { status: 429, headers: { 'retry-after': '5' } } }
+    const fn = vi.fn().mockImplementation(async () => {
+      try { throw err } catch (e: any) {
+        if (e?.response?.status === 429) throw e   // como el fix: re-lanzar
+      }
+    })
+    const p = createSequentialPoller(fn, { intervalMs: 1000, retryAfterMs: () => 5000 })
+    p.start(); await flush()
+    expect(fn).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1000)         // backoff de 5s: aún no
+    expect(fn).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(fn).toHaveBeenCalledTimes(2)
+    p.stop()
+  })
+
+  it('callback que SE TRAGA el 429 → NO hay backoff (regresión del bug)', async () => {
+    const err = { response: { status: 429, headers: { 'retry-after': '5' } } }
+    const fn = vi.fn().mockImplementation(async () => {
+      try { throw err } catch { /* tragado — el poller lo ve como éxito */ }
+    })
+    const p = createSequentialPoller(fn, { intervalMs: 1000, retryAfterMs: () => 5000 })
+    p.start(); await flush()
+    await vi.advanceTimersByTimeAsync(1000)         // sin backoff → sigue a 1s
+    expect(fn).toHaveBeenCalledTimes(2)
+    p.stop()
+  })
+
   it('stop() cancela y no vuelve a ejecutar', async () => {
     const fn = vi.fn().mockResolvedValue(undefined)
     const p = createSequentialPoller(fn, { intervalMs: 1000 })
