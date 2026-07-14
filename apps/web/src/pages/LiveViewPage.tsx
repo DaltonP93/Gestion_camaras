@@ -311,6 +311,27 @@ export function LiveViewPage() {
         TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
         TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
         TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
+        // Límites de streams que también pueden llegar por el heartbeat (reconcileView)
+        STREAM_LIMIT_GLOBAL:     'STREAM_LIMIT_REACHED',
+        STREAM_LIMIT_REACHED:    'STREAM_LIMIT_REACHED',
+      }
+      // Límite de streams vía heartbeat: aplicar backoff (no reintentar en cada
+      // ciclo) y mostrar current/max si el backend los entrega.
+      if (err.code === 'STREAM_LIMIT_GLOBAL' || err.code === 'STREAM_LIMIT_REACHED') {
+        const cur = (err as any).current as number | undefined
+        const max = (err as any).max as number | undefined
+        limitBackoffUntil.current[cameraId] = Date.now() + 15_000
+        setStreamErrors(prev => ({
+          ...prev,
+          [cameraId]: {
+            code: 'STREAM_LIMIT_REACHED',
+            message: cur !== undefined && max !== undefined
+              ? `Límite de streams alcanzado (${cur}/${max} activos)`
+              : err.message,
+          },
+        }))
+        setLoadingStreams(prev => ({ ...prev, [cameraId]: false }))
+        continue
       }
       const isHevc = err.code === 'CODEC_UNSUPPORTED_HEVC'
       setStreamErrors(prev => ({
@@ -346,9 +367,16 @@ export function LiveViewPage() {
         return !err || !PERMANENT_ERROR_CODES.includes(err.code)
       })
       if (filteredIds.length === 0) return
+      // Cámaras con backoff de límite vigente y sin sesión activa: se mantienen
+      // visibles pero se pide al backend NO iniciarlas (evita que reconcileView
+      // se salte el backoff del frontend y golpee el límite en cada heartbeat).
+      const now = Date.now()
+      const suppressStartCameraIds = filteredIds.filter(id =>
+        (limitBackoffUntil.current[id] ?? 0) > now && !activeSessions.current.has(id))
       const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', {
         viewId,
         visibleCameraIds: filteredIds,
+        ...(suppressStartCameraIds.length > 0 ? { suppressStartCameraIds } : {}),
       })
       applyHeartbeat(result)
     } catch (err: any) {

@@ -8,6 +8,9 @@ import { getFfmpegCapabilities, isTranscodingEnabled } from '../services/stream'
 const heartbeatSchema = z.object({
   viewId:           z.string().min(1).max(128),
   visibleCameraIds: z.array(z.string()).max(25),
+  // Cámaras que deben permanecer visibles pero NO iniciarse (backoff de límite
+  // en el frontend). El backend las omite del arranque sin detener sesiones vivas.
+  suppressStartCameraIds: z.array(z.string()).max(25).optional(),
   layout:           z.number().int().positive().optional(),
   page:             z.number().int().min(0).optional(),
 })
@@ -28,6 +31,7 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
       user.sub,
       body.viewId,
       body.visibleCameraIds,
+      body.suppressStartCameraIds ?? [],
     )
 
     // Log estructurado para diagnosticar producción

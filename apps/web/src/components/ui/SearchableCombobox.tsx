@@ -7,7 +7,13 @@
 //   - agrupación por `group`
 //   - navegación con teclado (↑ ↓ Enter Escape) con aria-activedescendant
 //   - botón limpiar, estados vacío / disabled / loading
-//   - ventana con scroll y tope de render para acotar listas enormes
+//   - ventana con scroll + tope de render (maxRender, 300 por defecto)
+//
+// NOTA: NO usa virtualización real — renderiza hasta `maxRender` opciones dentro
+// de un contenedor con scroll. Con 300 por defecto, una lista de 144 cámaras se
+// muestra completa y scrolleable; el tope sólo recorta listas mucho mayores (ahí
+// aparece "+N más — refiná la búsqueda"). Si en el futuro hay listas de miles de
+// ítems, cambiar a virtualización real (react-virtual/react-window).
 //
 // Para enums cortos (severidad, dirección, tipo) seguir usando <select> nativo.
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -34,7 +40,7 @@ interface Props {
   disabled?: boolean
   loading?: boolean
   className?: string
-  maxRender?: number        // tope de opciones renderizadas (default 100)
+  maxRender?: number        // tope de opciones renderizadas (default 300, no virtualiza)
 }
 
 // Normaliza para comparar: minúsculas y sin diacríticos (tildes).
@@ -61,7 +67,7 @@ export function SearchableCombobox({
   disabled = false,
   loading = false,
   className,
-  maxRender = 100,
+  maxRender = 300,
 }: Props) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')

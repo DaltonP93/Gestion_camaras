@@ -77,4 +77,43 @@ describe('stream-manager session lifecycle', () => {
     expect(diag.sessions[0].cameraId).toBe('fresh')
     expect(diag.sessions[0].idleSec).toBeGreaterThanOrEqual(0)
   })
+
+  // ── Punto A del review: la purga debe reclamar sesiones vencidas del límite
+  // POR USUARIO, no sólo del global. Un usuario con el máximo de sesiones
+  // vencidas debe quedar en 0 tras la purga (y así poder iniciar una nueva).
+  it('prune reclaims a full per-user quota of expired sessions', () => {
+    for (let i = 0; i < 32; i++) seedSub('u1', `old${i}`, `oldview${i}`, 300)  // 32 vencidas
+    expect(getStreamCounts('u1').currentUserStreams).toBe(32)
+    const pruned = pruneStaleSessions()
+    expect(pruned).toBe(32)
+    expect(getStreamCounts('u1').currentUserStreams).toBe(0)  // habilitado a iniciar
+  })
+
+  // ── Aislamiento multi-view (dos pestañas / recarga rápida): la pestaña vieja
+  // (cámaras distintas, heartbeat vencido) se purga; la nueva (fresca) se
+  // conserva — no se mata la sesión recién iniciada por la otra pestaña/recarga.
+  // (Una misma cámara comparte clave user:cam:sub, así que no puede duplicarse
+  //  entre pestañas: el propio modelo evita ese leak.)
+  it('two-tab / fast-reload: stale view pruned, fresh view kept', () => {
+    seedSub('u1', 'camA', 'tab-old', 200)   // pestaña vieja — heartbeat vencido
+    seedSub('u1', 'camB', 'tab-new', 0); __setViewHeartbeatForTest('u1', 'tab-new', now())
+    expect(getStreamCounts('u1').currentGlobalStreams).toBe(2)
+    expect(pruneStaleSessions()).toBe(1)
+    const diag = getSessionsDiagnostic()
+    expect(diag.counts.total).toBe(1)
+    expect(diag.sessions[0].viewId).toBe('tab-new')   // se conservó la pestaña activa
+  })
+
+  // ── Cambio de página/NVR/layout: el view previo cambia su conjunto visible y
+  // su heartbeat expira; las cámaras del layout anterior se purgan, las del
+  // nuevo (heartbeat fresco) se conservan.
+  it('page/NVR/layout change: old-view cameras pruned, new-view kept', () => {
+    // layout anterior (3x3) en un view que dejó de recibir heartbeat
+    for (let i = 0; i < 9; i++) seedSub('u1', `prev${i}`, 'view-prev', 200)
+    // layout nuevo (1x1) activo
+    seedSub('u1', 'now1', 'view-now', 0); __setViewHeartbeatForTest('u1', 'view-now', now())
+    expect(getStreamCounts('u1').currentGlobalStreams).toBe(10)
+    expect(pruneStaleSessions()).toBe(9)
+    expect(getStreamCounts('u1').currentGlobalStreams).toBe(1)
+  })
 })

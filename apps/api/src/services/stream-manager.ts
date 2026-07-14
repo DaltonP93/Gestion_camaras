@@ -665,13 +665,16 @@ export async function startStream(
   }
 
   // ── Stream limits (only sub counts toward per-user limit) ─────────────
+  // Purgar sesiones vencidas ANTES de calcular AMBOS límites y los conteos, para
+  // que sesiones huérfanas (pestañas muertas, recargas) no disparen ni el límite
+  // por usuario ni el global.
+  pruneStaleSessions()
   const userSessions = getSessionsForUser(userId)
   const userSubSessions = userSessions.filter(s => s.streamType === 'sub')
   if (effectiveType === 'sub' && userSubSessions.length >= MAX_STREAMS_PER_USER) {
     console.info(`[userLimit] reject reason=limit cameraId=${cameraId} current=${userSubSessions.length} max=${MAX_STREAMS_PER_USER}`)
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'STREAM_LIMIT_REACHED', message: 'Límite de streams por usuario alcanzado', current: userSubSessions.length, max: MAX_STREAMS_PER_USER } as any }
   }
-  if (sessions.size >= MAX_STREAMS_GLOBAL) pruneStaleSessions()
   if (sessions.size >= MAX_STREAMS_GLOBAL) {
     return { hlsUrl: '', webrtcUrl: '', streamPath: '',
       error: { code: 'STREAM_LIMIT_GLOBAL', message: 'Límite global de streams alcanzado', current: sessions.size, max: MAX_STREAMS_GLOBAL } as any }
@@ -788,8 +791,10 @@ export async function reconcileView(
   userId: string,
   viewId: string,
   visibleCameraIds: string[],
+  suppressStartCameraIds: string[] = [],
 ): Promise<ReconcileResult> {
   const visibleSet = new Set(visibleCameraIds)
+  const suppressSet = new Set(suppressStartCameraIds)
   const vk = vKey(userId, viewId)
 
   console.info(`[live] heartbeat userId=${userId} viewId=${viewId} cameraIds=[${visibleCameraIds.join(',')}]`)
@@ -836,6 +841,11 @@ export async function reconcileView(
         webrtc: getWebRtcUrl(existing.streamPath),
         streamPath: existing.streamPath,
       }
+    } else if (suppressSet.has(cameraId)) {
+      // Backoff de límite activo en el frontend: mantener visible pero NO iniciar
+      // (no cuenta como started ni como error, no toca MediaMTX).
+      console.info(`[reconcileView] suppress_start cameraId=${cameraId} reason=frontend_backoff`)
+      continue
     } else {
       // No tiene sesión — iniciar
       const result = await startStream(server, userId, cameraId, viewId)
