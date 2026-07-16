@@ -521,7 +521,9 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
 
     // KPIs derivados
     const kpis = {
-      totalEvents,
+      totalEvents,                    // eventos brutos (una detección/regla = 1)
+      uniqueIncidents: 0,             // incidentes únicos (distinct incidentId) — se llena abajo
+      uniqueTracks:    0,             // objetos únicos (distinct trackId) — se llena abajo
       persons:     sum('person'),
       vehicles:    sum('vehicle'),
       intrusions:  sum('zone_intrusion'),
@@ -553,6 +555,18 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       Prisma.sql`SELECT ${bucketExpr} AS bucket, COUNT(*)::bigint AS count
                  FROM "analytics_events" WHERE ${whereSql} GROUP BY 1 ORDER BY 1`
     )
+
+    // Métricas NO duplicadas: un mismo objeto genera varios eventos (vehicle +
+    // zone_intrusion + zone_reminder + zone_exit). Estas cuentan objetos/incidentes
+    // ÚNICOS, no eventos brutos, para que el operador no confunda 196 eventos de
+    // intrusión con 196 objetos distintos.
+    const [distinct] = await server.prisma.$queryRaw<{ inc: bigint; trk: bigint }[]>(
+      Prisma.sql`SELECT COUNT(DISTINCT "incidentId")::bigint AS inc,
+                        COUNT(DISTINCT "trackId")::bigint AS trk
+                 FROM "analytics_events" WHERE ${whereSql}`
+    )
+    kpis.uniqueIncidents = Number(distinct?.inc ?? 0)
+    kpis.uniqueTracks    = Number(distinct?.trk ?? 0)
 
     return reply.send({
       from: from.toISOString(), to: to.toISOString(),

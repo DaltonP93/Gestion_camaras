@@ -69,7 +69,8 @@ interface Summary {
   totalEvents: number
   granularity: string
   kpis: {
-    totalEvents: number; persons: number; vehicles: number; intrusions: number
+    totalEvents: number; uniqueIncidents: number; uniqueTracks: number
+    persons: number; vehicles: number; intrusions: number
     loitering: number; occupancy: number; lineCrossings: number; activeCameras: number
   }
   byType: { type: string; count: number }[]
@@ -933,19 +934,29 @@ export function AnalyticsPage() {
           </div>
 
           {/* KPIs */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-2">
             {([
-              ['Eventos', summary?.kpis.totalEvents], ['Personas', summary?.kpis.persons],
-              ['Vehículos', summary?.kpis.vehicles], ['Intrusiones', summary?.kpis.intrusions],
-              ['Permanencias', summary?.kpis.loitering], ['Aforo', summary?.kpis.occupancy],
-              ['Cruces', summary?.kpis.lineCrossings], ['Cámaras', summary?.kpis.activeCameras],
-            ] as const).map(([label, val]) => (
-              <div key={label} className="rounded-xl border border-surface-700 bg-surface-800/50 p-3">
+              ['Eventos (brutos)', summary?.kpis.totalEvents, 'Detecciones/reglas totales — un mismo objeto genera varios eventos'],
+              ['Incidentes únicos', summary?.kpis.uniqueIncidents, 'Incidentes de zona distintos (por incidentId)'],
+              ['Objetos únicos', summary?.kpis.uniqueTracks, 'Tracks distintos (por trackId)'],
+              ['Personas', summary?.kpis.persons, undefined],
+              ['Vehículos', summary?.kpis.vehicles, undefined],
+              ['Intrusiones', summary?.kpis.intrusions, 'Eventos zone_intrusion (brutos)'],
+              ['Permanencias', summary?.kpis.loitering, undefined],
+              ['Aforo', summary?.kpis.occupancy, undefined],
+              ['Cruces', summary?.kpis.lineCrossings, undefined],
+              ['Cámaras', summary?.kpis.activeCameras, 'Cámaras con eventos en el rango'],
+            ] as const).map(([label, val, hint]) => (
+              <div key={label} className="rounded-xl border border-surface-700 bg-surface-800/50 p-3" title={hint}>
                 <p className="text-[10px] text-surface-500 uppercase tracking-wide">{label}</p>
                 <p className="text-xl font-bold text-surface-100">{val ?? 0}</p>
               </div>
             ))}
           </div>
+          <p className="text-[10px] text-surface-500">
+            "Eventos (brutos)" cuenta cada detección/regla; un mismo objeto produce varios (detección + intrusión +
+            recordatorio + salida). Para conteos reales usá "Incidentes únicos" y "Objetos únicos".
+          </p>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {/* Serie temporal */}
