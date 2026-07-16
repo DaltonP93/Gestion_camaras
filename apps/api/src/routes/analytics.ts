@@ -560,9 +560,14 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     // zone_intrusion + zone_reminder + zone_exit). Estas cuentan objetos/incidentes
     // ÚNICOS, no eventos brutos, para que el operador no confunda 196 eventos de
     // intrusión con 196 objetos distintos.
+    // trackId es LOCAL por cámara (cada CameraWorker tiene su propio ByteTrack),
+    // así que dos cámaras pueden compartir trackId=1 siendo objetos distintos →
+    // se cuenta por el par (cameraId, trackId). El CASE excluye eventos sin track
+    // (trackId NULL) para no inflar el conteo. incidentId ya es global (incluye
+    // cameraId), por eso se cuenta directo.
     const [distinct] = await server.prisma.$queryRaw<{ inc: bigint; trk: bigint }[]>(
       Prisma.sql`SELECT COUNT(DISTINCT "incidentId")::bigint AS inc,
-                        COUNT(DISTINCT "trackId")::bigint AS trk
+                        COUNT(DISTINCT CASE WHEN "trackId" IS NOT NULL THEN ("cameraId", "trackId") END)::bigint AS trk
                  FROM "analytics_events" WHERE ${whereSql}`
     )
     kpis.uniqueIncidents = Number(distinct?.inc ?? 0)
