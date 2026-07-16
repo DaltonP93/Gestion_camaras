@@ -3,7 +3,7 @@
 // por evento), Vista en vivo (frame anotado + estado de workers), Eventos
 // (auto-refresh), Dashboard (conteos) y Forense (búsqueda con filtros).
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Activity, Loader2, Save, Trash2, Play, RefreshCw, Plus,
   Settings, MonitorPlay, ListVideo, BarChart3, SearchCode,
@@ -161,10 +161,20 @@ function StatusItem({ ok, label }: { ok?: boolean; label: string }) {
   )
 }
 
+const ALL_TABS: Tab[] = ['dashboard', 'config', 'live', 'events', 'snapshots', 'forensic']
+
 export function AnalyticsPage() {
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const { cameras, nvrs, loadCameras, loadNVRs } = useCameraStore()
-  const [tab, setTab] = useState<Tab>('config')
+  // La pestaña activa vive en la URL (?tab=), no sólo en estado: así el Dashboard
+  // es el inicio por defecto, la recarga conserva el módulo y funciona atrás/
+  // adelante del navegador. Se sincroniza con setTabUrl.
+  const urlTab = searchParams.get('tab') as Tab | null
+  const tab: Tab = urlTab && ALL_TABS.includes(urlTab) ? urlTab : 'dashboard'
+  const setTab = (t: Tab) => {
+    setSearchParams(prev => { const p = new URLSearchParams(prev); p.set('tab', t); return p }, { replace: false })
+  }
 
   const [configs, setConfigs] = useState<Map<string, AnalyticsConfig>>(new Map())
   const [supportedClasses, setSupportedClasses] = useState<string[]>(Object.keys(CLASS_LABELS))
@@ -529,10 +539,10 @@ export function AnalyticsPage() {
   )
 
   const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
+    { key: 'dashboard', label: 'Dashboard',     icon: <BarChart3 size={13} /> },
     { key: 'config',    label: 'Configuración', icon: <Settings size={13} /> },
     { key: 'live',      label: 'En vivo',       icon: <MonitorPlay size={13} /> },
     { key: 'events',    label: 'Eventos',       icon: <ListVideo size={13} /> },
-    { key: 'dashboard', label: 'Dashboard',     icon: <BarChart3 size={13} /> },
     { key: 'snapshots', label: 'Snapshots',     icon: <ImageIcon size={13} /> },
     { key: 'forensic',  label: 'Forense',       icon: <SearchCode size={13} /> },
   ]
