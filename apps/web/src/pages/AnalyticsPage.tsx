@@ -3,18 +3,19 @@
 // por evento), Vista en vivo (frame anotado + estado de workers), Eventos
 // (auto-refresh), Dashboard (conteos) y Forense (búsqueda con filtros).
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Activity, Loader2, Save, Trash2, Play, RefreshCw, Plus,
   Settings, MonitorPlay, ListVideo, BarChart3, SearchCode,
   CheckCircle2, XCircle, AlertTriangle, Image as ImageIcon,
-  ChevronLeft, ChevronRight, X, Download, Film,
+  ChevronLeft, ChevronRight,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { clsx } from 'clsx'
 import { api, apiGet, apiPut, resolveAssetUrl } from '@/lib/api'
 import { usePolling } from '@/hooks/usePolling'
 import { SearchableCombobox, type ComboOption } from '@/components/ui/SearchableCombobox'
+import { AnalyticsEventDetailModal } from '@/components/analytics/AnalyticsEventDetailModal'
 import { useCameraStore } from '@/stores/cameraStore'
 
 // ─── Tipos ────────────────────────────────────────────────────────────────
@@ -68,7 +69,8 @@ interface Summary {
   totalEvents: number
   granularity: string
   kpis: {
-    totalEvents: number; persons: number; vehicles: number; intrusions: number
+    totalEvents: number; uniqueIncidents: number; uniqueTracks: number
+    persons: number; vehicles: number; intrusions: number
     loitering: number; occupancy: number; lineCrossings: number; activeCameras: number
   }
   byType: { type: string; count: number }[]
@@ -159,10 +161,20 @@ function StatusItem({ ok, label }: { ok?: boolean; label: string }) {
   )
 }
 
+const ALL_TABS: Tab[] = ['dashboard', 'config', 'live', 'events', 'snapshots', 'forensic']
+
 export function AnalyticsPage() {
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const { cameras, nvrs, loadCameras, loadNVRs } = useCameraStore()
-  const [tab, setTab] = useState<Tab>('config')
+  // La pestaña activa vive en la URL (?tab=), no sólo en estado: así el Dashboard
+  // es el inicio por defecto, la recarga conserva el módulo y funciona atrás/
+  // adelante del navegador. Se sincroniza con setTabUrl.
+  const urlTab = searchParams.get('tab') as Tab | null
+  const tab: Tab = urlTab && ALL_TABS.includes(urlTab) ? urlTab : 'dashboard'
+  const setTab = (t: Tab) => {
+    setSearchParams(prev => { const p = new URLSearchParams(prev); p.set('tab', t); return p }, { replace: false })
+  }
 
   const [configs, setConfigs] = useState<Map<string, AnalyticsConfig>>(new Map())
   const [supportedClasses, setSupportedClasses] = useState<string[]>(Object.keys(CLASS_LABELS))
@@ -205,7 +217,9 @@ export function AnalyticsPage() {
   const [snapsPage, setSnapsPage] = useState(1)
   const [snapsTotal, setSnapsTotal] = useState(0)
   const [snapFilter, setSnapFilter] = useState({ cameraId: '', type: '', order: 'desc' })
-  const [snapModal, setSnapModal] = useState<AnalyticsEvent | null>(null)
+  // Visor de detalle de evento reutilizable (Eventos/Snapshots/Forense).
+  // detailList = la lista a la que pertenece, para navegar anterior/siguiente.
+  const [detail, setDetail] = useState<{ list: AnalyticsEvent[]; index: number } | null>(null)
 
   useEffect(() => { loadCameras(); loadNVRs() }, [])
 
@@ -483,13 +497,22 @@ export function AnalyticsPage() {
     />
   )
 
-  const eventCard = (ev: AnalyticsEvent) => (
+  // Abre el visor de detalle sobre una lista concreta (para prev/siguiente).
+  const openDetail = (list: AnalyticsEvent[], ev: AnalyticsEvent) => {
+    const index = list.findIndex(e => e.id === ev.id)
+    setDetail({ list, index: index >= 0 ? index : 0 })
+  }
+  const openRecordingFor = (ev: { cameraId: string; occurredAt: string }) =>
+    navigate(`/recordings?cameraId=${ev.cameraId}&t=${encodeURIComponent(ev.occurredAt)}`)
+
+  const eventCard = (ev: AnalyticsEvent, list: AnalyticsEvent[]) => (
     <div key={ev.id} className="flex gap-3 rounded-lg bg-surface-800 border border-surface-700/60 p-2">
       {ev.snapshotUrl ? (
         <img src={resolveAssetUrl(ev.snapshotUrl) ?? undefined} alt="" loading="lazy"
-          className="w-28 h-16 object-cover rounded flex-shrink-0 bg-black" />
+          onClick={() => openDetail(list, ev)}
+          className="w-28 h-16 object-cover rounded flex-shrink-0 bg-black cursor-pointer" />
       ) : <div className="w-28 h-16 rounded bg-black flex-shrink-0" />}
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 cursor-pointer" onClick={() => openDetail(list, ev)}>
         <p className="text-xs text-surface-200 truncate">
           <span className={clsx('inline-block px-1.5 py-0.5 rounded text-[9px] mr-1.5',
             ['zone_intrusion', 'loitering', 'occupancy_limit'].includes(ev.type)
@@ -506,7 +529,7 @@ export function AnalyticsPage() {
         <p className="text-[10px] text-surface-500 font-mono">{new Date(ev.occurredAt).toLocaleString('es')}</p>
       </div>
       <button
-        onClick={() => navigate(`/recordings?cameraId=${ev.cameraId}&t=${encodeURIComponent(ev.occurredAt)}`)}
+        onClick={() => openRecordingFor(ev)}
         title="Ver la grabación de este momento"
         className="self-center flex-shrink-0 flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-brand-800/60 hover:bg-brand-700/70 text-brand-300 transition-colors"
       >
@@ -516,10 +539,10 @@ export function AnalyticsPage() {
   )
 
   const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
+    { key: 'dashboard', label: 'Dashboard',     icon: <BarChart3 size={13} /> },
     { key: 'config',    label: 'Configuración', icon: <Settings size={13} /> },
     { key: 'live',      label: 'En vivo',       icon: <MonitorPlay size={13} /> },
     { key: 'events',    label: 'Eventos',       icon: <ListVideo size={13} /> },
-    { key: 'dashboard', label: 'Dashboard',     icon: <BarChart3 size={13} /> },
     { key: 'snapshots', label: 'Snapshots',     icon: <ImageIcon size={13} /> },
     { key: 'forensic',  label: 'Forense',       icon: <SearchCode size={13} /> },
   ]
@@ -880,7 +903,7 @@ export function AnalyticsPage() {
           </div>
           {events.length === 0
             ? <p className="text-xs text-surface-600 py-8 text-center">{eventsLoading ? 'Cargando…' : 'Sin eventos todavía.'}</p>
-            : <div className="space-y-2">{events.map(eventCard)}</div>}
+            : <div className="space-y-2">{events.map(ev => eventCard(ev, events))}</div>}
         </div>
       )}
 
@@ -921,19 +944,29 @@ export function AnalyticsPage() {
           </div>
 
           {/* KPIs */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-2">
             {([
-              ['Eventos', summary?.kpis.totalEvents], ['Personas', summary?.kpis.persons],
-              ['Vehículos', summary?.kpis.vehicles], ['Intrusiones', summary?.kpis.intrusions],
-              ['Permanencias', summary?.kpis.loitering], ['Aforo', summary?.kpis.occupancy],
-              ['Cruces', summary?.kpis.lineCrossings], ['Cámaras', summary?.kpis.activeCameras],
-            ] as const).map(([label, val]) => (
-              <div key={label} className="rounded-xl border border-surface-700 bg-surface-800/50 p-3">
+              ['Eventos (brutos)', summary?.kpis.totalEvents, 'Detecciones/reglas totales — un mismo objeto genera varios eventos'],
+              ['Incidentes únicos', summary?.kpis.uniqueIncidents, 'Incidentes de zona distintos (por incidentId)'],
+              ['Objetos únicos', summary?.kpis.uniqueTracks, 'Tracks distintos (por trackId)'],
+              ['Personas', summary?.kpis.persons, undefined],
+              ['Vehículos', summary?.kpis.vehicles, undefined],
+              ['Intrusiones', summary?.kpis.intrusions, 'Eventos zone_intrusion (brutos)'],
+              ['Permanencias', summary?.kpis.loitering, undefined],
+              ['Aforo', summary?.kpis.occupancy, undefined],
+              ['Cruces', summary?.kpis.lineCrossings, undefined],
+              ['Cámaras', summary?.kpis.activeCameras, 'Cámaras con eventos en el rango'],
+            ] as const).map(([label, val, hint]) => (
+              <div key={label} className="rounded-xl border border-surface-700 bg-surface-800/50 p-3" title={hint}>
                 <p className="text-[10px] text-surface-500 uppercase tracking-wide">{label}</p>
                 <p className="text-xl font-bold text-surface-100">{val ?? 0}</p>
               </div>
             ))}
           </div>
+          <p className="text-[10px] text-surface-500">
+            "Eventos (brutos)" cuenta cada detección/regla; un mismo objeto produce varios (detección + intrusión +
+            recordatorio + salida). Para conteos reales usá "Incidentes únicos" y "Objetos únicos".
+          </p>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {/* Serie temporal */}
@@ -1044,7 +1077,7 @@ export function AnalyticsPage() {
             ? <p className="text-xs text-surface-600 py-10 text-center">{snapsLoading ? 'Cargando…' : 'Sin snapshots para estos filtros.'}</p>
             : <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-2">
                 {snaps.map(e => (
-                  <button key={e.id} onClick={() => setSnapModal(e)}
+                  <button key={e.id} onClick={() => openDetail(snaps, e)}
                     className="relative rounded-lg overflow-hidden border border-surface-700 group text-left">
                     <img src={resolveAssetUrl(e.snapshotUrl!) ?? undefined} alt="" loading="lazy"
                       className="w-full aspect-video object-cover bg-black" />
@@ -1063,34 +1096,6 @@ export function AnalyticsPage() {
               <span>Página {snapsPage} / {Math.max(1, Math.ceil(snapsTotal / 24))}</span>
               <button disabled={snapsPage >= Math.ceil(snapsTotal / 24)} onClick={() => loadSnapshots(snapsPage + 1)}
                 className="p-1.5 rounded bg-surface-800 disabled:opacity-40 hover:bg-surface-700"><ChevronRight size={14} /></button>
-            </div>
-          )}
-
-          {/* Modal de imagen grande */}
-          {snapModal && (
-            <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setSnapModal(null)}>
-              <div className="bg-surface-900 border border-surface-700 rounded-xl max-w-4xl w-full overflow-hidden" onClick={e => e.stopPropagation()}>
-                <div className="flex items-center gap-2 px-4 py-2 border-b border-surface-800">
-                  <span className="text-sm text-surface-200 font-medium">{snapModal.cameraName}</span>
-                  <span className="text-xs text-surface-500">{snapModal.nvrName}</span>
-                  <div className="flex-1" />
-                  <button onClick={() => setSnapModal(null)} className="text-surface-400 hover:text-surface-200"><X size={16} /></button>
-                </div>
-                <img src={resolveAssetUrl(snapModal.snapshotUrl!) ?? undefined} alt="" className="w-full max-h-[60vh] object-contain bg-black" />
-                <div className="px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-surface-400">
-                  <span>{TYPE_LABELS[snapModal.type] ?? snapModal.type}</span>
-                  <span>Clase: {CLASS_LABELS[snapModal.className] ?? snapModal.className}</span>
-                  <span>Conf: {Math.round((snapModal.confidence ?? 0) * 100)}%</span>
-                  {snapModal.zoneName && <span>Zona: {snapModal.zoneName}</span>}
-                  {snapModal.trackId != null && <span>Track: {snapModal.trackId}</span>}
-                  <span>{new Date(snapModal.occurredAt).toLocaleString('es')}</span>
-                  <div className="flex-1" />
-                  <a href={resolveAssetUrl(snapModal.snapshotUrl!) ?? '#'} download
-                    className="flex items-center gap-1 text-brand-300 hover:text-brand-200"><Download size={12} /> Descargar</a>
-                  <button onClick={() => navigate(`/recordings?cameraId=${snapModal.cameraId}&t=${encodeURIComponent(snapModal.occurredAt)}`)}
-                    className="flex items-center gap-1 text-brand-300 hover:text-brand-200"><Film size={12} /> Ver grabación</button>
-                </div>
-              </div>
             </div>
           )}
         </div>
@@ -1133,8 +1138,22 @@ export function AnalyticsPage() {
           </div>
           {forensic.length === 0
             ? <p className="text-xs text-surface-600 py-6 text-center">Sin resultados — ajustá los filtros y buscá.</p>
-            : <div className="space-y-2">{forensic.map(eventCard)}</div>}
+            : <div className="space-y-2">{forensic.map(ev => eventCard(ev, forensic))}</div>}
         </div>
+      )}
+
+      {/* Visor de detalle de evento — compartido por Eventos, Snapshots y Forense */}
+      {detail && detail.list[detail.index] && (
+        <AnalyticsEventDetailModal
+          event={detail.list[detail.index]}
+          typeLabels={TYPE_LABELS}
+          classLabels={CLASS_LABELS}
+          resolveAssetUrl={resolveAssetUrl}
+          onClose={() => setDetail(null)}
+          onOpenRecording={(ev) => openRecordingFor(ev)}
+          onPrev={detail.index > 0 ? () => setDetail(d => d && { ...d, index: d.index - 1 }) : undefined}
+          onNext={detail.index < detail.list.length - 1 ? () => setDetail(d => d && { ...d, index: d.index + 1 }) : undefined}
+        />
       )}
     </div>
   )
