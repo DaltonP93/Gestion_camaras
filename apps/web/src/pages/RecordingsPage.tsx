@@ -1083,13 +1083,17 @@ export function RecordingsPage() {
     opts?:        { forceTranscode?: boolean; noClockAnchor?: boolean },
   ) => {
     const forceTranscode = opts?.forceTranscode ?? false
-    // Dedupe idempotente: si ya hay un arranque en vuelo para este slot con la
-    // MISMA grabación, no iniciar otro. Cubre la carrera deep link + autostart del
-    // playhead que apuntan al mismo rec y causaba el doble preview_start (con
-    // cancelación del play() del primero). Un retry con H.264 (forceTranscode) sí
-    // debe poder re-arrancar.
-    if (!forceTranscode && startingSlotsRef.current[slotIndex] === rec.id) {
-      console.info(`[recordings-ui] preview_start_deduped slot=${slotIndex} recId=${rec.id} reason=already_starting`)
+    // Clave de arranque = grabación + punto efectivo (a nivel de segundo). El
+    // dedupe idempotente descarta un segundo arranque SÓLO si apunta a la misma
+    // grabación Y al mismo punto — así cubre la carrera deep link + autostart del
+    // playhead (mismo tiempo → doble preview_start), pero NO descarta un seek
+    // legítimo de la línea de tiempo a la misma grabación en otro momento (que sí
+    // debe re-arrancar en el nuevo punto). Un retry H.264 (forceTranscode) también.
+    const recStartMs0 = new Date(rec.startTime).getTime()
+    const recEndMs0   = new Date(rec.endTime).getTime()
+    const effKey = `${rec.id}:${Math.round(Math.max(recStartMs0, Math.min(playheadTime.getTime(), recEndMs0 - 1000)) / 1000)}`
+    if (!forceTranscode && startingSlotsRef.current[slotIndex] === effKey) {
+      console.info(`[recordings-ui] preview_start_deduped slot=${slotIndex} effKey=${effKey} reason=already_starting_same_point`)
       return
     }
     const currentSlot = slotsRef.current[slotIndex]
@@ -1173,10 +1177,10 @@ export function RecordingsPage() {
 
     const myKey = `${Date.now()}-${Math.random()}`
     slotKeysRef.current[slotIndex] = myKey
-    // Marca de arranque en vuelo (síncrona, antes de cualquier await): guarda el
-    // recId para el dedupe de arriba y para que el autostart del playhead no
-    // dispare un segundo preview del mismo slot.
-    startingSlotsRef.current[slotIndex] = rec.id
+    // Marca de arranque en vuelo (síncrona, antes de cualquier await): guarda la
+    // effKey (rec+punto) para el dedupe de arriba y para que el autostart del
+    // playhead no dispare un segundo preview del mismo slot en el mismo punto.
+    startingSlotsRef.current[slotIndex] = effKey
     previewStartTimesRef.current[slotIndex] = null
     if (!forceTranscode) previewRetriedRef.current[slotIndex] = false
     // Cancelar cualquier detector de estancamiento previo del slot
@@ -1227,9 +1231,15 @@ export function RecordingsPage() {
         // (consumiendo RTSP del NVR hasta expirar) → eliminarla explícitamente.
         console.info(`[recordings-ui] preview_stale_generation slot=${slotIndex} discardedSessionId=${result.sessionId}`)
         deleteSessionOnce('preview', result.sessionId)
+        // Si el arranque fue cancelado (stopSlot/cierre/cambio de layout) sin un
+        // reemplazo, el marcador in-flight quedaría seteado a NUESTRA effKey y
+        // trabaría futuros intentos de la misma grabación en el mismo punto.
+        // Limpiarlo sólo si sigue siendo el nuestro (un reemplazo ya lo habría
+        // sobrescrito con su propia clave).
+        if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
         return
       }
-      if (startingSlotsRef.current[slotIndex] === rec.id) startingSlotsRef.current[slotIndex] = null
+      if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
 
       const { sessionId, streamUrl } = result
       // Track when this preview starts (video.currentTime = 0 → effectiveMs)
@@ -1239,7 +1249,7 @@ export function RecordingsPage() {
       if (!vid) {
         // No hay elemento de video: liberar la sesión recién creada y la guarda.
         deleteSessionOnce('preview', sessionId)
-        if (startingSlotsRef.current[slotIndex] === rec.id) startingSlotsRef.current[slotIndex] = null
+        if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
         return
       }
 
@@ -1427,10 +1437,10 @@ export function RecordingsPage() {
         vid.load()
       }
 
-      if (startingSlotsRef.current[slotIndex] === rec.id) startingSlotsRef.current[slotIndex] = null
+      if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
 
     } catch (err: any) {
-      if (startingSlotsRef.current[slotIndex] === rec.id) startingSlotsRef.current[slotIndex] = null
+      if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
       if (slotKeysRef.current[slotIndex] !== myKey) return
       const detail = err?.response?.data?.message ?? 'No se pudo iniciar el stream de preview'
       console.error(`[recordings-ui] preview_error slot=${slotIndex} err=${detail}`)
