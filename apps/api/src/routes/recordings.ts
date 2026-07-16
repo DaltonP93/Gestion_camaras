@@ -1711,17 +1711,40 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     reply.hijack()
     const res = reply.raw
 
-    res.writeHead(200, {
-      'Content-Type':  'video/mp4',
-      'Cache-Control': 'no-cache, no-store',
-      'Connection':    'keep-alive',
-      'X-Session-Id':  sessionId,
-    })
-
     const streamStartMs = Date.now()
     let firstByteSent = false
+    let headersSent   = false
     let clientGone    = false
     let currentProc: ChildProcess | null = null
+
+    // Los headers 200 se envían RECIÉN cuando FFmpeg produce el primer byte de
+    // MP4 — no antes. Así, si todas las variantes RTSP fallan, el cliente recibe
+    // un error real (5xx) en vez de un 200 con cuerpo vacío que lo dejaría con el
+    // spinner en 0:00 indefinidamente.
+    const sendHeadersOnce = () => {
+      if (headersSent) return
+      headersSent = true
+      res.writeHead(200, {
+        'Content-Type':  'video/mp4',
+        'Cache-Control': 'no-cache, no-store',
+        'Connection':    'keep-alive',
+        'X-Session-Id':  sessionId,
+      })
+    }
+    // Termina la respuesta con un estado de error si aún no se enviaron headers
+    // (ninguna variante llegó al primer byte). Mapea la causa a un status HTTP.
+    const endWithError = (category: string, detail: string) => {
+      if (headersSent) return
+      headersSent = true
+      const status = category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT' ? 503
+        : category === 'NVR_OFFLINE_OR_TIMEOUT' ? 504
+        : category === 'AUTH_FAILED' ? 401
+        : 502
+      try {
+        res.writeHead(status, { 'Content-Type': 'application/json', 'X-Session-Id': sessionId })
+        res.end(JSON.stringify({ code: category, message: 'El origen no entregó video', detail: detail.slice(0, 300) }))
+      } catch { /* conexión ya cerrada */ }
+    }
 
     const stderrTail: string[] = []
     session.stderrTail = stderrTail
@@ -1733,6 +1756,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         ` reason=${reason} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
       )
       releaseNvrSlot()
+      // Red de seguridad: si nunca se enviaron headers y el cliente sigue ahí,
+      // no cerrar con un 200 vacío (spinner infinito) — enviar 502.
+      if (!headersSent && !clientGone) endWithError('STREAM_ENDED_NO_OUTPUT', reason)
       try { res.end() } catch {}
     }
 
@@ -1767,6 +1793,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       })
 
       proc.stdout?.once('data', (chunk: Buffer) => {
+        // Primer byte real de FFmpeg → recién ahora enviamos el 200. Debe correr
+        // ANTES de que el pipe escriba el chunk (este listener se registró antes).
+        sendHeadersOnce()
         firstByteSent = true
         session.hadFirstByte  = true
         // A working variant wipes any error state from earlier attempts
@@ -1846,6 +1875,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
               ` cameraId=${session.cameraId} slot=${session.slotIndex}`
             )
           }
+          // Ninguna variante llegó al primer byte → responder error real (no un
+          // 200 vacío). Si ya se habían enviado headers (variante previa OK y
+          // luego cortó), esto es no-op y finish() cierra normalmente.
+          endWithError(final.category, final.detail)
         }
 
         finish(failedBeforeOutput ? 'ffmpeg_failed' : 'ffmpeg_exit')

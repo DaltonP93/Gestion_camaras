@@ -18,7 +18,12 @@ export interface NvrSearchError {
 
 export type PlaybackLayout = '1x1' | '2x2' | '3x3' | '4x4'
 
-export type SlotStatus = 'empty' | 'idle' | 'loading' | 'ready' | 'error' | 'no_recording'
+// loading = pidiendo sesión al API; buffering = tiene URL, esperando datos de
+// FFmpeg; playing = reproduciendo (currentTime avanza); ready = media lista pero
+// pausada; stalled = con URL pero sin avance tras el timeout → probable fallo.
+export type SlotStatus =
+  | 'empty' | 'idle' | 'loading' | 'buffering' | 'playing'
+  | 'ready' | 'stalled' | 'error' | 'no_recording'
 
 export interface PlaybackSlot {
   slotIndex: number

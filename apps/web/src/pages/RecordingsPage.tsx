@@ -18,9 +18,14 @@ import { RecordingSearchBar }   from '@/components/recordings/RecordingSearchBar
 import { RecordingTimeline }    from '@/components/recordings/RecordingTimeline'
 import type {
   RecordingWithCamera, NvrSearchError, PlaybackLayout,
-  PlaybackSlot,
+  PlaybackSlot, SlotStatus,
 } from '@/components/recordings/types'
 import { emptySlot } from '@/components/recordings/types'
+
+// Estados de slot que tienen un elemento de video con media activa (URL asignada):
+// el <video> debe mostrarse y las operaciones de rate/seek/continuidad aplican.
+const LIVE_SLOT_STATUSES: SlotStatus[] = ['ready', 'playing', 'buffering', 'stalled']
+const isLiveSlot = (s: SlotStatus) => LIVE_SLOT_STATUSES.includes(s)
 import {
   toLocalDatetimeString, localInputToNvrIso, formatNvrTime, classifyError,
 } from '@/components/recordings/utils'
@@ -129,6 +134,12 @@ export function RecordingsPage() {
   const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
   const errorDetailBySlotRef   = useRef<{ [k: number]: string | null }>({})
   const clipInfoBySlotRef      = useRef<{ [k: number]: { clipStartMs: number; clipEndMs: number; effectiveStartMs: number } | null }>({})
+  // Guarda de "un solo arranque en vuelo por slot": guarda el myKey de la
+  // generación que está iniciando ese slot. Evita el doble preview_start (deep
+  // link + autostart del playhead disparando el mismo slot a la vez).
+  const startingSlotsRef       = useRef<{ [k: number]: string | null }>({})
+  // Timers de detección de estancamiento (currentTime sigue en 0 tras el arranque)
+  const stallTimersRef         = useRef<{ [k: number]: ReturnType<typeof setTimeout> | null }>({})
   // Sessions already deleted — avoids duplicate DELETE from error/ended/unmount/slot-change
   const deletedSessionsRef    = useRef<Set<string>>(new Set())
   // Cameras manually closed (slot X / unchecked) — blocked from autostart
@@ -299,6 +310,9 @@ export function RecordingsPage() {
       if (slot.status !== 'no_recording' && slot.status !== 'idle') return
       // Manually closed cameras never autostart until re-selected/assigned
       if (closedCamerasRef.current.has(slot.cameraId)) return
+      // Ya hay un arranque en vuelo para este slot (p.ej. el deep link) → no
+      // iniciar un segundo preview que cancelaría el primero (doble preview_start).
+      if (startingSlotsRef.current[slot.slotIndex]) return
 
       // Debounce: don't retry the same slot more than once every 5 s
       const lastAttempt = autoStartLockRef.current[slot.slotIndex] ?? 0
@@ -531,7 +545,7 @@ export function RecordingsPage() {
         ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime} gapMs=${gap}`
       )
       if (gap <= CONTINUITY_GAP_MS) {
-        const otherPlaying = slotsRef.current.some((s, i) => i !== slotIndex && s.status === 'ready')
+        const otherPlaying = slotsRef.current.some((s, i) => i !== slotIndex && isLiveSlot(s.status))
         startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs), { noClockAnchor: otherPlaying })
         return
       }
@@ -1069,6 +1083,15 @@ export function RecordingsPage() {
     opts?:        { forceTranscode?: boolean; noClockAnchor?: boolean },
   ) => {
     const forceTranscode = opts?.forceTranscode ?? false
+    // Dedupe idempotente: si ya hay un arranque en vuelo para este slot con la
+    // MISMA grabación, no iniciar otro. Cubre la carrera deep link + autostart del
+    // playhead que apuntan al mismo rec y causaba el doble preview_start (con
+    // cancelación del play() del primero). Un retry con H.264 (forceTranscode) sí
+    // debe poder re-arrancar.
+    if (!forceTranscode && startingSlotsRef.current[slotIndex] === rec.id) {
+      console.info(`[recordings-ui] preview_start_deduped slot=${slotIndex} recId=${rec.id} reason=already_starting`)
+      return
+    }
     const currentSlot = slotsRef.current[slotIndex]
     // If the slot shows a different camera, adopt the recording's camera —
     // the caller routed this recording here deliberately.
@@ -1150,8 +1173,14 @@ export function RecordingsPage() {
 
     const myKey = `${Date.now()}-${Math.random()}`
     slotKeysRef.current[slotIndex] = myKey
+    // Marca de arranque en vuelo (síncrona, antes de cualquier await): guarda el
+    // recId para el dedupe de arriba y para que el autostart del playhead no
+    // dispare un segundo preview del mismo slot.
+    startingSlotsRef.current[slotIndex] = rec.id
     previewStartTimesRef.current[slotIndex] = null
     if (!forceTranscode) previewRetriedRef.current[slotIndex] = false
+    // Cancelar cualquier detector de estancamiento previo del slot
+    if (stallTimersRef.current[slotIndex]) { clearTimeout(stallTimersRef.current[slotIndex]!); stallTimersRef.current[slotIndex] = null }
 
     // Stop existing session
     if (videoCleanupRef.current[slotIndex]) {
@@ -1192,14 +1221,27 @@ export function RecordingsPage() {
         }
       )
 
-      if (slotKeysRef.current[slotIndex] !== myKey) return
+      if (slotKeysRef.current[slotIndex] !== myKey) {
+        // Generación obsoleta: otra llamada reemplazó este slot mientras
+        // esperábamos. La sesión que el backend acaba de crear quedaría huérfana
+        // (consumiendo RTSP del NVR hasta expirar) → eliminarla explícitamente.
+        console.info(`[recordings-ui] preview_stale_generation slot=${slotIndex} discardedSessionId=${result.sessionId}`)
+        deleteSessionOnce('preview', result.sessionId)
+        return
+      }
+      if (startingSlotsRef.current[slotIndex] === rec.id) startingSlotsRef.current[slotIndex] = null
 
       const { sessionId, streamUrl } = result
       // Track when this preview starts (video.currentTime = 0 → effectiveMs)
       previewStartTimesRef.current[slotIndex] = effectiveMs
 
       const vid = videoRefs.current[slotIndex]
-      if (!vid) return
+      if (!vid) {
+        // No hay elemento de video: liberar la sesión recién creada y la guarda.
+        deleteSessionOnce('preview', sessionId)
+        if (startingSlotsRef.current[slotIndex] === rec.id) startingSlotsRef.current[slotIndex] = null
+        return
+      }
 
       const handleError = async () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
@@ -1286,43 +1328,58 @@ export function RecordingsPage() {
 
       const handleEnded = () => runClipContinuity('ended_event')
 
+      // Cambia el estado del slot sólo si esta generación sigue vigente.
+      const setSlotStatusIfCurrent = (status: PlaybackSlot['status'], extra?: Partial<PlaybackSlot>) => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        setSlots(prev => prev.map((s, i) => i === slotIndex ? { ...s, status, ...extra } : s))
+      }
+      const clearStall = () => {
+        if (stallTimersRef.current[slotIndex]) { clearTimeout(stallTimersRef.current[slotIndex]!); stallTimersRef.current[slotIndex] = null }
+      }
+
+      // preview_ready del backend NO significa video reproduciéndose: sólo que se
+      // creó la sesión y entregó una URL. Marcamos el slot como 'buffering' y sólo
+      // pasamos a 'playing' cuando el video AVANZA de verdad (evento playing /
+      // timeupdate con currentTime>0). Si nunca avanza, el stall timer lo detecta.
+      const onMetadata = () => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        console.info(`[recordings-ui] recordings_deep_link_media_attached slot=${slotIndex} sessionId=${sessionId} metadata_loaded`)
+      }
+      const onPlaying = () => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        clearStall()
+        console.info(`[recordings-ui] recordings_deep_link_playing slot=${slotIndex} sessionId=${sessionId}`)
+        setSlotStatusIfCurrent('playing')
+      }
+      const onTimeUpdate = () => {
+        if (vid.currentTime > 0) { clearStall(); setSlotStatusIfCurrent('playing') }
+      }
+      const onCanPlay = () => {
+        // Media lista. Si NO hay intención de reproducir (pausado), queda 'ready'.
+        if (!globalPlayingRef.current) setSlotStatusIfCurrent('ready')
+      }
+
       ;(videoCleanupRef.current[slotIndex] as (() => void) | null)?.()
       vid.addEventListener('error', handleError)
       vid.addEventListener('ended', handleEnded)
+      vid.addEventListener('loadedmetadata', onMetadata)
+      vid.addEventListener('playing', onPlaying)
+      vid.addEventListener('timeupdate', onTimeUpdate)
+      vid.addEventListener('canplay', onCanPlay)
       videoCleanupRef.current[slotIndex] = () => {
         vid.removeEventListener('error', handleError)
         vid.removeEventListener('ended', handleEnded)
+        vid.removeEventListener('loadedmetadata', onMetadata)
+        vid.removeEventListener('playing', onPlaying)
+        vid.removeEventListener('timeupdate', onTimeUpdate)
+        vid.removeEventListener('canplay', onCanPlay)
+        clearStall()
       }
 
-      vid.src = streamUrl
-      vid.playbackRate = globalPlaybackRateRef.current
-      if (globalPlayingRef.current) {
-        // Intentar reproducir; si el media aún no está listo el play puede
-        // rechazar → reintentar una vez cuando dispare 'canplay'. Así el deep-link
-        // no queda en 0:00 esperando a que el estado global "arranque" solo.
-        const tryPlay = (phase: string) =>
-          vid.play()
-            .then(() => console.info(`[recordings-ui] recordings_deep_link_playing slot=${slotIndex} phase=${phase} sessionId=${sessionId}`))
-            .catch((e: Error) => {
-              console.warn(`[recordings-ui] recordings_deep_link_play_failed slot=${slotIndex} phase=${phase} reason=${e.message}`)
-              if (phase === 'immediate') {
-                const onCanPlay = () => { vid.removeEventListener('canplay', onCanPlay); if (globalPlayingRef.current) tryPlay('canplay') }
-                vid.addEventListener('canplay', onCanPlay)
-              }
-            })
-        tryPlay('immediate')
-      }
-
-      // Continuity timer: fires at expected clip end + safety margin even if
-      // onended/onerror never arrive (fMP4 pipe can silently close). Only armed
-      // while playing — pause clears it, resume re-schedules from remaining time.
-      if (globalPlayingRef.current) {
-        scheduleContinuityTimer(slotIndex, sessionId)
-      }
-
+      // Slot con URL pero aún sin datos confirmados de FFmpeg → 'buffering'.
       setSlots(prev => prev.map((s, i) => i === slotIndex ? {
         ...s,
-        status: 'ready',
+        status: 'buffering',
         playbackUrl: streamUrl,
         mimeType: 'video/mp4',
         sessionId,
@@ -1330,10 +1387,50 @@ export function RecordingsPage() {
         downloadUrl: null,
         vodProgress: null,
       } : s))
+      console.info(`[recordings-ui] preview_ready slot=${slotIndex} sessionId=${sessionId} (session created — awaiting real playback)`)
 
-      console.info(`[recordings-ui] preview_ready slot=${slotIndex} sessionId=${sessionId}`)
+      vid.src = streamUrl
+      vid.playbackRate = globalPlaybackRateRef.current
+
+      if (globalPlayingRef.current) {
+        // play() con manejo REAL de errores (no catch vacío): se registra la causa
+        // y, si fue por media no lista, se reintenta una vez en 'canplay'.
+        const tryPlay = (phase: string) =>
+          vid.play()
+            .then(() => console.info(`[recordings-ui] recordings_deep_link_play_ok slot=${slotIndex} phase=${phase} sessionId=${sessionId}`))
+            .catch((e: Error) => {
+              console.warn(`[recordings-ui] recordings_deep_link_play_failed slot=${slotIndex} phase=${phase} reason=${e.name}:${e.message}`)
+              if (phase === 'immediate') {
+                const retry = () => { vid.removeEventListener('canplay', retry); if (slotKeysRef.current[slotIndex] === myKey && globalPlayingRef.current) tryPlay('canplay') }
+                vid.addEventListener('canplay', retry)
+              } else if (e.name === 'NotAllowedError') {
+                // Autoplay bloqueado por el navegador → estado accionable
+                setSlotStatusIfCurrent('stalled', { errorMsg: 'Reproducción automática bloqueada — presioná Play' })
+              }
+            })
+        tryPlay('immediate')
+
+        // Detector de estancamiento: si tras 5 s currentTime sigue en 0, el video
+        // no avanzó (FFmpeg sin datos / src reemplazado / sesión caída) → 'stalled'.
+        clearStall()
+        stallTimersRef.current[slotIndex] = setTimeout(() => {
+          if (slotKeysRef.current[slotIndex] !== myKey) return
+          const v = videoRefs.current[slotIndex]
+          if (v && v.currentTime > 0) return
+          console.warn(`[recordings-ui] recordings_deep_link_stalled slot=${slotIndex} sessionId=${sessionId} currentTime=0 after 5s`)
+          setSlotStatusIfCurrent('stalled', { errorMsg: 'El video no avanzó (5 s) — el origen puede no estar entregando datos.' })
+        }, 5000)
+
+        scheduleContinuityTimer(slotIndex, sessionId)
+      } else {
+        // Sin intención de reproducir: cargar metadatos para poder mostrar frame.
+        vid.load()
+      }
+
+      if (startingSlotsRef.current[slotIndex] === rec.id) startingSlotsRef.current[slotIndex] = null
 
     } catch (err: any) {
+      if (startingSlotsRef.current[slotIndex] === rec.id) startingSlotsRef.current[slotIndex] = null
       if (slotKeysRef.current[slotIndex] !== myKey) return
       const detail = err?.response?.data?.message ?? 'No se pudo iniciar el stream de preview'
       console.error(`[recordings-ui] preview_error slot=${slotIndex} err=${detail}`)
@@ -1435,8 +1532,16 @@ export function RecordingsPage() {
       return
     }
 
+    // Activar la intención de reproducción de forma SÍNCRONA antes de iniciar
+    // cualquier preview. globalPlayingRef se sincroniza vía useEffect (tras el
+    // render); si arrancamos un preview antes, startPreviewInSlot leería false y
+    // nunca llamaría a play() → el slot quedaría cargado pero en 0:00.
+    globalPlayingRef.current = true
+
     const currentSlots   = slotsRef.current
-    const readySlots     = currentSlots.filter(s => s.status === 'ready')
+    // Slots ya con media (URL) que sólo necesitan play() — incluye pausados
+    // ('ready') y los que estaban esperando datos ('buffering'/'stalled').
+    const readySlots     = currentSlots.filter(s => s.playbackUrl && (s.status === 'ready' || s.status === 'buffering' || s.status === 'playing' || s.status === 'stalled'))
     const assignedSlots  = currentSlots.filter(s => s.cameraId && s.status !== 'loading')
 
     // Play never requires a prior timeline click: without a playhead, start
@@ -1468,7 +1573,10 @@ export function RecordingsPage() {
     // Play all slots that are already ready and re-arm their continuity
     // timers from the remaining clip time
     readySlots.forEach(s => {
-      videoRefs.current[s.slotIndex]?.play().catch(() => {})
+      // No ocultar el error de play(): registrar la causa (AbortError, autoplay
+      // bloqueado, formato, etc.) en vez de tragarla silenciosamente.
+      videoRefs.current[s.slotIndex]?.play()
+        .catch((e: Error) => console.warn(`[recordings-ui] manual_play_failed slot=${s.slotIndex} reason=${e.name}:${e.message}`))
       if (s.sessionType === 'preview' && s.sessionId) {
         scheduleContinuityTimer(s.slotIndex, s.sessionId)
       }
@@ -1478,7 +1586,7 @@ export function RecordingsPage() {
     // covers it, otherwise jump to that camera's NEXT block in range
     let clockAnchored = readySlots.length > 0
     assignedSlots
-      .filter(s => s.status !== 'ready')
+      .filter(s => !isLiveSlot(s.status))
       .forEach(slot => {
         if (!slot.cameraId) return
         if (playheadMs === null) return
@@ -1569,7 +1677,7 @@ export function RecordingsPage() {
     globalPlaybackRateRef.current = rate
     slotsRef.current.forEach((s, i) => {
       const vid = videoRefs.current[i]
-      if (vid && s.status === 'ready') {
+      if (vid && isLiveSlot(s.status)) {
         vid.playbackRate = rate
         if ('preservesPitch' in vid) (vid as any).preservesPitch = false
         if (globalPlayingRef.current && s.sessionType === 'preview' && s.sessionId) {
@@ -1583,7 +1691,7 @@ export function RecordingsPage() {
   const syncedJump = (seconds: number) => {
     slotsRef.current.forEach((s, i) => {
       const vid = videoRefs.current[i]
-      if (vid && s.status === 'ready') {
+      if (vid && isLiveSlot(s.status)) {
         vid.currentTime = Math.max(0, Math.min(vid.duration || 0, vid.currentTime + seconds))
         if (globalPlayingRef.current && s.sessionType === 'preview' && s.sessionId) {
           scheduleContinuityTimer(i, s.sessionId)
@@ -1595,7 +1703,7 @@ export function RecordingsPage() {
   const syncedFrameForward = () => {
     slotsRef.current.forEach((s, i) => {
       const vid = videoRefs.current[i]
-      if (vid && s.status === 'ready') {
+      if (vid && isLiveSlot(s.status)) {
         vid.pause()
         vid.currentTime = Math.min(vid.duration || 0, vid.currentTime + 1 / 25)
       }
@@ -1660,7 +1768,7 @@ export function RecordingsPage() {
   }
 
   const handleSlotWheel = (idx: number, e: React.WheelEvent<HTMLDivElement>) => {
-    if (slotsRef.current[idx]?.status !== 'ready') return
+    if (!slotsRef.current[idx] || !isLiveSlot(slotsRef.current[idx]!.status)) return
     const cur  = zoomBySlotRef.current[idx] ?? { scale: 1, x: 0, y: 0 }
     const dir  = e.deltaY < 0 ? 1.2 : 1 / 1.2
     const next = Math.min(8, Math.max(1, cur.scale * dir))
@@ -1753,7 +1861,7 @@ export function RecordingsPage() {
 
   // ── Derived values ─────────────────────────────────────────────────────────
 
-  const anySlotReady   = slots.some(s => s.status === 'ready')
+  const anySlotReady   = slots.some(s => isLiveSlot(s.status))
   const assignedSlotCount = slots.filter(s => s.cameraId !== null).length
   const canGlobalPlay  = Boolean(
     recordings.length > 0 &&
@@ -1927,8 +2035,17 @@ export function RecordingsPage() {
                           : `Canal ${idx + 1}`
                         }
                       </span>
-                      {slot.status === 'ready' && (
+                      {slot.status === 'playing' && (
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-green-700/60 text-green-300">● Play</span>
+                      )}
+                      {slot.status === 'ready' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-300">Pausado</span>
+                      )}
+                      {slot.status === 'buffering' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-amber-800/60 text-amber-300">Buffering…</span>
+                      )}
+                      {slot.status === 'stalled' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-red-800/60 text-red-300" title={slot.errorMsg ?? undefined}>Sin avance</span>
                       )}
                       {slot.status === 'loading' && (
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-300">Cargando…</span>
@@ -1961,7 +2078,7 @@ export function RecordingsPage() {
                       controlsList="nodownload"
                       className={clsx(
                         'absolute inset-0 w-full h-full bg-black',
-                        slot.status === 'ready' ? 'block' : 'hidden'
+                        isLiveSlot(slot.status) ? 'block' : 'hidden'
                       )}
                     />
 
@@ -2017,6 +2134,33 @@ export function RecordingsPage() {
                               style={{ width: `${vodPct}%` }}
                             />
                           </div>
+                        )}
+                      </div>
+                    )}
+
+                    {slot.status === 'buffering' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/40 pointer-events-none">
+                        <Loader2 size={20} className="text-brand-400 animate-spin" />
+                        <p className="text-[10px] text-surface-300">Preparando video…</p>
+                      </div>
+                    )}
+
+                    {slot.status === 'stalled' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/70 px-3">
+                        <AlertTriangle size={18} className="text-amber-500 flex-shrink-0" />
+                        <p className="text-[9px] text-surface-300 text-center line-clamp-2">
+                          {slot.errorMsg ?? 'El video no avanzó.'}
+                        </p>
+                        {slot.recording && (
+                          <button
+                            onClick={e => {
+                              e.stopPropagation()
+                              startPreviewInSlotRef.current(idx, slot.recording!, globalPlaybackTime ?? new Date(slot.recording!.startTime))
+                            }}
+                            className="text-[9px] px-2 py-0.5 rounded bg-brand-700/60 hover:bg-brand-600/70 border border-brand-600/50 text-brand-300 transition-colors"
+                          >
+                            Reintentar
+                          </button>
                         )}
                       </div>
                     )}
@@ -2126,7 +2270,7 @@ export function RecordingsPage() {
             <div className="flex-1" />
 
             {/* Snapshot of the active slot's current frame */}
-            {activeSlot.status === 'ready' && (
+            {isLiveSlot(activeSlot.status) && (
               <button
                 onClick={() => captureSnapshot(activeSlotIndex)}
                 title="Capturar imagen del canal activo (PNG)"
