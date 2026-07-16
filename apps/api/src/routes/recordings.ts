@@ -1813,6 +1813,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       // esto, un NVR que acepta el socket pero no envía datos deja a FFmpeg vivo
       // sin salida y la cadena de fallback nunca avanza.
       let variantTimedOut = false
+      let procExited = false   // se setea en el handler 'exit' (salida REAL)
       let killGraceTimer: NodeJS.Timeout | null = null
       const clearFirstByteWatchdog = () => {
         if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null }
@@ -1827,9 +1828,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           ` timeoutMs=${PREVIEW_FIRST_BYTE_TIMEOUT_MS} — killing ffmpeg to advance chain`
         )
         try { proc.kill('SIGTERM') } catch {}
-        // Si ignora SIGTERM, forzar SIGKILL tras la gracia
+        // Si ignora SIGTERM, forzar SIGKILL tras la gracia. Se comprueba procExited
+        // (salida REAL vía el evento 'exit'), NO proc.killed: en Node proc.killed
+        // se vuelve true apenas se ENVÍA la señal, no cuando el proceso termina —
+        // usarlo dejaría vivo a un FFmpeg que ignora SIGTERM y la cadena colgada.
         killGraceTimer = setTimeout(() => {
-          try { if (!proc.killed) proc.kill('SIGKILL') } catch {}
+          if (procExited) return
+          server.log.warn(`[recordings-preview] sigkill sessionId=${sessionId} variant=${variant} — ffmpeg ignored SIGTERM`)
+          try { proc.kill('SIGKILL') } catch {}
         }, PREVIEW_KILL_GRACE_MS)
       }, PREVIEW_FIRST_BYTE_TIMEOUT_MS)
 
@@ -1871,6 +1877,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       proc.stdout?.pipe(res, { end: false })
 
       proc.on('exit', (code, signal) => {
+        procExited = true
         clearFirstByteWatchdog()
         const elapsedMs = Date.now() - streamStartMs
         server.log.info(
