@@ -1073,6 +1073,24 @@ export function RecordingsPage() {
 
   loadInSlotRef.current = loadRecordingInSlot
 
+  // Arma un detector de estancamiento para un slot: si tras `ms` el video no
+  // avanzó (currentTime sigue en 0) y sigue siendo la misma sesión, lo pasa a
+  // 'stalled'. A nivel de componente para usarse tanto al iniciar el preview como
+  // al presionar Play sobre un slot que ya está en 'buffering'.
+  const armStallTimer = (slotIndex: number, sessionId: string | null, ms = 5000) => {
+    if (stallTimersRef.current[slotIndex]) clearTimeout(stallTimersRef.current[slotIndex]!)
+    stallTimersRef.current[slotIndex] = setTimeout(() => {
+      const v = videoRefs.current[slotIndex]
+      if (v && v.currentTime > 0) return                 // ya avanza
+      const s = slotsRef.current[slotIndex]
+      if (!s || (sessionId && s.sessionId !== sessionId)) return  // otra sesión reemplazó
+      if (s.status === 'playing') return
+      console.warn(`[recordings-ui] preview_stalled slot=${slotIndex} sessionId=${sessionId} currentTime=0`)
+      setSlots(prev => prev.map((x, i) => i === slotIndex
+        ? { ...x, status: 'stalled', errorMsg: 'El video no avanzó — el origen puede no estar entregando datos.' } : x))
+    }, ms)
+  }
+
   // ── Preview streaming ─────────────────────────────────────────────────────
   // Starts an fMP4 stream directly from NVR RTSP → browser <video>.
   // Starts in 1-3s instead of waiting for full MP4 generation.
@@ -1423,13 +1441,7 @@ export function RecordingsPage() {
         // Detector de estancamiento: si tras 5 s currentTime sigue en 0, el video
         // no avanzó (FFmpeg sin datos / src reemplazado / sesión caída) → 'stalled'.
         clearStall()
-        stallTimersRef.current[slotIndex] = setTimeout(() => {
-          if (slotKeysRef.current[slotIndex] !== myKey) return
-          const v = videoRefs.current[slotIndex]
-          if (v && v.currentTime > 0) return
-          console.warn(`[recordings-ui] recordings_deep_link_stalled slot=${slotIndex} sessionId=${sessionId} currentTime=0 after 5s`)
-          setSlotStatusIfCurrent('stalled', { errorMsg: 'El video no avanzó (5 s) — el origen puede no estar entregando datos.' })
-        }, 5000)
+        armStallTimer(slotIndex, sessionId)
 
         scheduleContinuityTimer(slotIndex, sessionId)
       } else {
@@ -1590,6 +1602,10 @@ export function RecordingsPage() {
       if (s.sessionType === 'preview' && s.sessionId) {
         scheduleContinuityTimer(s.slotIndex, s.sessionId)
       }
+      // Si el slot todavía no reproduce (buffering/stalled), armar el detector de
+      // estancamiento: al presionar Play sobre un slot que arrancó sin intención
+      // de reproducir, antes no se armaba y quedaba en buffering para siempre.
+      if (s.status !== 'playing') armStallTimer(s.slotIndex, s.sessionId)
     })
 
     // For assigned-but-not-ready slots: start at the playhead if a recording

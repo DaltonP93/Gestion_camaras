@@ -425,6 +425,16 @@ const PREVIEW_PROBE_ENABLED = process.env.RECORDINGS_PREVIEW_PROBE === 'true'
 const MAX_PREVIEW_PER_NVR = Math.max(1, parseInt(process.env.RECORDINGS_MAX_PREVIEW_PER_NVR || '1', 10) || 1)
 const PREVIEW_START_STAGGER_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVIEW_START_STAGGER_MS || '1200', 10) || 1200)
 const PREVIEW_QUEUE_WAIT_MAX_MS = 30_000
+// Watchdog de PRIMER BYTE por variante RTSP. Si FFmpeg no produce stdout dentro
+// de este plazo (el NVR aceptó el socket pero no envía video ni cierra), se lo
+// mata y se avanza a la siguiente variante. Sin esto, un FFmpeg colgado bloquea
+// toda la cadena de fallback y la request queda pendiente para siempre.
+const PREVIEW_FIRST_BYTE_TIMEOUT_MS = Math.max(3_000, parseInt(process.env.RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS || '13000', 10) || 13_000)
+// Gracia tras SIGTERM antes de SIGKILL a un FFmpeg que ignora la señal.
+const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS || '2000', 10) || 2000)
+// Presupuesto TOTAL de arranque (todas las variantes juntas). Si se supera, se
+// deja de intentar y se responde error — cota superior dura al peor caso.
+const PREVIEW_TOTAL_STARTUP_MS = Math.max(10_000, parseInt(process.env.RECORDINGS_PREVIEW_TOTAL_STARTUP_MS || '60000', 10) || 60_000)
 
 interface NvrPreviewState { active: number; lastStartAt: number; queue: Array<() => void> }
 const nvrPreviewStates = new Map<string, NvrPreviewState>()
@@ -1738,6 +1748,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       headersSent = true
       const status = category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT' ? 503
         : category === 'NVR_OFFLINE_OR_TIMEOUT' ? 504
+        : category === 'FIRST_BYTE_TIMEOUT' ? 504
         : category === 'AUTH_FAILED' ? 401
         : 502
       try {
@@ -1769,8 +1780,22 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const attemptErrors: Array<{ variant: PlaybackVariant; category: string; detail: string }> = []
 
     const startAttempt = (chainIndex: number) => {
+      // Presupuesto total agotado → no iniciar otra variante; responder error.
+      const totalElapsed = Date.now() - streamStartMs
+      if (totalElapsed > PREVIEW_TOTAL_STARTUP_MS && !firstByteSent) {
+        server.log.warn(`[recordings-preview] startup_budget_exceeded sessionId=${sessionId} elapsedMs=${totalElapsed}`)
+        const prev = attemptErrors[attemptErrors.length - 1]
+        session.errorCategory = prev?.category ?? 'FIRST_BYTE_TIMEOUT'
+        session.errorDetail   = prev?.detail ?? 'presupuesto de arranque agotado'
+        session.hadFirstByte  = false
+        retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+        endWithError(session.errorCategory, session.errorDetail ?? '')
+        finish('startup_budget_exceeded')
+        return
+      }
       const { variant, url: inputUrl } = variantChain[chainIndex]
       const maskedUrl = maskUrlCredentials(inputUrl)
+      let firstByteTimer: NodeJS.Timeout | null = null
       server.log.info(`[recordings-preview] rtsp_variant_try sessionId=${sessionId} variant=${variant}`)
       server.log.info(
         `[recordings-preview] stream_start sessionId=${sessionId}` +
@@ -1781,6 +1806,32 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       const proc = spawn('ffmpeg', buildFfmpegArgs(inputUrl), { stdio: ['ignore', 'pipe', 'pipe'] })
       currentProc = proc
       session.vodProcess = proc
+
+      // ── Watchdog de primer byte (por variante) ──────────────────────────
+      // Si FFmpeg no emite stdout antes del deadline, lo matamos (SIGTERM →
+      // SIGKILL) para que su 'exit' dispare el avance al siguiente variant. Sin
+      // esto, un NVR que acepta el socket pero no envía datos deja a FFmpeg vivo
+      // sin salida y la cadena de fallback nunca avanza.
+      let variantTimedOut = false
+      let killGraceTimer: NodeJS.Timeout | null = null
+      const clearFirstByteWatchdog = () => {
+        if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null }
+        if (killGraceTimer) { clearTimeout(killGraceTimer); killGraceTimer = null }
+      }
+      firstByteTimer = setTimeout(() => {
+        if (firstByteSent) return
+        variantTimedOut = true
+        session.errorCategory = 'FIRST_BYTE_TIMEOUT'
+        server.log.warn(
+          `[recordings-preview] first_byte_timeout sessionId=${sessionId} variant=${variant}` +
+          ` timeoutMs=${PREVIEW_FIRST_BYTE_TIMEOUT_MS} — killing ffmpeg to advance chain`
+        )
+        try { proc.kill('SIGTERM') } catch {}
+        // Si ignora SIGTERM, forzar SIGKILL tras la gracia
+        killGraceTimer = setTimeout(() => {
+          try { if (!proc.killed) proc.kill('SIGKILL') } catch {}
+        }, PREVIEW_KILL_GRACE_MS)
+      }, PREVIEW_FIRST_BYTE_TIMEOUT_MS)
 
       proc.stderr?.on('data', (chunk: Buffer) => {
         for (const raw of chunk.toString().split('\n')) {
@@ -1793,8 +1844,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       })
 
       proc.stdout?.once('data', (chunk: Buffer) => {
-        // Primer byte real de FFmpeg → recién ahora enviamos el 200. Debe correr
-        // ANTES de que el pipe escriba el chunk (este listener se registró antes).
+        // Primer byte real de FFmpeg → cancelar el watchdog y recién ahora enviar
+        // el 200. Debe correr ANTES de que el pipe escriba el chunk (este listener
+        // se registró antes).
+        clearFirstByteWatchdog()
         sendHeadersOnce()
         firstByteSent = true
         session.hadFirstByte  = true
@@ -1817,21 +1870,30 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       // end:false — on a failed variant we reuse the same response for the next one
       proc.stdout?.pipe(res, { end: false })
 
-      proc.on('exit', (code) => {
+      proc.on('exit', (code, signal) => {
+        clearFirstByteWatchdog()
         const elapsedMs = Date.now() - streamStartMs
         server.log.info(
           `[recordings-preview] ffmpeg_exit sessionId=${sessionId}` +
-          ` code=${code} variant=${variant} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
+          ` code=${code} signal=${signal ?? 'none'} variant=${variant} elapsedMs=${elapsedMs}` +
+          ` hadFirstByte=${firstByteSent} timedOut=${variantTimedOut}`
         )
         if (session.vodProcess === proc) session.vodProcess = undefined
 
-        const failedBeforeOutput = code !== 0 && code !== null && !firstByteSent
+        // Cualquier salida SIN primer byte es un fallo de esta variante (incluye
+        // el kill del watchdog por timeout y una salida limpia sin datos) → hay
+        // que avanzar al siguiente variant. Antes se exigía code!==0 && code!==null,
+        // por lo que un proceso matado por señal (code=null) NO avanzaba.
+        const failedBeforeOutput = !firstByteSent
         if (failedBeforeOutput) {
           // Classify locally — session error state is only written when NO
           // more variants remain, so a successful fallback never leaves a
-          // stale error behind
-          const category = classifyRtspError(stderrTail.join('\n'))
-          const detail   = stderrTail.slice(-5).join(' | ').slice(0, 400)
+          // stale error behind. Un timeout de primer byte tiene su propia
+          // categoría (y SÍ avanza, a diferencia de offline).
+          const category = variantTimedOut ? 'FIRST_BYTE_TIMEOUT' : classifyRtspError(stderrTail.join('\n'))
+          const detail   = variantTimedOut
+            ? `sin primer byte en ${PREVIEW_FIRST_BYTE_TIMEOUT_MS}ms — ${stderrTail.slice(-3).join(' | ').slice(0, 300)}`
+            : stderrTail.slice(-5).join(' | ').slice(0, 400)
           attemptErrors.push({ variant, category, detail })
           stderrTail.length = 0  // fresh tail for the next attempt
           server.log.warn(
@@ -1885,6 +1947,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       })
 
       proc.on('error', (err: Error) => {
+        clearFirstByteWatchdog()
         server.log.warn(`[recordings-preview] ffmpeg_error sessionId=${sessionId} err=${err.message}`)
         try { proc.kill('SIGTERM') } catch {}
         finish('ffmpeg_error')
