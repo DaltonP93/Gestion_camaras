@@ -11,7 +11,9 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      # Sólo accesible desde el host (localhost), nunca desde la red externa.
+      # Los servicios internos usan la red docker (postgres:5432), no este mapeo.
+      - "127.0.0.1:5432:5432"
     networks:
       - visioncore_net
     healthcheck:
@@ -29,7 +31,8 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - "6379:6379"
+      # Sólo localhost del host — nunca expuesto a la red externa.
+      - "127.0.0.1:6379:6379"
     networks:
       - visioncore_net
     healthcheck:
@@ -51,7 +54,8 @@ services:
       - "8554:8554"   # RTSP
       - "8888:8888"   # HLS
       - "8889:8889"   # WebRTC
-      - "9997:9997"   # API REST de MediaMTX
+      # API REST de MediaMTX: interna (la usa el API vía red docker) — sólo localhost.
+      - "127.0.0.1:9997:9997"
     networks:
       - visioncore_net
     extra_hosts:
@@ -128,8 +132,18 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Healthcheck: nginx puede esperar a que el API esté listo (start_period cubre
+    # el arranque) en vez de dar 502 transitorios durante la recreación.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     ports:
-      - "4000:4000"
+      # Detrás de nginx: nginx llega por la red docker (api:4000), este mapeo es
+      # sólo para acceso directo/depuración desde el host → localhost únicamente.
+      - "127.0.0.1:4000:4000"
     networks:
       - visioncore_net
     # Allow the API container to resolve external hostnames (e.g. SMTP servers).

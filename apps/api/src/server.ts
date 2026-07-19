@@ -8,6 +8,7 @@ import staticFiles from '@fastify/static'
 import multipart from '@fastify/multipart'
 import path from 'path'
 import fs from 'fs'
+import { redactUrlSecrets } from './lib/log-redact'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -39,6 +40,22 @@ const server = Fastify({
     transport: process.env.NODE_ENV !== 'production'
       ? { target: 'pino-pretty', options: { colorize: true } }
       : undefined,
+    // Redactar tokens del query en el log de request (p.ej. /ws/alerts?token=<JWT>,
+    // /recordings/.../stream?token=...) y el header Authorization.
+    serializers: {
+      req(req: any) {
+        return {
+          method: req.method,
+          url: redactUrlSecrets(req.url ?? ''),
+          hostname: req.hostname,
+          remoteAddress: req.ip,
+        }
+      },
+    },
+    redact: {
+      paths: ['req.headers.authorization', 'req.headers.cookie', 'headers.authorization', 'headers.cookie'],
+      censor: '***',
+    },
   },
 })
 
