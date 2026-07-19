@@ -210,9 +210,15 @@ services:
       - "80:80"
       - "443:443"
     depends_on:
-      - api
-      - web
-      - mediamtx
+      # Esperar a que el API esté SANO (no sólo iniciado) para no producir 502
+      # transitorios mientras corren migraciones / arranque. web y mediamtx sólo
+      # necesitan estar iniciados.
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+      mediamtx:
+        condition: service_started
     networks:
       - visioncore_net
 

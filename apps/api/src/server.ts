@@ -131,7 +131,7 @@ async function main() {
       ? error.statusCode
       : 500
     if (status >= 500) {
-      server.log.error({ err: error, url: request.url }, 'unhandled_error')
+      server.log.error({ err: error, url: redactUrlSecrets(request.url) }, 'unhandled_error')
       return reply.status(status).send({ code: 'INTERNAL_ERROR', message: 'Error interno del servidor' })
     }
     return reply.status(status).send({
