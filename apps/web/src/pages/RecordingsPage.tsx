@@ -1371,20 +1371,28 @@ export function RecordingsPage() {
       // timeupdate con currentTime>0). Si nunca avanza, el stall timer lo detecta.
       const onMetadata = () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
-        console.info(`[recordings-ui] recordings_deep_link_media_attached slot=${slotIndex} sessionId=${sessionId} metadata_loaded`)
+        console.info(`[recordings-ui] media_attached slot=${slotIndex} sessionId=${sessionId} metadata_loaded`)
+        // El detector de estancamiento se arma RECIÉN cuando hay media adjunto
+        // (metadata), no mientras el backend espera el primer byte del NVR (que
+        // puede tardar ~13-15 s). Antes se armaba al iniciar y marcaba 'stalled'
+        // falsamente a los 5 s, mostrando error y luego reproduciendo.
+        if (globalPlayingRef.current) armStallTimer(slotIndex, sessionId)
       }
       const onPlaying = () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
         clearStall()
-        console.info(`[recordings-ui] recordings_deep_link_playing slot=${slotIndex} sessionId=${sessionId}`)
+        console.info(`[recordings-ui] preview_playing slot=${slotIndex} sessionId=${sessionId}`)
         setSlotStatusIfCurrent('playing')
       }
       const onTimeUpdate = () => {
         if (vid.currentTime > 0) { clearStall(); setSlotStatusIfCurrent('playing') }
       }
       const onCanPlay = () => {
-        // Media lista. Si NO hay intención de reproducir (pausado), queda 'ready'.
+        // Media lista. Si NO hay intención de reproducir (pausado), queda 'ready';
+        // si hay intención, asegurar el detector de estancamiento (por si no llegó
+        // loadedmetadata primero).
         if (!globalPlayingRef.current) setSlotStatusIfCurrent('ready')
+        else if (!stallTimersRef.current[slotIndex]) armStallTimer(slotIndex, sessionId)
       }
 
       ;(videoCleanupRef.current[slotIndex] as (() => void) | null)?.()
@@ -1421,14 +1429,20 @@ export function RecordingsPage() {
       vid.playbackRate = globalPlaybackRateRef.current
 
       if (globalPlayingRef.current) {
-        // play() con manejo REAL de errores (no catch vacío): se registra la causa
-        // y, si fue por media no lista, se reintenta una vez en 'canplay'.
+        // play() con manejo REAL de errores. Un AbortError cuando esta generación
+        // ya fue reemplazada (seek/continuidad/cambio de cámara) es una transición
+        // ESPERADA, no un fallo: no se registra como error ni marca el slot.
         const tryPlay = (phase: string) =>
           vid.play()
-            .then(() => console.info(`[recordings-ui] recordings_deep_link_play_ok slot=${slotIndex} phase=${phase} sessionId=${sessionId}`))
+            .then(() => console.info(`[recordings-ui] preview_play_ok slot=${slotIndex} phase=${phase} sessionId=${sessionId}`))
             .catch((e: Error) => {
-              console.warn(`[recordings-ui] recordings_deep_link_play_failed slot=${slotIndex} phase=${phase} reason=${e.name}:${e.message}`)
-              if (phase === 'immediate') {
+              const superseded = slotKeysRef.current[slotIndex] !== myKey
+              if (e.name === 'AbortError' && superseded) {
+                console.info(`[recordings-ui] play_aborted_superseded slot=${slotIndex} phase=${phase} — transición esperada`)
+                return
+              }
+              console.warn(`[recordings-ui] preview_play_failed slot=${slotIndex} phase=${phase} reason=${e.name}:${e.message}`)
+              if (phase === 'immediate' && !superseded) {
                 const retry = () => { vid.removeEventListener('canplay', retry); if (slotKeysRef.current[slotIndex] === myKey && globalPlayingRef.current) tryPlay('canplay') }
                 vid.addEventListener('canplay', retry)
               } else if (e.name === 'NotAllowedError') {
@@ -1438,11 +1452,9 @@ export function RecordingsPage() {
             })
         tryPlay('immediate')
 
-        // Detector de estancamiento: si tras 5 s currentTime sigue en 0, el video
-        // no avanzó (FFmpeg sin datos / src reemplazado / sesión caída) → 'stalled'.
-        clearStall()
-        armStallTimer(slotIndex, sessionId)
-
+        // NOTA: el detector de estancamiento NO se arma acá — se arma en
+        // onMetadata/onCanPlay (media adjunto). Mientras se espera el primer byte
+        // del NVR el slot queda en 'buffering' ("Preparando origen…"), no 'stalled'.
         scheduleContinuityTimer(slotIndex, sessionId)
       } else {
         // Sin intención de reproducir: cargar metadatos para poder mostrar frame.
@@ -1602,10 +1614,11 @@ export function RecordingsPage() {
       if (s.sessionType === 'preview' && s.sessionId) {
         scheduleContinuityTimer(s.slotIndex, s.sessionId)
       }
-      // Si el slot todavía no reproduce (buffering/stalled), armar el detector de
-      // estancamiento: al presionar Play sobre un slot que arrancó sin intención
-      // de reproducir, antes no se armaba y quedaba en buffering para siempre.
-      if (s.status !== 'playing') armStallTimer(s.slotIndex, s.sessionId)
+      // Si el slot ya tiene media adjunto (metadata) pero no avanza, armar el
+      // detector de estancamiento. NO armarlo si todavía está esperando el primer
+      // byte (readyState < HAVE_METADATA) para no marcar 'stalled' prematuro.
+      const vEl = videoRefs.current[s.slotIndex]
+      if (s.status !== 'playing' && vEl && vEl.readyState >= 1) armStallTimer(s.slotIndex, s.sessionId)
     })
 
     // For assigned-but-not-ready slots: start at the playhead if a recording
@@ -2167,7 +2180,7 @@ export function RecordingsPage() {
                     {slot.status === 'buffering' && (
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/40 pointer-events-none">
                         <Loader2 size={20} className="text-brand-400 animate-spin" />
-                        <p className="text-[10px] text-surface-300">Preparando video…</p>
+                        <p className="text-[10px] text-surface-300">Preparando origen de grabación…</p>
                       </div>
                     )}
 
