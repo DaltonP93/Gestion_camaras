@@ -573,7 +573,28 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     kpis.uniqueIncidents = Number(distinct?.inc ?? 0)
     kpis.uniqueTracks    = Number(distinct?.trk ?? 0)
 
+    // Comparación con el periodo ANTERIOR (misma duración y mismos filtros).
+    const periodMs = to.getTime() - from.getTime()
+    const prevFrom = new Date(from.getTime() - periodMs)
+    const prevWhere = { ...where, occurredAt: { gte: prevFrom, lt: from } }
+    const previousTotal = await server.prisma.analyticsEvent.count({ where: prevWhere })
+    const comparison = {
+      previousTotal,
+      delta: totalEvents - previousTotal,
+      deltaPct: previousTotal > 0 ? Math.round(((totalEvents - previousTotal) / previousTotal) * 100) : null,
+    }
+
+    // Mapa de calor día-de-semana (0=domingo) × hora (0-23) en la timezone pedida.
+    const heatmapRows = await server.prisma.$queryRaw<{ dow: number; hour: number; count: bigint }[]>(
+      Prisma.sql`SELECT extract(dow  from "occurredAt" AT TIME ZONE ${opts.timezone})::int AS dow,
+                        extract(hour from "occurredAt" AT TIME ZONE ${opts.timezone})::int AS hour,
+                        COUNT(*)::bigint AS count
+                 FROM "analytics_events" WHERE ${whereSql} GROUP BY 1, 2`
+    )
+    const heatmap = heatmapRows.map(r => ({ dow: Number(r.dow), hour: Number(r.hour), count: Number(r.count) }))
+
     return reply.send({
+      comparison, heatmap,
       from: from.toISOString(), to: to.toISOString(),
       granularity: opts.granularity, timezone: opts.timezone,
       filters: { nvrIds, cameraIds, types, classNames, zoneNames, directions },
