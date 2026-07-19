@@ -13,6 +13,7 @@ import path from 'path'
 
 import { decryptNvrPassword as decryptPass } from '../services/credentials'
 import { MemorySessionStore, RedisSessionStore, type SessionStore } from '../services/session-store'
+import { shouldAcceptFirstByte, errorStatusForCategory, isCancellation } from './recordings-preview-state'
 import {
   maskUrlCredentials, classifyRtspError,
   buildVariantChain as buildVariantChainPure,
@@ -429,7 +430,11 @@ const PREVIEW_QUEUE_WAIT_MAX_MS = 30_000
 // de este plazo (el NVR aceptó el socket pero no envía video ni cierra), se lo
 // mata y se avanza a la siguiente variante. Sin esto, un FFmpeg colgado bloquea
 // toda la cadena de fallback y la request queda pendiente para siempre.
-const PREVIEW_FIRST_BYTE_TIMEOUT_MS = Math.max(3_000, parseInt(process.env.RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS || '13000', 10) || 13_000)
+// 25s por defecto: la evidencia de producción muestra que ciertos NVR Hikvision
+// tardan 13,2–14,4 s en entregar el primer byte (apertura RTSP + primer keyframe +
+// demux + transcode H.264 + header fMP4). 13s cortaba streams válidos justo antes
+// de arrancar. FFmpeg mismo espera ~60s a nivel RTSP; Node no debe cortar antes.
+const PREVIEW_FIRST_BYTE_TIMEOUT_MS = Math.max(3_000, parseInt(process.env.RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS || '25000', 10) || 25_000)
 // Gracia tras SIGTERM antes de SIGKILL a un FFmpeg que ignora la señal.
 const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS || '2000', 10) || 2000)
 // Presupuesto TOTAL de arranque (todas las variantes juntas). Si se supera, se
@@ -1725,7 +1730,20 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     let firstByteSent = false
     let headersSent   = false
     let clientGone    = false
+    let responseEnded = false
+    // El presupuesto total ya terminó la sesión (mató FFmpeg + respondió error):
+    // el 'exit' del proceso NO debe reclasificar la causa ni avanzar la cadena,
+    // para no pisar la categoría FIRST_BYTE_TIMEOUT con UNKNOWN (que dispararía un
+    // retry H.264 indebido en el frontend).
+    let deadlineTerminated = false
     let currentProc: ChildProcess | null = null
+    // Limpieza del intento activo (timers + estado terminal), invocable desde
+    // onClientGone / presupuesto total para no dejar watchdogs vivos tras cerrar.
+    let currentAttemptCleanup: (() => void) | null = null
+    // Presupuesto TOTAL de arranque: un único timer por sesión (no basta con
+    // chequear elapsed al iniciar cada variante).
+    let totalStartupTimer: NodeJS.Timeout | null = null
+    const clearTotalStartupTimer = () => { if (totalStartupTimer) { clearTimeout(totalStartupTimer); totalStartupTimer = null } }
 
     // Los headers 200 se envían RECIÉN cuando FFmpeg produce el primer byte de
     // MP4 — no antes. Así, si todas las variantes RTSP fallan, el cliente recibe
@@ -1746,11 +1764,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const endWithError = (category: string, detail: string) => {
       if (headersSent) return
       headersSent = true
-      const status = category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT' ? 503
-        : category === 'NVR_OFFLINE_OR_TIMEOUT' ? 504
-        : category === 'FIRST_BYTE_TIMEOUT' ? 504
-        : category === 'AUTH_FAILED' ? 401
-        : 502
+      const status = errorStatusForCategory(category)
       try {
         res.writeHead(status, { 'Content-Type': 'application/json', 'X-Session-Id': sessionId })
         res.end(JSON.stringify({ code: category, message: 'El origen no entregó video', detail: detail.slice(0, 300) }))
@@ -1761,6 +1775,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     session.stderrTail = stderrTail
 
     const finish = (reason: string) => {
+      if (responseEnded) return
+      responseEnded = true
+      clearTotalStartupTimer()
       const elapsedMs = Date.now() - streamStartMs
       server.log.info(
         `[recordings-preview] stream_closed sessionId=${sessionId}` +
@@ -1807,11 +1824,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       currentProc = proc
       session.vodProcess = proc
 
-      // ── Watchdog de primer byte (por variante) ──────────────────────────
-      // Si FFmpeg no emite stdout antes del deadline, lo matamos (SIGTERM →
-      // SIGKILL) para que su 'exit' dispare el avance al siguiente variant. Sin
-      // esto, un NVR que acepta el socket pero no envía datos deja a FFmpeg vivo
-      // sin salida y la cadena de fallback nunca avanza.
+      // ── Máquina de estado del intento + watchdog de primer byte ─────────
+      // Estados: waiting_first_byte → streaming → (exited) ; o → timed_out /
+      // cancelled. Los bytes de stdout SÓLO se aceptan en waiting_first_byte. Un
+      // NVR lento puede vaciar bytes durante el cierre (tras SIGTERM); aceptarlos
+      // marcaba éxito y enviaba un MP4 truncado → aquí se ignoran (late byte).
+      let attemptState: 'waiting_first_byte' | 'streaming' | 'terminal' = 'waiting_first_byte'
       let variantTimedOut = false
       let procExited = false   // se setea en el handler 'exit' (salida REAL)
       let killGraceTimer: NodeJS.Timeout | null = null
@@ -1819,10 +1837,21 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null }
         if (killGraceTimer) { clearTimeout(killGraceTimer); killGraceTimer = null }
       }
+      // Marca el intento como terminal y detiene toda entrada de datos al cliente.
+      const finalizeAttempt = () => {
+        attemptState = 'terminal'
+        clearFirstByteWatchdog()
+        try { proc.stdout?.unpipe(res) } catch {}
+      }
+      currentAttemptCleanup = finalizeAttempt
       firstByteTimer = setTimeout(() => {
-        if (firstByteSent) return
+        if (firstByteSent || attemptState !== 'waiting_first_byte') return
         variantTimedOut = true
+        attemptState = 'terminal'
         session.errorCategory = 'FIRST_BYTE_TIMEOUT'
+        // Cortar cualquier byte tardío antes de matar: si FFmpeg vacía datos
+        // durante el cierre, NO deben llegar al navegador (MP4 truncado).
+        try { proc.stdout?.unpipe(res) } catch {}
         server.log.warn(
           `[recordings-preview] first_byte_timeout sessionId=${sessionId} variant=${variant}` +
           ` timeoutMs=${PREVIEW_FIRST_BYTE_TIMEOUT_MS} — killing ffmpeg to advance chain`
@@ -1850,10 +1879,22 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       })
 
       proc.stdout?.once('data', (chunk: Buffer) => {
+        // Sólo el primer byte que llega en 'waiting_first_byte' (y con el cliente
+        // presente) cuenta como éxito. Un byte tardío tras timeout/kill/cierre se
+        // ignora — nunca envía headers, marca éxito ni escribe al navegador.
+        if (!shouldAcceptFirstByte({ state: attemptState, variantTimedOut, procExited, clientGone, responseEnded })) {
+          server.log.info(
+            `[recordings-preview] late_first_byte_ignored sessionId=${sessionId} variant=${variant}` +
+            ` state=${attemptState} timedOut=${variantTimedOut} exited=${procExited} clientGone=${clientGone}`
+          )
+          return
+        }
+        attemptState = 'streaming'
         // Primer byte real de FFmpeg → cancelar el watchdog y recién ahora enviar
         // el 200. Debe correr ANTES de que el pipe escriba el chunk (este listener
         // se registró antes).
         clearFirstByteWatchdog()
+        clearTotalStartupTimer()
         sendHeadersOnce()
         firstByteSent = true
         session.hadFirstByte  = true
@@ -1878,7 +1919,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
       proc.on('exit', (code, signal) => {
         procExited = true
+        // No marcar terminal si ya está streaming (salida normal al fin del clip):
+        // sólo cerrar watchdog. Si aún esperaba primer byte, es terminal.
         clearFirstByteWatchdog()
+        if (attemptState === 'waiting_first_byte') attemptState = 'terminal'
         const elapsedMs = Date.now() - streamStartMs
         server.log.info(
           `[recordings-preview] ffmpeg_exit sessionId=${sessionId}` +
@@ -1886,6 +1930,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           ` hadFirstByte=${firstByteSent} timedOut=${variantTimedOut}`
         )
         if (session.vodProcess === proc) session.vodProcess = undefined
+
+        // El presupuesto total ya terminó la sesión (mató el proceso + respondió
+        // error): no reclasificar ni avanzar la cadena — pisaría la categoría
+        // FIRST_BYTE_TIMEOUT con UNKNOWN. Sólo cerrar.
+        if (deadlineTerminated) {
+          finish('deadline_terminated_exit')
+          return
+        }
 
         // Cualquier salida SIN primer byte es un fallo de esta variante (incluye
         // el kill del watchdog por timeout y una salida limpia sin datos) → hay
@@ -1926,6 +1978,17 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             return
           }
 
+          // Cancelación (cliente desconectado / sesión eliminada): NO es un fallo
+          // del NVR — no emitir all_variants_failed ni error al cliente.
+          if (isCancellation({ clientGone, sessionAlive: previewSessions.has(sessionId) })) {
+            server.log.info(
+              `[recordings-preview] attempt_cancelled sessionId=${sessionId} variant=${variant}` +
+              ` reason=${clientGone ? 'client_disconnect' : 'session_removed'}`
+            )
+            finish('attempt_cancelled')
+            return
+          }
+
           // All variants exhausted — persist the final error state. A 453 in
           // ANY attempt wins: it's the actionable cause for the operator.
           const final = attemptErrors.find(e => e.category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT')
@@ -1954,7 +2017,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       })
 
       proc.on('error', (err: Error) => {
-        clearFirstByteWatchdog()
+        finalizeAttempt()
         server.log.warn(`[recordings-preview] ffmpeg_error sessionId=${sessionId} err=${err.message}`)
         try { proc.kill('SIGTERM') } catch {}
         finish('ffmpeg_error')
@@ -1964,6 +2027,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const onClientGone = (reason: string) => {
       if (clientGone) return
       clientGone = true
+      // Detener el intento activo (timers + unpipe) y el presupuesto total antes
+      // de matar FFmpeg, para que ningún watchdog dispare tras el cierre.
+      currentAttemptCleanup?.()
+      clearTotalStartupTimer()
       if (currentProc) { try { currentProc.kill('SIGTERM') } catch {} }
       if (session.vodProcess === currentProc) session.vodProcess = undefined
       finish(reason)
@@ -1975,6 +2042,25 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       `[recordings-preview] variant_chain sessionId=${sessionId} mode=${PLAYBACK_STREAM_MODE}` +
       ` chain=${variantChain.map(v => v.variant).join('→')}`
     )
+
+    // Presupuesto TOTAL de arranque como timer independiente (una vez por sesión):
+    // aunque una variante quede colgada más allá del budget, esto corta y responde
+    // error. Se cancela al primer byte (clearTotalStartupTimer) y en finish().
+    totalStartupTimer = setTimeout(() => {
+      if (firstByteSent || clientGone || responseEnded) return
+      deadlineTerminated = true   // el 'exit' del proceso ya no debe reclasificar
+      server.log.warn(`[recordings-preview] startup_budget_exceeded sessionId=${sessionId} totalMs=${PREVIEW_TOTAL_STARTUP_MS}`)
+      currentAttemptCleanup?.()
+      if (currentProc) { try { currentProc.kill('SIGKILL') } catch {} }
+      const prev = attemptErrors[attemptErrors.length - 1]
+      session.errorCategory = prev?.category ?? 'FIRST_BYTE_TIMEOUT'
+      session.errorDetail   = prev?.detail ?? 'presupuesto de arranque agotado'
+      session.hadFirstByte  = false
+      retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+      endWithError(session.errorCategory, session.errorDetail ?? '')
+      finish('startup_budget_exceeded')
+    }, PREVIEW_TOTAL_STARTUP_MS)
+
     startAttempt(0)
   })
 
