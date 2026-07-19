@@ -1,6 +1,7 @@
 // apps/api/src/plugins/auth.ts
 import fp from 'fastify-plugin'
 import fastifyJwt from '@fastify/jwt'
+import { redactUrlSecrets } from '../lib/log-redact'
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
 import type { Role } from '@prisma/client'
 
@@ -52,7 +53,7 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
       const reason = err?.message || 'unknown'
       const code   = err?.code   || ''
       server.log.warn(
-        `[auth] 401 ${request.method} ${request.url} | ` +
+        `[auth] 401 ${request.method} ${redactUrlSecrets(request.url)} | ` +
         `header=${hasHeader} | code=${code} | reason=${reason}`
       )
       reply.status(401).send({
@@ -83,7 +84,7 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
         const reason = err?.message || 'unknown'
         const code   = err?.code   || ''
         server.log.warn(
-          `[auth] 401 ${request.method} ${request.url} | ` +
+          `[auth] 401 ${request.method} ${redactUrlSecrets(request.url)} | ` +
           `header=${hasHeader} | code=${code} | reason=${reason}`
         )
         reply.status(401).send({
