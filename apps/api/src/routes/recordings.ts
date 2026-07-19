@@ -1731,6 +1731,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     let headersSent   = false
     let clientGone    = false
     let responseEnded = false
+    // El presupuesto total ya terminó la sesión (mató FFmpeg + respondió error):
+    // el 'exit' del proceso NO debe reclasificar la causa ni avanzar la cadena,
+    // para no pisar la categoría FIRST_BYTE_TIMEOUT con UNKNOWN (que dispararía un
+    // retry H.264 indebido en el frontend).
+    let deadlineTerminated = false
     let currentProc: ChildProcess | null = null
     // Limpieza del intento activo (timers + estado terminal), invocable desde
     // onClientGone / presupuesto total para no dejar watchdogs vivos tras cerrar.
@@ -1926,6 +1931,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         )
         if (session.vodProcess === proc) session.vodProcess = undefined
 
+        // El presupuesto total ya terminó la sesión (mató el proceso + respondió
+        // error): no reclasificar ni avanzar la cadena — pisaría la categoría
+        // FIRST_BYTE_TIMEOUT con UNKNOWN. Sólo cerrar.
+        if (deadlineTerminated) {
+          finish('deadline_terminated_exit')
+          return
+        }
+
         // Cualquier salida SIN primer byte es un fallo de esta variante (incluye
         // el kill del watchdog por timeout y una salida limpia sin datos) → hay
         // que avanzar al siguiente variant. Antes se exigía code!==0 && code!==null,
@@ -2035,6 +2048,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // error. Se cancela al primer byte (clearTotalStartupTimer) y en finish().
     totalStartupTimer = setTimeout(() => {
       if (firstByteSent || clientGone || responseEnded) return
+      deadlineTerminated = true   // el 'exit' del proceso ya no debe reclasificar
       server.log.warn(`[recordings-preview] startup_budget_exceeded sessionId=${sessionId} totalMs=${PREVIEW_TOTAL_STARTUP_MS}`)
       currentAttemptCleanup?.()
       if (currentProc) { try { currentProc.kill('SIGKILL') } catch {} }

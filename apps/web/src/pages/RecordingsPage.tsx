@@ -1452,9 +1452,12 @@ export function RecordingsPage() {
             })
         tryPlay('immediate')
 
-        // NOTA: el detector de estancamiento NO se arma acá — se arma en
-        // onMetadata/onCanPlay (media adjunto). Mientras se espera el primer byte
-        // del NVR el slot queda en 'buffering' ("Preparando origen…"), no 'stalled'.
+        // Watchdog PRE-metadata con deadline largo (30 s): cubre el caso en que
+        // FFmpeg emite un chunk inicial pero se estanca antes de que el navegador
+        // llegue a loadedmetadata/canplay (que limpian los timers del backend) —
+        // sin esto el slot podría quedar en 'buffering' sin watchdog. onMetadata/
+        // onCanPlay lo REEMPLAZAN por el detector corto (5 s) ya con media adjunto.
+        armStallTimer(slotIndex, sessionId, 30_000)
         scheduleContinuityTimer(slotIndex, sessionId)
       } else {
         // Sin intención de reproducir: cargar metadatos para poder mostrar frame.
