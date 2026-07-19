@@ -105,7 +105,7 @@ services:
       RECORDINGS_FORCE_TRANSCODE: "false"
       # Watchdog de primer byte por variante RTSP (mata FFmpeg colgado y avanza
       # la cadena de fallback), gracia SIGTERM→SIGKILL y presupuesto total.
-      RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS: ${RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS:-13000}
+      RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS: ${RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS:-25000}
       RECORDINGS_PREVIEW_KILL_GRACE_MS: ${RECORDINGS_PREVIEW_KILL_GRACE_MS:-2000}
       RECORDINGS_PREVIEW_TOTAL_STARTUP_MS: ${RECORDINGS_PREVIEW_TOTAL_STARTUP_MS:-60000}
       # ── Analítica de video ───────────────────────────────────
