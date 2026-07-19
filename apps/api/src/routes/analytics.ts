@@ -548,9 +548,13 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     if (zoneNames.length)    conds.push(Prisma.sql`"zoneName" IN (${Prisma.join(zoneNames)})`)
     if (directions.length)   conds.push(Prisma.sql`"direction" IN (${Prisma.join(directions)})`)
     const whereSql = Prisma.join(conds, ' AND ')
+    // occurredAt es 'timestamp without time zone' con el instante en UTC. Para
+    // agrupar por hora/día en la timezone pedida hay que PRIMERO marcarlo como UTC
+    // (→ timestamptz) y LUEGO convertirlo a la zona destino. Un solo AT TIME ZONE
+    // interpretaría el valor como si ya estuviera en esa zona → hora/día erróneos.
     const bucketExpr = opts.granularity === '5min'
-      ? Prisma.sql`to_timestamp(floor(extract(epoch from "occurredAt") / 300) * 300)`
-      : Prisma.sql`date_trunc(${opts.granularity}, "occurredAt" AT TIME ZONE ${opts.timezone})`
+      ? Prisma.sql`to_timestamp(floor(extract(epoch from ("occurredAt" AT TIME ZONE 'UTC')) / 300) * 300)`
+      : Prisma.sql`date_trunc(${opts.granularity}, ("occurredAt" AT TIME ZONE 'UTC') AT TIME ZONE ${opts.timezone})`
     const series = await server.prisma.$queryRaw<{ bucket: Date; count: bigint }[]>(
       Prisma.sql`SELECT ${bucketExpr} AS bucket, COUNT(*)::bigint AS count
                  FROM "analytics_events" WHERE ${whereSql} GROUP BY 1 ORDER BY 1`
@@ -585,9 +589,11 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
     }
 
     // Mapa de calor día-de-semana (0=domingo) × hora (0-23) en la timezone pedida.
+    // Mismo cuidado de timezone que la serie: marcar UTC y luego convertir a la
+    // zona destino antes de extraer día/hora (occurredAt es timestamp sin tz, UTC).
     const heatmapRows = await server.prisma.$queryRaw<{ dow: number; hour: number; count: bigint }[]>(
-      Prisma.sql`SELECT extract(dow  from "occurredAt" AT TIME ZONE ${opts.timezone})::int AS dow,
-                        extract(hour from "occurredAt" AT TIME ZONE ${opts.timezone})::int AS hour,
+      Prisma.sql`SELECT extract(dow  from ("occurredAt" AT TIME ZONE 'UTC') AT TIME ZONE ${opts.timezone})::int AS dow,
+                        extract(hour from ("occurredAt" AT TIME ZONE 'UTC') AT TIME ZONE ${opts.timezone})::int AS hour,
                         COUNT(*)::bigint AS count
                  FROM "analytics_events" WHERE ${whereSql} GROUP BY 1, 2`
     )

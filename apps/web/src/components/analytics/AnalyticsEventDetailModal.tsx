@@ -54,7 +54,11 @@ export function AnalyticsEventDetailModal({
   const dragRef = useRef<{ x: number; y: number } | null>(null)
   // Reiniciar el zoom al cambiar de evento (prev/next).
   useEffect(() => { setScale(1); setPan({ x: 0, y: 0 }) }, [event.id])
-  const zoomBy = (f: number) => setScale(s => Math.min(6, Math.max(1, +(s * f).toFixed(2))))
+  const zoomBy = (f: number) => setScale(s => {
+    const next = Math.min(6, Math.max(1, +(s * f).toFixed(2)))
+    if (next === 1) setPan({ x: 0, y: 0 })  // al volver a 100% recentrar la imagen
+    return next
+  })
   const resetZoom = () => { setScale(1); setPan({ x: 0, y: 0 }) }
 
   const img = resolveAssetUrl(event.snapshotUrl)
@@ -76,9 +80,9 @@ export function AnalyticsEventDetailModal({
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={onClose}>
-      <div className={`bg-surface-900 border border-surface-700 rounded-xl w-full overflow-hidden ${fullscreen ? 'max-w-[98vw]' : 'max-w-4xl'}`} onClick={e => e.stopPropagation()}>
+      <div className={`bg-surface-900 border border-surface-700 rounded-xl w-full overflow-hidden flex flex-col max-h-[95vh] ${fullscreen ? 'max-w-[98vw]' : 'max-w-4xl'}`} onClick={e => e.stopPropagation()}>
         {/* Encabezado */}
-        <div className="flex items-center gap-2 px-4 py-2 border-b border-surface-800">
+        <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-surface-800">
           <span className="text-sm text-surface-200 font-medium truncate">{event.cameraName}</span>
           <span className="text-xs text-surface-500 truncate">{event.nvrName}</span>
           <div className="flex-1" />
@@ -100,8 +104,7 @@ export function AnalyticsEventDetailModal({
         {/* Imagen con zoom/pan (rueda = zoom; arrastrar = paneo cuando hay zoom) */}
         {img
           ? <div
-              className={`w-full bg-black overflow-hidden ${fullscreen ? 'max-h-[80vh]' : 'max-h-[55vh]'} ${scale > 1 ? 'cursor-grab' : ''}`}
-              style={{ height: fullscreen ? '80vh' : '55vh' }}
+              className={`w-full bg-black overflow-hidden flex-1 min-h-0 ${fullscreen ? '' : 'max-h-[55vh]'} ${scale > 1 ? 'cursor-grab' : ''}`}
               onWheel={(e) => { e.preventDefault(); zoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15) }}
               onDoubleClick={resetZoom}
               onMouseDown={(e) => { if (scale > 1) dragRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y } }}
@@ -115,8 +118,8 @@ export function AnalyticsEventDetailModal({
             </div>
           : <div className="w-full h-64 bg-black flex items-center justify-center text-xs text-surface-600">Sin imagen para este evento</div>}
 
-        {/* Metadatos */}
-        <div className="px-4 py-3 grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1.5 text-xs">
+        {/* Metadatos (scrolleable si no entra, para no tapar las acciones) */}
+        <div className="shrink-0 max-h-[22vh] overflow-y-auto px-4 py-3 grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1.5 text-xs">
           {meta.filter(([, v]) => v !== null && v !== undefined && v !== '').map(([label, value]) => (
             <div key={label} className="min-w-0">
               <span className="text-surface-500">{label}: </span>
@@ -126,7 +129,7 @@ export function AnalyticsEventDetailModal({
         </div>
 
         {/* Acciones */}
-        <div className="px-4 py-2.5 border-t border-surface-800 flex items-center gap-4 text-xs">
+        <div className="shrink-0 px-4 py-2.5 border-t border-surface-800 flex items-center gap-4 text-xs">
           {img && (
             <a href={img} download className="flex items-center gap-1 text-brand-300 hover:text-brand-200"><Download size={13} /> Descargar snapshot</a>
           )}
