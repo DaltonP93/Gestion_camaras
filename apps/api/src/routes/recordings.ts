@@ -388,6 +388,9 @@ interface NvrPlaybackProfile {
   preferredBaseStrategy?:   PlaybackBaseStrategy
   supportsPlaybackSubstream?: boolean
   lastVerifiedAt?:          number
+  // Timestamp DEDICADO del rechazo de substream — separado de lastVerifiedAt (que
+  // lo pisaría cada preview main exitoso, impidiendo que el TTL venza nunca).
+  substreamRejectedAt?:     number
 }
 const nvrPlaybackProfiles = new Map<string, NvrPlaybackProfile>()
 // TTL del marcaje "sin soporte de substream": tras este tiempo se vuelve a probar
@@ -396,8 +399,9 @@ const nvrPlaybackProfiles = new Map<string, NvrPlaybackProfile>()
 const NVR_SUBSTREAM_UNSUPPORTED_TTL_MS = Number(process.env.RECORDINGS_NVR_SUBSTREAM_TTL_MS || 6 * 60 * 60 * 1000)
 function nvrSubstreamAllowed(p: NvrPlaybackProfile): boolean {
   if (p.supportsPlaybackSubstream !== false) return true
-  // marcado sin soporte: permitir reintento si venció el TTL
-  return !!p.lastVerifiedAt && (Date.now() - p.lastVerifiedAt) > NVR_SUBSTREAM_UNSUPPORTED_TTL_MS
+  // marcado sin soporte: permitir reintento si venció el TTL, medido desde el
+  // MOMENTO DEL RECHAZO (substreamRejectedAt), no desde lastVerifiedAt.
+  return !!p.substreamRejectedAt && (Date.now() - p.substreamRejectedAt) > NVR_SUBSTREAM_UNSUPPORTED_TTL_MS
 }
 
 // Prueba UNA estrategia de URL RTSP con FFmpeg y timeout corto: resuelve si llegó
@@ -509,9 +513,12 @@ const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREV
 // Presupuesto TOTAL de arranque (todas las variantes juntas). Si se supera, se
 // deja de intentar y se responde error — cota superior dura al peor caso.
 const PREVIEW_TOTAL_STARTUP_MS = Math.max(10_000, parseInt(process.env.RECORDINGS_PREVIEW_TOTAL_STARTUP_MS || '60000', 10) || 60_000)
-// Piso del timeout por intento (el timeout real es adaptativo: presupuesto
-// restante / intentos que faltan, acotado a [MIN, FIRST_BYTE_TIMEOUT]).
+// Piso del timeout por intento (cada intento recibe el watchdog completo salvo
+// que el presupuesto efectivo esté por agotarse).
 const PREVIEW_MIN_ATTEMPT_TIMEOUT_MS = Math.max(2_000, parseInt(process.env.RECORDINGS_PREVIEW_MIN_ATTEMPT_TIMEOUT_MS || '7000', 10) || 7_000)
+// Tope duro del presupuesto total (el presupuesto efectivo escala con el nº de
+// intentos: cada uno merece FIRST_BYTE_TIMEOUT completo, pero acotado a esto).
+const PREVIEW_STARTUP_HARD_CAP_MS = Math.max(30_000, parseInt(process.env.RECORDINGS_PREVIEW_STARTUP_HARD_CAP_MS || '120000', 10) || 120_000)
 
 interface NvrPreviewState { active: number; lastStartAt: number; queue: Array<() => void> }
 const nvrPreviewStates = new Map<string, NvrPreviewState>()
@@ -1884,21 +1891,41 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       try { res.end() } catch {}
     }
 
-    // Plan de intentos: estrategias de URL BASE (A→E) desde la sesión. Fallback al
-    // esquema legacy (main/sub × name/size sobre una base) si no hay plan.
-    const attemptChain: PlaybackAttempt[] = (session.attemptPlan && session.attemptPlan.length > 0)
+    // Plan de intentos: estrategias de URL BASE desde la sesión. Se distingue
+    // "sin plan" (undefined → ruta legacy) de "plan intencionalmente VACÍO"
+    // (length 0, p.ej. mode=sub con substream no soportado): en ese caso NO se
+    // cae al legacy (que reintentaría el sub rechazado) — se responde error.
+    const attemptChain: PlaybackAttempt[] = session.attemptPlan !== undefined
       ? session.attemptPlan
       : buildVariantChain(rtspUrl, session.cameraId).map(v => ({
           strategy: v.variant as unknown as PlaybackBaseStrategy, url: v.url,
           masked: maskUrlCredentials(v.url), track: (session.channel ?? 0) * 100 + 1,
           respectsPlayhead: true,  // ruta legacy: la base ya trae el start correcto
         }))
+    if (attemptChain.length === 0) {
+      server.log.warn(`[recordings-preview] empty_attempt_plan sessionId=${sessionId} — sin estrategia compatible (mode/perfil)`)
+      session.errorCategory = 'RTSP_PLAYBACK_URI_REJECTED'
+      session.errorDetail   = 'No hay estrategia de reproducción compatible para este NVR/modo (substream no soportado).'
+      retainFailedPreview(sessionId, session, (m) => server.log.info(m))
+      endWithError(session.errorCategory, session.errorDetail)
+      finish('empty_attempt_plan')
+      return
+    }
     const attemptErrors: Array<{ variant: string; category: string; detail: string }> = []
+
+    // Presupuesto TOTAL efectivo: cada intento merece el watchdog completo
+    // (el Hikvision puede tardar 13-15s en el primer byte; comprimir por debajo
+    // mataría streams válidos). El presupuesto escala con el nº de intentos, con
+    // tope duro para acotar la espera del peor caso.
+    const effectiveTotalBudget = Math.min(
+      PREVIEW_STARTUP_HARD_CAP_MS,
+      Math.max(PREVIEW_TOTAL_STARTUP_MS, attemptChain.length * PREVIEW_FIRST_BYTE_TIMEOUT_MS)
+    )
 
     const startAttempt = (chainIndex: number) => {
       // Presupuesto total agotado → no iniciar otra variante; responder error.
       const totalElapsed = Date.now() - streamStartMs
-      if (totalElapsed > PREVIEW_TOTAL_STARTUP_MS && !firstByteSent) {
+      if (totalElapsed > effectiveTotalBudget && !firstByteSent) {
         server.log.warn(`[recordings-preview] startup_budget_exceeded sessionId=${sessionId} elapsedMs=${totalElapsed}`)
         const prev = attemptErrors[attemptErrors.length - 1]
         session.errorCategory = prev?.category ?? 'FIRST_BYTE_TIMEOUT'
@@ -1913,19 +1940,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       const { strategy: variant, url: inputUrl, track } = attempt
       const maskedUrl = maskUrlCredentials(inputUrl)
       let firstByteTimer: NodeJS.Timeout | null = null
-      // Timeout por intento ADAPTATIVO: reparte el presupuesto restante entre los
-      // intentos que faltan (acotado a [MIN, FIRST_BYTE_TIMEOUT]). Así estrategias
-      // de alto valor como generated_main se ejecutan dentro del presupuesto en
-      // vez de quedar tapadas por 1-2 timeouts largos.
-      const remainingBudget = PREVIEW_TOTAL_STARTUP_MS - totalElapsed
-      const attemptsLeft    = attemptChain.length - chainIndex
+      // Cada intento recibe el watchdog COMPLETO (no se comprime por debajo de la
+      // latencia real del NVR ~13-15s). Sólo se recorta si el presupuesto efectivo
+      // está por agotarse (último intento). El presupuesto total escala con el nº
+      // de intentos, así generated_main (al frente) corre a tiempo completo.
+      const remainingBudget = effectiveTotalBudget - totalElapsed
       const attemptTimeout  = Math.max(
         PREVIEW_MIN_ATTEMPT_TIMEOUT_MS,
-        Math.min(PREVIEW_FIRST_BYTE_TIMEOUT_MS, Math.floor(remainingBudget / Math.max(1, attemptsLeft)))
+        Math.min(PREVIEW_FIRST_BYTE_TIMEOUT_MS, remainingBudget)
       )
       server.log.info(
         `[recordings-preview] attempt_budget sessionId=${sessionId} attempt_index=${chainIndex}` +
-        ` baseStrategy=${variant} remaining_budget_ms=${remainingBudget} attempts_left=${attemptsLeft}` +
+        ` baseStrategy=${variant} remaining_budget_ms=${remainingBudget} total_budget_ms=${effectiveTotalBudget}` +
         ` timeout_for_attempt_ms=${attemptTimeout}`
       )
       server.log.info(`[recordings-preview] base_strategy_try sessionId=${sessionId} baseStrategy=${variant} track=${track}`)
@@ -2087,7 +2113,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           if (variant.startsWith('sub') && category === 'RTSP_PLAYBACK_URI_REJECTED') {
             const prof = nvrPlaybackProfiles.get(session.nvrId) ?? {}
             prof.supportsPlaybackSubstream = false
-            prof.lastVerifiedAt = Date.now()
+            prof.substreamRejectedAt = Date.now()   // timestamp dedicado (TTL se mide de acá)
             nvrPlaybackProfiles.set(session.nvrId, prof)
             server.log.info(`[recordings-preview] nvr_profile_no_substream nvrId=${session.nvrId} — 400 en ${variant}`)
           }
@@ -2185,7 +2211,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     totalStartupTimer = setTimeout(() => {
       if (firstByteSent || clientGone || responseEnded) return
       deadlineTerminated = true   // el 'exit' del proceso ya no debe reclasificar
-      server.log.warn(`[recordings-preview] startup_budget_exceeded sessionId=${sessionId} totalMs=${PREVIEW_TOTAL_STARTUP_MS}`)
+      server.log.warn(`[recordings-preview] startup_budget_exceeded sessionId=${sessionId} totalMs=${effectiveTotalBudget}`)
       currentAttemptCleanup?.()
       if (currentProc) { try { currentProc.kill('SIGKILL') } catch {} }
       const prev = attemptErrors[attemptErrors.length - 1]
@@ -2195,7 +2221,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       retainFailedPreview(sessionId, session, (m) => server.log.info(m))
       endWithError(session.errorCategory, session.errorDetail ?? '')
       finish('startup_budget_exceeded')
-    }, PREVIEW_TOTAL_STARTUP_MS)
+    }, effectiveTotalBudget)
 
     startAttempt(0)
   })

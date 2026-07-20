@@ -87,6 +87,10 @@ describe('buildPlaybackAttemptPlan — mode main/sub/auto', () => {
     expect(plan.some(p => p.strategy === 'generated_main')).toBe(true)
     expect(plan.some(p => p.strategy.startsWith('sub'))).toBe(true)
   })
+  it('mode=sub + includeSubstream=false: plan VACÍO (el handler debe dar error, no legacy)', () => {
+    const plan = buildPlaybackAttemptPlan({ playbackURI: null, channel: 1, effectiveStart: START, end: END, creds: CREDS, mode: 'sub', includeSubstream: false })
+    expect(plan.length).toBe(0)
+  })
 })
 
 describe('buildPlaybackAttemptPlan', () => {
