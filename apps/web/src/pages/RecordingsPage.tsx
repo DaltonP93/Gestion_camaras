@@ -1325,6 +1325,7 @@ export function RecordingsPage() {
           RTSP_TRACK_NOT_FOUND:           'Track de grabación no disponible.',
           NVR_OFFLINE_OR_TIMEOUT:         'El NVR no responde (timeout / conexión rechazada).',
           RTSP_OPEN_FAILED:               'No se pudo abrir RTSP de reproducción.',
+          RTSP_PLAYBACK_URI_REJECTED:     'El NVR rechazó la URL de reproducción. VisionCore intentó las estrategias compatibles sin recibir video.',
           CODEC_UNSUPPORTED:              'Codec no soportado. Probá convertir a H.264.',
         }
         // H.264 transcode only fixes codec problems — never retry it for

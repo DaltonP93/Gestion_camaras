@@ -19,12 +19,28 @@ export function classifyRtspError(text: string): string {
   // 453 first — its stderr also contains "4XX Client Error" and "DESCRIBE
   // failed", which would otherwise mismatch as auth/open errors
   if (/453|not enough bandwidth/.test(t))                             return 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
+  // 400 Bad Request: el NVR rechazó la URL/parámetros de reproducción (formato
+  // de la playbackURI, track sin soporte de playback, etc.) — es una causa
+  // distinta de "no pudo abrir" y debe probar otras estrategias de URL base.
+  if (/\b400\b|bad request/.test(t))                                  return 'RTSP_PLAYBACK_URI_REJECTED'
   if (/401|unauthorized|credenciales/.test(t))                        return 'RTSP_AUTH_OR_TRACK_DENIED'
   if (/404|not found|no encontrado/.test(t))                          return 'RTSP_TRACK_NOT_FOUND'
   if (/connection refused|conexi.n rechazada|timed? ?out|timeout/.test(t)) return 'NVR_OFFLINE_OR_TIMEOUT'
   if (/no supported streams|invalid data found|could not find codec/.test(t)) return 'CODEC_UNSUPPORTED'
   if (/could not open|open context|error opening input/.test(t))      return 'RTSP_OPEN_FAILED'
   return 'UNKNOWN'
+}
+
+// Normaliza /Streaming/tracks/NNN/? → /Streaming/tracks/NNN?  (quita el slash
+// antes del '?'). Algunos firmwares Hikvision entregan la playbackURI con ese
+// slash y rechazan/aceptan según la variante — por eso se prueba de ambas formas.
+export function normalizeTracksSlashBeforeQuery(uri: string): string {
+  return uri.replace(/(\/Streaming\/tracks\/\d+)\/(\?)/i, '$1$2')
+}
+
+function trackFromPath(pathQuery: string, fallback: number): number {
+  const m = pathQuery.match(/\/Streaming\/tracks\/(\d+)/i)
+  return m ? parseInt(m[1], 10) : fallback
 }
 
 // Strip name/size params from a playback RTSP URL — some NVR firmwares
@@ -122,6 +138,84 @@ export function rewritePlaybackUriStart(playbackURI: string, effectiveStart: Dat
     rewritten: true,
     originalStart: m[2],
   }
+}
+
+// ── Matriz de estrategias de reproducción ─────────────────────────────────────
+// El problema real de compatibilidad Hikvision no es main/sub × name/size sobre
+// UNA base, sino QUÉ URL base usar. Esta función arma un plan ordenado y deduplicado
+// de estrategias BASE distintas (A→E del análisis), cada una un intento FFmpeg:
+//   nvr_original                — playbackURI exacta del NVR (con slash, start original)
+//   nvr_original_normalized     — playbackURI sin slash antes de '?'
+//   nvr_rewritten               — normalizada + starttime reescrito al playhead
+//   nvr_rewritten_no_metadata   — la anterior sin name/size
+//   generated_main              — URL generada /Streaming/tracks/{ch*100+1}?start&end
+//   sub_full / sub_no_name_size — substream (sólo si el perfil del NVR lo permite)
+// baseStrategy y streamVariant quedan separados (streamVariant='full' salvo *_no_metadata).
+export type PlaybackBaseStrategy =
+  | 'nvr_original' | 'nvr_original_normalized' | 'nvr_rewritten'
+  | 'nvr_rewritten_no_metadata' | 'generated_main' | 'sub_full' | 'sub_no_name_size'
+
+export interface PlaybackAttempt {
+  strategy: PlaybackBaseStrategy
+  url:     string   // con credenciales
+  masked:  string
+  track:   number
+}
+
+export function buildPlaybackAttemptPlan(opts: {
+  playbackURI?: string | null
+  channel:      number
+  effectiveStart: Date
+  end:          Date
+  creds:        { username: string; password: string; ipAddress: string; rtspPort: number }
+  includeSubstream?: boolean               // false si el perfil del NVR lo marcó sin soporte
+  preferred?:   PlaybackBaseStrategy | null // estrategia que funcionó antes en este NVR
+}): PlaybackAttempt[] {
+  const { playbackURI, channel, effectiveStart, end, creds } = opts
+  const inject = (pathQuery: string) => injectCredentialsIntoPlaybackUri({
+    playbackURI: pathQuery, username: creds.username, password: creds.password,
+    ipAddress: creds.ipAddress, rtspPort: creds.rtspPort,
+  })
+
+  // pathQuery (sin credenciales) por estrategia
+  const paths: Array<{ strategy: PlaybackBaseStrategy; pathQuery: string }> = []
+  if (playbackURI) {
+    const normalized = normalizeTracksSlashBeforeQuery(playbackURI)
+    const rewritten  = rewritePlaybackUriStart(normalized, effectiveStart).uri
+    paths.push({ strategy: 'nvr_original',              pathQuery: playbackURI })
+    paths.push({ strategy: 'nvr_original_normalized',   pathQuery: normalized })
+    paths.push({ strategy: 'nvr_rewritten',             pathQuery: rewritten })
+    paths.push({ strategy: 'nvr_rewritten_no_metadata', pathQuery: stripNameSizeParams(rewritten) })
+  }
+  const generated = buildFallbackRecordingRtspUrl({ ...creds, channel, start: effectiveStart, end })
+  const genPath = generated.masked.replace(/^rtsp:\/\/[^/]+/, '')  // path+query desde el masked
+  paths.push({ strategy: 'generated_main', pathQuery: genPath })
+
+  if (opts.includeSubstream !== false) {
+    const subBase = toSubstreamTrackUrl(genPath)
+    if (subBase) {
+      paths.push({ strategy: 'sub_full',         pathQuery: subBase })
+      paths.push({ strategy: 'sub_no_name_size', pathQuery: stripNameSizeParams(subBase) })
+    }
+  }
+
+  // Estrategia preferida (la que funcionó) primero
+  if (opts.preferred) {
+    const i = paths.findIndex(p => p.strategy === opts.preferred)
+    if (i > 0) paths.unshift(paths.splice(i, 1)[0])
+  }
+
+  // Construir, deduplicar por pathQuery final
+  const plan: PlaybackAttempt[] = []
+  const seen = new Set<string>()
+  for (const { strategy, pathQuery } of paths) {
+    const pq = pathQuery.startsWith('/') ? pathQuery : `/${pathQuery}`
+    if (seen.has(pq)) continue
+    seen.add(pq)
+    const { url, masked } = inject(pq)
+    plan.push({ strategy, url, masked, track: trackFromPath(pq, channel * 100 + 1) })
+  }
+  return plan
 }
 
 export function buildFallbackRecordingRtspUrl(opts: {

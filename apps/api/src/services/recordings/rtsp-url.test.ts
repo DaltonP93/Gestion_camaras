@@ -5,8 +5,88 @@ import {
   maskUrlCredentials, classifyRtspError, stripNameSizeParams,
   toSubstreamTrackUrl, buildVariantUrl, buildVariantChain,
   injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
-  buildFallbackRecordingRtspUrl,
+  buildFallbackRecordingRtspUrl, normalizeTracksSlashBeforeQuery,
+  buildPlaybackAttemptPlan,
 } from './rtsp-url'
+
+const CREDS = { username: 'admin', password: 'p@ss/w:rd', ipAddress: '192.168.1.112', rtspPort: 554 }
+const START = new Date('2026-07-16T17:04:52Z')
+const END   = new Date('2026-07-16T17:22:06Z')
+
+describe('normalizeTracksSlashBeforeQuery', () => {
+  it('quita el slash antes de ? en /Streaming/tracks/NNN/?', () => {
+    expect(normalizeTracksSlashBeforeQuery('/Streaming/tracks/101/?starttime=x'))
+      .toBe('/Streaming/tracks/101?starttime=x')
+  })
+  it('deja intacta una URI ya normalizada', () => {
+    expect(normalizeTracksSlashBeforeQuery('/Streaming/tracks/101?starttime=x'))
+      .toBe('/Streaming/tracks/101?starttime=x')
+  })
+})
+
+describe('classifyRtspError — 400', () => {
+  it('clasifica 400 Bad Request como RTSP_PLAYBACK_URI_REJECTED (no RTSP_OPEN_FAILED)', () => {
+    expect(classifyRtspError('Server returned 400 Bad Request')).toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(classifyRtspError('method DESCRIBE failed: 400 Bad Request')).toBe('RTSP_PLAYBACK_URI_REJECTED')
+  })
+})
+
+describe('buildPlaybackAttemptPlan', () => {
+  it('con playbackURI: prueba original, normalizada, reescrita, sin-metadata Y generated_main', () => {
+    const plan = buildPlaybackAttemptPlan({
+      playbackURI: '/Streaming/tracks/101/?starttime=20260716T170000Z&endtime=20260716T172206Z&name=x&size=y',
+      channel: 1, effectiveStart: START, end: END, creds: CREDS,
+    })
+    const strategies = plan.map(p => p.strategy)
+    expect(strategies).toContain('nvr_original')
+    expect(strategies).toContain('nvr_original_normalized')
+    expect(strategies).toContain('nvr_rewritten')
+    // La URL GENERADA (track 101, sin name/size, start=playhead) SIEMPRE se
+    // intenta aunque exista playbackURI — el bug era que nunca se probaba. Puede
+    // aparecer bajo el label generated_main o colapsada en nvr_rewritten_no_metadata
+    // (misma URL); lo que importa es que la URL esté en el plan.
+    const genMasked = buildFallbackRecordingRtspUrl({ ...CREDS, channel: 1, start: START, end: END }).masked
+    expect(plan.some(p => p.masked === genMasked)).toBe(true)
+    // La normalizada no debe llevar el slash antes de ?
+    const norm = plan.find(p => p.strategy === 'nvr_original_normalized')!
+    expect(norm.masked).toContain('/Streaming/tracks/101?')
+    // Nunca credenciales en claro en el masked
+    expect(plan.every(p => !p.masked.includes(CREDS.password))).toBe(true)
+    expect(plan.every(p => p.masked.includes(':***@'))).toBe(true)
+  })
+
+  it('sin playbackURI: sólo generated_main (+ sub si aplica)', () => {
+    const plan = buildPlaybackAttemptPlan({ playbackURI: null, channel: 3, effectiveStart: START, end: END, creds: CREDS })
+    expect(plan.some(p => p.strategy === 'generated_main')).toBe(true)
+    const gen = plan.find(p => p.strategy === 'generated_main')!
+    expect(gen.track).toBe(301)  // channel 3 → 3*100+1
+  })
+
+  it('omite el substream cuando includeSubstream=false (NVR sin soporte de playback sub)', () => {
+    const withSub = buildPlaybackAttemptPlan({ playbackURI: null, channel: 1, effectiveStart: START, end: END, creds: CREDS })
+    const noSub   = buildPlaybackAttemptPlan({ playbackURI: null, channel: 1, effectiveStart: START, end: END, creds: CREDS, includeSubstream: false })
+    expect(withSub.some(p => p.strategy.startsWith('sub'))).toBe(true)
+    expect(noSub.some(p => p.strategy.startsWith('sub'))).toBe(false)
+  })
+
+  it('la estrategia preferida va primero', () => {
+    const plan = buildPlaybackAttemptPlan({
+      playbackURI: '/Streaming/tracks/101?starttime=20260716T170452Z&endtime=20260716T172206Z',
+      channel: 1, effectiveStart: START, end: END, creds: CREDS, preferred: 'generated_main',
+    })
+    expect(plan[0].strategy).toBe('generated_main')
+  })
+
+  it('deduplica estrategias que producen la misma URL', () => {
+    // Sin name/size y con start ya == effectiveStart, original/normalized/rewritten colapsan
+    const plan = buildPlaybackAttemptPlan({
+      playbackURI: '/Streaming/tracks/101?starttime=20260716T170452Z&endtime=20260716T172206Z',
+      channel: 1, effectiveStart: START, end: END, creds: CREDS, includeSubstream: false,
+    })
+    const urls = plan.map(p => p.url)
+    expect(new Set(urls).size).toBe(urls.length)  // sin duplicados
+  })
+})
 
 describe('maskUrlCredentials', () => {
   it('enmascara contraseñas en URLs rtsp y http', () => {
