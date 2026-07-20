@@ -134,12 +134,15 @@ services:
         condition: service_healthy
     # Healthcheck: nginx puede esperar a que el API esté listo (start_period cubre
     # el arranque) en vez de dar 502 transitorios durante la recreación.
+    # Healthcheck: usa 127.0.0.1 explícito (no 'localhost', que puede resolver a
+    # [::1] y fallar) vía fetch de Node — sin depender de wget/curl en la imagen.
+    # start_period amplio para cubrir migraciones + arranque en el primer deploy.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/api/health || exit 1"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 15s
       timeout: 5s
-      retries: 5
-      start_period: 40s
+      retries: 8
+      start_period: 150s
     ports:
       # Detrás de nginx: nginx llega por la red docker (api:4000), este mapeo es
       # sólo para acceso directo/depuración desde el host → localhost únicamente.

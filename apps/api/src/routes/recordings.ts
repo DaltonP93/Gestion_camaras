@@ -18,8 +18,8 @@ import {
   maskUrlCredentials, classifyRtspError,
   buildVariantChain as buildVariantChainPure,
   injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
-  buildFallbackRecordingRtspUrl,
-  type PlaybackVariant,
+  buildFallbackRecordingRtspUrl, buildPlaybackAttemptPlan,
+  type PlaybackVariant, type PlaybackAttempt, type PlaybackBaseStrategy,
 } from '../services/recordings/rtsp-url'
 
 // ─── VOD configuration ────────────────────────────────────────────
@@ -375,6 +375,50 @@ interface PreviewSession {
   errorCategory?:  string
   errorDetail?:    string
   hadFirstByte?:   boolean
+  // Plan ordenado de estrategias de URL base a intentar (A→E). Reemplaza el
+  // toggle main/sub × name/size sobre una única base.
+  attemptPlan?:    PlaybackAttempt[]
+  channel?:        number
+}
+
+// Perfil de compatibilidad aprendido POR NVR (en memoria). Una estrategia que
+// funciona queda preferida para ese NVR; un 400 en substream marca que no soporta
+// playback sub — así no se re-gasta tiempo probándolo en cada reproducción.
+interface NvrPlaybackProfile {
+  preferredBaseStrategy?:   PlaybackBaseStrategy
+  supportsPlaybackSubstream?: boolean
+  lastVerifiedAt?:          number
+}
+const nvrPlaybackProfiles = new Map<string, NvrPlaybackProfile>()
+
+// Prueba UNA estrategia de URL RTSP con FFmpeg y timeout corto: resuelve si llegó
+// el primer byte, el exit code y el stderr (para diagnóstico). SIEMPRE mata el
+// proceso. No imprime credenciales (el caller enmascara).
+function diagnoseStrategy(url: string, timeoutMs: number): Promise<{
+  firstByte: boolean; firstByteMs: number | null; exitCode: number | null; stderr: string; elapsedMs: number
+}> {
+  return new Promise(resolve => {
+    const started = Date.now()
+    const args = ['-rtsp_transport', 'tcp', '-i', url, '-t', '2', '-f', 'mp4',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof', 'pipe:1']
+    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let firstByte = false, firstByteMs: number | null = null, settled = false
+    const stderr: string[] = []
+    const done = (exitCode: number | null) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { proc.kill('SIGKILL') } catch {}
+      resolve({ firstByte, firstByteMs, exitCode, stderr: stderr.join('\n'), elapsedMs: Date.now() - started })
+    }
+    proc.stdout?.once('data', () => { firstByte = true; firstByteMs = Date.now() - started; done(0) })
+    proc.stderr?.on('data', (c: Buffer) => {
+      for (const l of c.toString().split('\n')) { const s = l.trim(); if (s) { stderr.push(s); if (stderr.length > 40) stderr.shift() } }
+    })
+    proc.on('exit', (code) => done(code))
+    proc.on('error', () => done(null))
+    const timer = setTimeout(() => done(null), timeoutMs)
+  })
 }
 
 // Failed previews are retained here after the session is deleted so the
@@ -1633,11 +1677,30 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       ` strategy=${strategy} source=${rtspMasked}`
     )
 
+    // Plan de estrategias de URL base (A→E), respetando el perfil aprendido del
+    // NVR (estrategia preferida primero, sub omitido si no lo soporta).
+    const nvrProfile = nvrPlaybackProfiles.get(camera.nvr.id) ?? {}
+    const attemptPlan = buildPlaybackAttemptPlan({
+      playbackURI: body.playbackURI ?? null,
+      channel: camera.channel,
+      effectiveStart: new Date(body.startTime),
+      end: new Date(body.endTime),
+      creds: { username: camera.nvr.username, password: plainPass, ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort },
+      includeSubstream: nvrProfile.supportsPlaybackSubstream !== false,
+      preferred: nvrProfile.preferredBaseStrategy ?? null,
+    })
+    server.log.info(
+      `[recordings-preview] attempt_plan sessionId=${sessionId} nvrId=${camera.nvr.id}` +
+      ` strategies=[${attemptPlan.map(a => `${a.strategy}(t${a.track})`).join(',')}]` +
+      ` preferred=${nvrProfile.preferredBaseStrategy ?? 'none'} subSupported=${nvrProfile.supportsPlaybackSubstream ?? 'unknown'}`
+    )
+
     previewSessions.set(sessionId, {
       streamToken, userId: user.sub, createdAt: Date.now(), expiresAt,
       rtspUrl, rtspMasked, cameraId: body.cameraId, nvrId: camera.nvr.id, slotIndex: body.slotIndex,
       startTime: body.startTime, endTime: body.endTime,
       forceTranscode, strategy, detectedCodec, canPlayHevcMp4,
+      attemptPlan, channel: camera.channel,
       // Probe failure (e.g. 401 on the playback track) — pre-seed the category
       // so the frontend can show the real cause if the stream also fails
       errorCategory: probeErrorCategory,
@@ -1790,11 +1853,15 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       try { res.end() } catch {}
     }
 
-    // Ordered variant chain: main/sub × with/without name-size, preferred
-    // variant first, deduped by URL. Only when EVERY variant fails is the
-    // session marked failed.
-    const variantChain = buildVariantChain(rtspUrl, session.cameraId)
-    const attemptErrors: Array<{ variant: PlaybackVariant; category: string; detail: string }> = []
+    // Plan de intentos: estrategias de URL BASE (A→E) desde la sesión. Fallback al
+    // esquema legacy (main/sub × name/size sobre una base) si no hay plan.
+    const attemptChain: PlaybackAttempt[] = (session.attemptPlan && session.attemptPlan.length > 0)
+      ? session.attemptPlan
+      : buildVariantChain(rtspUrl, session.cameraId).map(v => ({
+          strategy: v.variant as unknown as PlaybackBaseStrategy, url: v.url,
+          masked: maskUrlCredentials(v.url), track: (session.channel ?? 0) * 100 + 1,
+        }))
+    const attemptErrors: Array<{ variant: string; category: string; detail: string }> = []
 
     const startAttempt = (chainIndex: number) => {
       // Presupuesto total agotado → no iniciar otra variante; responder error.
@@ -1810,14 +1877,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         finish('startup_budget_exceeded')
         return
       }
-      const { variant, url: inputUrl } = variantChain[chainIndex]
+      const attempt = attemptChain[chainIndex]
+      const { strategy: variant, url: inputUrl, track } = attempt
       const maskedUrl = maskUrlCredentials(inputUrl)
       let firstByteTimer: NodeJS.Timeout | null = null
+      server.log.info(`[recordings-preview] base_strategy_try sessionId=${sessionId} baseStrategy=${variant} track=${track}`)
       server.log.info(`[recordings-preview] rtsp_variant_try sessionId=${sessionId} variant=${variant}`)
       server.log.info(
         `[recordings-preview] stream_start sessionId=${sessionId}` +
         ` slotIndex=${session.slotIndex} cameraId=${session.cameraId}` +
-        ` strategy=${strategy} codec=${session.detectedCodec} variant=${variant} url=${maskedUrl.slice(0, 160)}`
+        ` strategy=${strategy} codec=${session.detectedCodec} baseStrategy=${variant} track=${track} url=${maskedUrl.slice(0, 160)}`
       )
 
       const proc = spawn('ffmpeg', buildFfmpegArgs(inputUrl), { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -1902,8 +1971,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         session.errorCategory = undefined
         session.errorDetail   = undefined
         failedPreviewSessions.delete(sessionId)
-        previewVariantPreferenceByCamera.set(session.cameraId, variant)
-        server.log.info(`[recordings-preview] rtsp_variant_preferred cameraId=${session.cameraId} variant=${variant}`)
+        // Perfil aprendido del NVR: esta estrategia base funcionó → preferirla la
+        // próxima; si fue una substream, confirma que el NVR soporta playback sub.
+        const prof = nvrPlaybackProfiles.get(session.nvrId) ?? {}
+        prof.preferredBaseStrategy = variant as PlaybackBaseStrategy
+        if (variant.startsWith('sub')) prof.supportsPlaybackSubstream = true
+        prof.lastVerifiedAt = Date.now()
+        nvrPlaybackProfiles.set(session.nvrId, prof)
+        server.log.info(`[recordings-preview] base_strategy_preferred nvrId=${session.nvrId} baseStrategy=${variant} track=${track}`)
         server.log.info(
           `[recordings-preview] rtsp_variant_success cameraId=${session.cameraId} sessionId=${sessionId}` +
           ` variant=${variant} firstByteMs=${Date.now() - streamStartMs}`
@@ -1955,6 +2030,15 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             : stderrTail.slice(-5).join(' | ').slice(0, 400)
           attemptErrors.push({ variant, category, detail })
           stderrTail.length = 0  // fresh tail for the next attempt
+          // Substream rechazado por el NVR (400) → marcar el perfil para NO volver
+          // a probar playback substream en este NVR (ahorra ~25s por intento).
+          if (variant.startsWith('sub') && category === 'RTSP_PLAYBACK_URI_REJECTED') {
+            const prof = nvrPlaybackProfiles.get(session.nvrId) ?? {}
+            prof.supportsPlaybackSubstream = false
+            prof.lastVerifiedAt = Date.now()
+            nvrPlaybackProfiles.set(session.nvrId, prof)
+            server.log.info(`[recordings-preview] nvr_profile_no_substream nvrId=${session.nvrId} — 400 en ${variant}`)
+          }
           server.log.warn(
             `[recordings-preview] ffmpeg_failed sessionId=${sessionId}` +
             ` code=${code} variant=${variant} category=${category} stderr_tail=${detail}`
@@ -1964,7 +2048,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           // Advance the chain — except on offline/timeout, where every
           // further attempt would just burn the 60 s RTSP timeout again
           const advance =
-            chainIndex + 1 < variantChain.length &&
+            chainIndex + 1 < attemptChain.length &&
             category !== 'NVR_OFFLINE_OR_TIMEOUT' &&
             !clientGone
           if (advance) {
@@ -2040,7 +2124,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     server.log.info(
       `[recordings-preview] variant_chain sessionId=${sessionId} mode=${PLAYBACK_STREAM_MODE}` +
-      ` chain=${variantChain.map(v => v.variant).join('→')}`
+      ` chain=${attemptChain.map(a => a.strategy).join('→')}`
     )
 
     // Presupuesto TOTAL de arranque como timer independiente (una vez por sesión):
@@ -2116,6 +2200,56 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     server.log.info(`[recordings-preview] status_not_found sessionId=${sessionId}`)
     return reply.status(404).send({ message: 'Sesión de preview no encontrada' })
+  })
+
+  // POST /api/recordings/diagnostics/playback — ADMIN. Prueba cada estrategia de
+  // URL base secuencialmente (timeout corto, SIEMPRE libera FFmpeg) y devuelve
+  // resultados SANITIZADOS (sin credenciales) para determinar qué forma acepta el
+  // firmware del NVR. Corta en la primera estrategia que entrega primer byte.
+  server.post('/diagnostics/playback', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const body = z.object({
+      cameraId:       z.string().min(1),
+      playbackURI:    z.string().optional(),
+      requestedStart: z.string().datetime(),
+      requestedEnd:   z.string().datetime(),
+      perStrategyTimeoutMs: z.number().int().min(2000).max(30000).optional(),
+    }).parse(request.body)
+
+    const camera = await server.prisma.camera.findUnique({ where: { id: body.cameraId }, include: { nvr: true } })
+    if (!camera?.nvr) return reply.status(404).send({ message: 'Cámara no encontrada' })
+    const plainPass = decryptPass(camera.nvr.password)
+    if (!plainPass) return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
+
+    const plan = buildPlaybackAttemptPlan({
+      playbackURI: body.playbackURI ?? null,
+      channel: camera.channel,
+      effectiveStart: new Date(body.requestedStart),
+      end: new Date(body.requestedEnd),
+      creds: { username: camera.nvr.username, password: plainPass, ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort },
+    })
+
+    const timeoutMs = body.perStrategyTimeoutMs ?? 12000
+    const results: Array<Record<string, unknown>> = []
+    for (const attempt of plan) {
+      const r = await diagnoseStrategy(attempt.url, timeoutMs)
+      const rtspStatus = classifyRtspError(r.stderr)
+      results.push({
+        strategy: attempt.strategy, track: attempt.track,
+        sanitizedUri: attempt.masked,
+        elapsedMs: r.elapsedMs, ffmpegExitCode: r.exitCode,
+        firstByteReceived: r.firstByte, firstByteMs: r.firstByteMs,
+        rtspStatus,
+        stderr: maskUrlCredentials(r.stderr).slice(-600),
+        result: r.firstByte ? 'success' : 'error',
+      })
+      if (r.firstByte) break
+    }
+    const winner = results.find(x => x.result === 'success')
+    server.log.info(
+      `[recordings-diag] playback cameraId=${body.cameraId} nvrId=${camera.nvr.id}` +
+      ` winner=${winner ? winner.strategy : 'none'} tried=${results.length}`
+    )
+    return reply.send({ cameraId: body.cameraId, nvrId: camera.nvr.id, channel: camera.channel, results })
   })
 
   // DELETE /api/recordings/preview/:sessionId — Stop FFmpeg, remove session.
