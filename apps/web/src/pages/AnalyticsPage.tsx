@@ -78,6 +78,8 @@ interface Summary {
   byCamera: { cameraId: string; cameraName: string; count: number }[]
   lineCounts: { cameraId: string; cameraName: string; lineName: string; direction: string; count: number }[]
   series: { bucket: string; count: number }[]
+  comparison?: { previousTotal: number; delta: number; deltaPct: number | null }
+  heatmap?: { dow: number; hour: number; count: number }[]
 }
 interface WorkerStatus {
   cameraId: string
@@ -948,7 +950,7 @@ export function AnalyticsPage() {
             {([
               ['Eventos (brutos)', summary?.kpis.totalEvents, 'Detecciones/reglas totales — un mismo objeto genera varios eventos'],
               ['Incidentes únicos', summary?.kpis.uniqueIncidents, 'Incidentes de zona distintos (por incidentId)'],
-              ['Objetos únicos', summary?.kpis.uniqueTracks, 'Tracks distintos (por trackId)'],
+              ['Tracks únicos', summary?.kpis.uniqueTracks, 'Tracks distintos por cámara (cameraId+trackId). NO son objetos físicos únicos: un objeto puede re-trackearse y no hay reidentificación entre cámaras.'],
               ['Personas', summary?.kpis.persons, undefined],
               ['Vehículos', summary?.kpis.vehicles, undefined],
               ['Intrusiones', summary?.kpis.intrusions, 'Eventos zone_intrusion (brutos)'],
@@ -965,8 +967,23 @@ export function AnalyticsPage() {
           </div>
           <p className="text-[10px] text-surface-500">
             "Eventos (brutos)" cuenta cada detección/regla; un mismo objeto produce varios (detección + intrusión +
-            recordatorio + salida). Para conteos reales usá "Incidentes únicos" y "Objetos únicos".
+            recordatorio + salida). Para conteos reales usá "Incidentes únicos" y "Tracks únicos".
           </p>
+
+          {/* Comparación con el periodo anterior */}
+          {summary?.comparison && (
+            <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-3 flex items-center gap-3 text-xs">
+              <span className="text-surface-400">vs periodo anterior:</span>
+              <span className="text-surface-300">{summary.comparison.previousTotal} eventos</span>
+              {summary.comparison.deltaPct !== null && (
+                <span className={clsx('font-semibold', summary.comparison.delta >= 0 ? 'text-green-400' : 'text-red-400')}>
+                  {summary.comparison.delta >= 0 ? '▲' : '▼'} {Math.abs(summary.comparison.deltaPct)}%
+                  <span className="text-surface-500 font-normal"> ({summary.comparison.delta >= 0 ? '+' : ''}{summary.comparison.delta})</span>
+                </span>
+              )}
+              {summary.comparison.deltaPct === null && <span className="text-surface-600">sin datos previos para comparar</span>}
+            </div>
+          )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {/* Serie temporal */}
@@ -980,6 +997,41 @@ export function AnalyticsPage() {
                 ))}
               </div>
               {(summary?.series ?? []).length === 0 && <p className="text-xs text-surface-600">Sin datos en el rango.</p>}
+            </div>
+
+            {/* Mapa de calor día × hora */}
+            <div className="rounded-xl border border-surface-700 bg-surface-800/50 p-4 lg:col-span-2 overflow-x-auto">
+              <h2 className="text-sm font-semibold text-surface-200 mb-2">Actividad por día y hora</h2>
+              {(() => {
+                const hm = summary?.heatmap ?? []
+                if (hm.length === 0) return <p className="text-xs text-surface-600">Sin datos en el rango.</p>
+                const max = Math.max(1, ...hm.map(h => h.count))
+                const byKey = new Map(hm.map(h => [`${h.dow}-${h.hour}`, h.count]))
+                const DOW = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb']
+                return (
+                  <div className="inline-block min-w-max">
+                    <div className="flex gap-0.5 ml-8 mb-0.5">
+                      {Array.from({ length: 24 }, (_, h) => (
+                        <div key={h} className="w-4 text-[8px] text-surface-600 text-center">{h}</div>
+                      ))}
+                    </div>
+                    {[1, 2, 3, 4, 5, 6, 0].map(dow => (  // Lun→Dom
+                      <div key={dow} className="flex gap-0.5 items-center mb-0.5">
+                        <div className="w-8 text-[9px] text-surface-500">{DOW[dow]}</div>
+                        {Array.from({ length: 24 }, (_, h) => {
+                          const c = byKey.get(`${dow}-${h}`) ?? 0
+                          const intensity = c === 0 ? 0 : 0.15 + 0.85 * (c / max)
+                          return (
+                            <div key={h} title={`${DOW[dow]} ${h}:00 — ${c} eventos`}
+                              className="w-4 h-4 rounded-sm"
+                              style={{ backgroundColor: c === 0 ? 'rgb(var(--surface-800))' : `rgba(59,130,246,${intensity})` }} />
+                          )
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                )
+              })()}
             </div>
 
             {/* Distribución por tipo */}
