@@ -25,9 +25,67 @@ describe('normalizeTracksSlashBeforeQuery', () => {
 })
 
 describe('classifyRtspError — 400', () => {
-  it('clasifica 400 Bad Request como RTSP_PLAYBACK_URI_REJECTED (no RTSP_OPEN_FAILED)', () => {
+  it('clasifica patrones RTSP 400 reales como RTSP_PLAYBACK_URI_REJECTED', () => {
     expect(classifyRtspError('Server returned 400 Bad Request')).toBe('RTSP_PLAYBACK_URI_REJECTED')
-    expect(classifyRtspError('method DESCRIBE failed: 400 Bad Request')).toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(classifyRtspError('method DESCRIBE failed: 400')).toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(classifyRtspError('RTSP/1.0 400 Bad Request')).toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(classifyRtspError('SETUP failed: 400')).toBe('RTSP_PLAYBACK_URI_REJECTED')
+  })
+  it('NO clasifica un 400 no relacionado (puerto, bitrate, resolución) como rechazo de URI', () => {
+    expect(classifyRtspError('Opening rtsp on port 400')).not.toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(classifyRtspError('bitrate: 400 kb/s')).not.toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(classifyRtspError('Stream #0: Video 400x300')).not.toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(classifyRtspError('frame 400 dropped')).not.toBe('RTSP_PLAYBACK_URI_REJECTED')
+  })
+})
+
+describe('buildPlaybackAttemptPlan — respeta el playhead', () => {
+  // Bloque 09:00–09:30, playhead solicitado 09:22.
+  const BLOCK_START = '20260716T090000Z', PLAYHEAD = new Date('2026-07-16T09:22:00Z'), BLOCK_END = new Date('2026-07-16T09:30:00Z')
+  const uri = `/Streaming/tracks/101/?starttime=${BLOCK_START}&endtime=20260716T093000Z&name=x&size=y`
+
+  it('la PRIMERA estrategia preserva 09:22 (no reproduce desde 09:00)', () => {
+    const plan = buildPlaybackAttemptPlan({ playbackURI: uri, channel: 1, effectiveStart: PLAYHEAD, end: BLOCK_END, creds: CREDS, mode: 'main' })
+    expect(plan[0].respectsPlayhead).toBe(true)
+    expect(plan[0].masked).toContain('starttime=20260716T092200Z')
+    expect(plan[0].strategy).not.toBe('nvr_original')
+  })
+
+  it('nvr_original/normalized (start del bloque) van al final y quedan marcadas !respectsPlayhead', () => {
+    const plan = buildPlaybackAttemptPlan({ playbackURI: uri, channel: 1, effectiveStart: PLAYHEAD, end: BLOCK_END, creds: CREDS, mode: 'main' })
+    const orig = plan.find(p => p.strategy === 'nvr_original')!
+    expect(orig.respectsPlayhead).toBe(false)                 // conserva 09:00
+    // Todas las que respetan el playhead vienen antes que las que no
+    const firstNonRespect = plan.findIndex(p => !p.respectsPlayhead)
+    const lastRespect     = plan.map(p => p.respectsPlayhead).lastIndexOf(true)
+    expect(firstNonRespect === -1 || firstNonRespect > lastRespect).toBe(true)
+  })
+
+  it('no promueve como preferida una estrategia que NO respeta el playhead', () => {
+    const plan = buildPlaybackAttemptPlan({
+      playbackURI: uri, channel: 1, effectiveStart: PLAYHEAD, end: BLOCK_END, creds: CREDS, mode: 'main',
+      preferred: 'nvr_original',  // preferida pero NO respeta → no debe ir primero
+    })
+    expect(plan[0].strategy).not.toBe('nvr_original')
+    expect(plan[0].respectsPlayhead).toBe(true)
+  })
+})
+
+describe('buildPlaybackAttemptPlan — mode main/sub/auto', () => {
+  it('mode=main: nunca agrega substream', () => {
+    const plan = buildPlaybackAttemptPlan({ playbackURI: null, channel: 1, effectiveStart: START, end: END, creds: CREDS, mode: 'main' })
+    expect(plan.some(p => p.strategy.startsWith('sub'))).toBe(false)
+    expect(plan.some(p => p.strategy === 'generated_main')).toBe(true)
+  })
+  it('mode=sub: sólo substream, nunca main', () => {
+    const plan = buildPlaybackAttemptPlan({ playbackURI: null, channel: 1, effectiveStart: START, end: END, creds: CREDS, mode: 'sub' })
+    expect(plan.length).toBeGreaterThan(0)
+    expect(plan.every(p => p.strategy.startsWith('sub'))).toBe(true)
+  })
+  it('mode=auto: main y sub', () => {
+    const plan = buildPlaybackAttemptPlan({ playbackURI: null, channel: 1, effectiveStart: START, end: END, creds: CREDS, mode: 'auto' })
+    expect(plan.some(p => p.strategy === 'generated_main')).toBe(true)
+    expect(plan.some(p => p.strategy.startsWith('sub'))).toBe(true)
   })
 })
 

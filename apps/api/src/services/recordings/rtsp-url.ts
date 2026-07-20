@@ -19,10 +19,10 @@ export function classifyRtspError(text: string): string {
   // 453 first — its stderr also contains "4XX Client Error" and "DESCRIBE
   // failed", which would otherwise mismatch as auth/open errors
   if (/453|not enough bandwidth/.test(t))                             return 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
-  // 400 Bad Request: el NVR rechazó la URL/parámetros de reproducción (formato
-  // de la playbackURI, track sin soporte de playback, etc.) — es una causa
-  // distinta de "no pudo abrir" y debe probar otras estrategias de URL base.
-  if (/\b400\b|bad request/.test(t))                                  return 'RTSP_PLAYBACK_URI_REJECTED'
+  // 400 Bad Request del NVR: sólo patrones RTSP/FFmpeg reales, NO cualquier "400"
+  // suelto (puerto 400, 400 kb/s, 400x300, etc. no deben clasificarse así).
+  if (/rtsp\/\d\.\d\s+400|server returned 400|400 bad request|(?:describe|setup|play|options|teardown|method[^:\n]*)\s+failed:\s*400/.test(t))
+                                                                       return 'RTSP_PLAYBACK_URI_REJECTED'
   if (/401|unauthorized|credenciales/.test(t))                        return 'RTSP_AUTH_OR_TRACK_DENIED'
   if (/404|not found|no encontrado/.test(t))                          return 'RTSP_TRACK_NOT_FOUND'
   if (/connection refused|conexi.n rechazada|timed? ?out|timeout/.test(t)) return 'NVR_OFFLINE_OR_TIMEOUT'
@@ -160,7 +160,19 @@ export interface PlaybackAttempt {
   url:     string   // con credenciales
   masked:  string
   track:   number
+  // ¿El starttime de esta URL coincide con el playhead solicitado (effectiveStart)?
+  // Las que NO lo respetan (nvr_original/normalized con el start del bloque) sólo
+  // sirven de fallback controlado — nunca deben "ganar" reproduciendo desde el
+  // inicio equivocado ni quedar como estrategia preferida general.
+  respectsPlayhead: boolean
 }
+
+// Extrae el starttime (YYYYMMDDTHHMMSSZ) de un pathQuery de playback.
+function starttimeOf(pathQuery: string): string | null {
+  const m = pathQuery.match(/[?&]starttime=(\d{8}T\d{6}Z)/i)
+  return m ? m[1].toUpperCase() : null
+}
+const fmtPlaybackTs = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
 
 export function buildPlaybackAttemptPlan(opts: {
   playbackURI?: string | null
@@ -168,30 +180,57 @@ export function buildPlaybackAttemptPlan(opts: {
   effectiveStart: Date
   end:          Date
   creds:        { username: string; password: string; ipAddress: string; rtspPort: number }
-  includeSubstream?: boolean               // false si el perfil del NVR lo marcó sin soporte
-  preferred?:   PlaybackBaseStrategy | null // estrategia que funcionó antes en este NVR
+  mode?:        PlaybackStreamMode           // 'main' | 'sub' | 'auto' (default auto)
+  includeSubstream?: boolean                 // false si el perfil del NVR lo marcó sin soporte
+  preferred?:   PlaybackBaseStrategy | null  // estrategia que funcionó antes en este NVR
+  playheadToleranceSec?: number              // tolerancia para "respeta el playhead" (default 2s)
 }): PlaybackAttempt[] {
   const { playbackURI, channel, effectiveStart, end, creds } = opts
+  const mode = opts.mode ?? 'auto'
+  const wantMain = mode === 'main' || mode === 'auto'
+  const wantSub  = (mode === 'sub' || mode === 'auto') && opts.includeSubstream !== false
+  const toleranceMs = (opts.playheadToleranceSec ?? 2) * 1000
+  const wantTs = fmtPlaybackTs(effectiveStart)
   const inject = (pathQuery: string) => injectCredentialsIntoPlaybackUri({
     playbackURI: pathQuery, username: creds.username, password: creds.password,
     ipAddress: creds.ipAddress, rtspPort: creds.rtspPort,
   })
-
-  // pathQuery (sin credenciales) por estrategia
-  const paths: Array<{ strategy: PlaybackBaseStrategy; pathQuery: string }> = []
-  if (playbackURI) {
-    const normalized = normalizeTracksSlashBeforeQuery(playbackURI)
-    const rewritten  = rewritePlaybackUriStart(normalized, effectiveStart).uri
-    paths.push({ strategy: 'nvr_original',              pathQuery: playbackURI })
-    paths.push({ strategy: 'nvr_original_normalized',   pathQuery: normalized })
-    paths.push({ strategy: 'nvr_rewritten',             pathQuery: rewritten })
-    paths.push({ strategy: 'nvr_rewritten_no_metadata', pathQuery: stripNameSizeParams(rewritten) })
+  // ¿El starttime del pathQuery cae dentro de la tolerancia del playhead?
+  const respects = (pathQuery: string): boolean => {
+    const st = starttimeOf(pathQuery)
+    if (!st) return false
+    const parsed = Date.parse(st.replace(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/, '$1-$2-$3T$4:$5:$6Z'))
+    if (Number.isNaN(parsed)) return st === wantTs
+    return Math.abs(parsed - effectiveStart.getTime()) <= toleranceMs
   }
-  const generated = buildFallbackRecordingRtspUrl({ ...creds, channel, start: effectiveStart, end })
-  const genPath = generated.masked.replace(/^rtsp:\/\/[^/]+/, '')  // path+query desde el masked
-  paths.push({ strategy: 'generated_main', pathQuery: genPath })
 
-  if (opts.includeSubstream !== false) {
+  // Candidatos (path+query, sin credenciales). El ORDEN prioriza las que respetan
+  // el playhead solicitado; original/normalizada van al final como fallback.
+  const paths: Array<{ strategy: PlaybackBaseStrategy; pathQuery: string }> = []
+  if (wantMain) {
+    let rewritten: string | null = null
+    if (playbackURI) {
+      const normalized = normalizeTracksSlashBeforeQuery(playbackURI)
+      rewritten = rewritePlaybackUriStart(normalized, effectiveStart).uri
+      // 1) respetan el playhead
+      paths.push({ strategy: 'nvr_rewritten_no_metadata', pathQuery: stripNameSizeParams(rewritten) })
+      paths.push({ strategy: 'nvr_rewritten',             pathQuery: rewritten })
+    }
+    const generated = buildFallbackRecordingRtspUrl({ ...creds, channel, start: effectiveStart, end })
+    const genPath = generated.masked.replace(/^rtsp:\/\/[^/]+/, '')
+    // generated_main va entre las de rewritten y las fallback: siempre respeta el playhead
+    paths.push({ strategy: 'generated_main', pathQuery: genPath })
+    if (playbackURI) {
+      const normalized = normalizeTracksSlashBeforeQuery(playbackURI)
+      // 2) fallback controlado (pueden NO respetar el playhead si el NVR incrustó otro start)
+      paths.push({ strategy: 'nvr_original_normalized', pathQuery: normalized })
+      paths.push({ strategy: 'nvr_original',            pathQuery: playbackURI })
+    }
+  }
+  if (wantSub) {
+    // Sub derivada de la mejor base main disponible (generated respeta el playhead).
+    const generated = buildFallbackRecordingRtspUrl({ ...creds, channel, start: effectiveStart, end })
+    const genPath = generated.masked.replace(/^rtsp:\/\/[^/]+/, '')
     const subBase = toSubstreamTrackUrl(genPath)
     if (subBase) {
       paths.push({ strategy: 'sub_full',         pathQuery: subBase })
@@ -199,10 +238,11 @@ export function buildPlaybackAttemptPlan(opts: {
     }
   }
 
-  // Estrategia preferida (la que funcionó) primero
+  // Estrategia preferida primero SÓLO si respeta el playhead (no promover una que
+  // reproduce desde el inicio equivocado).
   if (opts.preferred) {
     const i = paths.findIndex(p => p.strategy === opts.preferred)
-    if (i > 0) paths.unshift(paths.splice(i, 1)[0])
+    if (i > 0 && respects(paths[i].pathQuery)) paths.unshift(paths.splice(i, 1)[0])
   }
 
   // Construir, deduplicar por pathQuery final
@@ -213,7 +253,7 @@ export function buildPlaybackAttemptPlan(opts: {
     if (seen.has(pq)) continue
     seen.add(pq)
     const { url, masked } = inject(pq)
-    plan.push({ strategy, url, masked, track: trackFromPath(pq, channel * 100 + 1) })
+    plan.push({ strategy, url, masked, track: trackFromPath(pq, channel * 100 + 1), respectsPlayhead: respects(pq) })
   }
   return plan
 }
