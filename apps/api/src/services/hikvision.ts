@@ -261,6 +261,32 @@ export async function getNVRStatus(nvr: NVR): Promise<HikNVRStatus> {
 
 // ─── Información detallada del dispositivo ────────────────────
 
+// Reloj/zona horaria del NVR (/ISAPI/System/time). Clave para auditar el desfase
+// de reproducción: si el NVR usa hora local y VisionCore envía UTC (o viceversa),
+// el playback RTSP busca en el momento equivocado y no entrega video.
+export interface HikSystemTime {
+  timeMode: string   // 'manual' | 'NTP'
+  localTime: string  // hora local del NVR (ISO parcial, con o sin offset)
+  timeZone: string   // p.ej. 'CST-8:00:00' o 'GMT-04:00'
+}
+export async function getNvrSystemTime(nvr: NVR): Promise<HikSystemTime | null> {
+  try {
+    const client = createHikClient(nvr)
+    const res = await client.get('/ISAPI/System/time')
+    if (typeof res.data === 'string') {
+      return {
+        timeMode:  xmlGet(res.data, 'timeMode'),
+        localTime: xmlGet(res.data, 'localTime'),
+        timeZone:  xmlGet(res.data, 'timeZone'),
+      }
+    }
+    const t = res.data?.Time || {}
+    return { timeMode: t.timeMode || '', localTime: t.localTime || '', timeZone: t.timeZone || '' }
+  } catch {
+    return null
+  }
+}
+
 export async function getDeviceInfo(nvr: NVR): Promise<HikDeviceInfo | null> {
   try {
     const client = createHikClient(nvr)

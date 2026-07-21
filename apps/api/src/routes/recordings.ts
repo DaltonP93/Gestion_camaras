@@ -19,8 +19,11 @@ import {
   buildVariantChain as buildVariantChainPure,
   injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
   buildFallbackRecordingRtspUrl, buildPlaybackAttemptPlan,
+  extractRtspPlaybackTimes, urlFingerprint,
   type PlaybackVariant, type PlaybackAttempt, type PlaybackBaseStrategy,
 } from '../services/recordings/rtsp-url'
+import { planStartupBudget } from '../services/recordings/preview-budget'
+import { getNvrSystemTime } from '../services/hikvision'
 
 // ─── VOD configuration ────────────────────────────────────────────
 const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000
@@ -404,6 +407,54 @@ function nvrSubstreamAllowed(p: NvrPlaybackProfile): boolean {
   return !!p.substreamRejectedAt && (Date.now() - p.substreamRejectedAt) > NVR_SUBSTREAM_UNSUPPORTED_TTL_MS
 }
 
+// Caché en memoria del reloj del NVR (/ISAPI/System/time) — para auditar el
+// desfase horario SIN pegarle al NVR en cada preview. TTL corto: el reloj cambia
+// poco pero queremos detectar drift/NTP. Se refresca en background (no bloquea).
+interface NvrClockCacheEntry { localTime: string; timeZone: string; timeMode: string; utcTime: string | null; fetchedAt: number }
+const nvrClockCache = new Map<string, NvrClockCacheEntry>()
+const NVR_CLOCK_CACHE_TTL_MS = Number(process.env.RECORDINGS_NVR_CLOCK_TTL_MS || 5 * 60 * 1000)
+const nvrClockInFlight = new Set<string>()
+
+// Deriva la hora UTC del NVR a partir de su localTime cuando éste trae offset
+// (p.ej. '2026-07-21T07:06:00-04:00'). Si no trae offset, no se puede afirmar el
+// UTC — se devuelve null (NO asumir el desfase). Nunca concatena 'Z' a mano.
+function deriveNvrUtc(localTime: string): string | null {
+  if (!localTime) return null
+  // Sólo si el string ya declara zona (offset ±HH:MM o Z): Date lo interpreta bien.
+  if (!/[zZ]$|[+-]\d{2}:?\d{2}$/.test(localTime.trim())) return null
+  const ms = Date.parse(localTime.trim())
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString()
+}
+
+/** Reloj del NVR desde caché; refresca en background si venció el TTL. Best-effort:
+ *  nunca lanza ni bloquea el preview (una llamada ISAPI colgada no debe demorar el
+ *  arranque del video). Devuelve null si aún no hay dato cacheado. */
+function getNvrClockCached(nvr: { id: string } & Record<string, any>, log: (m: string) => void): NvrClockCacheEntry | null {
+  const cached = nvrClockCache.get(nvr.id)
+  const fresh = cached && (Date.now() - cached.fetchedAt) < NVR_CLOCK_CACHE_TTL_MS
+  if (!fresh && !nvrClockInFlight.has(nvr.id)) {
+    nvrClockInFlight.add(nvr.id)
+    getNvrSystemTime(nvr as any)
+      .then(t => {
+        if (t) {
+          const entry: NvrClockCacheEntry = {
+            localTime: t.localTime, timeZone: t.timeZone, timeMode: t.timeMode,
+            utcTime: deriveNvrUtc(t.localTime), fetchedAt: Date.now(),
+          }
+          nvrClockCache.set(nvr.id, entry)
+          log(
+            `[recordings-time] nvr_clock nvrId=${nvr.id} timeMode=${entry.timeMode}` +
+            ` nvrLocalTime=${entry.localTime} nvrTimezone=${entry.timeZone}` +
+            ` nvrUtcTime=${entry.utcTime ?? 'unknown(no offset in localTime)'}`
+          )
+        }
+      })
+      .catch(() => {})
+      .finally(() => { nvrClockInFlight.delete(nvr.id) })
+  }
+  return cached ?? null
+}
+
 // Prueba UNA estrategia de URL RTSP con FFmpeg y timeout corto: resuelve si llegó
 // el primer byte, el exit code y el stderr (para diagnóstico). SIEMPRE mata el
 // proceso. No imprime credenciales (el caller enmascara).
@@ -413,7 +464,8 @@ function nvrSubstreamAllowed(p: NvrPlaybackProfile): boolean {
 const DIAG_MIN_MEDIA_BYTES = 48 * 1024
 function diagnoseStrategy(url: string, timeoutMs: number): Promise<{
   firstByte: boolean; firstByteMs: number | null; playableMs: number | null
-  exitCode: number | null; stderr: string; elapsedMs: number; bytes: number
+  exitCode: number | null; signal: string | null; timedOut: boolean
+  stderr: string; elapsedMs: number; bytes: number
 }> {
   return new Promise(resolve => {
     const started = Date.now()
@@ -422,14 +474,18 @@ function diagnoseStrategy(url: string, timeoutMs: number): Promise<{
     const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
     let firstByte = false, firstByteMs: number | null = null
     let playable = false, playableMs: number | null = null
-    let settled = false, bytes = 0, sawMoof = false
+    let settled = false, bytes = 0, sawMoof = false, timedOut = false
+    let exitSignal: string | null = null
     const stderr: string[] = []
     const done = (exitCode: number | null) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       try { proc.kill('SIGKILL') } catch {}
-      resolve({ firstByte, firstByteMs, playableMs, exitCode, stderr: stderr.join('\n'), elapsedMs: Date.now() - started, bytes })
+      resolve({
+        firstByte, firstByteMs, playableMs, exitCode, signal: exitSignal, timedOut,
+        stderr: stderr.join('\n'), elapsedMs: Date.now() - started, bytes,
+      })
     }
     proc.stdout?.on('data', (chunk: Buffer) => {
       if (!firstByte) { firstByte = true; firstByteMs = Date.now() - started }
@@ -444,9 +500,9 @@ function diagnoseStrategy(url: string, timeoutMs: number): Promise<{
     proc.stderr?.on('data', (c: Buffer) => {
       for (const l of c.toString().split('\n')) { const s = l.trim(); if (s) { stderr.push(s); if (stderr.length > 40) stderr.shift() } }
     })
-    proc.on('exit', (code) => done(code))
+    proc.on('exit', (code, signal) => { exitSignal = signal ?? null; done(code) })
     proc.on('error', () => done(null))
-    const timer = setTimeout(() => done(null), timeoutMs)
+    const timer = setTimeout(() => { timedOut = true; done(null) }, timeoutMs)
   })
 }
 
@@ -513,12 +569,16 @@ const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREV
 // Presupuesto TOTAL de arranque (todas las variantes juntas). Si se supera, se
 // deja de intentar y se responde error — cota superior dura al peor caso.
 const PREVIEW_TOTAL_STARTUP_MS = Math.max(10_000, parseInt(process.env.RECORDINGS_PREVIEW_TOTAL_STARTUP_MS || '60000', 10) || 60_000)
-// Piso del timeout por intento (cada intento recibe el watchdog completo salvo
-// que el presupuesto efectivo esté por agotarse).
-const PREVIEW_MIN_ATTEMPT_TIMEOUT_MS = Math.max(2_000, parseInt(process.env.RECORDINGS_PREVIEW_MIN_ATTEMPT_TIMEOUT_MS || '7000', 10) || 7_000)
 // Tope duro del presupuesto total (el presupuesto efectivo escala con el nº de
 // intentos: cada uno merece FIRST_BYTE_TIMEOUT completo, pero acotado a esto).
 const PREVIEW_STARTUP_HARD_CAP_MS = Math.max(30_000, parseInt(process.env.RECORDINGS_PREVIEW_STARTUP_HARD_CAP_MS || '120000', 10) || 120_000)
+// Retardo entre el fallo de una variante y el arranque de la siguiente. El
+// presupuesto total DEBE contarlo: si no, el overhead acumulado comprime los
+// últimos intentos por debajo del watchdog completo (bug de producción).
+const PREVIEW_RETRY_DELAY_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVIEW_RETRY_DELAY_MS || '800', 10) || 800)
+// Margen de seguridad del presupuesto total para overhead no modelado (spawn de
+// FFmpeg, demux, GC) — evita cortar el último intento por unos ms de más.
+const PREVIEW_BUDGET_SAFETY_MARGIN_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVIEW_BUDGET_SAFETY_MARGIN_MS || '3000', 10) || 3000)
 
 interface NvrPreviewState { active: number; lastStartAt: number; queue: Array<() => void> }
 const nvrPreviewStates = new Map<string, NvrPreviewState>()
@@ -967,6 +1027,11 @@ const previewStartSchema = z.object({
   playbackURI:    z.string().startsWith('/').optional(),
   forceTranscode: z.boolean().optional(),
   canPlayHevcMp4: z.boolean().optional(),
+  // Instrumentación de zona horaria (opcional, retrocompatible): lo que el
+  // navegador tenía en pantalla y su offset UTC, para auditar el desfase de punta
+  // a punta SIN asumir todavía cuál es el correcto. No afecta la conversión.
+  browserLocal:          z.string().optional(),   // ej. "2026-07-21T07:06:00" (datetime-local)
+  browserTimezoneOffset: z.number().int().optional(),  // minutos, como Date.getTimezoneOffset()
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
@@ -1717,6 +1782,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // lo rechazó y el marcaje aún está dentro del TTL). PLAYBACK_STREAM_MODE decide
     // main/sub/auto.
     const nvrProfile = nvrPlaybackProfiles.get(camera.nvr.id) ?? {}
+    const dedupSink: Array<{ strategy: PlaybackBaseStrategy; duplicateOf: PlaybackBaseStrategy; urlFingerprint: string }> = []
     const attemptPlan = buildPlaybackAttemptPlan({
       playbackURI: body.playbackURI ?? null,
       channel: camera.channel,
@@ -1726,11 +1792,44 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       mode: PLAYBACK_STREAM_MODE,
       includeSubstream: nvrSubstreamAllowed(nvrProfile),
       preferred: nvrProfile.preferredBaseStrategy ?? null,
+      dedupSink,
     })
     server.log.info(
       `[recordings-preview] attempt_plan sessionId=${sessionId} nvrId=${camera.nvr.id} mode=${PLAYBACK_STREAM_MODE}` +
       ` strategies=[${attemptPlan.map(a => `${a.strategy}(t${a.track}${a.respectsPlayhead ? '' : ',!playhead'})`).join(',')}]` +
       ` preferred=${nvrProfile.preferredBaseStrategy ?? 'none'} subSupported=${nvrProfile.supportsPlaybackSubstream ?? 'unknown'}`
+    )
+    // P2: estrategias omitidas por dedup (misma URL final que otra anterior) — antes
+    // desaparecían sin dejar rastro (p.ej. generated_main colapsando en nvr_rewritten).
+    for (const d of dedupSink) {
+      server.log.info(
+        `[recordings-preview] strategy_dedup sessionId=${sessionId} strategy=${d.strategy}` +
+        ` duplicateOf=${d.duplicateOf} urlFingerprint=${d.urlFingerprint}`
+      )
+    }
+
+    // ── Auditoría de zona horaria de PUNTA A PUNTA (P1) ─────────────────────
+    // Se registra TODA la cadena para diagnosticar el desfase SIN asumir aún cuál
+    // es el correcto. No se cambia ninguna conversión ni se concatena 'Z' a mano:
+    // sólo se observa qué se manda y con qué offset. rtspStart/rtspEnd es lo que
+    // realmente viaja en la URL RTSP (la fuente de verdad de lo que ve el NVR).
+    const rtspTimes = extractRtspPlaybackTimes(rtspMasked)
+    const reqStartDate = new Date(body.startTime)
+    const reqEndDate   = new Date(body.endTime)
+    // recordingStart/End = ventana que el NVR incrustó en la playbackURI (si vino).
+    const recTimes = body.playbackURI ? extractRtspPlaybackTimes(body.playbackURI) : { starttime: null, endtime: null }
+    const nvrClock = getNvrClockCached({ ...camera.nvr, password: plainPass }, (m) => server.log.info(m))
+    server.log.info(
+      `[recordings-time] timezone_audit sessionId=${sessionId} nvrId=${camera.nvr.id} cameraId=${body.cameraId}` +
+      ` browserLocal=${body.browserLocal ?? 'n/a'}` +
+      ` browserTimezoneOffsetMin=${body.browserTimezoneOffset ?? 'n/a'}` +
+      ` requestStartUtc=${reqStartDate.toISOString()} requestEndUtc=${reqEndDate.toISOString()}` +
+      ` recordingBlockStart=${recTimes.starttime ?? 'n/a'} recordingBlockEnd=${recTimes.endtime ?? 'n/a'}` +
+      ` effectiveStartUtc=${reqStartDate.toISOString()} effectiveEndUtc=${reqEndDate.toISOString()}` +
+      ` rtspStart=${rtspTimes.starttime ?? 'n/a'} rtspEnd=${rtspTimes.endtime ?? 'n/a'}` +
+      ` nvrLocalTime=${nvrClock?.localTime ?? 'pending'} nvrTimezone=${nvrClock?.timeZone ?? 'pending'}` +
+      ` nvrUtcTime=${nvrClock?.utcTime ?? 'pending'} nvrTimeMode=${nvrClock?.timeMode ?? 'pending'}` +
+      ` urlFingerprint=${urlFingerprint(rtspMasked)}`
     )
 
     previewSessions.set(sessionId, {
@@ -1913,13 +2012,42 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     }
     const attemptErrors: Array<{ variant: string; category: string; detail: string }> = []
 
-    // Presupuesto TOTAL efectivo: cada intento merece el watchdog completo
-    // (el Hikvision puede tardar 13-15s en el primer byte; comprimir por debajo
-    // mataría streams válidos). El presupuesto escala con el nº de intentos, con
-    // tope duro para acotar la espera del peor caso.
-    const effectiveTotalBudget = Math.min(
-      PREVIEW_STARTUP_HARD_CAP_MS,
-      Math.max(PREVIEW_TOTAL_STARTUP_MS, attemptChain.length * PREVIEW_FIRST_BYTE_TIMEOUT_MS)
+    // Presupuesto TOTAL efectivo (lógica pura, testeable con reloj simulado):
+    // cada intento merece el watchdog COMPLETO (el Hikvision puede tardar 13-15s
+    // en el primer byte; comprimir por debajo mataría streams válidos). El
+    // presupuesto global reserva el overhead REAL entre intentos (gracia de
+    // SIGKILL + retardo de reintento + margen), que antes NO se contaba y
+    // comprimía los últimos intentos (evidencia: 16,484s / 19,322s en vez de 25s).
+    // Si el plan no cabe bajo el tope duro, se recortan las variantes de menor
+    // prioridad y se registran (nunca se comprime un intento por debajo del piso).
+    const budgetPlan = planStartupBudget(attemptChain.length, {
+      firstByteTimeoutMs: PREVIEW_FIRST_BYTE_TIMEOUT_MS,
+      killGraceMs:        PREVIEW_KILL_GRACE_MS,
+      retryDelayMs:       PREVIEW_RETRY_DELAY_MS,
+      safetyMarginMs:     PREVIEW_BUDGET_SAFETY_MARGIN_MS,
+      hardCapMs:          PREVIEW_STARTUP_HARD_CAP_MS,
+      minTotalMs:         PREVIEW_TOTAL_STARTUP_MS,
+    })
+    const effectiveTotalBudget = budgetPlan.effectiveTotalBudgetMs
+    // Recorte por presupuesto: conservar las de MAYOR prioridad (van al frente del
+    // plan). Las descartadas se registran EXPLÍCITAMENTE (nunca truncado silencioso).
+    if (budgetPlan.skippedAttempts > 0) {
+      for (let i = budgetPlan.keptAttempts; i < attemptChain.length; i++) {
+        const sk = attemptChain[i]
+        server.log.warn(
+          `[recordings-preview] strategy_skipped sessionId=${sessionId} reason=budget` +
+          ` strategy=${sk.strategy} track=${sk.track} attempt_index=${i}` +
+          ` kept=${budgetPlan.keptAttempts} total=${attemptChain.length}` +
+          ` per_attempt_cost_ms=${budgetPlan.perAttemptCostMs} hard_cap_ms=${PREVIEW_STARTUP_HARD_CAP_MS}`
+        )
+      }
+      attemptChain.length = budgetPlan.keptAttempts
+    }
+    server.log.info(
+      `[recordings-preview] budget_plan sessionId=${sessionId}` +
+      ` attempts=${attemptChain.length} per_attempt_timeout_ms=${budgetPlan.perAttemptTimeoutMs}` +
+      ` per_attempt_cost_ms=${budgetPlan.perAttemptCostMs} total_budget_ms=${effectiveTotalBudget}` +
+      ` skipped=${budgetPlan.skippedAttempts}`
     )
 
     const startAttempt = (chainIndex: number) => {
@@ -1940,15 +2068,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       const { strategy: variant, url: inputUrl, track } = attempt
       const maskedUrl = maskUrlCredentials(inputUrl)
       let firstByteTimer: NodeJS.Timeout | null = null
-      // Cada intento recibe el watchdog COMPLETO (no se comprime por debajo de la
-      // latencia real del NVR ~13-15s). Sólo se recorta si el presupuesto efectivo
-      // está por agotarse (último intento). El presupuesto total escala con el nº
-      // de intentos, así generated_main (al frente) corre a tiempo completo.
+      // Cada intento recibe el watchdog COMPLETO como deadline individual FIJA — ya
+      // NO se comprime por "presupuesto restante". El presupuesto global se
+      // dimensionó (planStartupBudget) para que todos los intentos conservados
+      // quepan a tiempo completo contando el overhead, así que ningún intento —
+      // ni el último — se queda por debajo del watchdog real del NVR (~13-15s).
       const remainingBudget = effectiveTotalBudget - totalElapsed
-      const attemptTimeout  = Math.max(
-        PREVIEW_MIN_ATTEMPT_TIMEOUT_MS,
-        Math.min(PREVIEW_FIRST_BYTE_TIMEOUT_MS, remainingBudget)
-      )
+      const attemptTimeout  = budgetPlan.perAttemptTimeoutMs
       server.log.info(
         `[recordings-preview] attempt_budget sessionId=${sessionId} attempt_index=${chainIndex}` +
         ` baseStrategy=${variant} remaining_budget_ms=${remainingBudget} total_budget_ms=${effectiveTotalBudget}` +
@@ -2136,7 +2262,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
               } else {
                 finish('cancelled_before_fallback')
               }
-            }, 800)
+            }, PREVIEW_RETRY_DELAY_MS)
             return
           }
 
@@ -2293,7 +2419,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       requestedStart: z.string().datetime(),
       requestedEnd:   z.string().datetime(),
       mode:           z.enum(['main', 'sub', 'auto']).optional(),
-      perStrategyTimeoutMs: z.number().int().min(2000).max(30000).optional(),
+      // Hasta 45s para distinguir "NVR lento" (main tarda 13-15s, a veces más) de
+      // "URI inválida" (400 inmediato). Permite probar 25/35/45s explícitamente.
+      perStrategyTimeoutMs: z.number().int().min(2000).max(45000).optional(),
     }).parse(request.body)
 
     // Debe haber recordingId o playbackURI — sin ninguno, el diagnóstico sería
@@ -2325,6 +2453,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
+    const diagDedup: Array<{ strategy: PlaybackBaseStrategy; duplicateOf: PlaybackBaseStrategy; urlFingerprint: string }> = []
     const plan = buildPlaybackAttemptPlan({
       playbackURI,
       channel: camera.channel,
@@ -2332,6 +2461,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       end: new Date(body.requestedEnd),
       creds: { username: camera.nvr.username, password: plainPass, ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort },
       mode: body.mode ?? PLAYBACK_STREAM_MODE,
+      dedupSink: diagDedup,
     })
 
     // Cobertura: qué estrategias se probaron y cuáles quedaron fuera (sin playbackURI).
@@ -2341,7 +2471,25 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const diagnosticsCoverage = {
       playbackUriUsed: !!playbackURI, playbackUriSource,
       testedStrategies, skippedStrategies,
+      dedupedStrategies: diagDedup,   // estrategias que colapsaron en otra (misma URL)
       complete: !!playbackURI,
+    }
+
+    // Reloj del NVR (bloqueante acá — es un diagnóstico ADMIN, no el hot path del
+    // preview) para correlacionar el desfase horario con las horas RTSP probadas.
+    const nvrClock = await getNvrSystemTime({ ...camera.nvr, password: plainPass } as any).catch(() => null)
+    const nvrClockSanitized = nvrClock
+      ? { timeMode: nvrClock.timeMode, localTime: nvrClock.localTime, timeZone: nvrClock.timeZone, utcTime: deriveNvrUtc(nvrClock.localTime) }
+      : null
+    // Ventana solicitada y el bloque que el NVR incrustó en la playbackURI.
+    const recBlock = playbackURI ? extractRtspPlaybackTimes(playbackURI) : { starttime: null, endtime: null }
+    const timeContext = {
+      requestedStartUtc: new Date(body.requestedStart).toISOString(),
+      requestedEndUtc:   new Date(body.requestedEnd).toISOString(),
+      effectiveStartUtc: new Date(body.requestedStart).toISOString(),
+      effectiveEndUtc:   new Date(body.requestedEnd).toISOString(),
+      recordingBlockStart: recBlock.starttime, recordingBlockEnd: recBlock.endtime,
+      nvrClock: nvrClockSanitized,
     }
 
     await AuditAction(server.prisma, user.sub, 'VIEW_RECORDING', body.cameraId, request, {
@@ -2362,15 +2510,29 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         const rtspStatus = classifyRtspError(r.stderr)
         // 'success' exige video utilizable (moof/datos), no sólo el primer byte.
         const result = r.playableMs != null ? 'success' : (r.firstByte ? 'partial_no_media' : 'error')
+        const rtspTimes = extractRtspPlaybackTimes(attempt.masked)
         results.push({
           strategy: attempt.strategy, track: attempt.track, respectsPlayhead: attempt.respectsPlayhead,
-          sanitizedUri: attempt.masked,
-          elapsedMs: r.elapsedMs, ffmpegExitCode: r.exitCode,
-          firstByteReceived: r.firstByte, firstByteMs: r.firstByteMs, playableMs: r.playableMs, bytes: r.bytes,
+          sanitizedUri: attempt.masked, urlFingerprint: urlFingerprint(attempt.masked),
+          // Tiempos de la prueba
+          timeoutMs, durationMs: r.elapsedMs, elapsedMs: r.elapsedMs,
+          firstByteReceived: r.firstByte, firstByteAtMs: r.firstByteMs, firstByteMs: r.firstByteMs,
+          playableMs: r.playableMs, bytes: r.bytes,
+          // Cómo terminó FFmpeg
+          ffmpegExitCode: r.exitCode, exitCode: r.exitCode, signal: r.signal, timedOut: r.timedOut,
+          // Horas RTSP realmente enviadas al NVR (sin credenciales)
+          rtspStart: rtspTimes.starttime, rtspEnd: rtspTimes.endtime,
           rtspStatus,
           stderr: maskUrlCredentials(r.stderr).slice(-600),
           result,
         })
+        server.log.info(
+          `[recordings-diag] strategy_result cameraId=${body.cameraId} strategy=${attempt.strategy}` +
+          ` track=${attempt.track} respectsPlayhead=${attempt.respectsPlayhead} timeoutMs=${timeoutMs}` +
+          ` firstByteAtMs=${r.firstByteMs ?? 'none'} durationMs=${r.elapsedMs} exitCode=${r.exitCode ?? 'null'}` +
+          ` signal=${r.signal ?? 'none'} timedOut=${r.timedOut} rtspStatus=${rtspStatus}` +
+          ` rtspStart=${rtspTimes.starttime ?? 'n/a'} result=${result} urlFingerprint=${urlFingerprint(attempt.masked)}`
+        )
         if (result === 'success') break
       }
     } finally {
@@ -2379,9 +2541,45 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const winner = results.find(x => x.result === 'success')
     server.log.info(
       `[recordings-diag] playback cameraId=${body.cameraId} nvrId=${camera.nvr.id}` +
-      ` winner=${winner ? winner.strategy : 'none'} tried=${results.length} coverageComplete=${diagnosticsCoverage.complete}`
+      ` winner=${winner ? winner.strategy : 'none'} tried=${results.length} coverageComplete=${diagnosticsCoverage.complete}` +
+      ` nvrTimezone=${nvrClockSanitized?.timeZone ?? 'unknown'} nvrLocalTime=${nvrClockSanitized?.localTime ?? 'unknown'}`
     )
-    return reply.send({ cameraId: body.cameraId, nvrId: camera.nvr.id, channel: camera.channel, mode: body.mode ?? PLAYBACK_STREAM_MODE, diagnosticsCoverage, results })
+    return reply.send({
+      cameraId: body.cameraId, nvrId: camera.nvr.id, channel: camera.channel,
+      mode: body.mode ?? PLAYBACK_STREAM_MODE,
+      timeContext, diagnosticsCoverage, results,
+    })
+  })
+
+  // GET /api/recordings/diagnostics/nvr-time — ADMIN. Reloj/zona del NVR
+  // (/ISAPI/System/time) SANITIZADO. Para diagnosticar el desfase horario de
+  // reproducción sin exponer credenciales ni tocar producción.
+  server.get('/diagnostics/nvr-time', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const q = z.object({ cameraId: z.string().min(1) }).parse(request.query)
+    const camera = await server.prisma.camera.findUnique({ where: { id: q.cameraId }, include: { nvr: true } })
+    if (!camera?.nvr) return reply.status(404).send({ message: 'Cámara no encontrada' })
+    const plainPass = decryptPass(camera.nvr.password)
+    if (!plainPass) return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
+
+    const clock = await getNvrSystemTime({ ...camera.nvr, password: plainPass } as any).catch(() => null)
+    if (!clock) {
+      return reply.status(502).send({ code: 'NVR_TIME_UNAVAILABLE', message: 'El NVR no respondió /ISAPI/System/time.' })
+    }
+    const utcTime = deriveNvrUtc(clock.localTime)
+    server.log.info(
+      `[recordings-diag] nvr_time cameraId=${q.cameraId} nvrId=${camera.nvr.id}` +
+      ` timeMode=${clock.timeMode} timeZone=${clock.timeZone} localTime=${clock.localTime}` +
+      ` utcTime=${utcTime ?? 'unknown(no offset in localTime)'}`
+    )
+    await AuditAction(server.prisma, request.user.sub, 'VIEW_RECORDING', q.cameraId, request, {
+      action: 'diagnostics_nvr_time',
+    }).catch(() => {})
+    return reply.send({
+      cameraId: q.cameraId, nvrId: camera.nvr.id,
+      timeMode: clock.timeMode, localTime: clock.localTime, timeZone: clock.timeZone,
+      utcTime,   // null si el localTime del NVR no declara offset (no se asume)
+      serverUtcTime: new Date(Date.now()).toISOString(),
+    })
   })
 
   // DELETE /api/recordings/preview/:sessionId — Stop FFmpeg, remove session.

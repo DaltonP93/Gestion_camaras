@@ -174,6 +174,28 @@ function starttimeOf(pathQuery: string): string | null {
 }
 const fmtPlaybackTs = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z'
 
+// Extrae starttime/endtime (formato Hikvision YYYYMMDDTHHMMSSZ) de una URL o
+// pathQuery de playback — para auditar el desfase horario de punta a punta sin
+// exponer credenciales (opera sólo sobre la query, nunca sobre el userinfo).
+export function extractRtspPlaybackTimes(uriOrPath: string): { starttime: string | null; endtime: string | null } {
+  const s = uriOrPath.match(/[?&]starttime=(\d{8}T\d{6}Z)/i)
+  const e = uriOrPath.match(/[?&]endtime=(\d{8}T\d{6}Z)/i)
+  return { starttime: s ? s[1].toUpperCase() : null, endtime: e ? e[1].toUpperCase() : null }
+}
+
+// Fingerprint estable y corto de una URL/pathQuery — SIN credenciales (FNV-1a).
+// Sirve para correlacionar estrategias duplicadas en los logs sin filtrar user/pass.
+export function urlFingerprint(uriOrPath: string): string {
+  // Quitar cualquier userinfo por si llega una URL con credenciales.
+  const safe = uriOrPath.replace(/\/\/[^/@]+@/, '//')
+  let h = 0x811c9dc5
+  for (let i = 0; i < safe.length; i++) {
+    h ^= safe.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
+
 export function buildPlaybackAttemptPlan(opts: {
   playbackURI?: string | null
   channel:      number
@@ -184,6 +206,10 @@ export function buildPlaybackAttemptPlan(opts: {
   includeSubstream?: boolean                 // false si el perfil del NVR lo marcó sin soporte
   preferred?:   PlaybackBaseStrategy | null  // estrategia que funcionó antes en este NVR
   playheadToleranceSec?: number              // tolerancia para "respeta el playhead" (default 2s)
+  // Sumidero opcional: se rellena con las estrategias descartadas por dedup (misma
+  // URL final que otra anterior). Permite al llamador registrarlas sin que la
+  // función deje de ser pura respecto a su valor de retorno.
+  dedupSink?:   Array<{ strategy: PlaybackBaseStrategy; duplicateOf: PlaybackBaseStrategy; urlFingerprint: string }>
 }): PlaybackAttempt[] {
   const { playbackURI, channel, effectiveStart, end, creds } = opts
   const mode = opts.mode ?? 'auto'
@@ -245,13 +271,19 @@ export function buildPlaybackAttemptPlan(opts: {
     if (i > 0 && respects(paths[i].pathQuery)) paths.unshift(paths.splice(i, 1)[0])
   }
 
-  // Construir, deduplicar por pathQuery final
+  // Construir, deduplicar por pathQuery final. Las descartadas por dedup se
+  // reportan al sumidero (con la estrategia de la que son duplicado y un
+  // fingerprint sin credenciales) en vez de desaparecer en silencio.
   const plan: PlaybackAttempt[] = []
-  const seen = new Set<string>()
+  const seenBy = new Map<string, PlaybackBaseStrategy>()
   for (const { strategy, pathQuery } of paths) {
     const pq = pathQuery.startsWith('/') ? pathQuery : `/${pathQuery}`
-    if (seen.has(pq)) continue
-    seen.add(pq)
+    const dupOf = seenBy.get(pq)
+    if (dupOf) {
+      opts.dedupSink?.push({ strategy, duplicateOf: dupOf, urlFingerprint: urlFingerprint(pq) })
+      continue
+    }
+    seenBy.set(pq, strategy)
     const { url, masked } = inject(pq)
     plan.push({ strategy, url, masked, track: trackFromPath(pq, channel * 100 + 1), respectsPlayhead: respects(pq) })
   }

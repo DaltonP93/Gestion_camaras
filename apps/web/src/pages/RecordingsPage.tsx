@@ -82,6 +82,15 @@ const GRID_COLS:  Record<PlaybackLayout, string> = {
   '4x4': 'grid-cols-4',
 }
 
+// Formatea una fecha en hora LOCAL del navegador estilo datetime-local
+// (YYYY-MM-DDTHH:mm:ss), para instrumentar el desfase horario en el backend.
+// No se usa para ninguna conversión: es sólo lo que el usuario ve en pantalla.
+function formatBrowserLocal(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T` +
+         `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export function RecordingsPage() {
@@ -1240,6 +1249,10 @@ export function RecordingsPage() {
           playbackURI:    (rec as any).playbackURI,
           forceTranscode,
           canPlayHevcMp4,
+          // Instrumentación de zona horaria (P1): lo que el navegador ve en local
+          // + su offset UTC, para auditar el desfase de punta a punta en el backend.
+          browserLocal:          formatBrowserLocal(new Date(effectiveStart)),
+          browserTimezoneOffset: new Date().getTimezoneOffset(),
         }
       )
 
