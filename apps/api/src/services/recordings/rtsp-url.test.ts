@@ -7,6 +7,7 @@ import {
   injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
   buildFallbackRecordingRtspUrl, normalizeTracksSlashBeforeQuery,
   buildPlaybackAttemptPlan, extractRtspPlaybackTimes, urlFingerprint,
+  hikTimestampToIso,
   type PlaybackBaseStrategy,
 } from './rtsp-url'
 
@@ -321,5 +322,18 @@ describe('buildPlaybackAttemptPlan — dedupSink', () => {
     // El plan resultante no contiene URLs duplicadas.
     const urls = plan.map(p => p.masked)
     expect(new Set(urls).size).toBe(urls.length)
+  })
+})
+
+describe('hikTimestampToIso', () => {
+  it('convierte YYYYMMDDTHHMMSSZ a ISO UTC', () => {
+    // import perezoso para no tocar el bloque de imports de arriba
+    
+    expect(hikTimestampToIso('20260721T110811Z')).toBe('2026-07-21T11:08:11.000Z')
+  })
+  it('tolera minúsculas y devuelve null en formato inválido', () => {
+    
+    expect(hikTimestampToIso('20260721t110811z')).toBe('2026-07-21T11:08:11.000Z')
+    expect(hikTimestampToIso('nope')).toBeNull()
   })
 })

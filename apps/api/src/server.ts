@@ -15,7 +15,7 @@ import { authPlugin } from './plugins/auth'
 import { authRoutes } from './routes/auth'
 import { nvrRoutes } from './routes/nvr'
 import { cameraRoutes } from './routes/cameras'
-import { recordingRoutes } from './routes/recordings'
+import { recordingRoutes, logPreviewStartupConfig } from './routes/recordings'
 import { userRoutes } from './routes/users'
 import { alertRoutes } from './routes/alerts'
 import { wsHandler } from './routes/websocket'
@@ -238,6 +238,9 @@ async function main() {
 
   await server.listen({ host, port })
   server.log.info(`VisionCore API v1.0.0 commit=${COMMIT_SHA} corriendo en http://${host}:${port}`)
+  // TASK 1 — config efectiva del preview de grabaciones (commit + presupuesto real
+  // + detección de override viejo). Confirma qué código/presupuesto corren.
+  logPreviewStartupConfig((m) => server.log.info(m), COMMIT_SHA)
 
   // Re-registrar todos los streams en MediaMTX al arrancar
   // MediaMTX pierde los paths dinámicos al reiniciarse; este bloque los restaura
