@@ -19,10 +19,13 @@ import {
   buildVariantChain as buildVariantChainPure,
   injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
   buildFallbackRecordingRtspUrl, buildPlaybackAttemptPlan,
-  extractRtspPlaybackTimes, urlFingerprint,
+  extractRtspPlaybackTimes, urlFingerprint, hikTimestampToIso,
+  classifyStageFailure, type StageEvidence,
   type PlaybackVariant, type PlaybackAttempt, type PlaybackBaseStrategy,
 } from '../services/recordings/rtsp-url'
 import { planStartupBudget } from '../services/recordings/preview-budget'
+import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
+import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
 import { getNvrSystemTime } from '../services/hikvision'
 
 // ─── VOD configuration ────────────────────────────────────────────
@@ -389,6 +392,7 @@ interface PreviewSession {
 // playback sub — así no se re-gasta tiempo probándolo en cada reproducción.
 interface NvrPlaybackProfile {
   preferredBaseStrategy?:   PlaybackBaseStrategy
+  preferredTransport?:      'tcp' | 'udp'   // TASK 5 — transporte que funcionó en el diagnóstico
   supportsPlaybackSubstream?: boolean
   lastVerifiedAt?:          number
   // Timestamp DEDICADO del rechazo de substream — separado de lastVerifiedAt (que
@@ -455,56 +459,9 @@ function getNvrClockCached(nvr: { id: string } & Record<string, any>, log: (m: s
   return cached ?? null
 }
 
-// Prueba UNA estrategia de URL RTSP con FFmpeg y timeout corto: resuelve si llegó
-// el primer byte, el exit code y el stderr (para diagnóstico). SIEMPRE mata el
-// proceso. No imprime credenciales (el caller enmascara).
-// Umbral de datos de video para considerar 'success' — el primer chunk suele ser
-// sólo ftyp+moov (init), no video utilizable. Se exige ver un box 'moof' (fragmento
-// de media) o acumular suficientes bytes.
-const DIAG_MIN_MEDIA_BYTES = 48 * 1024
-function diagnoseStrategy(url: string, timeoutMs: number): Promise<{
-  firstByte: boolean; firstByteMs: number | null; playableMs: number | null
-  exitCode: number | null; signal: string | null; timedOut: boolean
-  stderr: string; elapsedMs: number; bytes: number
-}> {
-  return new Promise(resolve => {
-    const started = Date.now()
-    const args = ['-rtsp_transport', 'tcp', '-i', url, '-t', '2', '-f', 'mp4',
-      '-movflags', 'frag_keyframe+empty_moov+default_base_moof', 'pipe:1']
-    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
-    let firstByte = false, firstByteMs: number | null = null
-    let playable = false, playableMs: number | null = null
-    let settled = false, bytes = 0, sawMoof = false, timedOut = false
-    let exitSignal: string | null = null
-    const stderr: string[] = []
-    const done = (exitCode: number | null) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      try { proc.kill('SIGKILL') } catch {}
-      resolve({
-        firstByte, firstByteMs, playableMs, exitCode, signal: exitSignal, timedOut,
-        stderr: stderr.join('\n'), elapsedMs: Date.now() - started, bytes,
-      })
-    }
-    proc.stdout?.on('data', (chunk: Buffer) => {
-      if (!firstByte) { firstByte = true; firstByteMs = Date.now() - started }
-      bytes += chunk.length
-      if (!sawMoof && chunk.includes('moof')) sawMoof = true
-      // 'playable' = vimos un fragmento de media (moof) o acumulamos datos suficientes
-      if (!playable && (sawMoof || bytes >= DIAG_MIN_MEDIA_BYTES)) {
-        playable = true; playableMs = Date.now() - started
-        done(0)  // suficiente para confirmar video utilizable
-      }
-    })
-    proc.stderr?.on('data', (c: Buffer) => {
-      for (const l of c.toString().split('\n')) { const s = l.trim(); if (s) { stderr.push(s); if (stderr.length > 40) stderr.shift() } }
-    })
-    proc.on('exit', (code, signal) => { exitSignal = signal ?? null; done(code) })
-    proc.on('error', () => done(null))
-    const timer = setTimeout(() => { timedOut = true; done(null) }, timeoutMs)
-  })
-}
+// El diagnóstico por etapas vive en services/recordings/staged-diagnostics.ts
+// (stageProbe / stageDecode / stageEncodeMux). Reemplazó al antiguo diagnoseStrategy
+// (que sólo miraba el primer byte del MP4 y no distinguía la etapa de detención).
 
 // Failed previews are retained here after the session is deleted so the
 // frontend can still fetch the error category (the slot cleanup often
@@ -579,6 +536,53 @@ const PREVIEW_RETRY_DELAY_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVI
 // Margen de seguridad del presupuesto total para overhead no modelado (spawn de
 // FFmpeg, demux, GC) — evita cortar el último intento por unos ms de más.
 const PREVIEW_BUDGET_SAFETY_MARGIN_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVIEW_BUDGET_SAFETY_MARGIN_MS || '3000', 10) || 3000)
+
+// Config del presupuesto reunida en un solo lugar (para el log de arranque y el
+// per-sesión). RAW = valor crudo del env (o null), para detectar overrides viejos.
+const PREVIEW_TOTAL_STARTUP_RAW = process.env.RECORDINGS_PREVIEW_TOTAL_STARTUP_MS ?? null
+function previewBudgetConfig() {
+  return {
+    firstByteTimeoutMs: PREVIEW_FIRST_BYTE_TIMEOUT_MS,
+    killGraceMs:        PREVIEW_KILL_GRACE_MS,
+    retryDelayMs:       PREVIEW_RETRY_DELAY_MS,
+    safetyMarginMs:     PREVIEW_BUDGET_SAFETY_MARGIN_MS,
+    hardCapMs:          PREVIEW_STARTUP_HARD_CAP_MS,
+    minTotalMs:         PREVIEW_TOTAL_STARTUP_MS,
+  }
+}
+
+// TASK 1 — Log de arranque de la config efectiva del preview. Verifica QUÉ código
+// y QUÉ presupuesto corren realmente (evidencia de producción mostraba
+// total_budget_ms=75000 con el último intento comprimido: un override viejo por
+// debajo del presupuesto calculado). Se calcula para un plan típico de 4 intentos.
+export function logPreviewStartupConfig(log: (msg: string) => void, gitCommit: string) {
+  const cfg = previewBudgetConfig()
+  const TYPICAL_ATTEMPTS = 4
+  const calc = planStartupBudget(TYPICAL_ATTEMPTS, cfg)
+  const override = PREVIEW_TOTAL_STARTUP_RAW
+  log(
+    `[recordings-config] preview_startup_config gitCommit=${gitCommit}` +
+    ` firstByteTimeoutMs=${cfg.firstByteTimeoutMs} killGraceMs=${cfg.killGraceMs}` +
+    ` retryDelayMs=${cfg.retryDelayMs} safetyMarginMs=${cfg.safetyMarginMs}` +
+    ` maxStartupBudgetMs=${cfg.hardCapMs} minStartupBudgetMs=${cfg.minTotalMs}` +
+    ` configuredStartupBudgetOverride=${override ?? 'none'}` +
+    ` calculatedStartupBudgetMs(${TYPICAL_ATTEMPTS}attempts)=${calc.effectiveTotalBudgetMs}` +
+    ` perAttemptCostMs=${calc.perAttemptCostMs}`
+  )
+  // Override viejo por debajo del presupuesto calculado → los últimos intentos se
+  // comprimirían. Advertir explícitamente (esto explica el 19.322s de producción).
+  if (override != null) {
+    const overrideMs = parseInt(override, 10)
+    if (!Number.isNaN(overrideMs) && overrideMs < calc.effectiveTotalBudgetMs) {
+      log(
+        `[recordings-config] WARN stale_startup_budget_override override=${overrideMs}` +
+        ` calculated=${calc.effectiveTotalBudgetMs} — el override recorta el presupuesto` +
+        ` por debajo del necesario para dar ${cfg.firstByteTimeoutMs}ms a cada intento.` +
+        ` Subilo o quitá RECORDINGS_PREVIEW_TOTAL_STARTUP_MS (ahora es sólo el PISO).`
+      )
+    }
+  }
+}
 
 interface NvrPreviewState { active: number; lastStartAt: number; queue: Array<() => void> }
 const nvrPreviewStates = new Map<string, NvrPreviewState>()
@@ -1883,9 +1887,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     // Use codec strategy determined at session creation (probe ran in POST /preview/start)
     const codecArgs = buildPreviewCodecArgs(strategy)
+    // TASK 5 — transporte aprendido por el diagnóstico (sólo se setea cuando una
+    // combinación funcionó). No cambia el transporte GLOBAL: es por-NVR y verificado.
+    const previewTransport: RtspTransport = nvrPlaybackProfiles.get(session.nvrId)?.preferredTransport ?? 'tcp'
 
+    // TASK 3 — -progress en un fd dedicado (pipe:3) para instrumentar por etapas
+    // (first_encoded_frame, frames, out_time_ms, total_size) sin ensuciar stdout.
     const buildFfmpegArgs = (inputUrl: string) => [
-      '-rtsp_transport', 'tcp',
+      '-rtsp_transport', previewTransport,
       '-fflags', '+genpts+discardcorrupt',
       ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
       '-reorder_queue_size', '0',
@@ -1893,6 +1902,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       ...codecArgs,
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
+      '-progress', 'pipe:3',
       'pipe:1',
     ]
 
@@ -2034,21 +2044,37 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     if (budgetPlan.skippedAttempts > 0) {
       for (let i = budgetPlan.keptAttempts; i < attemptChain.length; i++) {
         const sk = attemptChain[i]
+        // requiredMs = lo que costaría ejecutar hasta este intento inclusive;
+        // remainingMs = lo que el tope duro deja disponible. Nunca se ejecuta un
+        // intento con timeout reducido en silencio: se OMITE y se registra.
+        const requiredMs  = (i + 1) * budgetPlan.perAttemptCostMs - PREVIEW_RETRY_DELAY_MS + PREVIEW_BUDGET_SAFETY_MARGIN_MS
+        const remainingMs = Math.max(0, PREVIEW_STARTUP_HARD_CAP_MS - budgetPlan.effectiveTotalBudgetMs)
         server.log.warn(
-          `[recordings-preview] strategy_skipped sessionId=${sessionId} reason=budget` +
+          `[recordings-preview] attempt_skipped sessionId=${sessionId} reason=insufficient_budget` +
           ` strategy=${sk.strategy} track=${sk.track} attempt_index=${i}` +
           ` kept=${budgetPlan.keptAttempts} total=${attemptChain.length}` +
+          ` requiredMs=${requiredMs} remainingMs=${remainingMs}` +
           ` per_attempt_cost_ms=${budgetPlan.perAttemptCostMs} hard_cap_ms=${PREVIEW_STARTUP_HARD_CAP_MS}`
         )
       }
       attemptChain.length = budgetPlan.keptAttempts
     }
+    // TASK 1 — presupuesto EFECTIVO por sesión + detección de override viejo.
+    const calcOverride = PREVIEW_TOTAL_STARTUP_RAW != null ? parseInt(PREVIEW_TOTAL_STARTUP_RAW, 10) : null
     server.log.info(
       `[recordings-preview] budget_plan sessionId=${sessionId}` +
       ` attempts=${attemptChain.length} per_attempt_timeout_ms=${budgetPlan.perAttemptTimeoutMs}` +
-      ` per_attempt_cost_ms=${budgetPlan.perAttemptCostMs} total_budget_ms=${effectiveTotalBudget}` +
-      ` skipped=${budgetPlan.skippedAttempts}`
+      ` per_attempt_cost_ms=${budgetPlan.perAttemptCostMs}` +
+      ` calculatedStartupBudgetMs=${effectiveTotalBudget} maxStartupBudgetMs=${PREVIEW_STARTUP_HARD_CAP_MS}` +
+      ` configuredStartupBudgetOverride=${calcOverride ?? 'none'} skipped=${budgetPlan.skippedAttempts}`
     )
+    if (calcOverride != null && calcOverride < effectiveTotalBudget) {
+      server.log.warn(
+        `[recordings-preview] WARN stale_startup_budget_override sessionId=${sessionId}` +
+        ` override=${calcOverride} calculated=${effectiveTotalBudget} — el override recorta el presupuesto` +
+        ` (ahora RECORDINGS_PREVIEW_TOTAL_STARTUP_MS es sólo el PISO; el efectivo escala con los intentos)`
+      )
+    }
 
     const startAttempt = (chainIndex: number) => {
       // Presupuesto total agotado → no iniciar otra variante; responder error.
@@ -2088,9 +2114,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         ` strategy=${strategy} codec=${session.detectedCodec} baseStrategy=${variant} track=${track} url=${maskedUrl.slice(0, 160)}`
       )
 
-      const proc = spawn('ffmpeg', buildFfmpegArgs(inputUrl), { stdio: ['ignore', 'pipe', 'pipe'] })
+      // stdio: [ignore, stdout(mp4), stderr, progress(pipe:3)] — el 4º fd es -progress.
+      const proc = spawn('ffmpeg', buildFfmpegArgs(inputUrl), { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] })
       currentProc = proc
       session.vodProcess = proc
+      server.log.info(`[recordings-preview] ffmpeg_transport sessionId=${sessionId} variant=${variant} transport=${previewTransport}`)
 
       // ── Máquina de estado del intento + watchdog de primer byte ─────────
       // Estados: waiting_first_byte → streaming → (exited) ; o → timed_out /
@@ -2101,6 +2129,19 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       let variantTimedOut = false
       let procExited = false   // se setea en el handler 'exit' (salida REAL)
       let killGraceTimer: NodeJS.Timeout | null = null
+      // TASK 4 — 'exit' no garantiza stdout drenado; la finalización definitiva va
+      // en 'close'. Estos registran la salida y si hubo bytes (incluso tardíos).
+      let exitCode: number | null = null
+      let exitSignal: string | null = null
+      let closeHandled = false
+      let sawStdoutByte = false           // ¿llegó ALGÚN byte por stdout? (aun tardío)
+      let lateByteAfterKill = false       // el 1er byte llegó tras timeout/kill (drain race)
+      let firstMuxedByteMs: number | null = null
+      // TASK 3 — instrumentación -progress / etapas de FFmpeg.
+      const stderrHead: string[] = []     // primeras líneas (Input/Stream) que el tail perdía
+      let sawInputOpened = false
+      let firstEncodedFrameLogged = false
+      let progressBuf = ''
       const clearFirstByteWatchdog = () => {
         if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null }
         if (killGraceTimer) { clearTimeout(killGraceTimer); killGraceTimer = null }
@@ -2140,20 +2181,61 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         for (const raw of chunk.toString().split('\n')) {
           const line = maskUrlCredentials(raw.trim())
           if (!line) continue
+          // HEAD + tail: conservar las primeras líneas (incluyen "Input #0" y
+          // "Stream #0:0 Video" — hoy se perdían con sólo el tail) además del final.
+          if (stderrHead.length < 15) stderrHead.push(line)
           stderrTail.push(line)
           if (stderrTail.length > 30) stderrTail.shift()
+          // TASK 3 — marcar input_opened y el primer stream de video/audio detectado.
+          if (!sawInputOpened && /Input #\d+|Stream #\d+:\d+/.test(line)) {
+            sawInputOpened = true
+            const info = parseStreamInfoFromStderr(stderrHead.join('\n'))
+            server.log.info(
+              `[recordings-preview] input_opened sessionId=${sessionId} variant=${variant}` +
+              ` elapsedMs=${Date.now() - streamStartMs} video=${info.videoCodec ?? 'pending'}` +
+              ` audio=${info.audioCodec ?? 'none'} ${info.width ?? '?'}x${info.height ?? '?'}`
+            )
+          }
           server.log.debug(`[recordings-preview] ffmpeg_stderr sessionId=${sessionId} line=${line.slice(0, 200)}`)
         }
       })
 
+      // TASK 3 — -progress (fd 3): primer frame codificado + progreso periódico.
+      const progressPipe = (proc.stdio as any)[3]
+      progressPipe?.on('data', (chunk: Buffer) => {
+        progressBuf += chunk.toString()
+        if (progressBuf.length > 8192) progressBuf = progressBuf.slice(-4096)
+        const snap = parseFfmpegProgress(progressBuf)
+        if (!firstEncodedFrameLogged && snap.frame != null && snap.frame >= 1) {
+          firstEncodedFrameLogged = true
+          server.log.info(
+            `[recordings-preview] first_encoded_frame sessionId=${sessionId} variant=${variant}` +
+            ` elapsedMs=${Date.now() - streamStartMs} frame=${snap.frame} outTimeMs=${snap.outTimeMs ?? 0}`
+          )
+        }
+        if (snap.progress === 'end') {
+          server.log.info(
+            `[recordings-preview] progress_end sessionId=${sessionId} variant=${variant}` +
+            ` frames=${snap.frame ?? 0} outTimeMs=${snap.outTimeMs ?? 0} totalSize=${snap.totalSize ?? 0}`
+          )
+        }
+      })
+
       proc.stdout?.once('data', (chunk: Buffer) => {
+        // Registrar SIEMPRE que hubo salida (aun tardía): prueba que FFmpeg produjo
+        // bytes muxeados. firstMuxedByteMs alimenta el diagnóstico y distingue un
+        // MUXER_NO_OUTPUT real de una carrera de drenaje (OUTPUT_PIPE_DRAIN_RACE).
+        sawStdoutByte = true
+        if (firstMuxedByteMs == null) firstMuxedByteMs = Date.now() - streamStartMs
         // Sólo el primer byte que llega en 'waiting_first_byte' (y con el cliente
         // presente) cuenta como éxito. Un byte tardío tras timeout/kill/cierre se
         // ignora — nunca envía headers, marca éxito ni escribe al navegador.
         if (!shouldAcceptFirstByte({ state: attemptState, variantTimedOut, procExited, clientGone, responseEnded })) {
+          lateByteAfterKill = variantTimedOut || procExited
           server.log.info(
             `[recordings-preview] late_first_byte_ignored sessionId=${sessionId} variant=${variant}` +
-            ` state=${attemptState} timedOut=${variantTimedOut} exited=${procExited} clientGone=${clientGone}`
+            ` state=${attemptState} timedOut=${variantTimedOut} exited=${procExited} clientGone=${clientGone}` +
+            ` firstMuxedByteMs=${firstMuxedByteMs} — FFmpeg SÍ produjo salida (drain race), no rechazo del NVR`
           )
           return
         }
@@ -2197,16 +2279,36 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       proc.stdout?.pipe(res, { end: false })
 
       proc.on('exit', (code, signal) => {
+        // TASK 4 — 'exit' NO garantiza que stdout esté drenado. Aquí SÓLO se
+        // registra la salida real (necesaria para la gracia de SIGKILL y el
+        // diagnóstico) y se marca terminal si aún esperaba primer byte. La
+        // finalización DEFINITIVA (avanzar la cadena / all_variants_failed /
+        // finish) ocurre en 'close', tras drenar stdout — así no se pierden bytes
+        // tardíos ni se sirve un MP4 truncado de un proceso ya terminado.
         procExited = true
-        // No marcar terminal si ya está streaming (salida normal al fin del clip):
-        // sólo cerrar watchdog. Si aún esperaba primer byte, es terminal.
+        exitCode   = code
+        exitSignal = signal ?? null
         clearFirstByteWatchdog()
         if (attemptState === 'waiting_first_byte') attemptState = 'terminal'
-        const elapsedMs = Date.now() - streamStartMs
         server.log.info(
           `[recordings-preview] ffmpeg_exit sessionId=${sessionId}` +
-          ` code=${code} signal=${signal ?? 'none'} variant=${variant} elapsedMs=${elapsedMs}` +
-          ` hadFirstByte=${firstByteSent} timedOut=${variantTimedOut}`
+          ` code=${code} signal=${signal ?? 'none'} variant=${variant} elapsedMs=${Date.now() - streamStartMs}` +
+          ` hadFirstByte=${firstByteSent} timedOut=${variantTimedOut} sawStdoutByte=${sawStdoutByte}`
+        )
+      })
+
+      // 'close' = todos los stdio del proceso cerrados → stdout DRENADO. Ésta es la
+      // finalización definitiva del intento (TASK 4).
+      proc.on('close', () => {
+        if (closeHandled) return
+        closeHandled = true
+        const code = exitCode
+        const elapsedMs = Date.now() - streamStartMs
+        server.log.info(
+          `[recordings-preview] ffmpeg_close sessionId=${sessionId}` +
+          ` code=${code} signal=${exitSignal ?? 'none'} variant=${variant} elapsedMs=${elapsedMs}` +
+          ` hadFirstByte=${firstByteSent} timedOut=${variantTimedOut}` +
+          ` firstMuxedByteMs=${firstMuxedByteMs ?? 'none'} lateByteAfterKill=${lateByteAfterKill}`
         )
         if (session.vodProcess === proc) session.vodProcess = undefined
 
@@ -2214,23 +2316,25 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         // error): no reclasificar ni avanzar la cadena — pisaría la categoría
         // FIRST_BYTE_TIMEOUT con UNKNOWN. Sólo cerrar.
         if (deadlineTerminated) {
-          finish('deadline_terminated_exit')
+          finish('deadline_terminated_close')
           return
         }
 
-        // Cualquier salida SIN primer byte es un fallo de esta variante (incluye
-        // el kill del watchdog por timeout y una salida limpia sin datos) → hay
-        // que avanzar al siguiente variant. Antes se exigía code!==0 && code!==null,
-        // por lo que un proceso matado por señal (code=null) NO avanzaba.
+        // Cualquier cierre SIN primer byte aceptado es un fallo de esta variante
+        // (incluye el kill del watchdog por timeout y una salida limpia sin datos)
+        // → avanzar al siguiente variant.
         const failedBeforeOutput = !firstByteSent
         if (failedBeforeOutput) {
-          // Classify locally — session error state is only written when NO
-          // more variants remain, so a successful fallback never leaves a
-          // stale error behind. Un timeout de primer byte tiene su propia
-          // categoría (y SÍ avanza, a diferencia de offline).
+          // Bytes tardíos tras el kill PRUEBAN que FFmpeg producía salida muxeada:
+          // es una carrera de drenaje del pipe, NO un rechazo del NVR. Se refleja
+          // en el detalle para no mostrar "el NVR rechazó la URL" cuando en
+          // realidad sólo se agotó el tiempo de SALIDA (track 101 real).
+          const drainRace = variantTimedOut && lateByteAfterKill
           const category = variantTimedOut ? 'FIRST_BYTE_TIMEOUT' : classifyRtspError(stderrTail.join('\n'))
           const detail   = variantTimedOut
-            ? `sin primer byte en ${PREVIEW_FIRST_BYTE_TIMEOUT_MS}ms — ${stderrTail.slice(-3).join(' | ').slice(0, 300)}`
+            ? `sin primer byte aceptado en ${attemptTimeout}ms` +
+              (drainRace ? ` (late byte muxeado a ${firstMuxedByteMs}ms tras kill — drain race, FFmpeg SÍ producía salida)` : '') +
+              ` — ${stderrTail.slice(-3).join(' | ').slice(0, 300)}`
             : stderrTail.slice(-5).join(' | ').slice(0, 400)
           attemptErrors.push({ variant, category, detail })
           stderrTail.length = 0  // fresh tail for the next attempt
@@ -2301,7 +2405,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           endWithError(final.category, final.detail)
         }
 
-        finish(failedBeforeOutput ? 'ffmpeg_failed' : 'ffmpeg_exit')
+        finish(failedBeforeOutput ? 'ffmpeg_failed' : 'ffmpeg_close')
       })
 
       proc.on('error', (err: Error) => {
@@ -2406,30 +2510,38 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     return reply.status(404).send({ message: 'Sesión de preview no encontrada' })
   })
 
-  // POST /api/recordings/diagnostics/playback — ADMIN. Prueba cada estrategia de
-  // URL base secuencialmente (timeout corto, SIEMPRE libera FFmpeg) y devuelve
-  // resultados SANITIZADOS (sin credenciales) para determinar qué forma acepta el
-  // firmware del NVR. Corta en la primera estrategia que entrega primer byte.
+  // POST /api/recordings/diagnostics/playback — ADMIN. Diagnóstico POR ETAPAS de
+  // cada estrategia: RTSP/SDP → decode → encode → mux fMP4, con matriz de
+  // transporte (tcp/udp), video-only y variantes de fragmentación. Localiza el
+  // punto EXACTO donde se detiene el flujo (no sólo "abrió/no abrió"). Resultados
+  // SANITIZADOS (sin credenciales). Acepta {cameraId, recordingId} o
+  // {cameraId, playbackURI[, requestedStart, requestedEnd]}.
   server.post('/diagnostics/playback', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const user = request.user
     const body = z.object({
       cameraId:       z.string().min(1),
       recordingId:    z.string().optional(),
       playbackURI:    z.string().optional(),
-      requestedStart: z.string().datetime(),
-      requestedEnd:   z.string().datetime(),
+      // Opcionales: si hay playbackURI, la ventana se deriva de sus starttime/endtime.
+      requestedStart: z.string().datetime().optional(),
+      requestedEnd:   z.string().datetime().optional(),
       mode:           z.enum(['main', 'sub', 'auto']).optional(),
       // Hasta 45s para distinguir "NVR lento" (main tarda 13-15s, a veces más) de
       // "URI inválida" (400 inmediato). Permite probar 25/35/45s explícitamente.
       perStrategyTimeoutMs: z.number().int().min(2000).max(45000).optional(),
+      // TASK 5 — matriz de transporte. Por defecto sólo tcp (no cambia el global).
+      transports:     z.array(z.enum(['tcp', 'udp'])).nonempty().optional(),
+      // TASK 6/7 — comparaciones diagnósticas sobre la mejor estrategia.
+      videoOnly:      z.boolean().optional(),
+      fmp4Variants:   z.boolean().optional(),
     }).parse(request.body)
 
-    // Debe haber recordingId o playbackURI — sin ninguno, el diagnóstico sería
-    // incompleto (sólo generated_main/sub) y no debe correr silenciosamente.
+    // No exigir recordingId cuando ya hay playbackURI. Sólo se rechaza si no hay
+    // NINGUNO (el diagnóstico sería incompleto: sólo generated_main/sub).
     if (!body.recordingId && !body.playbackURI) {
       return reply.status(400).send({
         code: 'DIAGNOSTICS_INCOMPLETE_INPUT',
-        message: 'Enviá recordingId (preferido) o playbackURI: sin ellos no se pueden diagnosticar las estrategias nvr_original/normalized/rewritten.',
+        message: 'Enviá recordingId o playbackURI: sin ellos no se pueden diagnosticar las estrategias nvr_original/normalized/rewritten.',
       })
     }
 
@@ -2438,15 +2550,32 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const plainPass = decryptPass(camera.nvr.password)
     if (!plainPass) return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
 
-    // Resolver la playbackURI real: si viene recordingId, buscar el bloque en el NVR.
     let playbackURI = body.playbackURI ?? null
     let playbackUriSource: 'body' | 'recordingId' | 'none' = body.playbackURI ? 'body' : 'none'
+
+    // Ventana solicitada: fechas explícitas > horas incrustadas en la playbackURI.
+    // Con playbackURI ya NO hacen falta fechas separadas (TASK 2, formato B relajado).
+    const uriTimes = playbackURI ? extractRtspPlaybackTimes(playbackURI) : { starttime: null, endtime: null }
+    const startIso = body.requestedStart ?? (uriTimes.starttime ? hikTimestampToIso(uriTimes.starttime) : null)
+    const endIso   = body.requestedEnd   ?? (uriTimes.endtime   ? hikTimestampToIso(uriTimes.endtime)   : null)
+    if (!startIso || !endIso) {
+      // Sólo puede faltar la ventana si vino recordingId sin fechas y sin playbackURI:
+      // no hay forma de buscar el bloque en el NVR sin un rango temporal.
+      return reply.status(400).send({
+        code: 'DIAGNOSTICS_MISSING_WINDOW',
+        message: 'Falta la ventana temporal: enviá requestedStart/requestedEnd, o una playbackURI con starttime/endtime.',
+      })
+    }
+    const requestedStart = new Date(startIso)
+    const requestedEnd   = new Date(endIso)
+
+    // Resolver la playbackURI real por recordingId (buscar el bloque en el NVR).
     if (!playbackURI && body.recordingId) {
       try {
         const nvrWithPass = { ...camera.nvr, password: plainPass }
-        const recs = await searchRecordings(nvrWithPass as any, camera.channel, new Date(body.requestedStart), new Date(body.requestedEnd))
+        const recs = await searchRecordings(nvrWithPass as any, camera.channel, requestedStart, requestedEnd)
         const match = recs.find((r: any) => r.id === body.recordingId)
-          ?? recs.find((r: any) => new Date(r.startTime).getTime() <= new Date(body.requestedStart).getTime() && new Date(r.endTime).getTime() > new Date(body.requestedStart).getTime())
+          ?? recs.find((r: any) => new Date(r.startTime).getTime() <= requestedStart.getTime() && new Date(r.endTime).getTime() > requestedStart.getTime())
         if (match?.playbackURI) { playbackURI = match.playbackURI; playbackUriSource = 'recordingId' }
       } catch (e: any) {
         server.log.warn(`[recordings-diag] search_failed cameraId=${body.cameraId} err=${e?.message ?? 'unknown'}`)
@@ -2457,8 +2586,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const plan = buildPlaybackAttemptPlan({
       playbackURI,
       channel: camera.channel,
-      effectiveStart: new Date(body.requestedStart),
-      end: new Date(body.requestedEnd),
+      effectiveStart: requestedStart,
+      end: requestedEnd,
       creds: { username: camera.nvr.username, password: plainPass, ipAddress: camera.nvr.ipAddress, rtspPort: camera.nvr.rtspPort },
       mode: body.mode ?? PLAYBACK_STREAM_MODE,
       dedupSink: diagDedup,
@@ -2484,11 +2613,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // Ventana solicitada y el bloque que el NVR incrustó en la playbackURI.
     const recBlock = playbackURI ? extractRtspPlaybackTimes(playbackURI) : { starttime: null, endtime: null }
     const timeContext = {
-      requestedStartUtc: new Date(body.requestedStart).toISOString(),
-      requestedEndUtc:   new Date(body.requestedEnd).toISOString(),
-      effectiveStartUtc: new Date(body.requestedStart).toISOString(),
-      effectiveEndUtc:   new Date(body.requestedEnd).toISOString(),
+      requestedStartUtc: requestedStart.toISOString(),
+      requestedEndUtc:   requestedEnd.toISOString(),
+      effectiveStartUtc: requestedStart.toISOString(),
+      effectiveEndUtc:   requestedEnd.toISOString(),
       recordingBlockStart: recBlock.starttime, recordingBlockEnd: recBlock.endtime,
+      windowSource: body.requestedStart ? 'explicit' : (uriTimes.starttime ? 'playbackURI' : 'none'),
       nvrClock: nvrClockSanitized,
     }
 
@@ -2502,52 +2632,158 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(503).send({ code: 'NVR_BUSY', message: 'El NVR no tiene sesiones de reproducción libres para diagnosticar ahora.' })
     }
 
-    const timeoutMs = body.perStrategyTimeoutMs ?? 12000
+    const timeoutMs   = body.perStrategyTimeoutMs ?? 25000
+    const transports: RtspTransport[] = body.transports ?? ['tcp']
+    const primaryTransport = transports[0]
     const results: Array<Record<string, unknown>> = []
+    const extraProbes: Array<Record<string, unknown>> = []  // matriz transporte / video-only / fmp4
+    let stopPoint: string | null = null   // la etapa donde se detiene la MEJOR estrategia
+    let primaryPreferredTransport: RtspTransport | null = null  // transporte que funcionó (matriz)
+
+    // Construye la evidencia por etapas y clasifica el punto EXACTO de detención.
+    const buildEvidence = (
+      probe: Awaited<ReturnType<typeof stageProbe>>,
+      mux: Awaited<ReturnType<typeof stageEncodeMux>>,
+      decode: Awaited<ReturnType<typeof stageDecode>> | null,
+    ): StageEvidence => ({
+      inputOpened: probe.rtspOpened || mux.inputOpened || (decode?.inputOpened ?? false),
+      videoStreamPresent: (probe.videoCodec != null) || (mux.videoCodec != null),
+      // Un frame decodificado implica que llegaron paquetes de video (proxy honesto).
+      firstVideoPacketMs: decode?.firstDecodedFrameMs ?? mux.firstDecodedFrameMs ?? null,
+      firstDecodedFrameMs: decode?.firstDecodedFrameMs ?? mux.firstDecodedFrameMs ?? null,
+      firstEncodedFrameMs: mux.firstEncodedFrameMs,
+      firstMuxedByteMs: mux.firstMuxedByteMs,
+      bytesAfterKill: false,   // en el diagnóstico el byte se mide en vivo (no post-kill)
+      timedOut: mux.timedOut,
+      stderr: `${probe.stderrSample}\n${mux.stderrSample}`,
+    })
+
     try {
+      let winnerStrategy: PlaybackBaseStrategy | null = null
+      let winnerAttempt: PlaybackAttempt | null = null
       for (const attempt of plan) {
-        const r = await diagnoseStrategy(attempt.url, timeoutMs)
-        const rtspStatus = classifyRtspError(r.stderr)
-        // 'success' exige video utilizable (moof/datos), no sólo el primer byte.
-        const result = r.playableMs != null ? 'success' : (r.firstByte ? 'partial_no_media' : 'error')
         const rtspTimes = extractRtspPlaybackTimes(attempt.masked)
+        // Etapa 1 — RTSP/SDP (ffprobe).
+        const probe = await stageProbe(attempt.url, primaryTransport, Math.min(timeoutMs, 15000))
+        // Etapas encode+mux (lo que hace el preview real).
+        const mux = await stageEncodeMux(attempt.url, primaryTransport, timeoutMs)
+        // Si el mux no produjo byte pero SÍ hay video en el SDP, correr decode-only
+        // para separar "no llegan paquetes / no decodifica" de "no muxea".
+        let decode: Awaited<ReturnType<typeof stageDecode>> | null = null
+        if (mux.firstMuxedByteMs == null && (probe.videoCodec != null || mux.videoCodec != null)) {
+          decode = await stageDecode(attempt.url, primaryTransport, Math.min(timeoutMs, 15000))
+        }
+        const evidence = buildEvidence(probe, mux, decode)
+        const stageResult = classifyStageFailure(evidence)
+        const ok = stageResult === 'STAGE_OK'
         results.push({
           strategy: attempt.strategy, track: attempt.track, respectsPlayhead: attempt.respectsPlayhead,
+          transport: primaryTransport,
           sanitizedUri: attempt.masked, urlFingerprint: urlFingerprint(attempt.masked),
-          // Tiempos de la prueba
-          timeoutMs, durationMs: r.elapsedMs, elapsedMs: r.elapsedMs,
-          firstByteReceived: r.firstByte, firstByteAtMs: r.firstByteMs, firstByteMs: r.firstByteMs,
-          playableMs: r.playableMs, bytes: r.bytes,
-          // Cómo terminó FFmpeg
-          ffmpegExitCode: r.exitCode, exitCode: r.exitCode, signal: r.signal, timedOut: r.timedOut,
-          // Horas RTSP realmente enviadas al NVR (sin credenciales)
           rtspStart: rtspTimes.starttime, rtspEnd: rtspTimes.endtime,
-          rtspStatus,
-          stderr: maskUrlCredentials(r.stderr).slice(-600),
-          result,
+          timeoutMs,
+          // ── Evidencia por ETAPAS ──
+          rtspOpened: probe.rtspOpened, streamsDetected: probe.streamsDetected,
+          videoCodec: probe.videoCodec ?? mux.videoCodec, audioCodec: probe.audioCodec ?? mux.audioCodec,
+          width: probe.width, height: probe.height, fps: probe.fps,
+          firstVideoPacketMs: evidence.firstVideoPacketMs,
+          firstDecodedFrameMs: evidence.firstDecodedFrameMs,
+          firstEncodedFrameMs: evidence.firstEncodedFrameMs,
+          firstMuxedByteMs: evidence.firstMuxedByteMs,
+          producedBytes: mux.bytes, muxFrames: mux.frames, muxOutTimeMs: mux.outTimeMs,
+          // ── Cómo terminó ──
+          exitCode: mux.exitCode, signal: mux.signal, timedOut: mux.timedOut, durationMs: mux.elapsedMs,
+          stopPoint: stageResult,            // categoría GRANULAR (TASK 11)
+          result: ok ? 'success' : 'error',
+          stderrSample: mux.stderrSample.slice(0, 800),
         })
         server.log.info(
-          `[recordings-diag] strategy_result cameraId=${body.cameraId} strategy=${attempt.strategy}` +
-          ` track=${attempt.track} respectsPlayhead=${attempt.respectsPlayhead} timeoutMs=${timeoutMs}` +
-          ` firstByteAtMs=${r.firstByteMs ?? 'none'} durationMs=${r.elapsedMs} exitCode=${r.exitCode ?? 'null'}` +
-          ` signal=${r.signal ?? 'none'} timedOut=${r.timedOut} rtspStatus=${rtspStatus}` +
-          ` rtspStart=${rtspTimes.starttime ?? 'n/a'} result=${result} urlFingerprint=${urlFingerprint(attempt.masked)}`
+          `[recordings-diag] staged_result cameraId=${body.cameraId} strategy=${attempt.strategy}` +
+          ` transport=${primaryTransport} track=${attempt.track} timeoutMs=${timeoutMs}` +
+          ` rtspOpened=${probe.rtspOpened} video=${probe.videoCodec ?? mux.videoCodec ?? 'none'}` +
+          ` firstVideoPacketMs=${evidence.firstVideoPacketMs ?? 'none'} firstDecodedFrameMs=${evidence.firstDecodedFrameMs ?? 'none'}` +
+          ` firstEncodedFrameMs=${evidence.firstEncodedFrameMs ?? 'none'} firstMuxedByteMs=${evidence.firstMuxedByteMs ?? 'none'}` +
+          ` stopPoint=${stageResult} urlFingerprint=${urlFingerprint(attempt.masked)}`
         )
-        if (result === 'success') break
+        if (ok) { winnerStrategy = attempt.strategy; winnerAttempt = attempt; break }
+        if (!stopPoint) stopPoint = stageResult
+      }
+
+      // La MEJOR estrategia para las comparaciones extra: la ganadora, o la primera
+      // que al menos abrió el RTSP (para no diagnosticar sobre una URI muerta).
+      const bestAttempt = winnerAttempt
+        ?? plan.find(a => (results.find(r => r.strategy === a.strategy) as any)?.rtspOpened)
+        ?? plan[0]
+
+      // TASK 5 — matriz de transporte: probar los transportes restantes sobre la
+      // mejor estrategia (no cambia el transporte global; sólo diagnostica).
+      if (bestAttempt) {
+        for (const tr of transports.slice(1)) {
+          const mux = await stageEncodeMux(bestAttempt.url, tr, timeoutMs)
+          const ev = buildEvidence(await stageProbe(bestAttempt.url, tr, Math.min(timeoutMs, 15000)), mux, null)
+          const sp = classifyStageFailure(ev)
+          extraProbes.push({ kind: 'transport_matrix', transport: tr, strategy: bestAttempt.strategy,
+            firstMuxedByteMs: mux.firstMuxedByteMs, firstEncodedFrameMs: mux.firstEncodedFrameMs,
+            timedOut: mux.timedOut, exitCode: mux.exitCode, stopPoint: sp, result: sp === 'STAGE_OK' ? 'success' : 'error' })
+          server.log.info(`[recordings-diag] transport_matrix cameraId=${body.cameraId} strategy=${bestAttempt.strategy} transport=${tr} firstMuxedByteMs=${mux.firstMuxedByteMs ?? 'none'} stopPoint=${sp}`)
+          if (sp === 'STAGE_OK' && !winnerStrategy) { winnerStrategy = bestAttempt.strategy; primaryPreferredTransport = tr }
+        }
+
+        // TASK 6 — video-only H.264: aísla si el audio AAC/G.711 o la sync A/V bloquean.
+        if (body.videoOnly) {
+          const mux = await stageEncodeMux(bestAttempt.url, primaryTransport, timeoutMs, { videoOnly: true })
+          extraProbes.push({ kind: 'video_only_h264', transport: primaryTransport, strategy: bestAttempt.strategy,
+            firstMuxedByteMs: mux.firstMuxedByteMs, firstEncodedFrameMs: mux.firstEncodedFrameMs,
+            timedOut: mux.timedOut, exitCode: mux.exitCode,
+            producedBytes: mux.bytes, result: mux.firstMuxedByteMs != null ? 'success' : 'error',
+            note: 'comparar con encode_mux_fmp4 (video+audio): si aquí SÍ sale byte, el problema es audio/sync A/V' })
+          server.log.info(`[recordings-diag] video_only cameraId=${body.cameraId} strategy=${bestAttempt.strategy} firstMuxedByteMs=${mux.firstMuxedByteMs ?? 'none'} bytes=${mux.bytes}`)
+        }
+
+        // TASK 7 — variantes de fragmentación fMP4 (GOP corto / frag_duration).
+        if (body.fmp4Variants) {
+          const variants: Array<{ label: string; fragArgs: string[] }> = [
+            { label: 'frag_default', fragArgs: ['-movflags', 'frag_keyframe+empty_moov+default_base_moof'] },
+            { label: 'frag_duration_500ms', fragArgs: ['-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-frag_duration', '500000', '-g', '25', '-flush_packets', '1'] },
+            { label: 'frag_every_frame', fragArgs: ['-movflags', 'frag_keyframe+empty_moov+default_base_moof+frag_every_frame', '-flush_packets', '1'] },
+          ]
+          for (const v of variants) {
+            const mux = await stageEncodeMux(bestAttempt.url, primaryTransport, timeoutMs, { fragArgs: v.fragArgs, label: v.label })
+            extraProbes.push({ kind: 'fmp4_variant', variant: v.label, transport: primaryTransport, strategy: bestAttempt.strategy,
+              firstMuxedByteMs: mux.firstMuxedByteMs, firstEncodedFrameMs: mux.firstEncodedFrameMs,
+              producedBytes: mux.bytes, timedOut: mux.timedOut, exitCode: mux.exitCode,
+              result: mux.firstMuxedByteMs != null ? 'success' : 'error' })
+            server.log.info(`[recordings-diag] fmp4_variant cameraId=${body.cameraId} strategy=${bestAttempt.strategy} variant=${v.label} firstMuxedByteMs=${mux.firstMuxedByteMs ?? 'none'} bytes=${mux.bytes}`)
+          }
+        }
+      }
+
+      // TASK 5 — persistir preferencia (estrategia + transporte) si algo funcionó.
+      if (winnerStrategy) {
+        const prof = nvrPlaybackProfiles.get(camera.nvr.id) ?? {}
+        const wAttempt = plan.find(a => a.strategy === winnerStrategy)
+        if (wAttempt?.respectsPlayhead) prof.preferredBaseStrategy = winnerStrategy
+        prof.preferredTransport = primaryPreferredTransport ?? primaryTransport
+        prof.lastVerifiedAt = Date.now()
+        nvrPlaybackProfiles.set(camera.nvr.id, prof)
+        server.log.info(`[recordings-diag] profile_saved nvrId=${camera.nvr.id} preferredBaseStrategy=${prof.preferredBaseStrategy ?? 'none'} preferredTransport=${prof.preferredTransport}`)
       }
     } finally {
       releaseNvrSlot()
     }
+
     const winner = results.find(x => x.result === 'success')
     server.log.info(
       `[recordings-diag] playback cameraId=${body.cameraId} nvrId=${camera.nvr.id}` +
-      ` winner=${winner ? winner.strategy : 'none'} tried=${results.length} coverageComplete=${diagnosticsCoverage.complete}` +
+      ` winner=${winner ? winner.strategy : 'none'} stopPoint=${stopPoint ?? 'n/a'} tried=${results.length}` +
+      ` coverageComplete=${diagnosticsCoverage.complete}` +
       ` nvrTimezone=${nvrClockSanitized?.timeZone ?? 'unknown'} nvrLocalTime=${nvrClockSanitized?.localTime ?? 'unknown'}`
     )
     return reply.send({
       cameraId: body.cameraId, nvrId: camera.nvr.id, channel: camera.channel,
       mode: body.mode ?? PLAYBACK_STREAM_MODE,
-      timeContext, diagnosticsCoverage, results,
+      stopPoint,                       // dónde se detiene la mejor estrategia (resumen)
+      timeContext, diagnosticsCoverage, results, extraProbes,
     })
   })
 

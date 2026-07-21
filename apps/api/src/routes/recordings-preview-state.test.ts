@@ -2,7 +2,7 @@
 // (evita aceptar bytes tardíos tras timeout/kill/cierre → MP4 truncado), el mapeo
 // de status HTTP del error, y la clasificación de cancelación vs fallo del NVR.
 import { describe, it, expect } from 'vitest'
-import { shouldAcceptFirstByte, errorStatusForCategory, isCancellation } from './recordings-preview-state'
+import { shouldAcceptFirstByte, errorStatusForCategory, isCancellation, isDrainRace } from './recordings-preview-state'
 
 const base = { state: 'waiting_first_byte' as const, variantTimedOut: false, procExited: false, clientGone: false, responseEnded: false }
 
@@ -34,6 +34,42 @@ describe('errorStatusForCategory', () => {
     expect(errorStatusForCategory('FIRST_BYTE_TIMEOUT')).toBe(504)
     expect(errorStatusForCategory('AUTH_FAILED')).toBe(401)
     expect(errorStatusForCategory('UNKNOWN')).toBe(502)
+  })
+  it('mapea las categorías granulares por etapa', () => {
+    expect(errorStatusForCategory('RTSP_OPEN_TIMEOUT')).toBe(504)
+    expect(errorStatusForCategory('MUXER_NO_OUTPUT')).toBe(504)
+    expect(errorStatusForCategory('OUTPUT_PIPE_DRAIN_RACE')).toBe(504)
+    expect(errorStatusForCategory('ENCODE_FAILED')).toBe(500)
+    expect(errorStatusForCategory('RTSP_AUTH_FAILED')).toBe(401)
+  })
+})
+
+describe('isDrainRace / exit antes del último data de stdout (TASK 4)', () => {
+  it('exit ocurre ANTES del último data: el byte tardío NO se acepta y es drain race', () => {
+    // Secuencia real: watchdog no disparó, pero el proceso salió (procExited) y
+    // RECIÉN DESPUÉS llega un chunk de stdout (buffer vaciado en el cierre).
+    const gateAtByte = { ...base, procExited: true }
+    const accepted = shouldAcceptFirstByte(gateAtByte)
+    expect(accepted).toBe(false)                         // no se sirve MP4 truncado
+    expect(isDrainRace({ variantTimedOut: false, procExited: true, sawStdoutByte: true, firstByteAccepted: accepted }))
+      .toBe(true)                                        // FFmpeg SÍ produjo salida
+  })
+
+  it('timeout + byte tardío tras kill = drain race (no rechazo del NVR)', () => {
+    const accepted = shouldAcceptFirstByte({ ...base, variantTimedOut: true })
+    expect(accepted).toBe(false)
+    expect(isDrainRace({ variantTimedOut: true, procExited: false, sawStdoutByte: true, firstByteAccepted: accepted }))
+      .toBe(true)
+  })
+
+  it('NO es drain race si nunca hubo byte de stdout (MUXER_NO_OUTPUT real)', () => {
+    expect(isDrainRace({ variantTimedOut: true, procExited: true, sawStdoutByte: false, firstByteAccepted: false }))
+      .toBe(false)
+  })
+
+  it('NO es drain race si el primer byte se aceptó a tiempo (éxito normal)', () => {
+    expect(isDrainRace({ variantTimedOut: false, procExited: false, sawStdoutByte: true, firstByteAccepted: true }))
+      .toBe(false)
   })
 })
 

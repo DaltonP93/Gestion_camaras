@@ -31,8 +31,30 @@ export function errorStatusForCategory(category: string): number {
     case 'NVR_OFFLINE_OR_TIMEOUT':         return 504
     case 'FIRST_BYTE_TIMEOUT':             return 504
     case 'AUTH_FAILED':                    return 401
+    // Categorías granulares por etapa (classifyStageFailure).
+    case 'RTSP_AUTH_FAILED':               return 401
+    case 'RTSP_OPEN_TIMEOUT':              return 504
+    case 'RTSP_OPENED_NO_PACKETS':         return 504
+    case 'VIDEO_NO_KEYFRAME':              return 504
+    case 'MUXER_NO_OUTPUT':                return 504
+    case 'OUTPUT_PIPE_DRAIN_RACE':         return 504
+    case 'STARTUP_BUDGET_EXCEEDED':        return 504
+    case 'ENCODE_FAILED':                  return 500
     default:                               return 502
   }
+}
+
+/**
+ * ¿Hubo una CARRERA DE DRENAJE del pipe? Aparecieron bytes de stdout pero no se
+ * aceptaron como primer byte porque el intento ya había terminado
+ * (timeout/kill/exit). Prueba que FFmpeg SÍ producía salida muxeada: el punto de
+ * detención NO es un rechazo del NVR sino la salida/tiempo. Se usa para no
+ * clasificar erróneamente track 101 como URI rechazada.
+ */
+export function isDrainRace(opts: {
+  variantTimedOut: boolean; procExited: boolean; sawStdoutByte: boolean; firstByteAccepted: boolean
+}): boolean {
+  return opts.sawStdoutByte && !opts.firstByteAccepted && (opts.variantTimedOut || opts.procExited)
 }
 
 /**

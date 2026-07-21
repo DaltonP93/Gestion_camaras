@@ -31,6 +31,77 @@ export function classifyRtspError(text: string): string {
   return 'UNKNOWN'
 }
 
+// Categorías GRANULARES del punto EXACTO donde se detiene una estrategia. A
+// diferencia de classifyRtspError (heurística sólo-stderr), ésta consume la
+// EVIDENCIA POR ETAPAS del diagnóstico: no puede afirmarse "el NVR rechazó la
+// URL" cuando track 101 sólo agotó el tiempo sin producir salida — eso es un
+// MUXER_NO_OUTPUT / OPENED_NO_PACKETS, no un URI_REJECTED.
+export type StageFailureCategory =
+  | 'RTSP_URI_REJECTED'
+  | 'RTSP_AUTH_FAILED'
+  | 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
+  | 'RTSP_OPEN_TIMEOUT'
+  | 'RTSP_OPEN_FAILED'
+  | 'RTSP_OPENED_NO_PACKETS'
+  | 'VIDEO_STREAM_MISSING'
+  | 'VIDEO_NO_KEYFRAME'
+  | 'DECODE_FAILED'
+  | 'ENCODE_FAILED'
+  | 'MUXER_NO_OUTPUT'
+  | 'OUTPUT_PIPE_DRAIN_RACE'
+  | 'STARTUP_BUDGET_EXCEEDED'
+  | 'STAGE_OK'
+  | 'UNKNOWN'
+
+export interface StageEvidence {
+  inputOpened: boolean          // se vio "Input #0" / streams
+  videoStreamPresent: boolean   // hay Stream Video en el SDP/probe
+  firstVideoPacketMs: number | null
+  firstDecodedFrameMs: number | null
+  firstEncodedFrameMs: number | null
+  firstMuxedByteMs: number | null
+  bytesAfterKill?: boolean       // el primer byte llegó DESPUÉS del SIGKILL
+  timedOut: boolean
+  budgetExceeded?: boolean
+  stderr: string
+}
+
+// Devuelve la categoría del punto de detención. El orden importa: errores duros
+// del transporte (auth/453/400/open) ganan; luego se avanza etapa por etapa.
+export function classifyStageFailure(ev: StageEvidence): StageFailureCategory {
+  const t = (ev.stderr || '').toLowerCase()
+  if (ev.budgetExceeded) return 'STARTUP_BUDGET_EXCEEDED'
+  // Éxito real: hubo primer byte muxeado ANTES de cualquier kill.
+  if (ev.firstMuxedByteMs != null && !ev.bytesAfterKill) return 'STAGE_OK'
+  // Byte muxeado pero SÓLO tras el kill → carrera de drenaje del pipe (el proceso
+  // ya había producido salida cuando lo matamos). NO es rechazo del NVR.
+  if (ev.firstMuxedByteMs != null && ev.bytesAfterKill) return 'OUTPUT_PIPE_DRAIN_RACE'
+
+  // Errores duros de transporte (independientes de la etapa alcanzada).
+  if (/453|not enough bandwidth/.test(t)) return 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
+  if (/rtsp\/\d\.\d\s+400|server returned 400|400 bad request|(?:describe|setup|play|options|teardown|method[^:\n]*)\s+failed:\s*400/.test(t)) return 'RTSP_URI_REJECTED'
+  if (/401|unauthorized|credenciales/.test(t)) return 'RTSP_AUTH_FAILED'
+
+  // El input nunca abrió: distinguir timeout de fallo explícito.
+  if (!ev.inputOpened) {
+    if (/could not open|open context|error opening input|connection refused/.test(t)) return 'RTSP_OPEN_FAILED'
+    return 'RTSP_OPEN_TIMEOUT'
+  }
+  // Input abierto pero sin stream de video utilizable.
+  if (!ev.videoStreamPresent) return 'VIDEO_STREAM_MISSING'
+  // Abrió pero nunca llegó un paquete de video (RTP no fluye / firewall / PLAY sin datos).
+  if (ev.firstVideoPacketMs == null) return 'RTSP_OPENED_NO_PACKETS'
+  // Llegaron paquetes pero nunca se decodificó un frame (sin keyframe o decode roto).
+  if (ev.firstDecodedFrameMs == null) {
+    if (/decod|corrupt|invalid data|no frame/.test(t)) return 'DECODE_FAILED'
+    return 'VIDEO_NO_KEYFRAME'
+  }
+  // Se decodificó pero nunca se codificó un frame de salida.
+  if (ev.firstEncodedFrameMs == null) return 'ENCODE_FAILED'
+  // Se codificó pero el muxer nunca emitió un byte.
+  return 'MUXER_NO_OUTPUT'
+}
+
 // Normaliza /Streaming/tracks/NNN/? → /Streaming/tracks/NNN?  (quita el slash
 // antes del '?'). Algunos firmwares Hikvision entregan la playbackURI con ese
 // slash y rechazan/aceptan según la variante — por eso se prueba de ambas formas.
@@ -181,6 +252,19 @@ export function extractRtspPlaybackTimes(uriOrPath: string): { starttime: string
   const s = uriOrPath.match(/[?&]starttime=(\d{8}T\d{6}Z)/i)
   const e = uriOrPath.match(/[?&]endtime=(\d{8}T\d{6}Z)/i)
   return { starttime: s ? s[1].toUpperCase() : null, endtime: e ? e[1].toUpperCase() : null }
+}
+
+// Convierte un timestamp Hikvision de playback (YYYYMMDDTHHMMSSZ) a ISO 8601 UTC.
+// NO concatena 'Z' a mano ni convierte dos veces: interpreta el string tal cual
+// (el sufijo Z ya indica que la etiqueta es UTC en este formato). Devuelve null si
+// no matchea. Se usa para derivar la ventana solicitada desde la playbackURI del
+// NVR sin exigir fechas por separado.
+export function hikTimestampToIso(ts: string): string | null {
+  const m = ts.trim().toUpperCase().match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/)
+  if (!m) return null
+  const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`
+  const ms = Date.parse(iso)
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString()
 }
 
 // Fingerprint estable y corto de una URL/pathQuery — SIN credenciales (FNV-1a).
