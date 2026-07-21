@@ -6,7 +6,8 @@ import {
   toSubstreamTrackUrl, buildVariantUrl, buildVariantChain,
   injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
   buildFallbackRecordingRtspUrl, normalizeTracksSlashBeforeQuery,
-  buildPlaybackAttemptPlan,
+  buildPlaybackAttemptPlan, extractRtspPlaybackTimes, urlFingerprint,
+  type PlaybackBaseStrategy,
 } from './rtsp-url'
 
 const CREDS = { username: 'admin', password: 'p@ss/w:rd', ipAddress: '192.168.1.112', rtspPort: 554 }
@@ -259,5 +260,66 @@ describe('buildFallbackRecordingRtspUrl', () => {
     expect(r.trackId).toBe(301)
     expect(r.url).toContain('/Streaming/tracks/301?starttime=20260709T140000Z&endtime=20260709T150000Z')
     expect(r.masked).toContain(':***@')
+  })
+})
+
+describe('extractRtspPlaybackTimes', () => {
+  it('extrae starttime/endtime de una URL RTSP de playback', () => {
+    const uri = 'rtsp://admin:***@10.0.0.1:554/Streaming/tracks/101?starttime=20260721T110600Z&endtime=20260721T112200Z'
+    expect(extractRtspPlaybackTimes(uri)).toEqual({ starttime: '20260721T110600Z', endtime: '20260721T112200Z' })
+  })
+  it('funciona sobre un pathQuery suelto', () => {
+    expect(extractRtspPlaybackTimes('/Streaming/tracks/101?starttime=20260721T110600Z'))
+      .toEqual({ starttime: '20260721T110600Z', endtime: null })
+  })
+  it('devuelve null cuando no hay tiempos', () => {
+    expect(extractRtspPlaybackTimes('rtsp://host/live/101')).toEqual({ starttime: null, endtime: null })
+  })
+  it('normaliza a mayúsculas la Z', () => {
+    expect(extractRtspPlaybackTimes('/x?starttime=20260721t110600z').starttime).toBe('20260721T110600Z')
+  })
+})
+
+describe('urlFingerprint', () => {
+  it('es estable para la misma entrada', () => {
+    const a = urlFingerprint('/Streaming/tracks/101?starttime=20260721T110600Z')
+    const b = urlFingerprint('/Streaming/tracks/101?starttime=20260721T110600Z')
+    expect(a).toBe(b)
+    expect(a).toMatch(/^[0-9a-f]{8}$/)
+  })
+  it('difiere para entradas distintas', () => {
+    expect(urlFingerprint('/Streaming/tracks/101?starttime=A'))
+      .not.toBe(urlFingerprint('/Streaming/tracks/102?starttime=A'))
+  })
+  it('NO depende de las credenciales (mismo fingerprint con o sin userinfo)', () => {
+    const withCreds = urlFingerprint('rtsp://admin:secret@10.0.0.1:554/Streaming/tracks/101?starttime=A')
+    const withMask  = urlFingerprint('rtsp://admin:***@10.0.0.1:554/Streaming/tracks/101?starttime=A')
+    const noCreds   = urlFingerprint('rtsp://10.0.0.1:554/Streaming/tracks/101?starttime=A')
+    expect(withCreds).toBe(noCreds)
+    expect(withMask).toBe(noCreds)
+  })
+})
+
+describe('buildPlaybackAttemptPlan — dedupSink', () => {
+  it('reporta estrategias descartadas por dedup (misma URL final) sin credenciales', () => {
+    // Cuando el NVR incrusta el MISMO start que el playhead, la reescritura no
+    // cambia nada y generated_main puede colapsar en una nvr_rewritten: esa
+    // estrategia deduplicada debe reportarse, no desaparecer en silencio.
+    const start = new Date('2026-07-21T11:06:00Z')
+    const end   = new Date('2026-07-21T11:22:00Z')
+    const playbackURI = `/Streaming/tracks/101?starttime=20260721T110600Z&endtime=20260721T112200Z`
+    const dedupSink: Array<{ strategy: PlaybackBaseStrategy; duplicateOf: PlaybackBaseStrategy; urlFingerprint: string }> = []
+    const plan = buildPlaybackAttemptPlan({
+      playbackURI, channel: 1, effectiveStart: start, end, creds: CREDS, mode: 'main', dedupSink,
+    })
+    // Debe haber al menos una entrada de dedup y ninguna debe filtrar credenciales.
+    expect(dedupSink.length).toBeGreaterThan(0)
+    for (const d of dedupSink) {
+      expect(d.urlFingerprint).toMatch(/^[0-9a-f]{8}$/)
+      expect(d.strategy).not.toBe(d.duplicateOf)
+    }
+    // El plan resultante no contiene URLs duplicadas.
+    const urls = plan.map(p => p.masked)
+    expect(new Set(urls).size).toBe(urls.length)
   })
 })
