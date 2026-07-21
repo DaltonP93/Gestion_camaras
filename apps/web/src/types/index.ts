@@ -359,10 +359,14 @@ export interface Alert {
   readAt?: string | null
   createdAt: string
   nvrName?: string
+  cameraName?: string
 }
 
 export type AlertType =
   | 'CAMERA_OFFLINE'
+  | 'CAMERA_RECOVERED'
+  | 'CAMERA_STREAM_ERROR'
+  | 'CAMERA_STREAM_RECOVERED'
   | 'NVR_OFFLINE'
   | 'HDD_FULL'
   | 'HDD_ERROR'

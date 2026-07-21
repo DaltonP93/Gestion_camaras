@@ -29,6 +29,11 @@ export function connectWebSocket() {
         if (msg.type === 'alert' && msg.alert) {
           useAlertStore.getState().addAlert(msg.alert)
         }
+        // Resolución empujada por el servidor (p.ej. cámara recuperó señal):
+        // baja el contador de la campana en vivo, sin recargar.
+        if (msg.type === 'alert_resolved' && msg.alertId) {
+          useAlertStore.getState().resolveById(msg.alertId)
+        }
       } catch {
         // Ignorar mensajes mal formados
       }

@@ -3,6 +3,10 @@
 import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios'
 import crypto from 'crypto'
 import type { NVR } from '@prisma/client'
+import {
+  parseChannelHealthXml, mapOnlineToStatus,
+  type NvrChannelHealth,
+} from './hikvision-channel-health'
 
 // ─── Interfaces ───────────────────────────────────────────────
 
@@ -931,6 +935,80 @@ export async function getIpCameraList(nvr: NVR): Promise<HikIpCamera[]> {
 
   cameras.sort((a, b) => a.channel - b.channel)
   return cameras
+}
+
+// ─── Salud de canal por cámara (fuente FIABLE de online/offline) ──────────────
+// NO reutiliza getNVRChannels() (que marca online=true a todo canal VideoInput).
+// Prioriza InputProxy: /channels/status → /channels (variantes) → y sólo como
+// fallback INFORMATIVO VideoInput (todo UNKNOWN, jamás OFFLINE). Devuelve la salud
+// por canal para que el healthWorker aplique debounce. Nunca imprime credenciales.
+export async function getNvrChannelHealth(nvr: NVR): Promise<NvrChannelHealth[]> {
+  const checkedAt = new Date()
+  const byChannel = new Map<number, NvrChannelHealth>()
+  const put = (h: Omit<NvrChannelHealth, 'checkedAt'>) => {
+    // Prioridad: no degradar un ONLINE/OFFLINE ya conocido con un UNKNOWN posterior.
+    const prev = byChannel.get(h.channel)
+    if (prev && prev.status !== 'UNKNOWN' && h.status === 'UNKNOWN') return
+    byChannel.set(h.channel, { ...h, checkedAt })
+  }
+
+  // 1) /ISAPI/ContentMgmt/InputProxy/channels/status — la señal más directa.
+  try {
+    const client = createHikClient(nvr)
+    const res = await client.get('/ISAPI/ContentMgmt/InputProxy/channels/status')
+    const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '')
+    for (const e of parseChannelHealthXml(body, 'inputproxy_status')) put(e)
+  } catch (e: any) {
+    console.warn(`[channel-health] ${nvr.ipAddress} status endpoint error: ${e?.code || e?.message || 'unknown'}`)
+  }
+
+  // 2) InputProxy /channels (variantes con manejo de Digest) — completa canales
+  //    que el status no trajo, o los reemplaza si el status vino vacío.
+  if (byChannel.size === 0) {
+    try {
+      const { entries } = await fetchInputProxyChannels(nvr as any)
+      for (const e of entries) {
+        // entry.status ya viene 'online'|'offline'|'unknown' (parseHikOnlineStatus).
+        put({
+          channel: e.channel,
+          status: mapOnlineToStatus(e.status, e.chanDetectResult),
+          source: `inputproxy_${e._source}`,
+          onlineRaw: e.status || undefined,
+          chanDetectResult: e.chanDetectResult,
+          passwordStatus: e.passwordStatus,
+          ipAddress: e.ipAddress || undefined,
+        })
+      }
+    } catch (e: any) {
+      console.warn(`[channel-health] ${nvr.ipAddress} inputproxy channels error: ${e?.code || e?.message || 'unknown'}`)
+    }
+  }
+
+  // 3) Fallback INFORMATIVO: VideoInput sólo aporta la EXISTENCIA del canal, no la
+  //    señal física → UNKNOWN (nunca OFFLINE). Sólo para canales aún sin dato.
+  if (byChannel.size === 0) {
+    try {
+      const client = createHikClient(nvr)
+      const res = await client.get('/ISAPI/System/Video/inputs/channels')
+      const data = res.data
+      const ids: number[] = []
+      if (typeof data === 'string') {
+        for (const block of xmlGetAll(data, 'VideoInputChannel')) {
+          const id = parseInt(xmlGet(block, 'id') || xmlGet(block, 'inputPort') || '0')
+          if (id) ids.push(id)
+        }
+      } else {
+        const raw = data?.VideoInputChannelList?.VideoInputChannel
+        const list = raw ? (Array.isArray(raw) ? raw : [raw]) : []
+        for (const ch of list) { const id = parseInt(ch.id || ch.inputPort || '0'); if (id) ids.push(id) }
+      }
+      for (const id of ids) put({ channel: id, status: 'UNKNOWN', source: 'videoinput_fallback' })
+    } catch (e: any) {
+      console.warn(`[channel-health] ${nvr.ipAddress} videoinput fallback error: ${e?.code || e?.message || 'unknown'}`)
+    }
+  }
+
+  return [...byChannel.values()].sort((a, b) => a.channel - b.channel)
 }
 
 // ─── Debug: raw name sources from each ISAPI endpoint ─────────

@@ -5,7 +5,7 @@ import { useAlertStore } from '@/stores/alertStore'
 import { apiGet, apiPost, apiPut } from '@/lib/api'
 import { clsx } from 'clsx'
 import type { Alert, AlertSeverity } from '@/types'
-import { format } from 'date-fns'
+import { format, formatDistanceStrict, formatDistanceToNow } from 'date-fns'
 import { useAuthStore } from '@/stores/authStore'
 import toast from 'react-hot-toast'
 
@@ -17,13 +17,16 @@ const SEVERITY_CONFIG: Record<AlertSeverity, { label: string; color: string; bg:
 }
 
 const TYPE_LABELS: Record<string, string> = {
-  CAMERA_OFFLINE:    'Cámara offline',
-  NVR_OFFLINE:       'NVR offline',
-  HDD_FULL:          'Disco lleno',
-  HDD_ERROR:         'Error de disco',
-  MOTION_DETECTED:   'Movimiento detectado',
-  RECORDING_ERROR:   'Error de grabación',
-  AUTH_FAILED:       'Fallo de autenticación',
+  CAMERA_OFFLINE:          'Sin señal de cámara',
+  CAMERA_RECOVERED:        'Cámara recuperada',
+  CAMERA_STREAM_ERROR:     'Error de pipeline de streaming',
+  CAMERA_STREAM_RECOVERED: 'Pipeline recuperado',
+  NVR_OFFLINE:             'NVR no disponible',
+  HDD_FULL:                'Disco lleno',
+  HDD_ERROR:               'Error de disco',
+  MOTION_DETECTED:         'Movimiento detectado',
+  RECORDING_ERROR:         'Error de grabación',
+  AUTH_FAILED:             'Fallo de autenticación',
 }
 
 type FilterTab = 'active' | 'acknowledged' | 'resolved' | 'all'
@@ -272,13 +275,31 @@ export function AlertsPage() {
                     {sev.label}
                   </span>
                   <span className="text-xs text-surface-500">{TYPE_LABELS[alert.type] || alert.type}</span>
+                  {/* Estado Activa / Recuperada (TASK 7) */}
+                  <span className={clsx('text-[10px] px-1.5 py-0.5 rounded',
+                    alert.resolved ? 'bg-green-900/40 text-green-400' : 'bg-red-900/40 text-red-400')}>
+                    {alert.resolved ? 'Recuperada' : 'Activa'}
+                  </span>
                   {alert.readAt && !alert.resolved && (
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-400">Reconocida</span>
                   )}
                 </div>
                 <p className="text-xs text-surface-200 mt-1">{alert.message}</p>
+                {/* Cámara / NVR / canal / causa (TASK 7) */}
+                <div className="flex items-center gap-2 mt-1 text-[11px] text-surface-500 flex-wrap">
+                  {(alert.cameraName || (alert.detail as any)?.cameraName) && (
+                    <span>📷 {alert.cameraName || (alert.detail as any)?.cameraName}</span>
+                  )}
+                  {alert.nvrName && <span>🗄 {alert.nvrName}</span>}
+                  {(alert.detail as any)?.channel != null && <span>Canal {(alert.detail as any).channel}</span>}
+                  {(alert.detail as any)?.detectedBy && <span>Detectado por: {(alert.detail as any).detectedBy}</span>}
+                </div>
                 <div className="flex items-center gap-3 mt-1 text-xs text-surface-500">
                   <span>{format(new Date(alert.createdAt), 'dd/MM/yyyy HH:mm:ss')}</span>
+                  {/* Duración de la incidencia */}
+                  {alert.resolved && alert.resolvedAt
+                    ? <span className="text-green-600">Duración: {formatDistanceStrict(new Date(alert.createdAt), new Date(alert.resolvedAt))}</span>
+                    : <span className="text-amber-500">Activa hace {formatDistanceToNow(new Date(alert.createdAt))}</span>}
                   {alert.readAt && (
                     <span className="text-surface-400">Reconoc: {format(new Date(alert.readAt), 'HH:mm')}</span>
                   )}
