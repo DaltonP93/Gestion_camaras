@@ -6,9 +6,12 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { getNvrChannelHealth } from '../services/hikvision'
-import { getStreamPath, getTranscodedStreamPath, getHlsUrl, listRegisteredConfigPaths } from '../services/stream'
+import {
+  getStreamPath, getTranscodedStreamPath, getHlsUrl, listRegisteredConfigPaths,
+  getMediaMtxRuntimePaths, probeHlsManifest,
+} from '../services/stream'
 import { decryptNvrPasswordOrNull as decryptPass } from '../services/credentials'
-import { classifyMediaMtxPath } from '../services/camera-stream-diagnostics'
+import { getActiveSessions } from '../services/stream-manager'
 import { getCameraDebounceSnapshot } from '../jobs/healthWorker'
 
 export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
@@ -32,15 +35,27 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
       }
     }
 
-    // ── MediaMTX path (sin credenciales) ──
+    // ── MediaMTX path: config + estado RUNTIME REAL + sonda HLS activa ──
+    // (Antes sólo se miraba la config → "SOURCE_NOT_READY" era un artefacto: el
+    // runtime nunca se consultaba. Ahora se consulta /v3/paths/list y se sondea el
+    // manifest HLS de verdad — en paths on-demand la sonda dispara el source.)
     const subPath   = getStreamPath(camera.nvr as any, camera as any, 'sub')
     const mainPath   = getStreamPath(camera.nvr as any, camera as any, 'main')
     const h264Path  = getTranscodedStreamPath(camera.nvr as any, camera as any)
     const configured = await listRegisteredConfigPaths().catch(() => null)
+    const runtimeMap = await getMediaMtxRuntimePaths()
+    const runtime    = runtimeMap?.get(subPath) ?? null
     const subConfigured = configured ? configured.has(subPath) : null
-    const mediaMtxState = configured
-      ? classifyMediaMtxPath({ found: configured.has(subPath), source: configured.has(subPath) ? 'configured' : null })
-      : 'UNKNOWN'
+    const mediaMtxReady = runtime?.ready === true
+    const hlsProbe = await probeHlsManifest(subPath, 5000)
+    const mediaMtxState = runtimeMap === null ? 'UNKNOWN'
+      : mediaMtxReady ? (hlsProbe.playable ? 'READY' : 'HLS_NOT_READY')
+      : subConfigured === false ? 'PATH_MISSING'
+      : hlsProbe.playable ? 'READY' : 'SOURCE_NOT_READY'
+    if (hlsProbe.playable) {
+      await server.prisma.camera.update({ where: { id: cameraId }, data: { lastHlsSuccessAt: new Date() } as any }).catch(() => {})
+    }
+    const activeSessions = getActiveSessions().filter((s) => s.cameraId === cameraId).length
 
     // ── Alerta activa (una no resuelta por tipo) ──
     const activeOffline = await server.prisma.alert.findFirst({ where: { cameraId, type: 'CAMERA_OFFLINE', resolved: false }, orderBy: { createdAt: 'desc' } })
@@ -49,10 +64,16 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
     const debounce = getCameraDebounceSnapshot(cameraId)
     const now = Date.now()
 
-    server.log.info(`[diagnostics] camera_health_report cameraId=${cameraId} nvrId=${camera.nvr.id} channel=${camera.channel} inputProxy=${inputProxy?.status ?? 'n/a'} online=${camera.online} onlineInNvr=${c.onlineInNvr} mediaMtx=${mediaMtxState}`)
+    server.log.info(
+      `[diagnostics] camera_health_report cameraId=${cameraId} nvrId=${camera.nvr.id} channel=${camera.channel}` +
+      ` inputProxy=${inputProxy?.status ?? 'n/a'} online=${camera.online} onlineInNvr=${c.onlineInNvr}` +
+      ` mediaMtxReady=${mediaMtxReady} hlsReachable=${hlsProbe.playable} mediaMtx=${mediaMtxState}`
+    )
 
     return reply.send({
       cameraId, nvrId: camera.nvr.id, nvrName: camera.nvr.name, channel: camera.channel, cameraName: camera.name,
+      // Señal FÍSICA (InputProxy) — la fuente de CAMERA_OFFLINE.
+      physicalStatus: inputProxy?.status ?? 'UNKNOWN',
       db: {
         active: camera.active,
         online: camera.online,                 // RTSP-validator-owned
@@ -66,13 +87,36 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
         inMaintenance: c.maintenanceMode === true || (c.maintenanceUntil && new Date(c.maintenanceUntil).getTime() > now),
       },
       inputProxy,                               // status / chanDetectResult / passwordStatus / ipAddress
-      mediaMtx: { subPath, mainPath, h264Path, subConfigured, state: mediaMtxState, hlsUrl: getHlsUrl(subPath) },
+      // Pipeline de streaming: config + RUNTIME real + sonda HLS activa.
+      mediaMtx: {
+        subPath, mainPath, h264Path,
+        mediaMtxConfigured: subConfigured,
+        mediaMtxReady,
+        runtime: runtime ? { ready: runtime.ready, bytesReceived: runtime.bytesReceived, readers: runtime.readers } : null,
+        hlsReachable: hlsProbe.playable,
+        hlsProbeStatus: hlsProbe.status,
+        state: mediaMtxState,
+        hlsUrl: getHlsUrl(subPath),
+        activeSessions,
+        // legado (consumidores previos del endpoint)
+        subConfigured,
+      },
+      // Evidencia persistida del pipeline (migración 0023).
+      streamEvidence: {
+        lastStreamSuccessAt: c.lastStreamSuccessAt ?? null,
+        lastStreamFailureAt: c.lastStreamFailureAt ?? null,
+        lastMediaMtxReadyAt: c.lastMediaMtxReadyAt ?? null,
+        lastHlsSuccessAt:    hlsProbe.playable ? new Date(now).toISOString() : (c.lastHlsSuccessAt ?? null),
+        lastStreamErrorCode: c.lastStreamErrorCode ?? null,
+      },
       activeAlerts: {
         offline: activeOffline ? { id: activeOffline.id, severity: activeOffline.severity, createdAt: activeOffline.createdAt } : null,
         streamError: activeStream ? { id: activeStream.id, severity: activeStream.severity, createdAt: activeStream.createdAt } : null,
       },
       debounce: {
-        offline: debounce.offline, stream: debounce.stream,
+        offline: debounce.offline,
+        stream: debounce.stream,
+        streamDebounce: debounce.stream,   // alias del contrato pedido
       },
     })
   })
