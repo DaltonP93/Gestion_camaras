@@ -13,6 +13,7 @@ import { hlsRetryDecision } from './hlsRetryPolicy'
 export type CameraPlaybackErrorCode =
   | 'NVR_OFFLINE'
   | 'CAMERA_OFFLINE'
+  | 'CAMERA_STREAM_ERROR'
   | 'AUTH_FAILED'
   | 'RTSP_TIMEOUT'
   | 'RTSP_UNAUTHORIZED'
@@ -37,8 +38,9 @@ export interface CameraPlaybackError {
 }
 
 const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; label: string; color: string }> = {
-  NVR_OFFLINE:             { icon: <WifiOff size={16} />,      label: 'NVR offline',                 color: 'text-red-400' },
-  CAMERA_OFFLINE:          { icon: <WifiOff size={16} />,      label: 'Cámara offline',              color: 'text-red-400' },
+  NVR_OFFLINE:             { icon: <WifiOff size={16} />,      label: 'NVR no disponible',           color: 'text-red-400' },
+  CAMERA_OFFLINE:          { icon: <WifiOff size={16} />,      label: 'Sin señal de cámara',         color: 'text-red-400' },
+  CAMERA_STREAM_ERROR:     { icon: <Server size={16} />,       label: 'Error del pipeline de streaming', color: 'text-orange-400' },
   AUTH_FAILED:             { icon: <Lock size={16} />,         label: 'Credenciales inválidas',      color: 'text-amber-400' },
   RTSP_TIMEOUT:            { icon: <Clock size={16} />,        label: 'RTSP timeout',                color: 'text-amber-400' },
   RTSP_UNAUTHORIZED:       { icon: <Lock size={16} />,         label: 'RTSP 401 Unauthorized',       color: 'text-amber-400' },
@@ -46,7 +48,7 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   SUBSTREAM_DISABLED:      { icon: <Film size={16} />,         label: 'Substream deshabilitado',     color: 'text-amber-400' },
   CODEC_UNSUPPORTED:       { icon: <Film size={16} />,         label: 'Codec H.265 no compatible',  color: 'text-amber-400' },
   MEDIAMTX_ROUTE_MISSING:  { icon: <Server size={16} />,       label: 'Ruta MediaMTX no existe',    color: 'text-orange-400' },
-  MEDIAMTX_NOT_READY:      { icon: <Server size={16} />,       label: 'Stream MediaMTX no listo',   color: 'text-orange-400' },
+  MEDIAMTX_NOT_READY:      { icon: <Server size={16} />,       label: 'HLS preparando',              color: 'text-orange-400' },
   HLS_MANIFEST_NOT_FOUND:  { icon: <Film size={16} />,         label: 'HLS manifest no encontrado', color: 'text-orange-400' },
   HLS_SESSION_EXPIRED:        { icon: <Clock size={16} />,        label: 'Sesión HLS expirada',          color: 'text-amber-400' },
   TRANSCODE_NOT_READY:        { icon: <Cpu size={16} />,          label: 'Transcodificación no lista',   color: 'text-purple-400' },

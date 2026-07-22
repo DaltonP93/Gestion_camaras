@@ -11,6 +11,7 @@ interface AlertState {
   setAlerts: (alerts: Alert[]) => void
   setUnreadCount: (count: number) => void
   addAlert: (alert: Alert) => void
+  resolveById: (id: string) => void
   markResolved: (id: string) => void
   markRead: (id: string) => void
   markAllRead: () => void
@@ -36,15 +37,38 @@ export const useAlertStore = create<AlertState>((set, get) => ({
   setUnreadCount: (count) => set({ unreadCount: count }),
 
   addAlert: (alert) => {
-    set((state) => ({
-      alerts: [alert, ...state.alerts].slice(0, 200),
-      // New WebSocket alerts are always unread
-      unreadCount: state.unreadCount + 1,
-    }))
-    const icon = SEVERITY_ICONS[alert.severity] || '⚡'
-    const toastFn = ['CRITICAL', 'HIGH'].includes(alert.severity) ? toast.error : toast
-    toastFn(`${icon} ${alert.message}`, {
-      duration: alert.severity === 'CRITICAL' ? 10000 : 5000,
+    // El contador sólo cuenta no-leídas Y no-resueltas: un registro de recuperación
+    // (CAMERA_RECOVERED, resolved+read) llega por WS pero NO debe inflar la campana.
+    const countsAsUnread = !alert.resolved && !alert.readAt
+    set((state) => {
+      // dedup por id (evita duplicar si ya llegó por polling)
+      const exists = state.alerts.some((a) => a.id === alert.id)
+      const alerts = exists
+        ? state.alerts.map((a) => (a.id === alert.id ? { ...a, ...alert } : a))
+        : [alert, ...state.alerts].slice(0, 200)
+      return { alerts, unreadCount: state.unreadCount + (countsAsUnread && !exists ? 1 : 0) }
+    })
+    if (countsAsUnread) {
+      const icon = SEVERITY_ICONS[alert.severity] || '⚡'
+      const toastFn = ['CRITICAL', 'HIGH'].includes(alert.severity) ? toast.error : toast
+      toastFn(`${icon} ${alert.message}`, {
+        duration: alert.severity === 'CRITICAL' ? 10000 : 5000,
+      })
+    }
+  },
+
+  // Resolución empujada por el servidor (evento WS alert_resolved): marca resuelta
+  // y baja el contador sin recargar.
+  resolveById: (id) => {
+    set((state) => {
+      const alert = state.alerts.find((a) => a.id === id)
+      const wasUnread = alert && !alert.readAt && !alert.resolved
+      return {
+        alerts: state.alerts.map((a) =>
+          a.id === id ? { ...a, resolved: true, resolvedAt: a.resolvedAt ?? new Date().toISOString() } : a
+        ),
+        unreadCount: wasUnread ? Math.max(0, state.unreadCount - 1) : state.unreadCount,
+      }
     })
   },
 

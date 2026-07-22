@@ -2,12 +2,53 @@
 // Verifica el estado de todos los NVRs y cámaras cada 60 segundos
 import cron from 'node-cron'
 import type { FastifyInstance } from 'fastify'
-import { getNVRStatus, getNVRChannels } from '../services/hikvision'
+import { getNVRStatus, getNvrChannelHealth } from '../services/hikvision'
 import { broadcastAlert } from '../routes/websocket'
 import { publishStream, getStreamPath, listRegisteredConfigPaths, clearRegisteredPath } from '../services/stream'
 import { sendAlertNotification } from '../services/notification.service'
 import { cleanupIdleSessions } from '../services/stream-manager'
 import { decryptNvrPasswordOrNull as decryptPass } from '../services/credentials'
+import {
+  stepDebounce, initialDebounceState, isCameraInMaintenance,
+  type DebounceState, type HealthObservation, type DebounceConfig,
+} from '../services/camera-health-debounce'
+import { shouldFeedStreamDebounce } from '../services/camera-stream-diagnostics'
+import { raiseCameraAlert, recoverCameraAlert } from '../services/camera-alerts'
+
+// Estado de debounce por cámara (en memoria; se pierde al reiniciar el API, lo que
+// sólo re-arma la confirmación — nunca crea alertas de más). Dos dominios
+// independientes: señal física (InputProxy) y pipeline de streaming (RTSP/HLS).
+const cameraOfflineDebounce = new Map<string, DebounceState>()
+const cameraStreamDebounce  = new Map<string, DebounceState>()
+
+// Nº de comprobaciones consecutivas para CONFIRMAR (además del umbral por tiempo).
+const OFFLINE_CONFIRM_CHECKS = Number(process.env.CAMERA_OFFLINE_CONFIRM_CHECKS ?? 3)
+const STREAM_ERROR_CONFIRM_CHECKS = Number(process.env.CAMERA_STREAM_ERROR_CONFIRM_CHECKS ?? 3)
+const HEALTH_INTERVAL_SEC = 60
+
+// Exportado sólo para tests/diagnóstico: lee el estado de debounce actual.
+export function getCameraDebounceSnapshot(cameraId: string) {
+  return {
+    offline: cameraOfflineDebounce.get(cameraId) ?? null,
+    stream:  cameraStreamDebounce.get(cameraId) ?? null,
+  }
+}
+
+// Nombre del path de MediaMTX (SIN credenciales — es sólo el identificador del
+// path, p.ej. nvr_xxx_ch09_sub). Nunca expone RTSP con user/pass.
+function safeStreamPath(nvr: any, camera: any): string {
+  try { return getStreamPath(nvr, camera) } catch { return `nvr_${nvr.id}_ch${String(camera.channel).padStart(2, '0')}_sub` }
+}
+
+// Observación de pipeline a partir de señales RTSP ya persistidas (NO abre RTSP
+// aquí: evita 144 conexiones simultáneas). null/desconocido => UNKNOWN (no penaliza).
+function streamObservationFromCamera(camera: any): HealthObservation {
+  const main = camera.rtspMainOk as boolean | null | undefined
+  const sub  = camera.rtspSubOk  as boolean | null | undefined
+  if (main === true || sub === true) return 'ONLINE'
+  if (main === false && sub === false && (camera.consecutiveFailures ?? 0) >= 1) return 'OFFLINE'
+  return 'UNKNOWN'
+}
 
 // Throttle DECRYPT_ERROR logs: solo una vez cada 10 minutos por NVR
 const decryptErrorLastLog = new Map<string, number>()
@@ -130,24 +171,119 @@ export function startHealthWorker(server: FastifyInstance) {
               }
             }
 
-            // Actualizar onlineInNvr desde ISAPI y gestionar alertas CAMERA_OFFLINE
-            const channels = await getNVRChannels(nvrDecrypted as any)
-            const offlineCameraIds: string[] = []
+            // Salud por cámara desde InputProxy (fuente FIABLE), con DEBOUNCE.
+            // getNVRChannels() marcaba online=true a todo canal → nunca detectaba
+            // una IP-cam físicamente caída. Ahora UNKNOWN no toca onlineInNvr ni los
+            // contadores; OFFLINE/ONLINE se confirman con histéresis.
+            const healthList = await getNvrChannelHealth(nvrDecrypted as any)
+            const nowMs = Date.now()
+            const checkedAt = new Date(nowMs)
             const onlineCameraIds: string[] = []
+            const offlineCameraIds: string[] = []
+            const nvrCtx = { id: nvr.id, name: nvr.name }
 
-            for (const channel of channels) {
-              const camera = nvr.cameras.find((c) => c.channel === channel.id)
-              if (!camera) continue
-              if (channel.online) {
-                onlineCameraIds.push(camera.id)
-              } else {
-                offlineCameraIds.push(camera.id)
+            for (const camera of nvr.cameras) {
+              const health = healthList.find((h) => h.channel === camera.channel)
+              const status: HealthObservation = health?.status ?? 'UNKNOWN'
+              const camCtx = { id: camera.id, name: camera.name, channel: camera.channel }
+              server.log.info(
+                `[camera-health] camera_health_check cameraId=${camera.id} channel=${camera.channel}` +
+                ` status=${status} source=${health?.source ?? 'none'} chanDetect=${health?.chanDetectResult ?? 'n/a'}`
+              )
+
+              if (status === 'UNKNOWN') {
+                // Evidencia insuficiente: NO tocar onlineInNvr ni contadores, NO alertar.
+                server.log.info(`[camera-health] camera_health_unknown cameraId=${camera.id} channel=${camera.channel} — sin actualizar onlineInNvr`)
+                continue
+              }
+              if (status === 'ONLINE') onlineCameraIds.push(camera.id)
+              else offlineCameraIds.push(camera.id)
+
+              const maint = isCameraInMaintenance(camera, nowMs)
+              const cfg: DebounceConfig = {
+                offlineConfirmChecks: OFFLINE_CONFIRM_CHECKS,
+                offlineConfirmMs: ((camera as any).offlineConfirmSec ?? 90) * 1000,
+                recoveryConfirmChecks: Math.max(1, Math.round(((camera as any).recoveryConfirmSec ?? 120) / HEALTH_INTERVAL_SEC)),
+              }
+              const prev = cameraOfflineDebounce.get(camera.id) ?? initialDebounceState()
+              const { state, action } = stepDebounce(prev, status, nowMs, cfg)
+              cameraOfflineDebounce.set(camera.id, state)
+
+              if (action === 'offline_pending') {
+                server.log.info(`[camera-health] camera_offline_pending cameraId=${camera.id} channel=${camera.channel} firstFailureAt=${new Date(state.firstFailureAt ?? nowMs).toISOString()}`)
+              } else if (action === 'confirm_offline') {
+                if ((camera as any).offlineAlertEnabled === false || maint) {
+                  server.log.info(`[camera-health] camera_offline_confirmed_suppressed cameraId=${camera.id} reason=${maint ? 'maintenance' : 'alert_disabled'}`)
+                } else {
+                  server.log.warn(`[camera-health] camera_offline_confirmed cameraId=${camera.id} nvrId=${nvr.id} channel=${camera.channel} firstFailureAt=${new Date(state.firstFailureAt ?? nowMs).toISOString()} confirmedAt=${new Date(state.confirmedAt ?? nowMs).toISOString()}`)
+                  await raiseCameraAlert(server, {
+                    camera: camCtx, nvr: nvrCtx, type: 'CAMERA_OFFLINE',
+                    severity: (camera as any).offlineSeverity ?? 'HIGH',
+                    message: `Cámara ${camera.name} sin señal en ${nvr.name}`,
+                    detail: {
+                      channel: camera.channel, nvrName: nvr.name, detectedBy: 'inputproxy',
+                      firstFailureAt: new Date(state.firstFailureAt ?? nowMs).toISOString(),
+                      confirmedAt: new Date(state.confirmedAt ?? nowMs).toISOString(),
+                      isapiEvidence: { status: health?.status, source: health?.source, onlineRaw: health?.onlineRaw, chanDetectResult: health?.chanDetectResult, passwordStatus: health?.passwordStatus, ipAddress: health?.ipAddress },
+                    },
+                    sendEmail: (camera as any).sendEmailOnOffline !== false,
+                  })
+                }
+              } else if (action === 'recover') {
+                server.log.info(`[camera-health] camera_signal_recovered cameraId=${camera.id} channel=${camera.channel} nvrId=${nvr.id}`)
+                await recoverCameraAlert(server, {
+                  camera: camCtx, nvr: nvrCtx, offlineType: 'CAMERA_OFFLINE', recoveredType: 'CAMERA_RECOVERED',
+                  message: `Cámara ${camera.name} recuperó señal en ${nvr.name}`,
+                  detail: { channel: camera.channel, nvrName: nvr.name },
+                  sendEmail: (camera as any).sendEmailOnRecovery !== false,
+                })
+              }
+
+              // ── Pipeline de streaming (independiente): sólo si el físico NO es
+              //    OFFLINE. Usa señales RTSP ya persistidas (no abre RTSP aquí).
+              if (shouldFeedStreamDebounce(status)) {
+                const streamObs = streamObservationFromCamera(camera)
+                if (streamObs !== 'UNKNOWN') {
+                  const sPrev = cameraStreamDebounce.get(camera.id) ?? initialDebounceState()
+                  const sCfg: DebounceConfig = { offlineConfirmChecks: STREAM_ERROR_CONFIRM_CHECKS, offlineConfirmMs: cfg.offlineConfirmMs, recoveryConfirmChecks: cfg.recoveryConfirmChecks }
+                  const s = stepDebounce(sPrev, streamObs, nowMs, sCfg)
+                  cameraStreamDebounce.set(camera.id, s.state)
+                  if (streamObs === 'OFFLINE') server.log.info(`[camera-health] camera_stream_failure cameraId=${camera.id} channel=${camera.channel} rtspMainOk=${(camera as any).rtspMainOk} rtspSubOk=${(camera as any).rtspSubOk} consecutiveFailures=${(camera as any).consecutiveFailures}`)
+                  if (s.action === 'confirm_offline') {
+                    if ((camera as any).streamErrorAlertEnabled === false || maint) {
+                      server.log.info(`[camera-health] camera_stream_error_suppressed cameraId=${camera.id} reason=${maint ? 'maintenance' : 'alert_disabled'}`)
+                    } else {
+                      server.log.warn(`[camera-health] camera_stream_error_confirmed cameraId=${camera.id} channel=${camera.channel} nvrId=${nvr.id}`)
+                      await raiseCameraAlert(server, {
+                        camera: camCtx, nvr: nvrCtx, type: 'CAMERA_STREAM_ERROR',
+                        severity: (camera as any).streamErrorSeverity ?? 'MEDIUM',
+                        message: `Error de pipeline de streaming en ${camera.name} (${nvr.name})`,
+                        detail: {
+                          channel: camera.channel, streamPath: safeStreamPath(nvrDecrypted, camera),
+                          hlsStatus: 'not_checked', mediaMtxStatus: 'not_checked',
+                          rtspMainStatus: (camera as any).rtspMainOk, rtspSubStatus: (camera as any).rtspSubOk,
+                          lastErrorCode: (camera as any).lastRtspError ?? null,
+                          consecutiveFailures: (camera as any).consecutiveFailures ?? 0,
+                          firstFailureAt: new Date(s.state.firstFailureAt ?? nowMs).toISOString(),
+                        },
+                        sendEmail: false,   // el stream-error no spamea email por defecto
+                      })
+                    }
+                  } else if (s.action === 'recover') {
+                    server.log.info(`[camera-health] camera_stream_recovered cameraId=${camera.id} channel=${camera.channel}`)
+                    await recoverCameraAlert(server, {
+                      camera: camCtx, nvr: nvrCtx, offlineType: 'CAMERA_STREAM_ERROR', recoveredType: 'CAMERA_STREAM_RECOVERED',
+                      message: `Pipeline de streaming recuperado en ${camera.name}`,
+                      detail: { channel: camera.channel },
+                      sendEmail: false,
+                    })
+                  }
+                }
               }
             }
 
             // Only update onlineInNvr — never overwrite RTSP-based online field
-            // here. Batched: 2 updateMany instead of one UPDATE per channel.
-            const checkedAt = new Date()
+            // here. UNKNOWN quedó excluido de ambas listas (no se toca su estado).
             if (onlineCameraIds.length > 0) {
               await server.prisma.camera.updateMany({
                 where: { id: { in: onlineCameraIds } },
@@ -159,43 +295,6 @@ export function startHealthWorker(server: FastifyInstance) {
                 where: { id: { in: offlineCameraIds } },
                 data: { onlineInNvr: false, lastCheck: checkedAt } as any,
               })
-            }
-
-            // Resolver alertas para cámaras que volvieron online (batch)
-            if (onlineCameraIds.length > 0) {
-              await server.prisma.alert.updateMany({
-                where: { cameraId: { in: onlineCameraIds }, type: 'CAMERA_OFFLINE', resolved: false },
-                data: { resolved: true, resolvedAt: new Date() },
-              })
-            }
-
-            // Crear alertas para cámaras que siguen offline (evitar duplicados)
-            for (const cameraId of offlineCameraIds) {
-              const existingCamAlert = await server.prisma.alert.findFirst({
-                where: { cameraId, type: 'CAMERA_OFFLINE', resolved: false },
-              })
-              if (!existingCamAlert) {
-                const camera = nvr.cameras.find((c) => c.id === cameraId)!
-                const alert = await server.prisma.alert.create({
-                  data: {
-                    cameraId,
-                    nvrId: nvr.id,
-                    type: 'CAMERA_OFFLINE',
-                    severity: 'HIGH',
-                    message: `Cámara ${camera.name} sin señal en ${nvr.name}`,
-                    detail: { channel: camera.channel, nvrName: nvr.name },
-                  },
-                })
-                broadcastAlert({
-                  type: 'alert',
-                  alert: { ...alert, nvrName: nvr.name },
-                })
-                sendAlertNotification(server.prisma, {
-                  id: alert.id, type: alert.type, severity: alert.severity,
-                  message: alert.message, detail: alert.detail,
-                  cameraId: alert.cameraId, nvrId: alert.nvrId,
-                }).catch((e) => server.log.error(`Email CAMERA_OFFLINE: ${e}`))
-              }
             }
 
             await server.prisma.nVR.update({

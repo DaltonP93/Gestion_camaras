@@ -181,6 +181,18 @@ model Camera {
   streamHealthStatus String   @default("UNKNOWN")
   onlineInNvr        Boolean?
 
+  // ── Configuración de alertas por cámara (TASK 6) ──
+  offlineAlertEnabled     Boolean   @default(true)
+  streamErrorAlertEnabled Boolean   @default(true)
+  offlineConfirmSec       Int       @default(90)   // confirmar CAMERA_OFFLINE tras N segundos
+  recoveryConfirmSec      Int       @default(120)  // confirmar recuperación tras N segundos
+  offlineSeverity         String    @default("HIGH")
+  streamErrorSeverity     String    @default("MEDIUM")
+  sendEmailOnOffline      Boolean   @default(true)
+  sendEmailOnRecovery     Boolean   @default(true)
+  maintenanceMode         Boolean   @default(false)
+  maintenanceUntil        DateTime?
+
   // Legado / compatibilidad
   rtspUrl    String?
   hlsPath    String?
@@ -320,6 +332,10 @@ enum AlertType {
   LINE_CROSSING
   LOITERING
   OCCUPANCY_LIMIT
+  // Salud de cámara (TASK 3/4): señal física vs pipeline de streaming.
+  CAMERA_RECOVERED
+  CAMERA_STREAM_ERROR
+  CAMERA_STREAM_RECOVERED
 }
 
 enum AlertSeverity {
