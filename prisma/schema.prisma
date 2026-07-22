@@ -193,6 +193,14 @@ model Camera {
   maintenanceMode         Boolean   @default(false)
   maintenanceUntil        DateTime?
 
+  // ── Evidencia REAL del pipeline de streaming (no confiar en rtspMainOk/subOk
+  //    indefinidamente) — alimentan la detección de CAMERA_STREAM_ERROR ──
+  lastStreamSuccessAt  DateTime?
+  lastStreamFailureAt  DateTime?
+  lastMediaMtxReadyAt  DateTime?
+  lastHlsSuccessAt     DateTime?
+  lastStreamErrorCode  String?
+
   // Legado / compatibilidad
   rtspUrl    String?
   hlsPath    String?

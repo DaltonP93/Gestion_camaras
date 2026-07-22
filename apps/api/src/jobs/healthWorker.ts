@@ -4,9 +4,13 @@ import cron from 'node-cron'
 import type { FastifyInstance } from 'fastify'
 import { getNVRStatus, getNvrChannelHealth } from '../services/hikvision'
 import { broadcastAlert } from '../routes/websocket'
-import { publishStream, getStreamPath, listRegisteredConfigPaths, clearRegisteredPath } from '../services/stream'
+import {
+  publishStream, getStreamPath, listRegisteredConfigPaths, clearRegisteredPath,
+  getMediaMtxRuntimePaths, probeHlsManifest,
+} from '../services/stream'
 import { sendAlertNotification } from '../services/notification.service'
-import { cleanupIdleSessions } from '../services/stream-manager'
+import { cleanupIdleSessions, getActiveSessions } from '../services/stream-manager'
+import { observeStreamPipeline } from '../services/stream-observation'
 import { decryptNvrPasswordOrNull as decryptPass } from '../services/credentials'
 import {
   stepDebounce, initialDebounceState, isCameraInMaintenance,
@@ -25,6 +29,12 @@ const cameraStreamDebounce  = new Map<string, DebounceState>()
 const OFFLINE_CONFIRM_CHECKS = Number(process.env.CAMERA_OFFLINE_CONFIRM_CHECKS ?? 3)
 const STREAM_ERROR_CONFIRM_CHECKS = Number(process.env.CAMERA_STREAM_ERROR_CONFIRM_CHECKS ?? 3)
 const HEALTH_INTERVAL_SEC = 60
+// Ventana de demanda para el pipeline: un start-stream fallido dentro de esta
+// ventana cuenta como "alguien pidió video y no salió" (evidencia de fallo real).
+const STREAM_DEMAND_WINDOW_MS = Number(process.env.CAMERA_STREAM_DEMAND_WINDOW_MS ?? 10 * 60 * 1000)
+// Sondas HLS activas por ciclo (cada sonda a un path on-demand dispara una conexión
+// RTSP al NVR — acotado para no abrir RTSP contra las 144 cámaras).
+const HLS_PROBE_MAX_PER_CYCLE = Number(process.env.CAMERA_STREAM_HLS_PROBE_MAX_PER_CYCLE ?? 3)
 
 // Exportado sólo para tests/diagnóstico: lee el estado de debounce actual.
 export function getCameraDebounceSnapshot(cameraId: string) {
@@ -40,15 +50,10 @@ function safeStreamPath(nvr: any, camera: any): string {
   try { return getStreamPath(nvr, camera) } catch { return `nvr_${nvr.id}_ch${String(camera.channel).padStart(2, '0')}_sub` }
 }
 
-// Observación de pipeline a partir de señales RTSP ya persistidas (NO abre RTSP
-// aquí: evita 144 conexiones simultáneas). null/desconocido => UNKNOWN (no penaliza).
-function streamObservationFromCamera(camera: any): HealthObservation {
-  const main = camera.rtspMainOk as boolean | null | undefined
-  const sub  = camera.rtspSubOk  as boolean | null | undefined
-  if (main === true || sub === true) return 'ONLINE'
-  if (main === false && sub === false && (camera.consecutiveFailures ?? 0) >= 1) return 'OFFLINE'
-  return 'UNKNOWN'
-}
+// La observación de pipeline vive en services/stream-observation.ts (PURA):
+// estado RUNTIME de MediaMTX + evidencia de demanda. Ya NO se confía en
+// rtspMainOk/rtspSubOk persistidos (podían quedar true indefinidamente — caso
+// real: Sala Recuperación Endoscopía HEALTHY en DB con MediaMTX sin video).
 
 // Throttle DECRYPT_ERROR logs: solo una vez cada 10 minutos por NVR
 const decryptErrorLastLog = new Map<string, number>()
@@ -64,13 +69,39 @@ function logDecryptError(server: FastifyInstance, nvrId: string, nvrName: string
 }
 
 export function startHealthWorker(server: FastifyInstance) {
+  // Guard de reentrancia: un ciclo puede superar los 60s (ISAPI lentos + sondas
+  // HLS). Si el anterior sigue corriendo, saltar este tick — solapar ciclos
+  // duplicaría observaciones del debounce y sondas contra los mismos NVRs.
+  let healthCycleRunning = false
+
   // Verificar estado de NVRs cada 60 segundos
   cron.schedule('*/60 * * * * *', async () => {
+    if (healthCycleRunning) {
+      server.log.warn('[camera-health] health_cycle_skipped reason=previous_cycle_still_running')
+      return
+    }
+    healthCycleRunning = true
     try {
       const nvrs = await server.prisma.nVR.findMany({
         where: { active: true },
         include: { cameras: { where: { active: true } } },
       })
+
+      // ── Snapshot del pipeline (UNA VEZ por ciclo, no por cámara) ──
+      // Estado RUNTIME real de MediaMTX (/v3/paths/list), paths configurados y
+      // sesiones activas por cámara. null = API caída → observaciones UNKNOWN.
+      const mtxRuntime = await getMediaMtxRuntimePaths()
+      const mtxConfig  = await listRegisteredConfigPaths()
+      if (mtxRuntime === null) {
+        server.log.warn('[camera-health] mediamtx_api_unavailable — pipeline observations => UNKNOWN este ciclo')
+      }
+      const sessionsByCamera = new Map<string, number>()
+      for (const s of getActiveSessions()) {
+        sessionsByCamera.set(s.cameraId, (sessionsByCamera.get(s.cameraId) ?? 0) + 1)
+      }
+      // Presupuesto de sondas HLS activas del ciclo (compartido entre NVRs).
+      const probeState = { remaining: HLS_PROBE_MAX_PER_CYCLE }
+      const mtxReadyCameraIds: string[] = []
 
       for (const nvr of nvrs) {
         try {
@@ -191,20 +222,22 @@ export function startHealthWorker(server: FastifyInstance) {
                 ` status=${status} source=${health?.source ?? 'none'} chanDetect=${health?.chanDetectResult ?? 'n/a'}`
               )
 
-              if (status === 'UNKNOWN') {
-                // Evidencia insuficiente: NO tocar onlineInNvr ni contadores, NO alertar.
-                server.log.info(`[camera-health] camera_health_unknown cameraId=${camera.id} channel=${camera.channel} — sin actualizar onlineInNvr`)
-                continue
-              }
-              if (status === 'ONLINE') onlineCameraIds.push(camera.id)
-              else offlineCameraIds.push(camera.id)
-
               const maint = isCameraInMaintenance(camera, nowMs)
               const cfg: DebounceConfig = {
                 offlineConfirmChecks: OFFLINE_CONFIRM_CHECKS,
                 offlineConfirmMs: ((camera as any).offlineConfirmSec ?? 90) * 1000,
                 recoveryConfirmChecks: Math.max(1, Math.round(((camera as any).recoveryConfirmSec ?? 120) / HEALTH_INTERVAL_SEC)),
               }
+
+              if (status === 'UNKNOWN') {
+                // Evidencia física insuficiente: NO tocar onlineInNvr ni contadores del
+                // debounce físico, NO alertar CAMERA_OFFLINE. El pipeline SÍ se evalúa
+                // más abajo (físico ONLINE o UNKNOWN alimentan el debounce de stream).
+                server.log.info(`[camera-health] camera_health_unknown cameraId=${camera.id} channel=${camera.channel} — sin actualizar onlineInNvr`)
+              } else {
+              if (status === 'ONLINE') onlineCameraIds.push(camera.id)
+              else offlineCameraIds.push(camera.id)
+
               const prev = cameraOfflineDebounce.get(camera.id) ?? initialDebounceState()
               const { state, action } = stepDebounce(prev, status, nowMs, cfg)
               cameraOfflineDebounce.set(camera.id, state)
@@ -238,43 +271,106 @@ export function startHealthWorker(server: FastifyInstance) {
                   sendEmail: (camera as any).sendEmailOnRecovery !== false,
                 })
               }
+              }  // fin del bloque físico (status !== UNKNOWN)
 
               // ── Pipeline de streaming (independiente): sólo si el físico NO es
-              //    OFFLINE. Usa señales RTSP ya persistidas (no abre RTSP aquí).
+              //    OFFLINE confirmado. Observación REAL: runtime de MediaMTX +
+              //    evidencia de demanda + sonda HLS acotada. Server-side puro.
               if (shouldFeedStreamDebounce(status)) {
-                const streamObs = streamObservationFromCamera(camera)
+                const c = camera as any
+                const streamPath = safeStreamPath(nvrDecrypted, camera)
+                const runtime = mtxRuntime?.get(streamPath) ?? null
+                const mtxSnapshot = {
+                  configured: mtxConfig === null ? null : mtxConfig.has(streamPath),
+                  runtimeFound: mtxRuntime === null ? null : runtime !== null,
+                  ready: runtime?.ready === true,
+                  bytesReceived: runtime?.bytesReceived ?? 0,
+                  readers: runtime?.readers ?? 0,
+                }
+                const demand = {
+                  activeSessions: sessionsByCamera.get(camera.id) ?? 0,
+                  lastStreamFailureAt: c.lastStreamFailureAt ? new Date(c.lastStreamFailureAt).getTime() : null,
+                  lastStreamSuccessAt: c.lastStreamSuccessAt ? new Date(c.lastStreamSuccessAt).getTime() : null,
+                  lastHlsSuccessAt:    c.lastHlsSuccessAt    ? new Date(c.lastHlsSuccessAt).getTime()    : null,
+                }
+                let { observation: streamObs, reason: streamReason } = observeStreamPipeline(mtxSnapshot, demand, nowMs, STREAM_DEMAND_WINDOW_MS)
+                let hlsStatus: string = 'not_probed'
+
+                const sPrevState = cameraStreamDebounce.get(camera.id) ?? initialDebounceState()
+                // Sonda HLS activa (presupuesto acotado) en dos casos:
+                //  a) sospecha OFFLINE → confirmar antes de contar el fallo;
+                //  b) error YA confirmado y sin demanda (UNKNOWN) → detectar la
+                //     RECUPERACIÓN aunque los usuarios hayan dejado de intentar.
+                const wantProbe =
+                  (streamObs === 'OFFLINE') ||
+                  (streamObs === 'UNKNOWN' && sPrevState.phase === 'OFFLINE_CONFIRMED')
+                if (wantProbe && probeState.remaining > 0) {
+                  probeState.remaining--
+                  const probe = await probeHlsManifest(streamPath)
+                  hlsStatus = probe.playable ? 'playable' : (probe.reachable ? `reachable_status_${probe.status}` : `unreachable_status_${probe.status}`)
+                  server.log.info(
+                    `[camera-health] camera_stream_probe cameraId=${camera.id} path=${streamPath}` +
+                    ` playable=${probe.playable} status=${probe.status} priorObs=${streamObs} reason=${streamReason}`
+                  )
+                  if (probe.playable) {
+                    streamObs = 'ONLINE'
+                    streamReason = 'hls_probe_playable'
+                    await server.prisma.camera.update({
+                      where: { id: camera.id },
+                      data: { lastHlsSuccessAt: new Date(nowMs) } as any,
+                    }).catch(() => {})
+                  } else {
+                    // La sonda ES demanda: pedimos video y no salió → fallo real.
+                    streamObs = 'OFFLINE'
+                    streamReason = `${streamReason}+hls_probe_failed`
+                  }
+                }
+
+                if (mtxSnapshot.ready) mtxReadyCameraIds.push(camera.id)
+
                 if (streamObs !== 'UNKNOWN') {
-                  const sPrev = cameraStreamDebounce.get(camera.id) ?? initialDebounceState()
                   const sCfg: DebounceConfig = { offlineConfirmChecks: STREAM_ERROR_CONFIRM_CHECKS, offlineConfirmMs: cfg.offlineConfirmMs, recoveryConfirmChecks: cfg.recoveryConfirmChecks }
-                  const s = stepDebounce(sPrev, streamObs, nowMs, sCfg)
+                  const s = stepDebounce(sPrevState, streamObs, nowMs, sCfg)
                   cameraStreamDebounce.set(camera.id, s.state)
-                  if (streamObs === 'OFFLINE') server.log.info(`[camera-health] camera_stream_failure cameraId=${camera.id} channel=${camera.channel} rtspMainOk=${(camera as any).rtspMainOk} rtspSubOk=${(camera as any).rtspSubOk} consecutiveFailures=${(camera as any).consecutiveFailures}`)
+                  if (streamObs === 'OFFLINE') {
+                    server.log.info(
+                      `[camera-health] camera_stream_failure cameraId=${camera.id} channel=${camera.channel}` +
+                      ` reason=${streamReason} mediaMtxReady=${mtxSnapshot.ready} configured=${mtxSnapshot.configured}` +
+                      ` sessions=${demand.activeSessions} lastErrorCode=${c.lastStreamErrorCode ?? 'n/a'} hls=${hlsStatus} streak=${s.state.offlineStreak}`
+                    )
+                  }
                   if (s.action === 'confirm_offline') {
-                    if ((camera as any).streamErrorAlertEnabled === false || maint) {
+                    if (c.streamErrorAlertEnabled === false || maint) {
                       server.log.info(`[camera-health] camera_stream_error_suppressed cameraId=${camera.id} reason=${maint ? 'maintenance' : 'alert_disabled'}`)
                     } else {
-                      server.log.warn(`[camera-health] camera_stream_error_confirmed cameraId=${camera.id} channel=${camera.channel} nvrId=${nvr.id}`)
+                      server.log.warn(`[camera-health] camera_stream_error_confirmed cameraId=${camera.id} channel=${camera.channel} nvrId=${nvr.id} reason=${streamReason}`)
                       await raiseCameraAlert(server, {
                         camera: camCtx, nvr: nvrCtx, type: 'CAMERA_STREAM_ERROR',
-                        severity: (camera as any).streamErrorSeverity ?? 'MEDIUM',
+                        severity: c.streamErrorSeverity ?? 'MEDIUM',
                         message: `Error de pipeline de streaming en ${camera.name} (${nvr.name})`,
                         detail: {
-                          channel: camera.channel, streamPath: safeStreamPath(nvrDecrypted, camera),
-                          hlsStatus: 'not_checked', mediaMtxStatus: 'not_checked',
-                          rtspMainStatus: (camera as any).rtspMainOk, rtspSubStatus: (camera as any).rtspSubOk,
-                          lastErrorCode: (camera as any).lastRtspError ?? null,
-                          consecutiveFailures: (camera as any).consecutiveFailures ?? 0,
+                          channel: camera.channel, streamPath,
+                          hlsStatus,
+                          mediaMtxStatus: mtxSnapshot.runtimeFound === null ? 'api_unavailable'
+                            : mtxSnapshot.ready ? 'ready'
+                            : mtxSnapshot.configured === false ? 'path_missing' : 'source_not_ready',
+                          observationReason: streamReason,
+                          rtspMainStatus: c.rtspMainOk, rtspSubStatus: c.rtspSubOk,
+                          lastErrorCode: c.lastStreamErrorCode ?? c.lastRtspError ?? null,
+                          lastStreamFailureAt: c.lastStreamFailureAt ?? null,
+                          lastStreamSuccessAt: c.lastStreamSuccessAt ?? null,
+                          consecutiveFailures: s.state.offlineStreak,
                           firstFailureAt: new Date(s.state.firstFailureAt ?? nowMs).toISOString(),
                         },
                         sendEmail: false,   // el stream-error no spamea email por defecto
                       })
                     }
                   } else if (s.action === 'recover') {
-                    server.log.info(`[camera-health] camera_stream_recovered cameraId=${camera.id} channel=${camera.channel}`)
+                    server.log.info(`[camera-health] camera_stream_recovered cameraId=${camera.id} channel=${camera.channel} reason=${streamReason}`)
                     await recoverCameraAlert(server, {
                       camera: camCtx, nvr: nvrCtx, offlineType: 'CAMERA_STREAM_ERROR', recoveredType: 'CAMERA_STREAM_RECOVERED',
                       message: `Pipeline de streaming recuperado en ${camera.name}`,
-                      detail: { channel: camera.channel },
+                      detail: { channel: camera.channel, streamPath, hlsStatus, recoveredBy: streamReason },
                       sendEmail: false,
                     })
                   }
@@ -306,8 +402,18 @@ export function startHealthWorker(server: FastifyInstance) {
           server.log.error(`Health check error para NVR ${nvr.name}: ${err}`)
         }
       }
+
+      // Evidencia persistida: cámaras cuyo path estuvo READY en MediaMTX este ciclo.
+      if (mtxReadyCameraIds.length > 0) {
+        await server.prisma.camera.updateMany({
+          where: { id: { in: mtxReadyCameraIds } },
+          data: { lastMediaMtxReadyAt: new Date() } as any,
+        }).catch(() => {})
+      }
     } catch (err) {
       server.log.error(`Health worker error: ${err}`)
+    } finally {
+      healthCycleRunning = false
     }
   })
 

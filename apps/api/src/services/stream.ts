@@ -1216,3 +1216,54 @@ export async function listActiveStreams(): Promise<string[]> {
     return []
   }
 }
+
+// ─── Estado RUNTIME de TODOS los paths en una sola llamada (para healthWorker) ─
+// /v3/paths/list paginado → Map por nombre. Una llamada por ciclo, no por cámara.
+// Devuelve null si la API de MediaMTX no responde — el caller debe tratarlo como
+// "sin evidencia" (UNKNOWN), nunca como fallo de las cámaras.
+export interface MediaMtxRuntimePathInfo { ready: boolean; bytesReceived: number; readers: number }
+export async function getMediaMtxRuntimePaths(): Promise<Map<string, MediaMtxRuntimePathInfo> | null> {
+  try {
+    const out = new Map<string, MediaMtxRuntimePathInfo>()
+    for (let page = 0; page < 20; page++) {
+      const res = await mediamtxApi.get('/v3/paths/list', { params: { itemsPerPage: 100, page }, timeout: 4000 })
+      const items: any[] = res.data?.items || []
+      for (const p of items) {
+        if (!p?.name) continue
+        out.set(p.name, {
+          ready: p.ready === true,
+          bytesReceived: Number(p.bytesReceived) || 0,
+          readers: Array.isArray(p.readers) ? p.readers.length : 0,
+        })
+      }
+      const pageCount = Number(res.data?.pageCount) || 1
+      if (page + 1 >= pageCount || items.length === 0) break
+    }
+    return out
+  } catch {
+    return null
+  }
+}
+
+// ─── Sonda HLS single-shot (server-side) ─────────────────────
+// Pide el manifest al puerto HLS interno de MediaMTX (maneja el handshake de
+// cookies 302→200) y verifica que sea un playlist REAL (master con variante o
+// media playlist con segmentos), no un stub. En paths sourceOnDemand esta request
+// DISPARA la conexión al NVR — usarla con presupuesto acotado (probes por ciclo).
+export async function probeHlsManifest(streamPath: string, timeoutMs = 4000): Promise<{
+  reachable: boolean; status: number; playable: boolean
+}> {
+  try {
+    const jar = new Map<string, string>()
+    const master = await fetchWithCookieJar(`${MEDIAMTX_HLS_INTERNAL}/${streamPath}/index.m3u8`, jar, timeoutMs)
+    if (master.status !== 200) return { reachable: false, status: master.status, playable: false }
+    if (isMediaPlaylistReady(master.body)) return { reachable: true, status: 200, playable: true }
+    const variantUri = extractFirstVariantUri(master.body)
+    if (!variantUri) return { reachable: true, status: 200, playable: false }
+    const variantUrl = new URL(variantUri, `${MEDIAMTX_HLS_INTERNAL}/${streamPath}/`).href
+    const variant = await fetchWithCookieJar(variantUrl, jar, timeoutMs)
+    return { reachable: true, status: variant.status, playable: variant.status === 200 && isMediaPlaylistReady(variant.body) }
+  } catch {
+    return { reachable: false, status: 0, playable: false }
+  }
+}

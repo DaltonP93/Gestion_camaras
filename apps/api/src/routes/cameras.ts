@@ -373,8 +373,30 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       if (isLimitError || result.error.code === 'TRANSCODE_LIMIT_REACHED') {
         return reply.status(429).header('Retry-After', '10').send(result.error)
       }
+      // Evidencia de DEMANDA INSATISFECHA para la detección de CAMERA_STREAM_ERROR:
+      // un start-stream que falló por el PIPELINE (no por límites, ni por cámara
+      // deshabilitada/offline físico, ni por capacidad/config permanente como HEVC
+      // sin transcodificación — eso generaría demanda perpetua y falsos positivos)
+      // deja timestamp + código. El healthWorker lo usa como prueba de que alguien
+      // pidió video y el pipeline no lo entregó.
+      const isPhysicalOrConfig = [
+        'CAMERA_NOT_FOUND', 'CAMERA_DISABLED', 'CAMERA_OFFLINE', 'OFFLINE',
+        'CODEC_UNSUPPORTED_HEVC', 'TRANSCODING_DISABLED',
+      ].includes(result.error.code)
+      if (!isLimitError && !isPhysicalOrConfig) {
+        await server.prisma.camera.update({
+          where: { id },
+          data: { lastStreamFailureAt: new Date(), lastStreamErrorCode: result.error.code } as any,
+        }).catch(() => {})
+      }
       return reply.status(400).send(result.error)
     }
+
+    // Éxito de pipeline: el path quedó operativo y se entregó una URL HLS.
+    await server.prisma.camera.update({
+      where: { id },
+      data: { lastStreamSuccessAt: new Date() } as any,
+    }).catch(() => {})
 
     const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
     return reply.send({
