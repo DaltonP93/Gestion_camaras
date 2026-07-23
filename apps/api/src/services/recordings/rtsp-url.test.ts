@@ -7,7 +7,7 @@ import {
   injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
   buildFallbackRecordingRtspUrl, normalizeTracksSlashBeforeQuery,
   buildPlaybackAttemptPlan, extractRtspPlaybackTimes, urlFingerprint,
-  hikTimestampToIso,
+  hikTimestampToIso, pickFinalPlaybackError,
   type PlaybackBaseStrategy,
 } from './rtsp-url'
 
@@ -335,5 +335,50 @@ describe('hikTimestampToIso', () => {
     
     expect(hikTimestampToIso('20260721t110811z')).toBe('2026-07-21T11:08:11.000Z')
     expect(hikTimestampToIso('nope')).toBeNull()
+  })
+})
+
+describe('pickFinalPlaybackError — categoría final cuando todas las variantes fallan', () => {
+  it('main timeout + sub 400 => gana el timeout del MAIN (NO el URI_REJECTED del sub)', () => {
+    const res = pickFinalPlaybackError([
+      { variant: 'nvr_rewritten',    category: 'FIRST_BYTE_TIMEOUT',          detail: 'sin primer byte en 25000ms' },
+      { variant: 'generated_main',   category: 'FIRST_BYTE_TIMEOUT',          detail: 'sin primer byte en 25000ms' },
+      { variant: 'sub_full',         category: 'RTSP_PLAYBACK_URI_REJECTED',  detail: 'Server returned 400 Bad Request' },
+      { variant: 'sub_no_name_size', category: 'RTSP_PLAYBACK_URI_REJECTED',  detail: 'Server returned 400 Bad Request' },
+    ])
+    expect(res.chosenFrom).toBe('main')
+    expect(res.error.category).toBe('FIRST_BYTE_TIMEOUT')
+    expect(res.error.variant).toBe('nvr_rewritten')
+    expect(res.error.detail).toContain('sin primer byte')
+  })
+
+  it('un 453 en CUALQUIER intento gana siempre', () => {
+    const res = pickFinalPlaybackError([
+      { variant: 'nvr_rewritten',  category: 'FIRST_BYTE_TIMEOUT',              detail: 'timeout' },
+      { variant: 'generated_main', category: 'NVR_BANDWIDTH_OR_SESSION_LIMIT',  detail: '453 Not Enough Bandwidth' },
+      { variant: 'sub_full',       category: 'RTSP_PLAYBACK_URI_REJECTED',      detail: '400' },
+    ])
+    expect(res.chosenFrom).toBe('453')
+    expect(res.error.category).toBe('NVR_BANDWIDTH_OR_SESSION_LIMIT')
+    expect(res.error.detail).toBe('453 Not Enough Bandwidth')
+  })
+
+  it('todos los intentos sub con 400 => URI_REJECTED (chosen_from=sub)', () => {
+    const res = pickFinalPlaybackError([
+      { variant: 'sub_full',         category: 'RTSP_PLAYBACK_URI_REJECTED', detail: '400 en sub_full' },
+      { variant: 'sub_no_name_size', category: 'RTSP_PLAYBACK_URI_REJECTED', detail: '400 en sub_no_name_size' },
+    ])
+    expect(res.chosenFrom).toBe('sub')
+    expect(res.error.category).toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(res.error.detail).toBe('400 en sub_no_name_size')
+  })
+
+  it('un único intento MAIN con 400 => URI_REJECTED (chosen_from=main)', () => {
+    const res = pickFinalPlaybackError([
+      { variant: 'generated_main', category: 'RTSP_PLAYBACK_URI_REJECTED', detail: 'Server returned 400' },
+    ])
+    expect(res.chosenFrom).toBe('main')
+    expect(res.error.category).toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(res.error.variant).toBe('generated_main')
   })
 })

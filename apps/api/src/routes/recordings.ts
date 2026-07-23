@@ -20,7 +20,7 @@ import {
   injectCredentialsIntoPlaybackUri, rewritePlaybackUriStart,
   buildFallbackRecordingRtspUrl, buildPlaybackAttemptPlan,
   extractRtspPlaybackTimes, urlFingerprint, hikTimestampToIso,
-  classifyStageFailure, type StageEvidence,
+  classifyStageFailure, type StageEvidence, pickFinalPlaybackError,
   type PlaybackVariant, type PlaybackAttempt, type PlaybackBaseStrategy,
 } from '../services/recordings/rtsp-url'
 import { planStartupBudget } from '../services/recordings/preview-budget'
@@ -2382,16 +2382,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           }
 
           // All variants exhausted — persist the final error state. A 453 in
-          // ANY attempt wins: it's the actionable cause for the operator.
-          const final = attemptErrors.find(e => e.category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT')
-            ?? attemptErrors[attemptErrors.length - 1]
+          // ANY attempt wins; otherwise the highest-priority MAIN attempt's
+          // error wins over trailing sub (102) rejections, which are expected
+          // on NVRs without playback substream and would mislead the operator.
+          const { error: final, chosenFrom } = pickFinalPlaybackError(attemptErrors)
           session.errorCategory = final.category
           session.errorDetail   = final.detail
           session.hadFirstByte  = false
           retainFailedPreview(sessionId, session, (m) => server.log.info(m))
           server.log.warn(
             `[recordings-preview] all_variants_failed sessionId=${sessionId}` +
-            ` category=${final.category} attempts=${attemptErrors.map(e => `${e.variant}:${e.category}`).join(',')}`
+            ` category=${final.category} chosen_from=${chosenFrom} chosen_variant=${final.variant}` +
+            ` attempts=${attemptErrors.map(e => `${e.variant}:${e.category}`).join(',')}`
           )
           if (final.category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT') {
             server.log.warn(

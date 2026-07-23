@@ -102,6 +102,35 @@ export function classifyStageFailure(ev: StageEvidence): StageFailureCategory {
   return 'MUXER_NO_OUTPUT'
 }
 
+// ── Selección del error FINAL cuando TODAS las variantes fallaron ────────────
+// Los intentos sub (track 102) corren AL FINAL de la cadena: si se toma "el
+// último error" a secas, un 400 esperado del substream (muchos NVR no soportan
+// playback substream) PISA la causa real — p.ej. el track MAIN (101) agotó el
+// tiempo sin entregar video. Prioridad:
+//   1) NVR_BANDWIDTH_OR_SESSION_LIMIT (453) de CUALQUIER intento — causa
+//      accionable para el operador, siempre gana.
+//   2) El error del intento MAIN de mayor prioridad (estrategia que NO empieza
+//      con 'sub'): los intentos corren en orden de prioridad, así que es el
+//      PRIMER main del arreglo.
+//   3) Sólo si TODOS los intentos fueron sub, usar el error sub (el último).
+// detail siempre acompaña al intento elegido. chosenFrom explica el porqué en
+// el log de all_variants_failed.
+export interface PlaybackAttemptError {
+  variant:  string   // nombre de estrategia: 'nvr_rewritten', 'generated_main', 'sub_full', ...
+  category: string
+  detail:   string
+}
+
+export function pickFinalPlaybackError(
+  attemptErrors: readonly PlaybackAttemptError[],
+): { error: PlaybackAttemptError; chosenFrom: '453' | 'main' | 'sub' } {
+  const limit = attemptErrors.find(e => e.category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT')
+  if (limit) return { error: limit, chosenFrom: '453' }
+  const main = attemptErrors.find(e => !e.variant.startsWith('sub'))
+  if (main) return { error: main, chosenFrom: 'main' }
+  return { error: attemptErrors[attemptErrors.length - 1], chosenFrom: 'sub' }
+}
+
 // Normaliza /Streaming/tracks/NNN/? → /Streaming/tracks/NNN?  (quita el slash
 // antes del '?'). Algunos firmwares Hikvision entregan la playbackURI con ese
 // slash y rechazan/aceptan según la variante — por eso se prueba de ambas formas.
