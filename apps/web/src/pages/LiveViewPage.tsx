@@ -361,6 +361,7 @@ export function LiveViewPage() {
       const PERMANENT_ERROR_CODES: CameraPlaybackError['code'][] = [
         'RTSP_CHANNEL_NOT_FOUND', 'CAMERA_OFFLINE', 'AUTH_FAILED',
         'CODEC_UNSUPPORTED', 'SUBSTREAM_DISABLED', 'NVR_OFFLINE',
+        'NO_PERMISSION',  // 403 — reintentar en cada heartbeat no lo va a arreglar
       ]
       const filteredIds = visibleCameraIds.filter(id => {
         const err = streamErrorsRef.current[id]
@@ -551,7 +552,10 @@ export function LiveViewPage() {
       // El backend envía el error como { code, message } — antes se leía body.error
       // (siempre undefined), por eso STREAM_LIMIT_GLOBAL caía en "Error desconocido"
       // y el frontend seguía reintentando en cada heartbeat.
-      const code: string = body.code || body.error || ''
+      const status: number | undefined = err?.response?.status
+      // 403 sin código (backends viejos) también debe mostrar "Sin permiso" —
+      // antes caía en UNKNOWN o quedaba en tile vacío silencioso.
+      const code: string = body.code || body.error || (status === 403 ? 'NO_PERMISSION' : '')
       const rawMsg: string = body.message || body.code || body.error || ''
 
       if (code === 'STREAM_LIMIT_REACHED' || code === 'STREAM_LIMIT_GLOBAL') {
@@ -573,13 +577,18 @@ export function LiveViewPage() {
         TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
         TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
         TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
+        NO_PERMISSION:           'NO_PERMISSION',
       }
 
+      // Garantía anti-tile-vacío: TODO fallo de start-stream (403, red, código
+      // desconocido, etc.) debe dejar un error visible con el motivo real.
       setStreamErrors(prev => ({
         ...prev,
         [camera.id]: {
           code: (errCodeMap[code] || 'UNKNOWN') as any,
-          message: rawMsg || 'No se pudo obtener el stream',
+          message: code === 'NO_PERMISSION'
+            ? (rawMsg || 'Sin permiso para ver esta cámara')
+            : (rawMsg || 'No se pudo obtener el stream'),
           technicalDetail: body.details,
         },
       }))

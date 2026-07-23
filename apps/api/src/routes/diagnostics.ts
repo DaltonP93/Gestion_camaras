@@ -11,7 +11,9 @@ import {
   getMediaMtxRuntimePaths, probeHlsManifest,
 } from '../services/stream'
 import { decryptNvrPasswordOrNull as decryptPass } from '../services/credentials'
-import { getActiveSessions } from '../services/stream-manager'
+import {
+  getActiveSessions, getStreamLimits, getStreamOutcomeCounters, getUserIdsWithOutcomes,
+} from '../services/stream-manager'
 import { getCameraDebounceSnapshot } from '../jobs/healthWorker'
 
 export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
@@ -118,6 +120,97 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
         stream: debounce.stream,
         streamDebounce: debounce.stream,   // alias del contrato pedido
       },
+    })
+  })
+
+  // GET /api/diagnostics/stream-sessions — ADMIN. Radiografía por usuario del
+  // estado de Live View: límites efectivos, sesiones agrupadas por viewId
+  // (múltiples viewIds = otras pestañas/dispositivos consumiendo cupo), sesiones
+  // huérfanas (heartbeat > 60s), cámaras visibles según permisos y contadores
+  // rodantes de resultados de start-stream (últimos 15 min). SANITIZADO: sin
+  // contraseñas, sin RTSP con credenciales, sin JWT — streamPath es un id interno.
+  server.get('/stream-sessions', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const { userId } = z.object({ userId: z.string().min(1).optional() }).parse(request.query ?? {})
+    const now = Date.now()
+    const ORPHAN_HEARTBEAT_MS = 60_000
+
+    const allSessions = getActiveSessions()
+
+    // Usuarios de interés: los que tienen sesiones activas y/o resultados recientes
+    // (un usuario con 0 sesiones pero N rechazos es exactamente el caso a diagnosticar).
+    const userIds = new Set<string>([
+      ...allSessions.map((s) => s.userId),
+      ...getUserIdsWithOutcomes(),
+    ])
+    const targetIds = userId ? [userId] : Array.from(userIds)
+
+    // Lookups en batch: usuarios (rol) y nombres de cámaras de todas las sesiones.
+    const dbUsers = await server.prisma.user.findMany({
+      where: { id: { in: targetIds } },
+      select: { id: true, username: true, role: true },
+    })
+    const userById = new Map(dbUsers.map((u) => [u.id, u]))
+    const cameraIds = Array.from(new Set(allSessions.map((s) => s.cameraId)))
+    const dbCameras = cameraIds.length > 0
+      ? await server.prisma.camera.findMany({ where: { id: { in: cameraIds } }, select: { id: true, name: true } })
+      : []
+    const cameraNameById = new Map(dbCameras.map((c) => [c.id, c.name]))
+    const totalCameras = await server.prisma.camera.count({ where: { active: true } })
+
+    const users = await Promise.all(targetIds.map(async (uid) => {
+      const dbUser = userById.get(uid)
+      const role   = dbUser?.role ?? 'UNKNOWN'
+
+      // Cámaras visibles para el usuario — misma lógica que userCanAccessCamera:
+      // ADMIN/SUPERVISOR ven todas; el resto, sus UserPermission con canView.
+      const visibleCamerasCount = (role === 'ADMIN' || role === 'SUPERVISOR')
+        ? totalCameras
+        : await server.prisma.userPermission.count({
+            where: { userId: uid, cameraId: { not: null }, canView: true },
+          })
+
+      const userSessions = allSessions.filter((s) => s.userId === uid)
+      const sessionsByView: Record<string, Array<{
+        cameraId: string; cameraName: string | null; streamType: string
+        streamPath: string; startedAt: Date; heartbeatAgeMs: number
+      }>> = {}
+      let orphanSessions = 0
+      for (const s of userSessions) {
+        const heartbeatAgeMs = now - s.lastHeartbeat.getTime()
+        if (heartbeatAgeMs > ORPHAN_HEARTBEAT_MS) orphanSessions++
+        if (!sessionsByView[s.viewId]) sessionsByView[s.viewId] = []
+        sessionsByView[s.viewId].push({
+          cameraId:   s.cameraId,
+          cameraName: cameraNameById.get(s.cameraId) ?? null,
+          streamType: s.streamType,
+          streamPath: s.streamPath,
+          startedAt:  s.startedAt,
+          heartbeatAgeMs,
+        })
+      }
+
+      return {
+        userId:   uid,
+        username: dbUser?.username ?? null,
+        role,
+        visibleCamerasCount,
+        sessionCount:     userSessions.length,
+        distinctViewIds:  Object.keys(sessionsByView).length,   // >1 = otras pestañas/dispositivos
+        orphanSessions,                                          // heartbeat > 60s (candidatas a purga)
+        sessionsByView,
+        outcomes: getStreamOutcomeCounters(uid),                 // últimos 15 min
+      }
+    }))
+
+    server.log.info(
+      `[diagnostics] stream_sessions_report users=${users.length} globalSessions=${allSessions.length}` +
+      (userId ? ` filterUserId=${userId}` : '')
+    )
+
+    return reply.send({
+      limits: getStreamLimits(),                 // MAX_STREAMS_PER_USER / GLOBAL / TRANSCODE resueltos
+      globalSessionCount: allSessions.length,
+      users,
     })
   })
 }
