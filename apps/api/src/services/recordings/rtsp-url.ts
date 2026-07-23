@@ -109,9 +109,14 @@ export function classifyStageFailure(ev: StageEvidence): StageFailureCategory {
 // tiempo sin entregar video. Prioridad:
 //   1) NVR_BANDWIDTH_OR_SESSION_LIMIT (453) de CUALQUIER intento — causa
 //      accionable para el operador, siempre gana.
-//   2) El error del intento MAIN de mayor prioridad (estrategia que NO empieza
-//      con 'sub'): los intentos corren en orden de prioridad, así que es el
-//      PRIMER main del arreglo.
+//   2) Entre los intentos MAIN (estrategia que NO empieza con 'sub'), el fallo
+//      MÁS PROGRESADO: las variantes main existen justamente porque algunas
+//      formas de URL son rechazadas (400) y otras aceptadas — un main que fue
+//      ACEPTADO por el NVR y luego agotó el tiempo sin video (p.ej.
+//      FIRST_BYTE_TIMEOUT) es evidencia más avanzada y más significativa que
+//      un 400 temprano en otra forma de la URL. Por eso se toma el PRIMER main
+//      cuya categoría NO sea RTSP_PLAYBACK_URI_REJECTED; sólo si TODOS los
+//      main fueron 400 se usa el primer main (ahí sí el rechazo es la historia).
 //   3) Sólo si TODOS los intentos fueron sub, usar el error sub (el último).
 // detail siempre acompaña al intento elegido. chosenFrom explica el porqué en
 // el log de all_variants_failed.
@@ -126,8 +131,13 @@ export function pickFinalPlaybackError(
 ): { error: PlaybackAttemptError; chosenFrom: '453' | 'main' | 'sub' } {
   const limit = attemptErrors.find(e => e.category === 'NVR_BANDWIDTH_OR_SESSION_LIMIT')
   if (limit) return { error: limit, chosenFrom: '453' }
-  const main = attemptErrors.find(e => !e.variant.startsWith('sub'))
-  if (main) return { error: main, chosenFrom: 'main' }
+  const mains = attemptErrors.filter(e => !e.variant.startsWith('sub'))
+  if (mains.length > 0) {
+    // Fallo main más progresado: un 400 temprano en una forma de URL no debe
+    // pisar a un main posterior que el NVR aceptó y luego no entregó video.
+    const progressed = mains.find(e => e.category !== 'RTSP_PLAYBACK_URI_REJECTED')
+    return { error: progressed ?? mains[0], chosenFrom: 'main' }
+  }
   return { error: attemptErrors[attemptErrors.length - 1], chosenFrom: 'sub' }
 }
 

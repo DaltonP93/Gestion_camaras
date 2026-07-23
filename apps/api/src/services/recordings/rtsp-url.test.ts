@@ -373,6 +373,29 @@ describe('pickFinalPlaybackError — categoría final cuando todas las variantes
     expect(res.error.detail).toBe('400 en sub_no_name_size')
   })
 
+  it('main 400 temprano + main timeout posterior => gana el timeout (fallo main más progresado)', () => {
+    const res = pickFinalPlaybackError([
+      { variant: 'nvr_rewritten_no_metadata', category: 'RTSP_PLAYBACK_URI_REJECTED', detail: 'Server returned 400 Bad Request' },
+      { variant: 'generated_main',            category: 'FIRST_BYTE_TIMEOUT',         detail: 'sin primer byte en 25000ms' },
+      { variant: 'sub_full',                  category: 'RTSP_PLAYBACK_URI_REJECTED', detail: 'Server returned 400 Bad Request' },
+    ])
+    expect(res.chosenFrom).toBe('main')
+    expect(res.error.category).toBe('FIRST_BYTE_TIMEOUT')
+    expect(res.error.variant).toBe('generated_main')
+    expect(res.error.detail).toContain('sin primer byte')
+  })
+
+  it('TODOS los main con 400 => URI_REJECTED sigue reportándose (primer main)', () => {
+    const res = pickFinalPlaybackError([
+      { variant: 'nvr_rewritten',  category: 'RTSP_PLAYBACK_URI_REJECTED', detail: '400 en nvr_rewritten' },
+      { variant: 'generated_main', category: 'RTSP_PLAYBACK_URI_REJECTED', detail: '400 en generated_main' },
+      { variant: 'sub_full',       category: 'RTSP_PLAYBACK_URI_REJECTED', detail: '400 en sub_full' },
+    ])
+    expect(res.chosenFrom).toBe('main')
+    expect(res.error.category).toBe('RTSP_PLAYBACK_URI_REJECTED')
+    expect(res.error.variant).toBe('nvr_rewritten')
+  })
+
   it('un único intento MAIN con 400 => URI_REJECTED (chosen_from=main)', () => {
     const res = pickFinalPlaybackError([
       { variant: 'generated_main', category: 'RTSP_PLAYBACK_URI_REJECTED', detail: 'Server returned 400' },
