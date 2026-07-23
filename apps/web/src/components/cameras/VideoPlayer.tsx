@@ -28,6 +28,7 @@ export type CameraPlaybackErrorCode =
   | 'TRANSCODE_PROCESS_EXITED'
   | 'TRANSCODE_LIMIT_REACHED'
   | 'STREAM_LIMIT_REACHED'
+  | 'NO_PERMISSION'
   | 'PLAYER_TIMEOUT'
   | 'UNKNOWN'
 
@@ -55,6 +56,7 @@ const ERROR_CONFIG: Record<CameraPlaybackErrorCode, { icon: React.ReactNode; lab
   TRANSCODE_PROCESS_EXITED:   { icon: <Cpu size={16} />,          label: 'FFmpeg finalizó inesperadamente', color: 'text-purple-400' },
   TRANSCODE_LIMIT_REACHED:    { icon: <Cpu size={16} />,          label: 'Límite de transcodificaciones', color: 'text-amber-400' },
   STREAM_LIMIT_REACHED:       { icon: <Server size={16} />,       label: 'Límite de streams alcanzado',  color: 'text-amber-400' },
+  NO_PERMISSION:              { icon: <Lock size={16} />,         label: 'Sin permiso para esta cámara', color: 'text-amber-400' },
   PLAYER_TIMEOUT:             { icon: <Clock size={16} />,        label: 'Sin frames (timeout)',         color: 'text-surface-400' },
   UNKNOWN:                    { icon: <AlertTriangle size={16} />, label: 'Error desconocido',           color: 'text-surface-400' },
 }

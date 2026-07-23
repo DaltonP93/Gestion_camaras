@@ -2,7 +2,7 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus, getStreamDetails } from '../services/stream'
-import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary } from '../services/stream-manager'
+import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary, recordStreamOutcome } from '../services/stream-manager'
 import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -334,15 +334,19 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const { id } = request.params as { id: string }
     const user = request.user
 
-    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
-      return reply.status(403).send({ message: 'Sin permiso para ver esta cámara' })
-    }
-
     const body = request.body as any
     const streamType: 'sub' | 'main' | 'main_h264' =
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+
+    if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
+      // Registrar rechazo por permiso ANTES de startStream — es la única rama
+      // que no pasa por el stream-manager y antes quedaba invisible en logs.
+      recordStreamOutcome(user.sub, 'rejected_permission', 'NO_PERMISSION')
+      server.log.warn(`[live] start_stream_result userId=${user.sub} cameraId=${id} streamType=${streamType} outcome=rejected code=NO_PERMISSION`)
+      return reply.status(403).send({ code: 'NO_PERMISSION', message: 'Sin permiso para ver esta cámara' })
+    }
 
     server.log.info(`[live] start_stream_requested cameraId=${id} streamType=${streamType} userId=${user.sub}`)
 
@@ -354,6 +358,11 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       // Si el error es del servidor de medios (no de límites ni de estado de salud),
       // marcar la cámara como MEDIA_SERVER_ERROR
       const isLimitError = result.error.code === 'STREAM_LIMIT_REACHED' || result.error.code === 'STREAM_LIMIT_GLOBAL'
+      // Contadores rodantes de diagnóstico: límite vs otra falla, con código.
+      const isAnyLimit = isLimitError || result.error.code === 'TRANSCODE_LIMIT_REACHED'
+      recordStreamOutcome(user.sub, isAnyLimit ? 'rejected_limit' : 'failed_other', result.error.code)
+      // Log estructurado del resultado — sin secretos (solo ids y código).
+      server.log.warn(`[live] start_stream_result userId=${user.sub} cameraId=${id} streamType=${streamType} outcome=rejected code=${result.error.code}`)
       const isHealthError = Object.prototype.hasOwnProperty.call({ RTSP_SUB_NOT_FOUND: 1, CODEC_UNSUPPORTED_HEVC: 1, AUTH_FAILED: 1, OFFLINE: 1, RTSP_MAIN_NOT_FOUND: 1, TRANSCODING_DISABLED: 1, TRANSCODE_LIMIT_REACHED: 1, CAMERA_OFFLINE: 1, TRANSCODE_NOT_READY: 1, TRANSCODE_PROCESS_EXITED: 1 }, result.error.code)
       if (!isLimitError && !isHealthError) {
         await server.prisma.camera.update({
@@ -393,6 +402,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     }
 
     // Éxito de pipeline: el path quedó operativo y se entregó una URL HLS.
+    recordStreamOutcome(user.sub, 'accepted')
+    server.log.info(`[live] start_stream_result userId=${user.sub} cameraId=${id} streamType=${streamType} outcome=accepted`)
     await server.prisma.camera.update({
       where: { id },
       data: { lastStreamSuccessAt: new Date() } as any,

@@ -187,6 +187,72 @@ export function pruneStaleSessions(): number {
   return pruned
 }
 
+// ─── Contadores rodantes de resultados de start-stream (últimos 15 min) ─────
+// Para diagnosticar por qué a un usuario "solo le abren N cámaras": cuántos
+// start-stream fueron aceptados, rechazados por límite, rechazados por permiso
+// o fallaron por otra causa, con desglose por código de error. En memoria,
+// se pierde al reiniciar (intencional — es diagnóstico operativo).
+export type StreamOutcome = 'accepted' | 'rejected_limit' | 'rejected_permission' | 'failed_other'
+
+interface OutcomeEvent {
+  at: number            // ms epoch
+  outcome: StreamOutcome
+  code?: string         // código de error (p.ej. STREAM_LIMIT_REACHED, NO_PERMISSION)
+}
+
+const OUTCOME_WINDOW_MS = 15 * 60_000
+const startOutcomes = new Map<string, OutcomeEvent[]>()  // key: userId
+
+function pruneOutcomes(events: OutcomeEvent[]): OutcomeEvent[] {
+  const cutoff = Date.now() - OUTCOME_WINDOW_MS
+  return events.filter(e => e.at >= cutoff)
+}
+
+export function recordStreamOutcome(userId: string, outcome: StreamOutcome, code?: string): void {
+  const events = pruneOutcomes(startOutcomes.get(userId) ?? [])
+  events.push({ at: Date.now(), outcome, code })
+  startOutcomes.set(userId, events)
+}
+
+export interface StreamOutcomeCounters {
+  windowMs:           number
+  accepted:           number
+  rejectedLimit:      number
+  rejectedPermission: number
+  failedOther:        number
+  byCode:             Record<string, number>  // conteo por código de error
+}
+
+export function getStreamOutcomeCounters(userId: string): StreamOutcomeCounters {
+  const events = pruneOutcomes(startOutcomes.get(userId) ?? [])
+  startOutcomes.set(userId, events)
+  const byCode: Record<string, number> = {}
+  for (const e of events) {
+    if (e.code) byCode[e.code] = (byCode[e.code] ?? 0) + 1
+  }
+  return {
+    windowMs:           OUTCOME_WINDOW_MS,
+    accepted:           events.filter(e => e.outcome === 'accepted').length,
+    rejectedLimit:      events.filter(e => e.outcome === 'rejected_limit').length,
+    rejectedPermission: events.filter(e => e.outcome === 'rejected_permission').length,
+    failedOther:        events.filter(e => e.outcome === 'failed_other').length,
+    byCode,
+  }
+}
+
+export function getUserIdsWithOutcomes(): string[] {
+  return Array.from(startOutcomes.keys())
+}
+
+// Límites efectivos resueltos (env → número) — para el endpoint de diagnóstico.
+export function getStreamLimits(): { maxStreamsPerUser: number; maxStreamsGlobal: number; maxTranscodeSessions: number } {
+  return {
+    maxStreamsPerUser:    MAX_STREAMS_PER_USER,
+    maxStreamsGlobal:     MAX_STREAMS_GLOBAL,
+    maxTranscodeSessions: MAX_TRANSCODE_SESSIONS,
+  }
+}
+
 // Conteos actuales de streams — expuestos al frontend para que muestre "X/Y" en el
 // error de límite en vez de un mensaje genérico, y para el endpoint de diagnóstico.
 export interface StreamCounts {
