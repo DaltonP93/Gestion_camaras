@@ -2,14 +2,19 @@
 // que el límite global se dispare por sesiones huérfanas (pestañas muertas,
 // recargas, errores HLS). Usa los seams __*ForTest para poblar el mapa en memoria
 // sin depender de prisma/MediaMTX.
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   pruneStaleSessions,
   getStreamCounts,
   getSessionsDiagnostic,
+  recordStreamOutcome,
+  getStreamOutcomeCounters,
+  getUserIdsWithOutcomes,
+  getStreamIdleTimeoutMs,
   __seedSessionForTest,
   __setViewHeartbeatForTest,
   __resetSessionsForTest,
+  __resetOutcomesForTest,
 } from './stream-manager'
 
 const now = () => new Date()
@@ -115,5 +120,71 @@ describe('stream-manager session lifecycle', () => {
     expect(getStreamCounts('u1').currentGlobalStreams).toBe(10)
     expect(pruneStaleSessions()).toBe(9)
     expect(getStreamCounts('u1').currentGlobalStreams).toBe(1)
+  })
+})
+
+// ─── Contadores rodantes de resultados de start-stream (review Codex #117) ──
+describe('stream-manager outcome counters', () => {
+  beforeEach(() => {
+    __resetOutcomesForTest()
+    vi.useRealTimers()
+  })
+
+  it('aggregates outcomes per user with byCode breakdown', () => {
+    recordStreamOutcome('u1', 'accepted')
+    recordStreamOutcome('u1', 'accepted')
+    recordStreamOutcome('u1', 'rejected_limit', 'STREAM_LIMIT_REACHED')
+    recordStreamOutcome('u1', 'rejected_permission', 'NO_PERMISSION')
+    recordStreamOutcome('u1', 'failed_other', 'MEDIA_SERVER_ERROR')
+    const c = getStreamOutcomeCounters('u1')
+    expect(c.accepted).toBe(2)
+    expect(c.rejectedLimit).toBe(1)
+    expect(c.rejectedPermission).toBe(1)
+    expect(c.failedOther).toBe(1)
+    expect(c.byCode).toEqual({ STREAM_LIMIT_REACHED: 1, NO_PERMISSION: 1, MEDIA_SERVER_ERROR: 1 })
+  })
+
+  it('isolates counters between users', () => {
+    recordStreamOutcome('u1', 'accepted')
+    recordStreamOutcome('u2', 'rejected_limit', 'STREAM_LIMIT_GLOBAL')
+    expect(getStreamOutcomeCounters('u1').accepted).toBe(1)
+    expect(getStreamOutcomeCounters('u1').rejectedLimit).toBe(0)
+    expect(getStreamOutcomeCounters('u2').rejectedLimit).toBe(1)
+  })
+
+  it('expires events outside the 15-minute window', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-01T10:00:00Z'))
+    recordStreamOutcome('u1', 'rejected_limit', 'STREAM_LIMIT_REACHED')
+    vi.setSystemTime(new Date('2026-01-01T10:14:00Z'))
+    expect(getStreamOutcomeCounters('u1').rejectedLimit).toBe(1)   // aún vigente
+    vi.setSystemTime(new Date('2026-01-01T10:16:00Z'))
+    expect(getStreamOutcomeCounters('u1').rejectedLimit).toBe(0)   // expirado
+    vi.useRealTimers()
+  })
+
+  it('getUserIdsWithOutcomes drops users whose events all expired (no ghost keys)', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-01T10:00:00Z'))
+    recordStreamOutcome('viejo', 'accepted')
+    vi.setSystemTime(new Date('2026-01-01T10:10:00Z'))
+    recordStreamOutcome('reciente', 'accepted')
+    vi.setSystemTime(new Date('2026-01-01T10:16:00Z'))  // 'viejo' expiró, 'reciente' no
+    expect(getUserIdsWithOutcomes()).toEqual(['reciente'])
+    vi.useRealTimers()
+  })
+
+  it('getStreamOutcomeCounters removes the empty key from the index', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-01T10:00:00Z'))
+    recordStreamOutcome('u1', 'accepted')
+    vi.setSystemTime(new Date('2026-01-01T10:20:00Z'))
+    getStreamOutcomeCounters('u1')                       // poda y borra la clave vacía
+    expect(getUserIdsWithOutcomes()).toEqual([])
+    vi.useRealTimers()
+  })
+
+  it('orphan threshold getter matches the manager idle timeout (default 90s)', () => {
+    expect(getStreamIdleTimeoutMs()).toBe(90_000)
   })
 })

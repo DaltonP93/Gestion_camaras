@@ -13,6 +13,7 @@ import {
 import { decryptNvrPasswordOrNull as decryptPass } from '../services/credentials'
 import {
   getActiveSessions, getStreamLimits, getStreamOutcomeCounters, getUserIdsWithOutcomes,
+  getStreamIdleTimeoutMs,
 } from '../services/stream-manager'
 import { getCameraDebounceSnapshot } from '../jobs/healthWorker'
 
@@ -126,13 +127,15 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
   // GET /api/diagnostics/stream-sessions — ADMIN. Radiografía por usuario del
   // estado de Live View: límites efectivos, sesiones agrupadas por viewId
   // (múltiples viewIds = otras pestañas/dispositivos consumiendo cupo), sesiones
-  // huérfanas (heartbeat > 60s), cámaras visibles según permisos y contadores
+  // huérfanas (heartbeat > STREAM_IDLE_TIMEOUT), cámaras visibles según permisos y contadores
   // rodantes de resultados de start-stream (últimos 15 min). SANITIZADO: sin
   // contraseñas, sin RTSP con credenciales, sin JWT — streamPath es un id interno.
   server.get('/stream-sessions', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const { userId } = z.object({ userId: z.string().min(1).optional() }).parse(request.query ?? {})
     const now = Date.now()
-    const ORPHAN_HEARTBEAT_MS = 60_000
+    // Mismo umbral que la limpieza real (STREAM_IDLE_TIMEOUT, default 90s) —
+    // el reporte de huérfanas debe coincidir con lo que pruneStaleSessions podaría.
+    const ORPHAN_HEARTBEAT_MS = getStreamIdleTimeoutMs()
 
     const allSessions = getActiveSessions()
 
@@ -196,7 +199,7 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
         visibleCamerasCount,
         sessionCount:     userSessions.length,
         distinctViewIds:  Object.keys(sessionsByView).length,   // >1 = otras pestañas/dispositivos
-        orphanSessions,                                          // heartbeat > 60s (candidatas a purga)
+        orphanSessions,                                          // heartbeat > STREAM_IDLE_TIMEOUT (candidatas a purga)
         sessionsByView,
         outcomes: getStreamOutcomeCounters(uid),                 // últimos 15 min
       }
