@@ -21,6 +21,7 @@ const TYPE_LABELS: Record<string, string> = {
   CAMERA_RECOVERED:        'Cámara recuperada',
   CAMERA_STREAM_ERROR:     'Error de pipeline de streaming',
   CAMERA_STREAM_RECOVERED: 'Pipeline recuperado',
+  STREAM_DEGRADED:         'Stream degradado (sub no disponible, usando principal)',
   NVR_OFFLINE:             'NVR no disponible',
   HDD_FULL:                'Disco lleno',
   HDD_ERROR:               'Error de disco',

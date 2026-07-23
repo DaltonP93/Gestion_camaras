@@ -195,7 +195,8 @@ model Camera {
 
   // ── Evidencia REAL del pipeline de streaming (no confiar en rtspMainOk/subOk
   //    indefinidamente) — alimentan la detección de CAMERA_STREAM_ERROR ──
-  lastStreamSuccessAt  DateTime?
+  lastStreamSuccessAt  DateTime?   // éxito REAL verificado (HLS/frames)
+  lastStreamStartAcceptedAt DateTime?  // start-stream ACEPTADO (no prueba frames)
   lastStreamFailureAt  DateTime?
   lastMediaMtxReadyAt  DateTime?
   lastHlsSuccessAt     DateTime?
@@ -344,6 +345,7 @@ enum AlertType {
   CAMERA_RECOVERED
   CAMERA_STREAM_ERROR
   CAMERA_STREAM_RECOVERED
+  STREAM_DEGRADED
 }
 
 enum AlertSeverity {

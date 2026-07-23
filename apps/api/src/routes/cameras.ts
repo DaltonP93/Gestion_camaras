@@ -392,10 +392,13 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(400).send(result.error)
     }
 
-    // Éxito de pipeline: el path quedó operativo y se entregó una URL HLS.
+    // start-stream ACEPTADO: el API entregó una URL HLS. NO prueba frames — el
+    // éxito real (lastStreamSuccessAt/lastHlsSuccessAt) lo verifica el healthWorker
+    // con el runtime de MediaMTX y las sondas HLS (separación pedida: aceptación
+    // vs entrega verificada).
     await server.prisma.camera.update({
       where: { id },
-      data: { lastStreamSuccessAt: new Date() } as any,
+      data: { lastStreamStartAcceptedAt: new Date() } as any,
     }).catch(() => {})
 
     const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
