@@ -146,9 +146,15 @@ export function observeCameraPaths(
   demandWindowMs: number = DEFAULT_DEMAND_WINDOW_MS,
 ): CameraPipelineResult {
   const inWindow = (ts: number | null) => ts != null && now - ts <= demandWindowMs
+  // Un fallo sólo cuenta como demanda insatisfecha si es POSTERIOR a la última
+  // evidencia positiva — start aceptado O entrega HLS verificada (sonda). Sin el
+  // lastHlsSuccessAt, un fallo viejo seguido de una recuperación verificada por
+  // sonda mantendría demandActive toda la ventana y reclasificaría OFFLINE al
+  // path ocioso ya recuperado (review Codex #116).
+  const lastPositiveAt = Math.max(demand.lastStreamStartAcceptedAt ?? 0, demand.lastHlsSuccessAt ?? 0)
   const failedAfterAccept =
     inWindow(demand.lastStreamFailureAt) &&
-    (demand.lastStreamFailureAt as number) >= (demand.lastStreamStartAcceptedAt ?? 0)
+    (demand.lastStreamFailureAt as number) >= lastPositiveAt
   const demandActive = demand.activeSessions > 0 || failedAfterAccept
 
   if (paths.length === 0 || paths.every(p => p.runtimeFound === null)) {

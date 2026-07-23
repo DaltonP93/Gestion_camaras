@@ -240,3 +240,27 @@ describe('selectProbeTargets — fairness round-robin (TEST 11.6)', () => {
     expect(selectProbeTargets(['a', 'b', 'c'], last, 2)).toEqual(['c', 'b'])
   })
 })
+
+// Review Codex #116 (P1): un fallo viejo NO debe sobrevivir a una recuperación
+// verificada por sonda (lastHlsSuccessAt posterior al fallo).
+describe('observeCameraPaths — el fallo se retira tras recuperación HLS verificada', () => {
+  it('fallo viejo + sonda exitosa posterior + path ocioso => UNKNOWN (no OFFLINE)', () => {
+    const paths = [P({ path: 'p', streamType: 'sub', sessions: 0, ready: false })]
+    const demand = D({
+      activeSessions: 0,
+      lastStreamFailureAt: NOW - 5 * 60_000,   // falló hace 5 min (dentro de ventana)
+      lastHlsSuccessAt:    NOW - 2 * 60_000,   // …pero la sonda verificó entrega DESPUÉS
+    })
+    const r = observeCameraPaths(paths, demand, false, NOW)
+    expect(r.observation).toBe('UNKNOWN')      // demanda retirada: no reclasificar OFFLINE
+    expect(r.demandActive).toBe(false)
+  })
+  it('fallo POSTERIOR a la última entrega verificada sí mantiene la demanda', () => {
+    const paths = [P({ path: 'p', streamType: 'sub', sessions: 0, ready: false })]
+    const demand = D({
+      lastHlsSuccessAt:    NOW - 5 * 60_000,
+      lastStreamFailureAt: NOW - 2 * 60_000,   // volvió a fallar tras la recuperación
+    })
+    expect(observeCameraPaths(paths, demand, false, NOW).observation).toBe('OFFLINE')
+  })
+})

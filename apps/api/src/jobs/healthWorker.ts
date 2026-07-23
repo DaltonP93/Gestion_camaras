@@ -354,10 +354,12 @@ export function startHealthWorker(server: FastifyInstance) {
                 }
                 const subKnownDown = c.rtspSubOk === false || c.streamHealthStatus === 'RTSP_SUB_NOT_FOUND'
                 const result = observeCameraPaths(paths, demand, subKnownDown, nowMs, STREAM_DEMAND_WINDOW_MS)
+                // Mismo criterio que observeCameraPaths: el fallo debe ser posterior
+                // a la última evidencia POSITIVA (start aceptado o HLS verificado).
                 const hardStartFailure =
                   demand.lastStreamFailureAt != null &&
                   nowMs - demand.lastStreamFailureAt <= STREAM_DEMAND_WINDOW_MS &&
-                  demand.lastStreamFailureAt >= (demand.lastStreamStartAcceptedAt ?? 0)
+                  demand.lastStreamFailureAt >= Math.max(demand.lastStreamStartAcceptedAt ?? 0, demand.lastHlsSuccessAt ?? 0)
 
                 if (paths.some(p => p.ready)) mtxReadyCameraIds.push(camera.id)
                 streamEvals.push({
@@ -463,6 +465,10 @@ export function startHealthWorker(server: FastifyInstance) {
           )
         }
         if (s.action === 'confirm_offline') {
+          // El fallback murió del todo: la condición de degradación ya no existe —
+          // resolver STREAM_DEGRADED para que no quede activa junto al stream-error
+          // indefinidamente (review Codex #116).
+          await resolveCameraAlertQuiet(server, c.id, 'STREAM_DEGRADED').catch(() => {})
           if (c.streamErrorAlertEnabled === false || e.maint) {
             server.log.info(`[camera-health] camera_stream_error_suppressed cameraId=${c.id} reason=${e.maint ? 'maintenance' : 'alert_disabled'}`)
           } else {
