@@ -358,9 +358,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       // Si el error es del servidor de medios (no de límites ni de estado de salud),
       // marcar la cámara como MEDIA_SERVER_ERROR
       const isLimitError = result.error.code === 'STREAM_LIMIT_REACHED' || result.error.code === 'STREAM_LIMIT_GLOBAL'
-      // Contadores rodantes de diagnóstico: límite vs otra falla, con código.
-      const isAnyLimit = isLimitError || result.error.code === 'TRANSCODE_LIMIT_REACHED'
-      recordStreamOutcome(user.sub, isAnyLimit ? 'rejected_limit' : 'failed_other', result.error.code)
+      // Los contadores rodantes se registran DENTRO de startStream (punto único
+      // compartido con reconcileView) — aquí solo queda el log estructurado.
       // Log estructurado del resultado — sin secretos (solo ids y código).
       server.log.warn(`[live] start_stream_result userId=${user.sub} cameraId=${id} streamType=${streamType} outcome=rejected code=${result.error.code}`)
       const isHealthError = Object.prototype.hasOwnProperty.call({ RTSP_SUB_NOT_FOUND: 1, CODEC_UNSUPPORTED_HEVC: 1, AUTH_FAILED: 1, OFFLINE: 1, RTSP_MAIN_NOT_FOUND: 1, TRANSCODING_DISABLED: 1, TRANSCODE_LIMIT_REACHED: 1, CAMERA_OFFLINE: 1, TRANSCODE_NOT_READY: 1, TRANSCODE_PROCESS_EXITED: 1 }, result.error.code)
@@ -402,7 +401,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     }
 
     // Éxito de pipeline: el path quedó operativo y se entregó una URL HLS.
-    recordStreamOutcome(user.sub, 'accepted')
+    // (outcome "accepted" ya registrado dentro de startStream)
     server.log.info(`[live] start_stream_result userId=${user.sub} cameraId=${id} streamType=${streamType} outcome=accepted`)
     await server.prisma.camera.update({
       where: { id },
