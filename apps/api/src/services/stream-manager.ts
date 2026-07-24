@@ -187,6 +187,110 @@ export function pruneStaleSessions(): number {
   return pruned
 }
 
+// ─── Contadores rodantes de resultados de start-stream (últimos 15 min) ─────
+// Para diagnosticar por qué a un usuario "solo le abren N cámaras": cuántos
+// start-stream fueron aceptados, rechazados por límite, rechazados por permiso
+// o fallaron por otra causa, con desglose por código de error. En memoria,
+// se pierde al reiniciar (intencional — es diagnóstico operativo).
+export type StreamOutcome = 'accepted' | 'rejected_limit' | 'rejected_permission' | 'failed_other'
+
+interface OutcomeEvent {
+  at: number            // ms epoch
+  outcome: StreamOutcome
+  code?: string         // código de error (p.ej. STREAM_LIMIT_REACHED, NO_PERMISSION)
+}
+
+const OUTCOME_WINDOW_MS = 15 * 60_000
+const startOutcomes = new Map<string, OutcomeEvent[]>()  // key: userId
+
+function pruneOutcomes(events: OutcomeEvent[]): OutcomeEvent[] {
+  const cutoff = Date.now() - OUTCOME_WINDOW_MS
+  return events.filter(e => e.at >= cutoff)
+}
+
+export function recordStreamOutcome(userId: string, outcome: StreamOutcome, code?: string): void {
+  const events = pruneOutcomes(startOutcomes.get(userId) ?? [])
+  events.push({ at: Date.now(), outcome, code })
+  startOutcomes.set(userId, events)
+}
+
+// Códigos que cuentan como "rechazado por límite" en los contadores.
+const LIMIT_ERROR_CODES = new Set(['STREAM_LIMIT_REACHED', 'STREAM_LIMIT_GLOBAL', 'TRANSCODE_LIMIT_REACHED'])
+
+// Clasifica y registra el resultado de un startStream según su error (o éxito).
+// Punto único de registro — lo usan tanto el handler HTTP como reconcileView
+// (vía el wrapper startStream), así los heartbeats que recrean sesiones podadas
+// o chocan con límites también quedan contabilizados.
+function recordStartResult(userId: string, error?: { code: string } | null): void {
+  if (!error) {
+    recordStreamOutcome(userId, 'accepted')
+  } else {
+    recordStreamOutcome(userId, LIMIT_ERROR_CODES.has(error.code) ? 'rejected_limit' : 'failed_other', error.code)
+  }
+}
+
+export interface StreamOutcomeCounters {
+  windowMs:           number
+  accepted:           number
+  rejectedLimit:      number
+  rejectedPermission: number
+  failedOther:        number
+  byCode:             Record<string, number>  // conteo por código de error
+}
+
+export function getStreamOutcomeCounters(userId: string): StreamOutcomeCounters {
+  const events = pruneOutcomes(startOutcomes.get(userId) ?? [])
+  // No dejar claves vacías en el índice — un usuario sin eventos vigentes
+  // no debe seguir apareciendo en getUserIdsWithOutcomes para siempre.
+  if (events.length === 0) startOutcomes.delete(userId)
+  else startOutcomes.set(userId, events)
+  const byCode: Record<string, number> = {}
+  for (const e of events) {
+    if (e.code) byCode[e.code] = (byCode[e.code] ?? 0) + 1
+  }
+  return {
+    windowMs:           OUTCOME_WINDOW_MS,
+    accepted:           events.filter(e => e.outcome === 'accepted').length,
+    rejectedLimit:      events.filter(e => e.outcome === 'rejected_limit').length,
+    rejectedPermission: events.filter(e => e.outcome === 'rejected_permission').length,
+    failedOther:        events.filter(e => e.outcome === 'failed_other').length,
+    byCode,
+  }
+}
+
+export function getUserIdsWithOutcomes(): string[] {
+  // Podar el índice completo y eliminar claves sin eventos vigentes — evita
+  // reportar usuarios "fantasma" (todo expirado) y las consultas de permisos
+  // que cada uno costaría en el endpoint de diagnóstico.
+  for (const [uid, events] of startOutcomes.entries()) {
+    const pruned = pruneOutcomes(events)
+    if (pruned.length === 0) startOutcomes.delete(uid)
+    else startOutcomes.set(uid, pruned)
+  }
+  return Array.from(startOutcomes.keys())
+}
+
+// Seam de tests: limpiar los contadores rodantes.
+export function __resetOutcomesForTest(): void {
+  startOutcomes.clear()
+}
+
+// Timeout efectivo de expiración de sesiones (mismo umbral que usa
+// pruneStaleSessions/cleanupIdleSessions) — en ms, para que el diagnóstico
+// marque como "huérfana" exactamente lo que la limpieza real consideraría vencido.
+export function getStreamIdleTimeoutMs(): number {
+  return STREAM_IDLE_TIMEOUT * 1000
+}
+
+// Límites efectivos resueltos (env → número) — para el endpoint de diagnóstico.
+export function getStreamLimits(): { maxStreamsPerUser: number; maxStreamsGlobal: number; maxTranscodeSessions: number } {
+  return {
+    maxStreamsPerUser:    MAX_STREAMS_PER_USER,
+    maxStreamsGlobal:     MAX_STREAMS_GLOBAL,
+    maxTranscodeSessions: MAX_TRANSCODE_SESSIONS,
+  }
+}
+
 // Conteos actuales de streams — expuestos al frontend para que muestre "X/Y" en el
 // error de límite en vez de un mensaje genérico, y para el endpoint de diagnóstico.
 export interface StreamCounts {
@@ -365,7 +469,28 @@ const HEALTH_STATUS_ERRORS: Record<string, StreamError> = {
   USING_MAIN_STREAM:     { code: 'RTSP_SUB_NOT_FOUND',    message: 'Substream no disponible — doble clic para ver en pantalla completa' },
 }
 
+// Wrapper público: delega en startStreamCore y registra el resultado en los
+// contadores rodantes UNA sola vez, sin importar quién llame (handler HTTP o
+// reconcileView). El rechazo por permiso (403) se registra solo en el handler,
+// porque el chequeo de permisos ocurre antes de llegar aquí.
 export async function startStream(
+  server: FastifyInstance,
+  userId: string,
+  cameraId: string,
+  viewId?: string,
+  streamType: 'sub' | 'main' | 'main_h264' = 'sub',
+): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
+  try {
+    const result = await startStreamCore(server, userId, cameraId, viewId, streamType)
+    recordStartResult(userId, result.error)
+    return result
+  } catch (err) {
+    recordStreamOutcome(userId, 'failed_other', 'EXCEPTION')
+    throw err
+  }
+}
+
+async function startStreamCore(
   server: FastifyInstance,
   userId: string,
   cameraId: string,
