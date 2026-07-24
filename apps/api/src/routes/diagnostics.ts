@@ -58,7 +58,12 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
     if (hlsProbe.playable) {
       await server.prisma.camera.update({ where: { id: cameraId }, data: { lastHlsSuccessAt: new Date() } as any }).catch(() => {})
     }
-    const activeSessions = getActiveSessions().filter((s) => s.cameraId === cameraId).length
+    // Sesiones COMPLETAS de esta cámara (paths efectivamente demandados): la
+    // observación de salud evalúa ESTOS paths, no sólo el _sub calculado.
+    const camSessions = getActiveSessions()
+      .filter((s) => s.cameraId === cameraId)
+      .map((s) => ({ userId: s.userId, viewId: s.viewId, streamType: s.streamType, streamPath: s.streamPath, heartbeatAgeMs: Date.now() - s.lastHeartbeat.getTime() }))
+    const activeSessions = camSessions.length
 
     // ── Alerta activa (una no resuelta por tipo) ──
     const activeOffline = await server.prisma.alert.findFirst({ where: { cameraId, type: 'CAMERA_OFFLINE', resolved: false }, orderBy: { createdAt: 'desc' } })

@@ -94,3 +94,137 @@ export function observeStreamPipeline(
   }
   return { observation: 'UNKNOWN', reason: 'idle_on_demand', demandActive }
 }
+
+// ═══ Observación por PATHS EFECTIVOS (corrige falsos positivos por inspeccionar
+//     el path equivocado: el worker sondeaba _sub mientras el usuario reproducía
+//     _main/_main_h264 por fallback — caso real: Salida UTI con video en vivo y
+//     CAMERA_STREAM_ERROR generado igual) ═══════════════════════════════════════
+
+export type EffectiveStreamType = 'sub' | 'main' | 'main_h264' | 'unknown'
+
+export interface DemandedPathState {
+  path: string
+  streamType: EffectiveStreamType
+  sessions: number              // sesiones activas sobre ESTE path
+  configured: boolean | null
+  runtimeFound: boolean | null
+  ready: boolean
+  bytesReceived: number
+  readers: number
+  /** ¿Los bytes progresaron desde el ciclo anterior? null = sin historial. */
+  bytesProgressed: boolean | null
+}
+
+export interface CameraPipelineResult {
+  observation: HealthObservation
+  reason: string
+  demandActive: boolean
+  /** Entrega video por fallback main/main_h264 con el substream caído. */
+  degraded: boolean
+}
+
+export interface CameraDemandEvidence {
+  activeSessions: number
+  lastStreamFailureAt: number | null
+  /** start-stream ACEPTADO (no prueba de frames — ver lastHlsSuccessAt). */
+  lastStreamStartAcceptedAt: number | null
+  lastHlsSuccessAt: number | null
+}
+
+/**
+ * Observa TODOS los paths efectivamente demandados de una cámara. Regla central:
+ * si CUALQUIER path demandado entrega video (ready y, con lectores, con bytes
+ * progresando), la cámara está ONLINE — jamás CAMERA_STREAM_ERROR. Un path ready
+ * con lectores cuyos bytes NO progresan entre ciclos es un stream CONGELADO y
+ * cuenta como fallo (siempre sobre el path efectivo).
+ */
+export function observeCameraPaths(
+  paths: DemandedPathState[],
+  demand: CameraDemandEvidence,
+  subKnownDown: boolean,
+  now: number,
+  demandWindowMs: number = DEFAULT_DEMAND_WINDOW_MS,
+): CameraPipelineResult {
+  const inWindow = (ts: number | null) => ts != null && now - ts <= demandWindowMs
+  // Un fallo sólo cuenta como demanda insatisfecha si es POSTERIOR a la última
+  // evidencia positiva — start aceptado O entrega HLS verificada (sonda). Sin el
+  // lastHlsSuccessAt, un fallo viejo seguido de una recuperación verificada por
+  // sonda mantendría demandActive toda la ventana y reclasificaría OFFLINE al
+  // path ocioso ya recuperado (review Codex #116).
+  const lastPositiveAt = Math.max(demand.lastStreamStartAcceptedAt ?? 0, demand.lastHlsSuccessAt ?? 0)
+  const failedAfterAccept =
+    inWindow(demand.lastStreamFailureAt) &&
+    (demand.lastStreamFailureAt as number) >= lastPositiveAt
+  const demandActive = demand.activeSessions > 0 || failedAfterAccept
+
+  if (paths.length === 0 || paths.every(p => p.runtimeFound === null)) {
+    return { observation: 'UNKNOWN', reason: 'mediamtx_api_unavailable', demandActive, degraded: false }
+  }
+
+  const isFrozen = (p: DemandedPathState) => p.ready && p.readers > 0 && p.bytesProgressed === false
+  const delivering = paths.filter(p => p.ready && !isFrozen(p))
+  if (delivering.length > 0) {
+    // ¿Entrega por fallback con el sub caído? (sub demandado sin entregar, o
+    // rtspSubOk=false persistido, mientras un main/main_h264 sí entrega)
+    const subFailing = subKnownDown ||
+      paths.some(p => p.streamType === 'sub' && !p.ready)
+    const mainDelivers = delivering.some(p => p.streamType === 'main' || p.streamType === 'main_h264')
+    const degraded = subFailing && mainDelivers
+    return {
+      observation: 'ONLINE',
+      reason: degraded ? 'delivering_via_fallback' : 'path_delivering',
+      demandActive, degraded,
+    }
+  }
+
+  const frozen = paths.filter(isFrozen)
+  if (frozen.length > 0 && demandActive) {
+    return { observation: 'OFFLINE', reason: `frozen_stream:${frozen[0].path}`, demandActive, degraded: false }
+  }
+
+  if (!demandActive) {
+    return { observation: 'UNKNOWN', reason: 'idle_on_demand', demandActive, degraded: false }
+  }
+  const anyConfigured = paths.some(p => p.configured !== false)
+  return {
+    observation: 'OFFLINE',
+    reason: anyConfigured ? 'source_not_ready_with_demand' : 'path_missing_with_demand',
+    demandActive, degraded: false,
+  }
+}
+
+/**
+ * Aplica el resultado de una sonda HLS a la observación previa. status=0 (no se
+ * pudo NI contactar el endpoint HLS — probable infra/nginx/mediamtx reiniciando)
+ * NO fuerza OFFLINE por sí solo: sólo mantiene OFFLINE si hay evidencia adicional
+ * del path efectivo (MediaMTX no ready Y un start-stream fallido real).
+ */
+export function applyProbeResult(
+  prior: { observation: HealthObservation; reason: string },
+  probe: { playable: boolean; status: number },
+  extra: { anyPathReady: boolean; hardStartFailure: boolean },
+): { observation: HealthObservation; reason: string } {
+  if (probe.playable) return { observation: 'ONLINE', reason: 'hls_probe_playable' }
+  if (probe.status === 0) {
+    if (!extra.anyPathReady && extra.hardStartFailure) {
+      return { observation: 'OFFLINE', reason: `${prior.reason}+hls_unreachable_with_evidence` }
+    }
+    return { observation: 'UNKNOWN', reason: 'hls_probe_unreachable_inconclusive' }
+  }
+  return { observation: 'OFFLINE', reason: `${prior.reason}+hls_probe_status_${probe.status}` }
+}
+
+/**
+ * Fairness round-robin del presupuesto de sondas: prioriza las cámaras sondeadas
+ * hace MÁS tiempo (nunca sondeadas primero). Con más candidatas que presupuesto,
+ * todas reciben sonda en ciclos sucesivos — no siempre las tres primeras.
+ */
+export function selectProbeTargets(
+  candidateIds: string[],
+  lastProbedAt: Map<string, number>,
+  budget: number,
+): string[] {
+  return [...candidateIds]
+    .sort((a, b) => (lastProbedAt.get(a) ?? 0) - (lastProbedAt.get(b) ?? 0))
+    .slice(0, Math.max(0, budget))
+}

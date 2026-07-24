@@ -8,7 +8,7 @@ import { broadcastAlert } from '../routes/websocket'
 import { sendAlertNotification } from './notification.service'
 
 export type CameraAlertSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
-export type OfflineType = 'CAMERA_OFFLINE' | 'CAMERA_STREAM_ERROR'
+export type OfflineType = 'CAMERA_OFFLINE' | 'CAMERA_STREAM_ERROR' | 'STREAM_DEGRADED'
 export type RecoveredType = 'CAMERA_RECOVERED' | 'CAMERA_STREAM_RECOVERED'
 
 export interface CamCtx { id: string; name: string; channel: number }
@@ -116,4 +116,26 @@ export async function recoverCameraAlert(server: FastifyInstance, opts: {
     }).catch((e) => server.log.error(`[camera-health] email ${opts.recoveredType} error: ${e}`))
   }
   return { resolved: active.length }
+}
+
+/**
+ * Resuelve TODAS las alertas no resueltas de (cameraId, type) sin crear registro
+ * de recuperación (para estados informativos como STREAM_DEGRADED). Emite
+ * alert_resolved por WS para bajar el contador en vivo.
+ */
+export async function resolveCameraAlertQuiet(
+  server: FastifyInstance, cameraId: string, type: OfflineType,
+): Promise<number> {
+  const active = await server.prisma.alert.findMany({
+    where: { cameraId, type: type as any, resolved: false },
+    select: { id: true },
+  })
+  if (active.length === 0) return 0
+  await server.prisma.alert.updateMany({
+    where: { cameraId, type: type as any, resolved: false },
+    data: { resolved: true, resolvedAt: new Date() },
+  })
+  for (const a of active) broadcastAlert({ type: 'alert_resolved', alertId: a.id })
+  server.log.info(`[camera-health] camera_alert_resolved cameraId=${cameraId} type=${type} count=${active.length} quiet=true`)
+  return active.length
 }
