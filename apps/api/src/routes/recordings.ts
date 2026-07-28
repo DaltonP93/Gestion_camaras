@@ -2058,6 +2058,17 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       releaseNvrSlot()
       return reply.status(410).send({ message: 'Sesión de preview cancelada' })
     }
+    // (10/13) Revalidar la propiedad DESPUÉS del await de acquireNvrPreviewSlot:
+    // otro GET pudo tomar el control (bump de streamGeneration) o la sesión pudo
+    // entrar en cierre mientras esperábamos el slot del NVR. Sin esto, un handler
+    // obsoleto haría hijack + spawn igual (con MAX_PREVIEW_PER_NVR>1, DOS FFmpeg
+    // para la misma sesión; con el default, ocuparía el único slot). Liberar el
+    // slot recién adquirido antes de ceder (review Codex #124).
+    if (session.streamGeneration !== myGen || session.closing) {
+      releaseNvrSlot()
+      server.log.info(`[recordings-preview] stream_superseded_after_slot sessionId=${sessionId} gen=${myGen} current=${session.streamGeneration ?? 'none'} closing=${!!session.closing}`)
+      return reply.status(409).send({ message: 'Stream reemplazado por una solicitud más reciente' })
+    }
 
     // Hijack the raw TCP connection — bypass Fastify serialization entirely
     reply.hijack()
