@@ -28,6 +28,7 @@ const LIVE_SLOT_STATUSES: SlotStatus[] = ['ready', 'playing', 'buffering', 'stal
 const isLiveSlot = (s: SlotStatus) => LIVE_SLOT_STATUSES.includes(s)
 import {
   toLocalDatetimeString, localInputToNvrIso, formatNvrTime, classifyError,
+  selectRecordingForPlayhead,
 } from '@/components/recordings/utils'
 
 // ─── Local interfaces ─────────────────────────────────────────────────────────
@@ -142,7 +143,11 @@ export function RecordingsPage() {
   const nextRecBySlotRef      = useRef<{ [k: number]: RecordingWithCamera | null }>({})
   const errorCategoryBySlotRef = useRef<{ [k: number]: string | null }>({})
   const errorDetailBySlotRef   = useRef<{ [k: number]: string | null }>({})
-  const clipInfoBySlotRef      = useRef<{ [k: number]: { clipStartMs: number; clipEndMs: number; effectiveStartMs: number } | null }>({})
+  const clipInfoBySlotRef      = useRef<{ [k: number]: {
+    clipStartMs: number; clipEndMs: number; effectiveStartMs: number
+    // P1: fin EFECTIVO (recortado a searchEnd) vs fin real del bloque, separados.
+    effectiveEndMs: number; originalRecordingStartMs: number; originalRecordingEndMs: number
+  } | null }>({})
   // Guarda de "un solo arranque en vuelo por slot": guarda el myKey de la
   // generación que está iniciando ese slot. Evita el doble preview_start (deep
   // link + autostart del playhead disparando el mismo slot a la vez).
@@ -158,6 +163,10 @@ export function RecordingsPage() {
   // re-querying the NVR when a camera is re-selected for the same range
   const searchedKeysRef       = useRef<Set<string>>(new Set())
   const searchRangeIsoRef     = useRef<{ start: string; end: string } | null>(null)
+  // Rango buscado ACTIVO en epoch ms (hora de pared del NVR). Evita closures
+  // obsoletos: la selección de bloque/playhead, la continuidad, el clic en la
+  // línea de tiempo y el deep-link recortan SIEMPRE contra este rango (P1).
+  const activeSearchRangeRef  = useRef<{ startMs: number; endMs: number } | null>(null)
   const continuityTimerRef    = useRef<{ [k: number]: ReturnType<typeof setTimeout> | null }>({})
 
   const deleteSessionOnce = (sessionType: string | null, sessionId: string | null | undefined) => {
@@ -424,22 +433,18 @@ export function RecordingsPage() {
             const emptySi = currentSlots.findIndex(s => !s.cameraId)
             if (emptySi < 0) return
             const clock = masterClockRef.current
-            const playheadMs = clock
+            const range = activeSearchRangeRef.current
+            const clockMs = clock
               ? clock.playheadMs + (performance.now() - clock.wallMs) * clock.rate
               : null
-            const sorted = [...mapped].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
-            const covering = playheadMs != null
-              ? sorted.find(r => new Date(r.startTime).getTime() <= playheadMs && new Date(r.endTime).getTime() > playheadMs)
-              : null
-            const target = covering
-              ?? sorted.find(r => playheadMs == null || new Date(r.startTime).getTime() > playheadMs)
-              ?? sorted[0]
-            if (target) {
-              console.info(`[recordings-ui] incremental_autostart slot=${emptySi} cameraId=${cameraId} recId=${target.id}`)
-              startPreviewInSlotRef.current(emptySi, target,
-                covering && playheadMs != null ? new Date(playheadMs) : new Date(target.startTime),
-                { noClockAnchor: true }
-              )
+            // Selección con recorte al rango activo (P1): playhead = reloj actual o
+            // inicio del rango; nunca el bloque más nuevo por defecto.
+            if (!range) return
+            const requestedPlayheadMs = clockMs ?? range.startMs
+            const sel = selectRecordingForPlayhead(mapped, range.startMs, range.endMs, requestedPlayheadMs, MIN_PREVIEW_DURATION_MS)
+            if (sel.targetRecording) {
+              console.info(`[recordings-ui] incremental_autostart slot=${emptySi} cameraId=${cameraId} recId=${sel.targetRecording.id} effectiveStart=${new Date(sel.effectiveStartMs).toISOString()} reason=${sel.reason}`)
+              startPreviewInSlotRef.current(emptySi, sel.targetRecording, new Date(sel.effectiveStartMs), { noClockAnchor: true })
             }
           }, 100)
         }
@@ -540,22 +545,35 @@ export function RecordingsPage() {
 
     if (slot.sessionId) deleteSessionOnce(slot.sessionType, slot.sessionId)
 
-    const currentStartMs = new Date(rec.startTime).getTime()
     const currentEndMs = new Date(rec.endTime).getTime()
-    const nextRec = recordingsRef.current
-      .filter(r => r.cameraId === cameraId && new Date(r.startTime).getTime() > currentStartMs && r.id !== rec.id)
-      .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
+    // La continuidad NO debe pasar de searchEnd: buscar el siguiente bloque DENTRO
+    // del rango activo, con el playhead recortado (P1). Se toma como playhead el fin
+    // efectivo del bloque actual (recortado a searchEnd por clipInfo).
+    const range = activeSearchRangeRef.current
+    const rangeStartMs = range?.startMs ?? -Infinity
+    const rangeEndMs   = range?.endMs   ??  Infinity
+    const clip = clipInfoBySlotRef.current[slotIndex]
+    const currentEffectiveEndMs = clip?.effectiveEndMs ?? Math.min(currentEndMs, rangeEndMs)
+    const nextSel = selectRecordingForPlayhead(
+      recordingsRef.current.filter(r => r.cameraId === cameraId && r.id !== rec.id),
+      rangeStartMs === -Infinity ? currentEffectiveEndMs : rangeStartMs,
+      rangeEndMs === Infinity ? Number.MAX_SAFE_INTEGER : rangeEndMs,
+      currentEffectiveEndMs, MIN_PREVIEW_DURATION_MS,
+    )
+    const nextRec = nextSel.targetRecording
 
     if (nextRec) {
-      const nextStartMs = new Date(nextRec.startTime).getTime()
-      const gap = nextStartMs - currentEndMs
+      const gap = nextSel.effectiveStartMs - currentEndMs
       console.info(
         `[recordings-ui] continuity_next_clip slot=${slotIndex}` +
-        ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime} gapMs=${gap}`
+        ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime}` +
+        ` effectiveStart=${new Date(nextSel.effectiveStartMs).toISOString()} gapMs=${gap} reason=${nextSel.reason}`
       )
+      // gap contra el fin REAL del bloque actual; si el siguiente cubre el playhead
+      // (solapado) el gap es negativo y también continúa.
       if (gap <= CONTINUITY_GAP_MS) {
         const otherPlaying = slotsRef.current.some((s, i) => i !== slotIndex && isLiveSlot(s.status))
-        startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextStartMs), { noClockAnchor: otherPlaying })
+        startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextSel.effectiveStartMs), { noClockAnchor: otherPlaying })
         return
       }
     }
@@ -584,7 +602,9 @@ export function RecordingsPage() {
     if (!clip || previewStart == null) return
     const vid = videoRefs.current[slotIndex]
     const playedMs = (vid?.currentTime ?? 0) * 1000
-    const remainingMs = clip.clipEndMs - (previewStart + playedMs)
+    // Usar el fin EFECTIVO (recortado a searchEnd), no el fin real del bloque:
+    // la reproducción debe detenerse en searchEnd (P1).
+    const remainingMs = clip.effectiveEndMs - (previewStart + playedMs)
     const rate = globalPlaybackRateRef.current || 1
     const fireInMs = Math.max(0, remainingMs / rate) + 1000
     continuityTimerRef.current[slotIndex] = setTimeout(() => {
@@ -657,16 +677,22 @@ export function RecordingsPage() {
       }
     }))
 
-    // If we already have recordings for this camera, auto-load via preview
+    // If we already have recordings for this camera, auto-load via preview.
+    // Selección con recorte al rango buscado (P1): cubrir el playhead actual (o el
+    // inicio del rango) — NUNCA camRecs[0] (el bloque más nuevo).
     const camRecs = recordingsByCamera.get(cameraId)
-    if (camRecs && camRecs.length > 0) {
-      const first = camRecs[0]
-      console.info(`[recordings-ui] slot_camera_assigned_autoload slot=${activeSlotIndex} cameraId=${cameraId} recId=${first.id} recStart=${first.startTime}`)
-      // Slight delay so setSlots above has committed
-      setTimeout(() => {
-        const playhead = globalPlaybackTime ?? new Date(first.startTime)
-        startPreviewInSlotRef.current(activeSlotIndex, first, playhead)
-      }, 0)
+    const range = activeSearchRangeRef.current
+    if (camRecs && camRecs.length > 0 && range) {
+      const requestedPlayheadMs = globalPlaybackTime ? globalPlaybackTime.getTime() : range.startMs
+      const sel = selectRecordingForPlayhead(camRecs, range.startMs, range.endMs, requestedPlayheadMs, MIN_PREVIEW_DURATION_MS)
+      if (sel.targetRecording) {
+        console.info(`[recordings-ui] slot_camera_assigned_autoload slot=${activeSlotIndex} cameraId=${cameraId} recId=${sel.targetRecording.id} effectiveStart=${new Date(sel.effectiveStartMs).toISOString()} reason=${sel.reason}`)
+        const target = sel.targetRecording
+        const playhead = new Date(sel.effectiveStartMs)
+        setTimeout(() => startPreviewInSlotRef.current(activeSlotIndex, target, playhead), 0)
+      } else {
+        setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? { ...s, status: 'no_recording' } : s))
+      }
     }
   }
 
@@ -765,16 +791,19 @@ export function RecordingsPage() {
     setIsSearching(false)
 
     // Timeline spans exactly the searched range
-    setSearchRangeMs({ start: start.getTime(), end: end.getTime() })
+    const searchStartMs = start.getTime()
+    const searchEndMs   = end.getTime()
+    setSearchRangeMs({ start: searchStartMs, end: searchEndMs })
+    activeSearchRangeRef.current = { startMs: searchStartMs, endMs: searchEndMs }
 
-    // Initialize playhead: explicit seek target (deep link) or earliest recording
-    let earliest: RecordingWithCamera | null = null
+    // Playhead inicial: el punto del deep-link, o el INICIO del rango buscado —
+    // NUNCA earliest.startTime (el bloque más viejo). Antes se usaba earliest y se
+    // arrancaba en camRecs[0] (el más NUEVO), produciendo previews en 14:58 / 12:54
+    // para una búsqueda 14:14→15:14 (P1).
     const seekMs = dateOverride?.seekToWallMs ?? null
+    const requestedPlayheadMs = seekMs ?? searchStartMs
     if (all.length > 0) {
-      earliest = all.reduce((min, r) =>
-        new Date(r.startTime).getTime() < new Date(min.startTime).getTime() ? r : min
-      )
-      setGlobalPlaybackTime(new Date(seekMs ?? new Date(earliest.startTime).getTime()))
+      setGlobalPlaybackTime(new Date(Math.min(Math.max(requestedPlayheadMs, searchStartMs), searchEndMs)))
     }
 
     // Auto-assign: if exactly 1 camera searched and no slot has a camera assigned, assign to active slot
@@ -784,7 +813,17 @@ export function RecordingsPage() {
       const cam = cameras.find(c => c.id === singleCamId)
       const nvrObj = cam ? nvrs.find(n => n.id === cam.nvrId) : null
       const camRecs = all.filter(r => r.cameraId === singleCamId)
-      if (cam && camRecs.length > 0) {
+      // Selección CORRECTA: bloque que cubre el playhead (o el siguiente dentro del
+      // rango), con start/end recortados al rango y al bloque. Nunca el último bloque.
+      const sel = selectRecordingForPlayhead(camRecs, searchStartMs, searchEndMs, requestedPlayheadMs, MIN_PREVIEW_DURATION_MS)
+      console.info(
+        `[recordings-ui] initial_playhead cameraId=${singleCamId} searchStart=${new Date(searchStartMs).toISOString()}` +
+        ` searchEnd=${new Date(searchEndMs).toISOString()} requestedPlayhead=${new Date(requestedPlayheadMs).toISOString()}` +
+        ` targetRecStart=${sel.targetRecording?.startTime ?? 'none'} targetRecEnd=${sel.targetRecording?.endTime ?? 'none'}` +
+        ` effectiveStart=${sel.reason !== 'none' ? new Date(sel.effectiveStartMs).toISOString() : 'none'}` +
+        ` effectiveEnd=${sel.reason !== 'none' ? new Date(sel.effectiveEndMs).toISOString() : 'none'} selectionReason=${sel.reason}`
+      )
+      if (cam && sel.targetRecording) {
         console.info(`[recordings-ui] search_auto_assign cameraId=${singleCamId} slot=${activeSlotIndex} seek=${seekMs ?? 'none'}`)
         stopSlot(activeSlotIndex)
         setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
@@ -793,14 +832,6 @@ export function RecordingsPage() {
           recording: null, status: 'idle', playbackUrl: null, sessionId: null, sessionType: null,
           downloadUrl: null, errorMsg: null, vodProgress: null, mimeType: null,
         } : s))
-        // With a seek target, start at the block covering it (or the next one)
-        const sortedRecs = [...camRecs].sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
-        const target = seekMs !== null
-          ? sortedRecs.find(r => new Date(r.endTime).getTime() > seekMs) ?? sortedRecs[0]
-          : camRecs[0]
-        const playhead = seekMs !== null
-          ? new Date(Math.max(seekMs, new Date(target.startTime).getTime()))
-          : earliest ? new Date(earliest.startTime) : new Date(camRecs[0].startTime)
         // Deep link (Ver grabación desde un evento): activar el estado global de
         // reproducción ANTES de iniciar el preview. Sin esto, startPreviewInSlot ve
         // globalPlayingRef.current=false y nunca ejecuta play() → el video queda en
@@ -811,7 +842,16 @@ export function RecordingsPage() {
           setGlobalPlaying(true)
           console.info('[recordings-ui] recordings_deep_link_autoplay_armed')
         }
+        const target = sel.targetRecording
+        const playhead = new Date(sel.effectiveStartMs)
         setTimeout(() => startPreviewInSlotRef.current(activeSlotIndex, target, playhead), 0)
+      } else if (cam) {
+        // Sin bloque en este punto del rango → no iniciar preview.
+        setSlots(prev => prev.map((s, i) => i === activeSlotIndex ? {
+          ...s, cameraId: cam.id, cameraName: cam.name, nvrId: cam.nvrId, nvrName: nvrObj?.name ?? '',
+          recording: null, status: 'no_recording', playbackUrl: null, sessionId: null, sessionType: null,
+          downloadUrl: null, errorMsg: null,
+        } : s))
       }
     }
 
@@ -1145,19 +1185,32 @@ export function RecordingsPage() {
     const playheadMs    = playheadTime.getTime()
     const recStartMs    = new Date(rec.startTime).getTime()
     const recEndMs      = new Date(rec.endTime).getTime()
-    const effectiveMs   = Math.max(recStartMs, Math.min(playheadMs, recEndMs - 1000))
+    // Recortar SIEMPRE al rango buscado activo (P1): el preview no puede empezar
+    // antes de searchStart ni terminar después de searchEnd. Sin esto, un bloque
+    // que empieza antes del rango arrancaba en su propio inicio (12:54) y uno que
+    // termina después seguía hasta rec.endTime (15:14:41 en vez de 15:14:00).
+    const range = activeSearchRangeRef.current
+    const rangeStartMs = range?.startMs ?? -Infinity
+    const rangeEndMs   = range?.endMs   ??  Infinity
+    const effectiveEndMs = Math.min(recEndMs, rangeEndMs)
+    const effectiveMs    = Math.max(recStartMs, rangeStartMs, Math.min(playheadMs, effectiveEndMs - 1000))
     const effectiveStart = new Date(effectiveMs).toISOString()
+    const effectiveEnd   = new Date(effectiveEndMs).toISOString()
 
     // Never open a preview shorter than MIN_PREVIEW_DURATION_MS — the playhead
-    // is at the tail of this block, so jump straight to the next block instead
-    const remainingMs = recEndMs - effectiveMs
+    // is at the tail of this block (o del rango), so jump to the next block instead
+    const remainingMs = effectiveEndMs - effectiveMs
     if (remainingMs < MIN_PREVIEW_DURATION_MS) {
       console.info(`[recordings-ui] continuity_skip_short_clip slot=${slotIndex} durationMs=${remainingMs} recId=${rec.id}`)
-      const next = recordingsRef.current
-        .filter(r => r.cameraId === rec.cameraId && new Date(r.startTime).getTime() > effectiveMs)
-        .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
-      if (next && next.id !== rec.id) {
-        startPreviewInSlotRef.current(slotIndex, next, new Date(next.startTime), opts)
+      // Siguiente bloque DENTRO del rango buscado (no arrancar uno posterior a searchEnd).
+      const nextSel = selectRecordingForPlayhead(
+        recordingsRef.current.filter(r => r.cameraId === rec.cameraId),
+        rangeStartMs === -Infinity ? recStartMs : rangeStartMs,
+        rangeEndMs === Infinity ? recEndMs : rangeEndMs,
+        effectiveMs + 1000, MIN_PREVIEW_DURATION_MS,
+      )
+      if (nextSel.targetRecording && nextSel.targetRecording.id !== rec.id) {
+        startPreviewInSlotRef.current(slotIndex, nextSel.targetRecording, new Date(nextSel.effectiveStartMs), opts)
         return
       }
       nextRecBySlotRef.current[slotIndex] = null
@@ -1167,9 +1220,11 @@ export function RecordingsPage() {
       return
     }
 
-    // The slot remembers its clip bounds and real start point
+    // El slot recuerda los límites del bloque ORIGINAL y los EFECTIVOS (recortados
+    // al rango). Los timers de continuidad usan effectiveEndMs, no el fin del bloque.
     clipInfoBySlotRef.current[slotIndex] = {
       clipStartMs: recStartMs, clipEndMs: recEndMs, effectiveStartMs: effectiveMs,
+      effectiveEndMs, originalRecordingStartMs: recStartMs, originalRecordingEndMs: recEndMs,
     }
 
     // Anchor the master clock to the REAL start of this preview so the
@@ -1245,7 +1300,9 @@ export function RecordingsPage() {
           cameraId:       rec.cameraId,
           slotIndex,
           startTime:      effectiveStart,
-          endTime:        rec.endTime,
+          // endTime EFECTIVO recortado a searchEnd — NO rec.endTime cuando el bloque
+          // excede el rango buscado (P1: el video debe detenerse en searchEnd).
+          endTime:        effectiveEnd,
           playbackURI:    (rec as any).playbackURI,
           forceTranscode,
           canPlayHevcMp4,
@@ -1689,16 +1746,17 @@ export function RecordingsPage() {
         closedCamerasRef.current.delete(cameraId)
 
         const camRecs = recordingsByCamera.get(cameraId) ?? []
-        const covering = camRecs.find(r =>
-          new Date(r.startTime).getTime() <= playheadMs! && new Date(r.endTime).getTime() > playheadMs!
-        )
-        const target = covering ?? camRecs
-          .filter(r => new Date(r.startTime).getTime() > playheadMs!)
-          .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())[0] ?? null
+        // Selección con recorte al rango activo (P1): cubre el playhead del reloj o
+        // toma el siguiente bloque dentro del rango.
+        const range = activeSearchRangeRef.current
+        const sel = range
+          ? selectRecordingForPlayhead(camRecs, range.startMs, range.endMs, playheadMs!, MIN_PREVIEW_DURATION_MS)
+          : { targetRecording: null as RecordingWithCamera | null, effectiveStartMs: 0, reason: 'none' as const }
+        const target = sel.targetRecording
 
         if (target) {
-          console.info(`[recordings-ui] play_auto_assign slot=${si} cameraId=${cameraId} recId=${target.id}`)
-          const startAt = covering ? new Date(playheadMs!) : new Date(target.startTime)
+          console.info(`[recordings-ui] play_auto_assign slot=${si} cameraId=${cameraId} recId=${target.id} effectiveStart=${new Date(sel.effectiveStartMs).toISOString()} reason=${sel.reason}`)
+          const startAt = new Date(sel.effectiveStartMs)
           startPreviewInSlotRef.current(si, target, startAt, { noClockAnchor: clockAnchored })
           clockAnchored = true
         } else {
@@ -1881,15 +1939,19 @@ export function RecordingsPage() {
 
   // Called on mouseup — commits the seek; restarts preview if currently playing
   const handleTimelineCommit = (time: Date) => {
-    const timeMs    = time.getTime()
+    // Clic manual: recortar el punto al rango buscado activo (P1) antes de nada.
+    const range = activeSearchRangeRef.current
+    const rangeStartMs = range?.startMs ?? -Infinity
+    const rangeEndMs   = range?.endMs   ??  Infinity
+    const timeMs    = Math.min(Math.max(time.getTime(), rangeStartMs), rangeEndMs)
     const wasPlaying = globalPlayingRef.current
-    console.info(`[recordings-ui] timeline_seek_commit playhead=${time.toISOString()} wasPlaying=${wasPlaying}`)
+    console.info(`[recordings-ui] timeline_seek_commit playhead=${new Date(timeMs).toISOString()} wasPlaying=${wasPlaying}`)
 
     // Re-anchor master clock to the new seek position
     if (masterClockRef.current) {
       masterClockRef.current = { ...masterClockRef.current, wallMs: performance.now(), playheadMs: timeMs }
     }
-    setGlobalPlaybackTime(time)
+    setGlobalPlaybackTime(new Date(timeMs))
 
     if (!wasPlaying) return
 
@@ -1897,12 +1959,16 @@ export function RecordingsPage() {
     slotsRef.current.forEach((slot, slotIndex) => {
       if (!slot.cameraId) return
 
-      const camRecs  = recordingsByCamera.get(slot.cameraId) ?? []
-      const covering = camRecs.find(r =>
-        new Date(r.startTime).getTime() <= timeMs && new Date(r.endTime).getTime() > timeMs
+      const camRecs = recordingsByCamera.get(slot.cameraId) ?? []
+      // Selección con recorte al rango: cubre el punto o toma el siguiente bloque.
+      const sel = selectRecordingForPlayhead(
+        camRecs,
+        rangeStartMs === -Infinity ? Math.min(...camRecs.map(r => new Date(r.startTime).getTime()), timeMs) : rangeStartMs,
+        rangeEndMs === Infinity ? Number.MAX_SAFE_INTEGER : rangeEndMs,
+        timeMs, MIN_PREVIEW_DURATION_MS,
       )
 
-      if (!covering) {
+      if (!sel.targetRecording) {
         stopSlot(slotIndex)
         setSlots(prev => prev.map((s, i) => i === slotIndex ? {
           ...s, status: 'no_recording', recording: null, playbackUrl: null, sessionId: null,
@@ -1911,7 +1977,7 @@ export function RecordingsPage() {
       }
 
       // Preview streams don't support random seek — restart from the new point
-      startPreviewInSlotRef.current(slotIndex, covering, time)
+      startPreviewInSlotRef.current(slotIndex, sel.targetRecording, new Date(sel.effectiveStartMs))
     })
   }
 
