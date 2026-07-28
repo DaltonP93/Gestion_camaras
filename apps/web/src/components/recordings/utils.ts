@@ -82,20 +82,32 @@ export function selectRecordingForPlayhead<R extends { startTime: string; endTim
     .filter((x) => Number.isFinite(x.s) && Number.isFinite(x.e) && x.e > x.s)
     .sort((a, b) => a.s - b.s)
 
-  // a) bloque que CUBRE el playhead
-  let pick = blocks.find((x) => x.s <= playhead && x.e > playhead)
-  let reason: 'covering' | 'next' = 'covering'
-  // b) si no, el SIGUIENTE bloque dentro del rango
-  if (!pick) {
-    pick = blocks.find((x) => x.s > playhead && x.s < searchEndMs)
-    reason = 'next'
+  // Recorta un candidato al playhead/bloque/rango y valida la duración mínima.
+  // Devuelve null si tras el recorte queda demasiado corto → hay que SEGUIR
+  // buscando otro candidato (review Codex #121: no rendirse en el primer bloque
+  // solapado corto si otro posterior tiene metraje útil).
+  const clip = (x: { r: R; s: number; e: number }): PlayheadSelection<R> | null => {
+    const effectiveStartMs = Math.max(playhead, x.s, searchStartMs)
+    const effectiveEndMs   = Math.min(x.e, searchEndMs)
+    if (effectiveEndMs - effectiveStartMs < minDurationMs) return null
+    return { targetRecording: x.r, effectiveStartMs, effectiveEndMs, reason: 'covering' }
   }
-  if (!pick) return none
 
-  // c) recortar al bloque Y al rango buscado
-  const effectiveStartMs = Math.max(playhead, pick.s, searchStartMs)
-  const effectiveEndMs   = Math.min(pick.e, searchEndMs)
-  if (effectiveEndMs - effectiveStartMs < minDurationMs) return none
-
-  return { targetRecording: pick.r, effectiveStartMs, effectiveEndMs, reason }
+  // a) bloques que CUBREN el playhead (puede haber varios solapados) — tomar el
+  //    primero con duración efectiva suficiente.
+  for (const x of blocks) {
+    if (x.s <= playhead && x.e > playhead) {
+      const sel = clip(x)
+      if (sel) return sel
+    }
+  }
+  // b) si ninguno cubre con metraje útil, el SIGUIENTE bloque dentro del rango
+  //    (ascendente) con duración suficiente.
+  for (const x of blocks) {
+    if (x.s > playhead && x.s < searchEndMs) {
+      const sel = clip(x)
+      if (sel) return { ...sel, reason: 'next' }
+    }
+  }
+  return none
 }
