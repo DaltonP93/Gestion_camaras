@@ -2159,13 +2159,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       let lateByteAfterKill = false       // el 1er byte llegó tras timeout/kill (drain race)
       let firstMuxedByteMs: number | null = null
       // TASK 3 — instrumentación -progress / etapas de FFmpeg.
-      const stderrHead: string[] = []     // primeras líneas (Input/Stream) que el tail perdía
       let sawInputOpened = false
       let firstEncodedFrameLogged = false
       let progressBuf = ''
       // ── Fallback video-only por audio G.711 (causa raíz confirmada) ──
       let detectedAudioCodec: string | null = null
       let detectedVideoCodec: string | null = null
+      let detectedWidth:  number | null = null
+      let detectedHeight: number | null = null
       let audioFallbackTried = false      // ya se reintentó esta URI en video-only
       let audioRestartPending = false     // el 'close' debe re-lanzar el MISMO índice video-only
       const clearFirstByteWatchdog = () => {
@@ -2207,31 +2208,34 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         for (const raw of chunk.toString().split('\n')) {
           const line = maskUrlCredentials(raw.trim())
           if (!line) continue
-          // HEAD + tail: conservar las primeras líneas (incluyen "Input #0" y
-          // "Stream #0:0 Video" — hoy se perdían con sólo el tail) además del final.
-          if (stderrHead.length < 15) stderrHead.push(line)
           stderrTail.push(line)
           if (stderrTail.length > 30) stderrTail.shift()
+          // ── Detección de codecs por LÍNEA ACTUAL (no sobre el head capado a 15) ──
+          // El banner de FFmpeg (versión + configuración + libs) suele superar 15
+          // líneas ANTES de las líneas "Stream #0:N: Audio/Video", así que parsear
+          // stderrHead nunca vería el audio y el fallback quedaría inhabilitado
+          // (review Codex #120). Parseamos cada línea directamente, sin tope.
+          if (detectedAudioCodec == null || detectedVideoCodec == null) {
+            const info = parseStreamInfoFromStderr(line)
+            if (info.audioCodec) detectedAudioCodec = info.audioCodec
+            if (info.videoCodec) detectedVideoCodec = info.videoCodec
+            if (info.width  != null) detectedWidth  = info.width
+            if (info.height != null) detectedHeight = info.height
+          }
           // TASK 3 — marcar input_opened y el primer stream de video/audio detectado.
           if (!sawInputOpened && /Input #\d+|Stream #\d+:\d+/.test(line)) {
             sawInputOpened = true
-            const info = parseStreamInfoFromStderr(stderrHead.join('\n'))
             server.log.info(
               `[recordings-preview] input_opened sessionId=${sessionId} variant=${variant}` +
-              ` elapsedMs=${Date.now() - streamStartMs} video=${info.videoCodec ?? 'pending'}` +
-              ` audio=${info.audioCodec ?? 'none'} ${info.width ?? '?'}x${info.height ?? '?'}`
+              ` elapsedMs=${Date.now() - streamStartMs} video=${detectedVideoCodec ?? 'pending'}` +
+              ` audio=${detectedAudioCodec ?? 'none'} ${detectedWidth ?? '?'}x${detectedHeight ?? '?'}`
             )
           }
-          // ── Detección de audio G.711 → fallback video-only sobre la MISMA URI ──
+          // ── Fallback video-only por audio G.711 sobre la MISMA URI ──
           // El stderr revela el codec de audio (~1-2s), MUCHO antes del atasco de
           // encode/mux (~6-8s) y del watchdog (25s). Si es pcm_mulaw/pcm_alaw y el
           // intento A/V aún no produjo primer byte, se mata y se re-lanza la misma
           // URI sin audio — NO se avanza a otra estrategia RTSP (la URI es válida).
-          if (detectedAudioCodec == null || detectedVideoCodec == null) {
-            const info = parseStreamInfoFromStderr(stderrHead.join('\n'))
-            if (info.audioCodec) detectedAudioCodec = info.audioCodec
-            if (info.videoCodec) detectedVideoCodec = info.videoCodec
-          }
           if (shouldRestartVideoOnly({
             audioCodec: detectedAudioCodec, alreadyVideoOnly: attemptVideoOnly,
             firstByteSent, audioFallbackTried,
