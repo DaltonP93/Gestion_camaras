@@ -29,6 +29,7 @@ import {
 } from '../services/recordings/preview-audio-policy'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
+import { PreviewProcessRegistry, type AttemptRecord } from '../services/recordings/preview-process-registry'
 import { getNvrSystemTime } from '../services/hikvision'
 
 // ─── VOD configuration ────────────────────────────────────────────
@@ -383,7 +384,25 @@ interface PreviewSession {
   strategy:        PreviewStrategy
   detectedCodec:   string
   canPlayHevcMp4:  boolean
+  // Proceso ACTIVO (el que alimenta al consumidor actual). El registro de TODOS
+  // los hijos vive en `procRegistry` — vodProcess es sólo el "actual" para los
+  // guards de identidad. Nunca es la única referencia (bug P1: FFmpeg huérfano).
   vodProcess?: ChildProcess
+  // Registro de TODOS los FFmpeg de la sesión (req 11): alta al spawn, baja al
+  // close. Permite terminar/recolectar cada hijo aunque un takeover lo supere.
+  procRegistry?: PreviewProcessRegistry
+  // Generación del stream: se incrementa en cada GET /stream. Identifica al dueño
+  // actual; un GET más nuevo gana y el viejo cede sin tocar refs del nuevo (req 13).
+  streamGeneration?: number
+  // Cierre en curso: bloquea nuevos GET /stream y marca el teardown ordenado (12).
+  closing?:        boolean
+  // ¿Hay un consumidor (GET /stream) adjunto ahora? Para el reaper de sesiones sin
+  // consumidor (req 15). lastStreamAt = último momento con consumidor.
+  streamAttached?: boolean
+  lastStreamAt?:   number
+  // Cleanups del handler de stream activo (timers + listeners), para poder
+  // eliminarlos desde el teardown de la sesión (DELETE / sweep) — req 12d.
+  disposers?:      Set<() => void>
   stderrTail?:     string[]
   errorCategory?:  string
   errorDetail?:    string
@@ -507,6 +526,52 @@ function retainFailedPreview(sessionId: string, session: PreviewSession, log: (m
 
 const previewSessions = new Map<string, PreviewSession>()
 
+// ── Ciclo de vida de los FFmpeg de preview (P1: un solo FFmpeg por sesión) ──────
+// El registro por sesión es la fuente de verdad de TODOS los hijos; vodProcess es
+// sólo el "actual". Estas funciones centralizan la terminación y el teardown para
+// que ninguna ruta (DELETE, cierre de socket, request_error, sweep) deje huérfanos.
+
+// SIGTERM ahora + SIGKILL de gracia si el hijo ignora la señal. Idempotente por
+// attempt (el registro sólo señaliza a los vivos).
+function scheduleGraceKill(session: PreviewSession, rec: AttemptRecord, log: (m: string) => void) {
+  const t = setTimeout(() => {
+    session.procRegistry?.sigkillIfAlive(rec.attemptId, (r) =>
+      log(`[recordings-preview] sigkill_orphan attemptId=${r.attemptId} pid=${r.pid ?? 'none'} — ignoró SIGTERM`))
+  }, PREVIEW_KILL_GRACE_MS)
+  if (typeof t.unref === 'function') t.unref()
+}
+
+// Termina TODOS los hijos vivos de la sesión (req 11/14). Devuelve cuántos quedan
+// sin confirmar salida (pendientes de su `close`).
+function terminateAllPreviewChildren(session: PreviewSession, reason: string, log: (m: string) => void): number {
+  const reg = session.procRegistry
+  if (!reg) return 0
+  const pending = reg.terminateAll((rec) => {
+    log(`[recordings-preview] attempt_terminate sessionId_reason=${reason} attemptId=${rec.attemptId} pid=${rec.pid ?? 'none'}`)
+    scheduleGraceKill(session, rec, log)
+  })
+  session.vodProcess = undefined
+  return pending.length
+}
+
+// Teardown ORDENADO de una sesión (req 12): closing → bloquear GET → disposers →
+// terminar attempts → confirmar sin vivos (o cleanup_pending).
+function terminatePreviewSession(sessionId: string, session: PreviewSession, reason: string, log: (m: string) => void) {
+  const already = session.closing
+  session.closing = true                       // (12a) marcar closing (bloquea GET)
+  previewSessions.delete(sessionId)            // (12b) impedir nuevos GET (lookup falla)
+  if (session.disposers) {                     // (12d) eliminar timers y listeners
+    for (const d of [...session.disposers]) { try { d() } catch { /* noop */ } }
+    session.disposers.clear()
+  }
+  const pending = terminateAllPreviewChildren(session, reason, log)  // (12c)
+  if (pending > 0) {                           // (12e) confirmar, o marcar pendiente
+    log(`[recordings-preview] cleanup_pending sessionId=${sessionId} reason=${reason} pendingChildren=${pending}`)
+  } else if (!already) {
+    log(`[recordings-preview] session_deleted sessionId=${sessionId} slotIndex=${session.slotIndex} reason=${reason}`)
+  }
+}
+
 // Métricas para /metrics (Prometheus) — solo conteos, sin datos sensibles.
 export function getRecordingsMetrics(): { previewSessions: number; vodSessions: number } {
   return { previewSessions: previewSessions.size, vodSessions: recordingSessions.size }
@@ -534,6 +599,10 @@ const PREVIEW_QUEUE_WAIT_MAX_MS = 30_000
 const PREVIEW_FIRST_BYTE_TIMEOUT_MS = Math.max(3_000, parseInt(process.env.RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS || '25000', 10) || 25_000)
 // Gracia tras SIGTERM antes de SIGKILL a un FFmpeg que ignora la señal.
 const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS || '2000', 10) || 2000)
+// Edad a partir de la cual el sweep mata un FFmpeg huérfano (vivo pero superado
+// por un takeover, ya no es el proceso activo de la sesión). Red de seguridad
+// independiente del JWT y del ciclo de la request (req 15).
+const PREVIEW_ORPHAN_REAP_MS = Math.max(5_000, parseInt(process.env.RECORDINGS_PREVIEW_ORPHAN_REAP_MS || '30000', 10) || 30_000)
 // Presupuesto TOTAL de arranque (todas las variantes juntas). Si se supera, se
 // deja de intentar y se responde error — cota superior dura al peor caso.
 const PREVIEW_TOTAL_STARTUP_MS = Math.max(10_000, parseInt(process.env.RECORDINGS_PREVIEW_TOTAL_STARTUP_MS || '60000', 10) || 60_000)
@@ -675,15 +744,30 @@ function buildVariantChain(baseUrl: string, cameraId: string): Array<{ variant: 
 // so subsequent previews of the same camera skip the probe and go straight to transcode.
 const cameraPreviewStrategyOverride = new Map<string, PreviewStrategy>()
 
-// Periodic cleanup of stale preview sessions + expired failure records
+// Periodic cleanup of stale preview sessions + expired failure records.
+// (15) Además del TTL, es la RED DE SEGURIDAD independiente del JWT: reapea FFmpeg
+// huérfanos (vivos pero superados por un takeover) y sesiones sin consumidor.
 setInterval(() => {
   const now = Date.now()
   for (const [sid, session] of previewSessions.entries()) {
     if (now > session.expiresAt) {
-      previewSessions.delete(sid)
-      if (session.vodProcess) {
-        try { session.vodProcess.kill('SIGTERM') } catch {}
-      }
+      // Teardown ordenado: termina TODOS los hijos (no sólo vodProcess).
+      terminatePreviewSession(sid, session, 'ttl_expired', (m) => console.info(m))
+      continue
+    }
+    const reg = session.procRegistry
+    if (!reg) continue
+    // Reaper de huérfanos: un FFmpeg vivo que ya no es el proceso activo y lleva
+    // demasiado tiempo → SIGKILL (esto es EXACTAMENTE el bug de producción: el
+    // primer FFmpeg de una sessionId con dos GET, que quedó sin dueño).
+    reg.reapOrphans(session.vodProcess, now, PREVIEW_ORPHAN_REAP_MS, (rec) =>
+      console.warn(`[recordings-preview] orphan_ffmpeg_reaped sessionId=${sid} attemptId=${rec.attemptId} pid=${rec.pid ?? 'none'} ageMs=${now - rec.spawnedAt}`))
+    // Sesión con hijos vivos pero SIN consumidor adjunto por un tiempo → terminar
+    // (nadie está leyendo ese MP4; el FFmpeg sólo consume RTSP del NVR).
+    if (!session.streamAttached && reg.aliveCount() > 0 &&
+        session.lastStreamAt !== undefined && now - session.lastStreamAt > PREVIEW_ORPHAN_REAP_MS) {
+      console.warn(`[recordings-preview] session_no_consumer_reaped sessionId=${sid} slotIndex=${session.slotIndex} idleMs=${now - session.lastStreamAt}`)
+      terminatePreviewSession(sid, session, 'no_consumer', (m) => console.info(m))
     }
   }
   for (const [sid, info] of failedPreviewSessions.entries()) {
@@ -1882,14 +1966,46 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(401).send({ message: 'Token de stream inválido o expirado' })
     }
     if (Date.now() > session.expiresAt) {
-      previewSessions.delete(sessionId)
+      terminatePreviewSession(sessionId, session, 'expired_on_stream', (m) => server.log.info(m))
       return reply.status(401).send({ message: 'Sesión de preview expirada' })
     }
+    // (12) La sesión está en cierre → no aceptar nuevos GET /stream.
+    if (session.closing) {
+      server.log.warn(`[recordings-preview] stream_rejected_closing sessionId=${sessionId}`)
+      return reply.status(409).send({ message: 'Sesión de preview en cierre' })
+    }
 
-    // Kill any FFmpeg already running for this session (re-stream on seek)
-    if (session.vodProcess) {
-      try { session.vodProcess.kill('SIGTERM') } catch {}
-      session.vodProcess = undefined
+    // ── (10) UN SOLO consumidor / un solo FFmpeg por sesión ──────────────────
+    // Cada GET incrementa la generación del stream: el más nuevo es el dueño. En
+    // vez de arrancar un FFmpeg PARALELO (bug P1), se TOMA EL CONTROL: terminar el
+    // intento anterior y esperar su salida antes de spawnar el nuevo. Nunca dos
+    // FFmpeg vivos para la misma sessionId.
+    if (!session.procRegistry) session.procRegistry = new PreviewProcessRegistry()
+    const myGen = (session.streamGeneration = (session.streamGeneration ?? 0) + 1)
+    if (session.procRegistry.aliveCount() > 0) {
+      server.log.info(
+        `[recordings-preview] stream_takeover sessionId=${sessionId} gen=${myGen}` +
+        ` priorAlive=${session.procRegistry.aliveCount()}`
+      )
+      terminateAllPreviewChildren(session, 'stream_takeover', (m) => server.log.info(m))
+      // Esperar (acotado) a que el intento anterior confirme salida — evita
+      // solapar dos FFmpeg contra el mismo RTSP del NVR.
+      const waitDeadline = Date.now() + PREVIEW_KILL_GRACE_MS + 500
+      while (session.procRegistry.aliveCount() > 0 && Date.now() < waitDeadline) {
+        await new Promise((r) => setTimeout(r, 50))
+        // Otro GET aún más nuevo llegó mientras esperábamos → ceder sin spawnar.
+        if (session.streamGeneration !== myGen) {
+          return reply.status(409).send({ message: 'Stream reemplazado por una solicitud más reciente' })
+        }
+      }
+    }
+    // ¿Un GET más nuevo tomó el control mientras terminábamos el anterior? Ceder.
+    if (session.streamGeneration !== myGen) {
+      return reply.status(409).send({ message: 'Stream reemplazado por una solicitud más reciente' })
+    }
+    // La sesión pudo eliminarse (DELETE) durante la espera del takeover.
+    if (session.closing || !previewSessions.has(sessionId)) {
+      return reply.status(410).send({ message: 'Sesión de preview cancelada' })
     }
 
     const { rtspUrl, rtspMasked, strategy } = session
@@ -1946,6 +2062,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // Hijack the raw TCP connection — bypass Fastify serialization entirely
     reply.hijack()
     const res = reply.raw
+    // Consumidor adjunto (para el reaper de sesiones sin consumidor, req 15).
+    session.streamAttached = true
+    session.lastStreamAt   = Date.now()
 
     const streamStartMs = Date.now()
     let firstByteSent = false
@@ -1970,10 +2089,20 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // Limpieza del intento activo (timers + estado terminal), invocable desde
     // onClientGone / presupuesto total para no dejar watchdogs vivos tras cerrar.
     let currentAttemptCleanup: (() => void) | null = null
+    // Disposer registrado en la sesión (timers + listeners de ESTE handler), para
+    // que el teardown de la sesión (DELETE / sweep) pueda limpiarlo (req 12d).
+    let ownerDispose: (() => void) | null = null
     // Presupuesto TOTAL de arranque: un único timer por sesión (no basta con
     // chequear elapsed al iniciar cada variante).
     let totalStartupTimer: NodeJS.Timeout | null = null
     const clearTotalStartupTimer = () => { if (totalStartupTimer) { clearTimeout(totalStartupTimer); totalStartupTimer = null } }
+
+    // Dueño actual del stream: sólo ESTA generación puede avanzar la cadena o
+    // re-spawnar. Si un GET más nuevo tomó el control (bump de generación) o la
+    // sesión entró en cierre, este handler ya no es dueño y no debe tocar el
+    // intento nuevo ni arrancar otro FFmpeg (req 13).
+    const isOwner     = () => session.streamGeneration === myGen && !session.closing
+    const canContinue = () => !clientGone && isOwner() && previewSessions.has(sessionId)
 
     // Los headers 200 se envían RECIÉN cuando FFmpeg produce el primer byte de
     // MP4 — no antes. Así, si todas las variantes RTSP fallan, el cliente recibe
@@ -2014,6 +2143,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         ` reason=${reason} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
       )
       releaseNvrSlot()
+      // Este consumidor se va: soltar la marca SÓLO si seguimos siendo el dueño
+      // (un GET más nuevo puede haberla re-tomado). Deregistrar el disposer propio.
+      if (session.streamGeneration === myGen) session.streamAttached = false
+      if (ownerDispose) session.disposers?.delete(ownerDispose)
       // Red de seguridad: si nunca se enviaron headers y el cliente sigue ahí,
       // no cerrar con un 200 vacío (spinner infinito) — enviar 502.
       if (!headersSent && !clientGone) endWithError('STREAM_ENDED_NO_OUTPUT', reason)
@@ -2139,6 +2272,14 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       const proc = spawn('ffmpeg', buildFfmpegArgs(inputUrl, attemptVideoOnly), { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] })
       currentProc = proc
       session.vodProcess = proc
+      // (9/11) Alta en el registro de la sesión: attemptId único + pid. La baja va
+      // en el `close` de ESTE proc (drenado definitivo). Así el teardown, el
+      // takeover y el reaper alcanzan a TODOS los hijos, no sólo al actual.
+      const attemptRec = session.procRegistry!.register(proc, Date.now())
+      server.log.info(
+        `[recordings-preview] ffmpeg_spawn sessionId=${sessionId} attemptId=${attemptRec.attemptId}` +
+        ` pid=${proc.pid ?? 'none'} gen=${myGen} variant=${variant} videoOnly=${attemptVideoOnly}`
+      )
       server.log.info(`[recordings-preview] ffmpeg_transport sessionId=${sessionId} variant=${variant} transport=${previewTransport} videoOnly=${attemptVideoOnly}`)
 
       // ── Máquina de estado del intento + watchdog de primer byte ─────────
@@ -2372,6 +2513,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           ` firstMuxedByteMs=${firstMuxedByteMs ?? 'none'} lateByteAfterKill=${lateByteAfterKill}`
         )
         if (session.vodProcess === proc) session.vodProcess = undefined
+        // (11/13) Baja de ESTE intento del registro (por attemptId — no toca al
+        // intento nuevo si hubo takeover). Si la sesión está en cierre y ya no
+        // quedan hijos vivos, confirmar la limpieza completa.
+        session.procRegistry?.unregister(attemptRec.attemptId)
+        if (session.closing && (session.procRegistry?.aliveCount() ?? 0) === 0) {
+          server.log.info(`[recordings-preview] session_cleanup_complete sessionId=${sessionId} slotIndex=${session.slotIndex}`)
+        }
 
         // ── Reinicio por audio G.711: re-lanzar el MISMO índice en video-only ──
         // NO avanzar la cadena (la URI es válida: abrió RTSP y trae video). El
@@ -2379,7 +2527,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         if (audioRestartPending) {
           audioRestartPending = false
           server.log.info(`[recordings-preview] audio_fallback_restart sessionId=${sessionId} chainIndex=${chainIndex} — misma URI, video-only`)
-          if (!clientGone && previewSessions.has(sessionId)) startAttempt(chainIndex, true)
+          // (13) Sólo re-spawnar si SEGUIMOS siendo el dueño: un takeover o el
+          // cierre de la sesión invalidan este handler → no arrancar otro FFmpeg.
+          if (canContinue()) startAttempt(chainIndex, true)
           else finish('audio_fallback_cancelled')
           return
         }
@@ -2398,7 +2548,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         // avanzar de estrategia (spec: la URI es válida; sólo falla el mux A/V).
         const videoDecoded = sawInputOpened && detectedVideoCodec != null
         const audioProblematic = isProblematicPreviewAudio(detectedAudioCodec)
-        if (!firstByteSent && !attemptVideoOnly && !clientGone && previewSessions.has(sessionId)
+        if (!firstByteSent && !attemptVideoOnly && canContinue()
             && videoDecoded && audioProblematic) {
           sessionVideoOnly = true
           cameraAudioProblematic.add(session.cameraId)
@@ -2459,7 +2609,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             !clientGone
           if (advance) {
             setTimeout(() => {
-              if (!clientGone && previewSessions.has(sessionId)) {
+              // (13) Sólo avanzar la cadena si SEGUIMOS siendo el dueño del stream.
+              if (canContinue()) {
                 startAttempt(chainIndex + 1)
               } else {
                 finish('cancelled_before_fallback')
@@ -2516,6 +2667,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       })
     }
 
+    // (14) request_error / cierre de socket NO puede limitarse a cerrar la
+    // respuesta HTTP: debe terminar FFmpeg server-side, UNA sola vez, y alcanzar a
+    // TODOS los hijos de esta sesión (no sólo currentProc) — red independiente del
+    // JWT (el DELETE puede fallar por token expirado, pero el socket igual limpia).
+    const onClose = () => onClientGone('client_disconnect')
+    const onErr   = () => onClientGone('request_error')
     const onClientGone = (reason: string) => {
       if (clientGone) return
       clientGone = true
@@ -2523,12 +2680,29 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       // de matar FFmpeg, para que ningún watchdog dispare tras el cierre.
       currentAttemptCleanup?.()
       clearTotalStartupTimer()
-      if (currentProc) { try { currentProc.kill('SIGTERM') } catch {} }
+      // Terminar TODOS los FFmpeg de la sesión de la que somos dueños (no sólo el
+      // actual): un intento en vuelo o superado también debe morir server-side.
+      if (isOwner()) terminateAllPreviewChildren(session, reason, (m) => server.log.info(m))
+      else if (currentProc) { try { currentProc.kill('SIGTERM') } catch {} }
       if (session.vodProcess === currentProc) session.vodProcess = undefined
       finish(reason)
     }
-    request.raw.on('close', () => onClientGone('client_disconnect'))
-    request.raw.on('error', () => onClientGone('request_error'))
+    request.raw.on('close', onClose)
+    request.raw.on('error', onErr)
+    // request 'aborted' (deprecado en Node moderno pero aún emitido en algunos
+    // paths) → mismo tratamiento que un cierre de socket.
+    request.raw.on('aborted', onClose)
+    // (12d) Disposer registrado en la sesión: el teardown (DELETE / sweep) limpia
+    // timers + listeners de este handler sin depender de la request.
+    ownerDispose = () => {
+      clearTotalStartupTimer()
+      currentAttemptCleanup?.()
+      request.raw.removeListener('close', onClose)
+      request.raw.removeListener('error', onErr)
+      request.raw.removeListener('aborted', onClose)
+    }
+    if (!session.disposers) session.disposers = new Set()
+    session.disposers.add(ownerDispose)
 
     server.log.info(
       `[recordings-preview] variant_chain sessionId=${sessionId} mode=${PLAYBACK_STREAM_MODE}` +
@@ -2932,11 +3106,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // Preserve failure info so a status query arriving after this DELETE
     // still gets the real category
     retainFailedPreview(sessionId, session, (m) => server.log.info(m))
-    previewSessions.delete(sessionId)
-    if (session.vodProcess) {
-      try { session.vodProcess.kill('SIGTERM') } catch {}
-    }
-    server.log.info(`[recordings-preview] session_deleted sessionId=${sessionId} slotIndex=${session.slotIndex}`)
+    // (12) Teardown ORDENADO: closing → bloquear GET → disposers → terminar TODOS
+    // los intentos → confirmar sin vivos (o cleanup_pending). No basta con matar
+    // vodProcess (dejaba huérfanos los FFmpeg de intentos superados/en vuelo).
+    terminatePreviewSession(sessionId, session, 'delete_endpoint', (m) => server.log.info(m))
     return reply.send({ ok: true })
   })
 }
