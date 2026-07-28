@@ -21,9 +21,13 @@ export type PlaybackLayout = '1x1' | '2x2' | '3x3' | '4x4'
 // loading = pidiendo sesión al API; buffering = tiene URL, esperando datos de
 // FFmpeg; playing = reproduciendo (currentTime avanza); ready = media lista pero
 // pausada; stalled = con URL pero sin avance tras el timeout → probable fallo.
+// waiting_next_recording = terminó el bloque y hay un hueco hasta el siguiente;
+// en multicámara el slot ESPERA a que el reloj global llegue al siguiente bloque
+// (sin adelantar el reloj) y arranca solo — una única transición, sin clic manual.
 export type SlotStatus =
   | 'empty' | 'idle' | 'loading' | 'buffering' | 'playing'
   | 'ready' | 'stalled' | 'error' | 'no_recording'
+  | 'waiting_next_recording'
 
 export interface PlaybackSlot {
   slotIndex: number

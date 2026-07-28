@@ -30,6 +30,9 @@ import {
   toLocalDatetimeString, localInputToNvrIso, formatNvrTime, classifyError,
   selectRecordingForPlayhead,
 } from '@/components/recordings/utils'
+import {
+  decideContinuity, canClaimTransition, clockReachedNextStart,
+} from '@/components/recordings/continuity'
 
 // ─── Local interfaces ─────────────────────────────────────────────────────────
 
@@ -67,8 +70,10 @@ interface DownloadJob {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-// Continuity tuning — overridable at build time via Vite env
-const CONTINUITY_GAP_MS        = Number(import.meta.env.VITE_RECORDINGS_CONTINUITY_GAP_MS)        || 5_000
+// Continuity tuning — overridable at build time via Vite env.
+// (El antiguo umbral VITE_RECORDINGS_CONTINUITY_GAP_MS quedó obsoleto: la
+// continuidad ya NO se decide por tamaño del hueco — 1x1 siempre continúa
+// adelantando el reloj; multicámara espera al reloj. Ver continuity.ts.)
 const MIN_PREVIEW_DURATION_MS  = Number(import.meta.env.VITE_RECORDINGS_MIN_PREVIEW_DURATION_MS)  || 3_000
 
 const POLL_INTERVAL_MS     = 1_000
@@ -136,7 +141,7 @@ export function RecordingsPage() {
   const globalPlaybackRateRef = useRef(1)
   const videoCleanupRef = useRef<{ [k: number]: (() => void) | null }>({})
   const loadInSlotRef         = useRef<(si: number, rec: RecordingWithCamera, opts?: { forceTranscode?: boolean }) => void>(() => {})
-  const startPreviewInSlotRef = useRef<(si: number, rec: RecordingWithCamera, playheadTime: Date, opts?: { forceTranscode?: boolean; noClockAnchor?: boolean }) => void>(() => {})
+  const startPreviewInSlotRef = useRef<(si: number, rec: RecordingWithCamera, playheadTime: Date, opts?: { forceTranscode?: boolean; noClockAnchor?: boolean; continuityJump?: boolean }) => void>(() => {})
   const previewStartTimesRef  = useRef<{ [k: number]: number | null }>({})
   const previewRetriedRef     = useRef<{ [k: number]: boolean }>({})
   const recordingsRef         = useRef<RecordingWithCamera[]>([])
@@ -168,6 +173,19 @@ export function RecordingsPage() {
   // línea de tiempo y el deep-link recortan SIEMPRE contra este rango (P1).
   const activeSearchRangeRef  = useRef<{ startMs: number; endMs: number } | null>(null)
   const continuityTimerRef    = useRef<{ [k: number]: ReturnType<typeof setTimeout> | null }>({})
+  // ── Continuidad UNIFICADA (P1) ──────────────────────────────────────────────
+  // Lock por slot: clave (transitionKey) de la transición YA reclamada. Impide que
+  // dos caminos (timer de continuidad, evento ended/error, watcher del reloj)
+  // arranquen dos previews para la MISMA transición de bloque → session_init
+  // duplicados/cancelados. Se limpia al re-arrancar por acción del usuario
+  // (stopSlot / seek manual) para permitir re-reproducir el mismo tramo.
+  const slotTransitionRef     = useRef<{ [k: number]: string | null }>({})
+  // Bloque siguiente EN ESPERA (multicámara): se arranca UNA vez cuando el reloj
+  // global alcanza effectiveStartMs. El watcher del reloj es el ÚNICO disparador.
+  const waitingNextBySlotRef  = useRef<{ [k: number]: { rec: RecordingWithCamera; effectiveStartMs: number; effectiveEndMs: number } | null }>({})
+  // Marca cosmética: el estado 'loading' de este slot proviene de un salto de
+  // continuidad → mostrar "Cargando siguiente bloque…" en vez de "Conectando…".
+  const continuityJumpBySlotRef = useRef<{ [k: number]: boolean }>({})
 
   const deleteSessionOnce = (sessionType: string | null, sessionId: string | null | undefined) => {
     if (!sessionId) return
@@ -315,8 +333,13 @@ export function RecordingsPage() {
     }
   }, [globalPlaying])
 
-  // ── iVMS-style auto-start: while playing, slots waiting without a recording
-  // auto-load when the master clock reaches one of their recordings ──────────
+  // ── Watcher del reloj global: ÚNICO dueño del arranque por reloj ────────────
+  // Dos responsabilidades, sin competir con el timer de continuidad:
+  //  1) Continuidad multicámara: un slot en 'waiting_next_recording' arranca
+  //     EXACTAMENTE una vez cuando el reloj alcanza el inicio del siguiente bloque
+  //     (la transición ya fue reclamada por continueSlotToNextRecording).
+  //  2) Autostart legado: una cámara asignada durante la reproducción sin bloque
+  //     activo aún (idle/no_recording) — NO es parte de una transición de bloque.
   const autoStartLockRef = useRef<{ [k: number]: number }>({})
 
   useEffect(() => {
@@ -325,9 +348,30 @@ export function RecordingsPage() {
 
     slotsRef.current.forEach(slot => {
       if (!slot.cameraId) return
-      if (slot.status !== 'no_recording' && slot.status !== 'idle') return
       // Manually closed cameras never autostart until re-selected/assigned
       if (closedCamerasRef.current.has(slot.cameraId)) return
+
+      // (1) Continuidad multicámara: esperar el reloj y arrancar UNA sola vez.
+      if (slot.status === 'waiting_next_recording') {
+        const waiting = waitingNextBySlotRef.current[slot.slotIndex]
+        if (!waiting) return
+        if (!clockReachedNextStart(playheadMs, waiting.effectiveStartMs)) return
+        if (startingSlotsRef.current[slot.slotIndex]) return
+        waitingNextBySlotRef.current[slot.slotIndex] = null
+        console.info(
+          `[recordings-ui] continuity_next_started slot=${slot.slotIndex} recId=${waiting.rec.id}` +
+          ` effectiveStart=${new Date(waiting.effectiveStartMs).toISOString()} advanceClock=false trigger=clock`
+        )
+        // No re-anclar el reloj: lo maneja(n) la(s) otra(s) cámara(s).
+        startPreviewInSlotRef.current(
+          slot.slotIndex, waiting.rec, new Date(waiting.effectiveStartMs),
+          { noClockAnchor: true, continuityJump: true },
+        )
+        return
+      }
+
+      // (2) Autostart legado: sólo slots SIN transición de bloque en curso.
+      if (slot.status !== 'no_recording' && slot.status !== 'idle') return
       // Ya hay un arranque en vuelo para este slot (p.ej. el deep link) → no
       // iniciar un segundo preview que cancelaría el primero (doble preview_start).
       if (startingSlotsRef.current[slot.slotIndex]) return
@@ -477,6 +521,10 @@ export function RecordingsPage() {
       clearTimeout(continuityTimerRef.current[slotIndex]!)
       continuityTimerRef.current[slotIndex] = null
     }
+    // Descartar cualquier transición de continuidad pendiente de este slot.
+    slotTransitionRef.current[slotIndex] = null
+    waitingNextBySlotRef.current[slotIndex] = null
+    continuityJumpBySlotRef.current[slotIndex] = false
     slotKeysRef.current[slotIndex] = null
     previewStartTimesRef.current[slotIndex] = null
     if (videoCleanupRef.current[slotIndex]) {
@@ -561,32 +609,94 @@ export function RecordingsPage() {
       currentEffectiveEndMs, MIN_PREVIEW_DURATION_MS,
     )
     const nextRec = nextSel.targetRecording
+    // ¿Hay otras cámaras reproduciendo? Determina si este slot MANEJA el reloj
+    // (1x1 / única cámara → adelanta el reloj) o debe ESPERARLO (multicámara).
+    const otherSlotsPlaying = slotsRef.current.some((s, i) => i !== slotIndex && isLiveSlot(s.status))
 
-    if (nextRec) {
-      const gap = nextSel.effectiveStartMs - currentEndMs
+    // Decisión ÚNICA y pura de la transición (módulo continuity.ts). Reemplaza el
+    // antiguo umbral CONTINUITY_GAP_MS + botón manual: en 1x1 SIEMPRE continúa
+    // automáticamente (adelantando el reloj sobre el aire muerto); en multicámara
+    // espera al reloj sin adelantarlo.
+    const decision = decideContinuity({
+      slotIndex,
+      currentRecordingId: rec.id,
+      currentEffectiveEndMs,
+      next: nextRec
+        ? { recordingId: nextRec.id, effectiveStartMs: nextSel.effectiveStartMs, effectiveEndMs: nextSel.effectiveEndMs }
+        : null,
+      otherSlotsPlaying,
+    })
+
+    // Sin siguiente bloque en el rango → detener (no hay nada que continuar).
+    if (decision.action === 'none') {
       console.info(
-        `[recordings-ui] continuity_next_clip slot=${slotIndex}` +
-        ` currentEnd=${rec.endTime} nextStart=${nextRec.startTime}` +
-        ` effectiveStart=${new Date(nextSel.effectiveStartMs).toISOString()} gapMs=${gap} reason=${nextSel.reason}`
+        `[recordings-ui] continuity_no_next_clip slot=${slotIndex}` +
+        ` playhead=${new Date(endedAtMs).toISOString()}`
       )
-      // gap contra el fin REAL del bloque actual; si el siguiente cubre el playhead
-      // (solapado) el gap es negativo y también continúa.
-      if (gap <= CONTINUITY_GAP_MS) {
-        const otherPlaying = slotsRef.current.some((s, i) => i !== slotIndex && isLiveSlot(s.status))
-        startPreviewInSlotRef.current(slotIndex, nextRec, new Date(nextSel.effectiveStartMs), { noClockAnchor: otherPlaying })
-        return
-      }
+      slotTransitionRef.current[slotIndex] = null
+      waitingNextBySlotRef.current[slotIndex] = null
+      nextRecBySlotRef.current[slotIndex] = null
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s, status: 'no_recording', sessionId: null, sessionType: null, errorMsg: null,
+      } : s))
+      setGlobalPlaying(false)
+      return
     }
 
+    // Lock por slot: si ESTA transición ya fue reclamada (ended + timer + error de
+    // cola disparando a la vez, o el watcher del reloj), suprimir el 2.º arranque.
+    if (decision.transitionKey && !canClaimTransition(slotTransitionRef.current[slotIndex], decision.transitionKey)) {
+      console.info(
+        `[recordings-ui] continuity_duplicate_suppressed slot=${slotIndex} reason=${reason}` +
+        ` transitionKey=${decision.transitionKey}`
+      )
+      return
+    }
+    slotTransitionRef.current[slotIndex] = decision.transitionKey
     console.info(
-      `[recordings-ui] ${nextRec ? 'no_recording_at_playhead' : 'continuity_no_next_clip'} slot=${slotIndex}` +
-      ` playhead=${new Date(endedAtMs).toISOString()} nextRec=${nextRec?.id ?? 'none'}`
+      `[recordings-ui] continuity_transition_claimed slot=${slotIndex} reason=${reason}` +
+      ` action=${decision.action} decisionReason=${decision.reason} gapMs=${decision.gapMs}` +
+      ` transitionKey=${decision.transitionKey}`
     )
-    nextRecBySlotRef.current[slotIndex] = nextRec
-    setSlots(prev => prev.map((s, i) => i === slotIndex ? {
-      ...s, status: 'no_recording', sessionId: null, sessionType: null, errorMsg: null,
-    } : s))
-    if (!nextRec) setGlobalPlaying(false)
+
+    if (decision.action === 'wait_clock') {
+      // Multicámara: NO adelantar el reloj (otras cámaras lo manejan). Guardar el
+      // siguiente bloque y esperar: el watcher del reloj (único dueño) lo arranca
+      // UNA vez al alcanzar effectiveStart. UI: "Esperando siguiente bloque…".
+      waitingNextBySlotRef.current[slotIndex] = {
+        rec: nextRec!, effectiveStartMs: nextSel.effectiveStartMs, effectiveEndMs: nextSel.effectiveEndMs,
+      }
+      nextRecBySlotRef.current[slotIndex] = nextRec
+      console.info(
+        `[recordings-ui] continuity_waiting_gap slot=${slotIndex} gapMs=${decision.gapMs}` +
+        ` nextStart=${new Date(nextSel.effectiveStartMs).toISOString()} recId=${nextRec!.id}`
+      )
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s, status: 'waiting_next_recording', sessionId: null, sessionType: null, errorMsg: null,
+      } : s))
+      return
+    }
+
+    // start_now: 1x1 adelanta el reloj al siguiente bloque (advanceClock) o solape
+    // multicámara inmediato. Un ÚNICO startPreviewInSlot / session_init.
+    waitingNextBySlotRef.current[slotIndex] = null
+    nextRecBySlotRef.current[slotIndex] = null
+    if (decision.advanceClock) {
+      console.info(
+        `[recordings-ui] continuity_auto_jump slot=${slotIndex} gapMs=${decision.gapMs}` +
+        ` from=${rec.endTime} to=${new Date(nextSel.effectiveStartMs).toISOString()} recId=${nextRec!.id}`
+      )
+    }
+    console.info(
+      `[recordings-ui] continuity_next_started slot=${slotIndex} recId=${nextRec!.id}` +
+      ` effectiveStart=${new Date(nextSel.effectiveStartMs).toISOString()} advanceClock=${decision.advanceClock} trigger=${reason}`
+    )
+    // advanceClock ⇒ anclar el reloj (noClockAnchor=false) para saltar el hueco;
+    // solape multicámara ⇒ no re-anclar (noClockAnchor=true).
+    startPreviewInSlotRef.current(
+      slotIndex, nextRec!, new Date(nextSel.effectiveStartMs),
+      { noClockAnchor: !decision.advanceClock, continuityJump: true },
+    )
   }
 
   // (Re)programs the continuity timer for a slot from the REMAINING clip time,
@@ -1147,7 +1257,7 @@ export function RecordingsPage() {
     slotIndex:    number,
     rec:          RecordingWithCamera,
     playheadTime: Date,
-    opts?:        { forceTranscode?: boolean; noClockAnchor?: boolean },
+    opts?:        { forceTranscode?: boolean; noClockAnchor?: boolean; continuityJump?: boolean },
   ) => {
     const forceTranscode = opts?.forceTranscode ?? false
     // Clave de arranque = grabación + punto efectivo (a nivel de segundo). El
@@ -1264,6 +1374,9 @@ export function RecordingsPage() {
     // playhead no dispare un segundo preview del mismo slot en el mismo punto.
     startingSlotsRef.current[slotIndex] = effKey
     previewStartTimesRef.current[slotIndex] = null
+    // Rótulo de carga: "Cargando siguiente bloque…" sólo si este arranque es un
+    // salto de continuidad; un arranque manual/seek lo pone en false.
+    continuityJumpBySlotRef.current[slotIndex] = opts?.continuityJump ?? false
     if (!forceTranscode) previewRetriedRef.current[slotIndex] = false
     // Cancelar cualquier detector de estancamiento previo del slot
     if (stallTimersRef.current[slotIndex]) { clearTimeout(stallTimersRef.current[slotIndex]!); stallTimersRef.current[slotIndex] = null }
@@ -1700,10 +1813,12 @@ export function RecordingsPage() {
     })
 
     // For assigned-but-not-ready slots: start at the playhead if a recording
-    // covers it, otherwise jump to that camera's NEXT block in range
+    // covers it, otherwise jump to that camera's NEXT block in range.
+    // Los slots en 'waiting_next_recording' quedan a cargo del watcher del reloj
+    // (dueño único de la continuidad) — no arrancarlos aquí para no competir.
     let clockAnchored = readySlots.length > 0
     assignedSlots
-      .filter(s => !isLiveSlot(s.status))
+      .filter(s => !isLiveSlot(s.status) && s.status !== 'waiting_next_recording')
       .forEach(slot => {
         if (!slot.cameraId) return
         if (playheadMs === null) return
@@ -1951,6 +2066,11 @@ export function RecordingsPage() {
     const wasPlaying = globalPlayingRef.current
     console.info(`[recordings-ui] timeline_seek_commit playhead=${new Date(timeMs).toISOString()} wasPlaying=${wasPlaying}`)
 
+    // Un seek manual invalida CUALQUIER transición de continuidad pendiente: libera
+    // los locks por slot para poder re-reproducir el mismo tramo desde el nuevo punto.
+    slotTransitionRef.current = {}
+    waitingNextBySlotRef.current = {}
+
     // Re-anchor master clock to the new seek position
     if (masterClockRef.current) {
       masterClockRef.current = { ...masterClockRef.current, wallMs: performance.now(), playheadMs: timeMs }
@@ -2130,11 +2250,13 @@ export function RecordingsPage() {
                 const vodPct    = slot.vodProgress && slot.vodProgress.expectedDurationSec > 0
                   ? Math.min(99, Math.round(slot.vodProgress.outTimeSec / slot.vodProgress.expectedDurationSec * 100))
                   : null
-                const loadLabel = (vodPct !== null && vodPct >= 95)
-                  ? `Finalizando… ${vodPct}%`
-                  : vodPct !== null
-                    ? `Generando MP4… ${vodPct}%`
-                    : 'Conectando al NVR…'
+                const loadLabel = continuityJumpBySlotRef.current[idx]
+                  ? 'Cargando siguiente bloque…'
+                  : (vodPct !== null && vodPct >= 95)
+                    ? `Finalizando… ${vodPct}%`
+                    : vodPct !== null
+                      ? `Generando MP4… ${vodPct}%`
+                      : 'Conectando al NVR…'
 
                 return (
                   <div
@@ -2181,6 +2303,9 @@ export function RecordingsPage() {
                       )}
                       {slot.status === 'no_recording' && (
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-400">Sin grabación</span>
+                      )}
+                      {slot.status === 'waiting_next_recording' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-brand-800/60 text-brand-300">Esperando…</span>
                       )}
                       <span className="flex-1" />
                       {slot.cameraId && (
@@ -2248,6 +2373,13 @@ export function RecordingsPage() {
                         </div>
                       )
                     })()}
+
+                    {slot.status === 'waiting_next_recording' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black px-3">
+                        <Loader2 size={18} className="text-brand-400 animate-spin" />
+                        <span className="text-[9px] text-surface-400 text-center">Esperando siguiente bloque…</span>
+                      </div>
+                    )}
 
                     {slot.status === 'loading' && (
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black">

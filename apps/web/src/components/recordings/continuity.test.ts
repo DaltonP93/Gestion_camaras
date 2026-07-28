@@ -81,6 +81,39 @@ describe('transitionKey + lock', () => {
   })
 })
 
+// Escenario REAL de producción (Torre Vieja): bloque 15:43:00→15:46:51, siguiente
+// 15:46:57→16:43:00, gap 6000ms, 1x1. Antes: continuity_next_clip → no_recording →
+// slot_autostart → previews duplicados. Ahora: una sola transición start_now.
+describe('decideContinuity — caso real Torre Vieja (1x1, gap 6000)', () => {
+  const cur = new Date('2026-07-27T15:46:51Z').getTime()   // fin efectivo bloque actual
+  const nextStart = new Date('2026-07-27T15:46:57Z').getTime()
+  const nextEnd   = new Date('2026-07-27T16:43:00Z').getTime()
+  it('continúa automáticamente adelantando el reloj (un solo arranque)', () => {
+    const d = decideContinuity({
+      slotIndex: 0, currentRecordingId: 'b1543', currentEffectiveEndMs: cur, otherSlotsPlaying: false,
+      next: { recordingId: 'b1546', effectiveStartMs: nextStart, effectiveEndMs: nextEnd },
+    })
+    expect(d.action).toBe('start_now')
+    expect(d.advanceClock).toBe(true)
+    expect(d.gapMs).toBe(6000)
+    expect(d.transitionKey).toBe(`0|b1543|b1546|${nextStart}`)
+  })
+  it('lock: ended + expected_timer + watcher del reloj → una sola transición', () => {
+    const d = decideContinuity({
+      slotIndex: 0, currentRecordingId: 'b1543', currentEffectiveEndMs: cur, otherSlotsPlaying: false,
+      next: { recordingId: 'b1546', effectiveStartMs: nextStart, effectiveEndMs: nextEnd },
+    })
+    let claimed: string | null = null
+    const claim = () => {
+      if (canClaimTransition(claimed, d.transitionKey!)) { claimed = d.transitionKey; return true }
+      return false
+    }
+    expect(claim()).toBe(true)   // ended_event
+    expect(claim()).toBe(false)  // expected_timer → suprimido
+    expect(claim()).toBe(false)  // watcher del reloj → suprimido
+  })
+})
+
 describe('clockReachedNextStart', () => {
   it('arranca cuando el reloj alcanza nextEffectiveStart', () => {
     expect(clockReachedNextStart(999_999, 1_000_000)).toBe(false)
