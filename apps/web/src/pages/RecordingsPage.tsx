@@ -357,14 +357,41 @@ export function RecordingsPage() {
         if (!waiting) return
         if (!clockReachedNextStart(playheadMs, waiting.effectiveStartMs)) return
         if (startingSlotsRef.current[slot.slotIndex]) return
+
+        // Arrancar en el PLAYHEAD ACTUAL, no en el inicio programado. Si el watcher
+        // corre tarde (throttling de pestaña en segundo plano, ended tardío,
+        // navegador suspendido) el reloj ya pasó effectiveStart: arrancar en el
+        // inicio del bloque dejaría esta cámara ATRÁS del resto (review Codex #123).
+        const range = activeSearchRangeRef.current
+        let startRec = waiting.rec
+        let startAt  = new Date(playheadMs)
+        if (playheadMs >= waiting.effectiveEndMs) {
+          // Tras una suspensión larga el bloque en espera quedó OBSOLETO (el reloj
+          // lo pasó por completo): reseleccionar el que cubre el playhead dentro del
+          // rango; si no hay, soltar la espera y dejar al autostart legado.
+          const sel = range
+            ? selectRecordingForPlayhead(
+                recordingsRef.current.filter(r => r.cameraId === slot.cameraId),
+                range.startMs, range.endMs, playheadMs, MIN_PREVIEW_DURATION_MS,
+              )
+            : null
+          if (!sel?.targetRecording) {
+            waitingNextBySlotRef.current[slot.slotIndex] = null
+            slotTransitionRef.current[slot.slotIndex] = null
+            setSlots(prev => prev.map((s, i) => i === slot.slotIndex ? { ...s, status: 'no_recording' } : s))
+            return
+          }
+          startRec = sel.targetRecording
+          startAt  = new Date(sel.effectiveStartMs)
+        }
         waitingNextBySlotRef.current[slot.slotIndex] = null
         console.info(
-          `[recordings-ui] continuity_next_started slot=${slot.slotIndex} recId=${waiting.rec.id}` +
-          ` effectiveStart=${new Date(waiting.effectiveStartMs).toISOString()} advanceClock=false trigger=clock`
+          `[recordings-ui] continuity_next_started slot=${slot.slotIndex} recId=${startRec.id}` +
+          ` startAt=${startAt.toISOString()} advanceClock=false trigger=clock`
         )
         // No re-anclar el reloj: lo maneja(n) la(s) otra(s) cámara(s).
         startPreviewInSlotRef.current(
-          slot.slotIndex, waiting.rec, new Date(waiting.effectiveStartMs),
+          slot.slotIndex, startRec, startAt,
           { noClockAnchor: true, continuityJump: true },
         )
         return
@@ -2070,6 +2097,13 @@ export function RecordingsPage() {
     // los locks por slot para poder re-reproducir el mismo tramo desde el nuevo punto.
     slotTransitionRef.current = {}
     waitingNextBySlotRef.current = {}
+    // Un slot en espera (multicámara) ya no tiene bloque pendiente: si NO se
+    // reproduce (seek en pausa), el path de abajo hace return temprano y lo dejaría
+    // atascado en "Esperando…" (su waitingNextBySlotRef quedó vacío y Play excluye
+    // ese estado). Volverlo a 'no_recording' para que Play/el watcher lo resuelvan
+    // en el NUEVO punto (review Codex #123).
+    setSlots(prev => prev.map(s => s.status === 'waiting_next_recording'
+      ? { ...s, status: 'no_recording' } : s))
 
     // Re-anchor master clock to the new seek position
     if (masterClockRef.current) {
