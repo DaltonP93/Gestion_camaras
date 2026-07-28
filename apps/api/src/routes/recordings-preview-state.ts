@@ -40,6 +40,9 @@ export function errorStatusForCategory(category: string): number {
     case 'OUTPUT_PIPE_DRAIN_RACE':         return 504
     case 'STARTUP_BUDGET_EXCEEDED':        return 504
     case 'ENCODE_FAILED':                  return 500
+    // Video decodifica pero el mux A/V (G.711) no produce salida — se sirve
+    // video-only; si aun así falla es un error del pipeline, no del NVR.
+    case 'AUDIO_SYNC_OR_MUX_FAILURE':      return 502
     default:                               return 502
   }
 }
