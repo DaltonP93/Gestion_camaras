@@ -138,3 +138,31 @@ describe('selectRecordingForPlayhead', () => {
     expect(recs).toEqual(copy)
   })
 })
+
+describe('selectRecordingForPlayhead — review Codex #121 (saltar candidatos cortos)', () => {
+  const SEARCH_START = ms('2026-07-28T14:14:00Z')
+  const SEARCH_END   = ms('2026-07-28T15:14:00Z')
+
+  it('bloque solapado corto + otro solapado con metraje => elige el útil, no none', () => {
+    const recs = [
+      rec('2026-07-28T14:00:00Z', '2026-07-28T14:14:02Z'),  // cubre 14:14 pero sólo 2s tras recorte
+      rec('2026-07-28T14:10:00Z', '2026-07-28T14:40:00Z'),  // también cubre 14:14, metraje útil
+    ]
+    const r = selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, SEARCH_START)
+    expect(r.targetRecording).toBe(recs[1])
+    expect(r.reason).toBe('covering')
+    expect(r.effectiveStartMs).toBe(SEARCH_START)
+    expect(r.effectiveEndMs).toBe(ms('2026-07-28T14:40:00Z'))
+  })
+
+  it('primer bloque siguiente demasiado corto => salta al posterior con metraje', () => {
+    const recs = [
+      rec('2026-07-28T14:20:00Z', '2026-07-28T14:20:02Z'),  // next pero 2s
+      rec('2026-07-28T14:30:00Z', '2026-07-28T14:50:00Z'),  // next con metraje
+    ]
+    const r = selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, SEARCH_START)
+    expect(r.targetRecording).toBe(recs[1])
+    expect(r.reason).toBe('next')
+    expect(r.effectiveStartMs).toBe(ms('2026-07-28T14:30:00Z'))
+  })
+})

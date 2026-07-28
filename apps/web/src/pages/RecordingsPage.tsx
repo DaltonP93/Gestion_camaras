@@ -1357,7 +1357,11 @@ export function RecordingsPage() {
         const clipInfo = clipInfoBySlotRef.current[slotIndex]
         if (previewStartForEnd != null && vid.currentTime > 1 && clipInfo) {
           const positionMs  = previewStartForEnd + vid.currentTime * 1000
-          const remainingMs = clipInfo.clipEndMs - positionMs
+          // Comparar contra el fin EFECTIVO (recortado a searchEnd), igual que el
+          // timer de continuidad: si el rango termina antes del fin del bloque, el
+          // stream cierra en effectiveEnd — usar clipEndMs lo tomaría como fallo de
+          // codec y reintentaría H.264 en vez de continuar (review Codex #121).
+          const remainingMs = clipInfo.effectiveEndMs - positionMs
           if (remainingMs < 5_000) {
             console.info(
               `[recordings-ui] continuity_skip_error_because_natural_end slot=${slotIndex}` +
