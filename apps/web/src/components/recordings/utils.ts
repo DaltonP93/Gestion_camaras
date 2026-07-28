@@ -49,3 +49,53 @@ export function formatSize(bytes: number) {
   if (bytes > 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`
   return `${(bytes / 1048576).toFixed(0)} MB`
 }
+
+// ── Selección de bloque + playhead para una búsqueda de grabaciones ──────────
+// P1 confirmado: el frontend elegía el bloque MÁS NUEVO (camRecs[0] tras orden
+// descendente) y/o el playhead earliest.startTime, produciendo previews que
+// arrancaban en 14:58 o incluso 12:54 para una búsqueda 14:14→15:14. Este helper
+// PURO fija el contrato: nunca antes de searchStart, nunca después de searchEnd,
+// nunca el bloque equivocado.
+export interface PlayheadSelection<R> {
+  targetRecording: R | null
+  effectiveStartMs: number
+  effectiveEndMs: number
+  reason: 'covering' | 'next' | 'none'
+}
+
+export function selectRecordingForPlayhead<R extends { startTime: string; endTime: string }>(
+  recordings: readonly R[],
+  searchStartMs: number,
+  searchEndMs: number,
+  requestedPlayheadMs: number,
+  minDurationMs = 3_000,
+): PlayheadSelection<R> {
+  const none: PlayheadSelection<R> = { targetRecording: null, effectiveStartMs: 0, effectiveEndMs: 0, reason: 'none' }
+  if (!(searchEndMs > searchStartMs)) return none
+  // El playhead nunca puede estar antes del inicio del rango buscado.
+  const playhead = Math.min(Math.max(requestedPlayheadMs, searchStartMs), searchEndMs)
+
+  // Copia ordenada ASCENDENTE (no mutar el arreglo del caller); descartar bloques
+  // con fechas inválidas o de duración no positiva.
+  const blocks = recordings
+    .map((r) => ({ r, s: new Date(r.startTime).getTime(), e: new Date(r.endTime).getTime() }))
+    .filter((x) => Number.isFinite(x.s) && Number.isFinite(x.e) && x.e > x.s)
+    .sort((a, b) => a.s - b.s)
+
+  // a) bloque que CUBRE el playhead
+  let pick = blocks.find((x) => x.s <= playhead && x.e > playhead)
+  let reason: 'covering' | 'next' = 'covering'
+  // b) si no, el SIGUIENTE bloque dentro del rango
+  if (!pick) {
+    pick = blocks.find((x) => x.s > playhead && x.s < searchEndMs)
+    reason = 'next'
+  }
+  if (!pick) return none
+
+  // c) recortar al bloque Y al rango buscado
+  const effectiveStartMs = Math.max(playhead, pick.s, searchStartMs)
+  const effectiveEndMs   = Math.min(pick.e, searchEndMs)
+  if (effectiveEndMs - effectiveStartMs < minDurationMs) return none
+
+  return { targetRecording: pick.r, effectiveStartMs, effectiveEndMs, reason }
+}

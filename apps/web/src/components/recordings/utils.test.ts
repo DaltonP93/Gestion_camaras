@@ -59,3 +59,82 @@ describe('formatDuration / formatSize', () => {
     expect(formatSize(2 * 1073741824)).toBe('2.0 GB')
   })
 })
+
+// ── selectRecordingForPlayhead — P1 selección de bloque/playhead ─────────────
+import { selectRecordingForPlayhead } from './utils'
+
+const ms = (iso: string) => new Date(iso).getTime()
+const rec = (startTime: string, endTime: string) => ({ startTime, endTime })
+
+describe('selectRecordingForPlayhead', () => {
+  const SEARCH_START = ms('2026-07-28T14:14:00Z')
+  const SEARCH_END   = ms('2026-07-28T15:14:00Z')
+
+  // A. Bloque que empieza ANTES del rango → effectiveStart recortado a searchStart.
+  it('A) bloque que empieza antes del rango => effectiveStart=14:14:00, nunca 12:54:40', () => {
+    const recs = [rec('2026-07-28T12:54:40Z', '2026-07-28T14:14:18Z')]
+    const r = selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, SEARCH_START)
+    expect(r.reason).toBe('covering')
+    expect(r.targetRecording).toBe(recs[0])
+    expect(r.effectiveStartMs).toBe(ms('2026-07-28T14:14:00Z'))
+    expect(r.effectiveEndMs).toBe(ms('2026-07-28T14:14:18Z'))
+    expect(r.effectiveStartMs).not.toBe(ms('2026-07-28T12:54:40Z'))
+  })
+
+  // B. Varios bloques, sin seek → cubre 14:14, nunca el último 14:58:45.
+  it('B) varios bloques sin seek => cubre 14:14, nunca auto-selecciona el último', () => {
+    const recs = [
+      rec('2026-07-28T14:58:45Z', '2026-07-28T15:14:41Z'),  // desordenado a propósito
+      rec('2026-07-28T12:54:40Z', '2026-07-28T14:14:18Z'),
+      rec('2026-07-28T14:20:00Z', '2026-07-28T14:40:00Z'),
+    ]
+    const r = selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, SEARCH_START)
+    expect(r.targetRecording).toBe(recs[1])   // el que cubre 14:14
+    expect(r.effectiveStartMs).toBe(SEARCH_START)
+    expect(r.effectiveStartMs).not.toBe(ms('2026-07-28T14:58:45Z'))
+  })
+
+  // C. Hueco al inicio → siguiente bloque.
+  it('C) hueco al inicio => target=14:20, effectiveStart=14:20', () => {
+    const recs = [rec('2026-07-28T14:20:00Z', '2026-07-28T14:40:00Z')]
+    const r = selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, SEARCH_START)
+    expect(r.reason).toBe('next')
+    expect(r.effectiveStartMs).toBe(ms('2026-07-28T14:20:00Z'))
+    expect(r.effectiveEndMs).toBe(ms('2026-07-28T14:40:00Z'))
+  })
+
+  // D. Bloque que excede el final → effectiveEnd recortado a searchEnd.
+  it('D) bloque que excede el final => effectiveEnd=15:14:00, no 15:14:41', () => {
+    const recs = [rec('2026-07-28T14:58:45Z', '2026-07-28T15:14:41Z')]
+    const playhead = ms('2026-07-28T15:00:00Z')
+    const r = selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, playhead)
+    expect(r.effectiveEndMs).toBe(ms('2026-07-28T15:14:00Z'))
+    expect(r.effectiveEndMs).not.toBe(ms('2026-07-28T15:14:41Z'))
+  })
+
+  // E. Deep-link en 14:35 dentro de un bloque.
+  it('E) deep-link 14:35 en bloque 14:20-14:40 => effectiveStart=14:35', () => {
+    const recs = [rec('2026-07-28T14:20:00Z', '2026-07-28T14:40:00Z')]
+    const r = selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, ms('2026-07-28T14:35:00Z'))
+    expect(r.reason).toBe('covering')
+    expect(r.effectiveStartMs).toBe(ms('2026-07-28T14:35:00Z'))
+  })
+
+  it('sin bloques dentro del rango => none (no iniciar preview)', () => {
+    const recs = [rec('2026-07-28T10:00:00Z', '2026-07-28T11:00:00Z')]  // todo antes del rango
+    expect(selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, SEARCH_START).reason).toBe('none')
+  })
+
+  it('bloque demasiado corto tras recorte => none', () => {
+    // sólo se solapa 2s con el rango (< MIN 3s)
+    const recs = [rec('2026-07-28T14:00:00Z', '2026-07-28T14:14:02Z')]
+    expect(selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, SEARCH_START).reason).toBe('none')
+  })
+
+  it('no muta el arreglo de entrada', () => {
+    const recs = [rec('2026-07-28T14:58:45Z', '2026-07-28T15:14:41Z'), rec('2026-07-28T14:20:00Z', '2026-07-28T14:40:00Z')]
+    const copy = [...recs]
+    selectRecordingForPlayhead(recs, SEARCH_START, SEARCH_END, SEARCH_START)
+    expect(recs).toEqual(copy)
+  })
+})
