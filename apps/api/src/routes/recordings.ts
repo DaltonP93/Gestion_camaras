@@ -24,6 +24,9 @@ import {
   type PlaybackVariant, type PlaybackAttempt, type PlaybackBaseStrategy,
 } from '../services/recordings/rtsp-url'
 import { planStartupBudget } from '../services/recordings/preview-budget'
+import {
+  isProblematicPreviewAudio, shouldRestartVideoOnly, isAudioSyncOrMuxFailure,
+} from '../services/recordings/preview-audio-policy'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
 import { getNvrSystemTime } from '../services/hikvision'
@@ -132,13 +135,17 @@ const PREVIEW_AUDIO_ARGS = PREVIEW_AUDIO_ENABLED
   ? ['-map', '0:v:0', '-map', '0:a?', '-c:a', 'aac', '-b:a', '64k', '-ac', '1']
   : ['-an']
 
-function buildPreviewCodecArgs(strategy: PreviewStrategy): string[] {
+// videoOnly=true fuerza `-an` (sin audio) reutilizando la MISMA URI. Se usa cuando
+// el audio G.711 rompe el mux A/V (causa raíz confirmada) — la ruta video-only
+// produce fMP4 en ~5,5s. NO afecta la descarga MP4 (VOD), que va por otro camino.
+function buildPreviewCodecArgs(strategy: PreviewStrategy, videoOnly = false): string[] {
+  const audioArgs = videoOnly ? ['-an'] : PREVIEW_AUDIO_ARGS
   if (strategy === 'preview_copy_h264' || strategy === 'preview_copy_hevc') {
-    return [...PREVIEW_AUDIO_ARGS, '-c:v', 'copy']
+    return [...audioArgs, '-c:v', 'copy']
   }
   // preview_transcode_h264 — baseline profile + fixed keyframe interval for reliable fMP4 seek
   return [
-    ...PREVIEW_AUDIO_ARGS,
+    ...audioArgs,
     '-c:v',             'libx264',
     '-preset',          'ultrafast',
     '-tune',            'zerolatency',
@@ -400,6 +407,10 @@ interface NvrPlaybackProfile {
   substreamRejectedAt?:     number
 }
 const nvrPlaybackProfiles = new Map<string, NvrPlaybackProfile>()
+// Cámaras cuyo audio (G.711 μ-law/A-law) rompe el mux A/V del preview: una vez
+// detectado, los previews siguientes arrancan directo en video-only. En memoria
+// (se pierde al reiniciar el API — se vuelve a aprender en el 1er bloque).
+const cameraAudioProblematic = new Set<string>()
 // TTL del marcaje "sin soporte de substream": tras este tiempo se vuelve a probar
 // (evita bloquear sub permanentemente por un 400 puntual). En memoria: se pierde
 // al reiniciar el API.
@@ -1885,21 +1896,21 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const rtspTimeoutOpt = getRtspTimeoutOption()
     const rtspTimeoutUs  = 60_000_000 // 60s for NVR seek + locate
 
-    // Use codec strategy determined at session creation (probe ran in POST /preview/start)
-    const codecArgs = buildPreviewCodecArgs(strategy)
     // TASK 5 — transporte aprendido por el diagnóstico (sólo se setea cuando una
     // combinación funcionó). No cambia el transporte GLOBAL: es por-NVR y verificado.
     const previewTransport: RtspTransport = nvrPlaybackProfiles.get(session.nvrId)?.preferredTransport ?? 'tcp'
 
-    // TASK 3 — -progress en un fd dedicado (pipe:3) para instrumentar por etapas
-    // (first_encoded_frame, frames, out_time_ms, total_size) sin ensuciar stdout.
-    const buildFfmpegArgs = (inputUrl: string) => [
+    // TASK 3 — -progress en un fd dedicado (pipe:3) para instrumentar por etapas.
+    // videoOnly (`-an`): se usa cuando el audio G.711 rompe el mux A/V (causa raíz
+    // confirmada). La MISMA URI RTSP se reintenta sin audio; el video-only produce
+    // fMP4 en ~5,5s. La descarga MP4 (VOD) NO se ve afectada.
+    const buildFfmpegArgs = (inputUrl: string, videoOnly: boolean) => [
       '-rtsp_transport', previewTransport,
       '-fflags', '+genpts+discardcorrupt',
       ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
       '-reorder_queue_size', '0',
       '-i', inputUrl,
-      ...codecArgs,
+      ...buildPreviewCodecArgs(strategy, videoOnly),
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
       '-progress', 'pipe:3',
@@ -1946,6 +1957,15 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // para no pisar la categoría FIRST_BYTE_TIMEOUT con UNKNOWN (que dispararía un
     // retry H.264 indebido en el frontend).
     let deadlineTerminated = false
+    // Audio G.711 rompe el mux A/V (causa raíz confirmada): una vez detectado en
+    // esta sesión, TODOS los intentos siguientes arrancan video-only (no re-gastar
+    // un intento A/V que ya se sabe incompatible). Optimización codec-aware: si YA
+    // se detectó audio problemático en esta cámara (bloque anterior), arrancar el
+    // primer intento directo en video-only (primer byte ~5,5s en vez de 25s).
+    let sessionVideoOnly = cameraAudioProblematic.has(session.cameraId)
+    if (sessionVideoOnly) {
+      server.log.info(`[recordings-preview] preview_video_only_known sessionId=${sessionId} cameraId=${session.cameraId} — audio G.711 conocido, arranque video-only`)
+    }
     let currentProc: ChildProcess | null = null
     // Limpieza del intento activo (timers + estado terminal), invocable desde
     // onClientGone / presupuesto total para no dejar watchdogs vivos tras cerrar.
@@ -2076,7 +2096,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       )
     }
 
-    const startAttempt = (chainIndex: number) => {
+    const startAttempt = (chainIndex: number, videoOnlyOverride = false) => {
+      const attemptVideoOnly = videoOnlyOverride || sessionVideoOnly
       // Presupuesto total agotado → no iniciar otra variante; responder error.
       const totalElapsed = Date.now() - streamStartMs
       if (totalElapsed > effectiveTotalBudget && !firstByteSent) {
@@ -2115,10 +2136,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       )
 
       // stdio: [ignore, stdout(mp4), stderr, progress(pipe:3)] — el 4º fd es -progress.
-      const proc = spawn('ffmpeg', buildFfmpegArgs(inputUrl), { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] })
+      const proc = spawn('ffmpeg', buildFfmpegArgs(inputUrl, attemptVideoOnly), { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] })
       currentProc = proc
       session.vodProcess = proc
-      server.log.info(`[recordings-preview] ffmpeg_transport sessionId=${sessionId} variant=${variant} transport=${previewTransport}`)
+      server.log.info(`[recordings-preview] ffmpeg_transport sessionId=${sessionId} variant=${variant} transport=${previewTransport} videoOnly=${attemptVideoOnly}`)
 
       // ── Máquina de estado del intento + watchdog de primer byte ─────────
       // Estados: waiting_first_byte → streaming → (exited) ; o → timed_out /
@@ -2138,10 +2159,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       let lateByteAfterKill = false       // el 1er byte llegó tras timeout/kill (drain race)
       let firstMuxedByteMs: number | null = null
       // TASK 3 — instrumentación -progress / etapas de FFmpeg.
-      const stderrHead: string[] = []     // primeras líneas (Input/Stream) que el tail perdía
       let sawInputOpened = false
       let firstEncodedFrameLogged = false
       let progressBuf = ''
+      // ── Fallback video-only por audio G.711 (causa raíz confirmada) ──
+      let detectedAudioCodec: string | null = null
+      let detectedVideoCodec: string | null = null
+      let detectedWidth:  number | null = null
+      let detectedHeight: number | null = null
+      let audioFallbackTried = false      // ya se reintentó esta URI en video-only
+      let audioRestartPending = false     // el 'close' debe re-lanzar el MISMO índice video-only
       const clearFirstByteWatchdog = () => {
         if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null }
         if (killGraceTimer) { clearTimeout(killGraceTimer); killGraceTimer = null }
@@ -2181,20 +2208,54 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         for (const raw of chunk.toString().split('\n')) {
           const line = maskUrlCredentials(raw.trim())
           if (!line) continue
-          // HEAD + tail: conservar las primeras líneas (incluyen "Input #0" y
-          // "Stream #0:0 Video" — hoy se perdían con sólo el tail) además del final.
-          if (stderrHead.length < 15) stderrHead.push(line)
           stderrTail.push(line)
           if (stderrTail.length > 30) stderrTail.shift()
+          // ── Detección de codecs por LÍNEA ACTUAL (no sobre el head capado a 15) ──
+          // El banner de FFmpeg (versión + configuración + libs) suele superar 15
+          // líneas ANTES de las líneas "Stream #0:N: Audio/Video", así que parsear
+          // stderrHead nunca vería el audio y el fallback quedaría inhabilitado
+          // (review Codex #120). Parseamos cada línea directamente, sin tope.
+          if (detectedAudioCodec == null || detectedVideoCodec == null) {
+            const info = parseStreamInfoFromStderr(line)
+            if (info.audioCodec) detectedAudioCodec = info.audioCodec
+            if (info.videoCodec) detectedVideoCodec = info.videoCodec
+            if (info.width  != null) detectedWidth  = info.width
+            if (info.height != null) detectedHeight = info.height
+          }
           // TASK 3 — marcar input_opened y el primer stream de video/audio detectado.
           if (!sawInputOpened && /Input #\d+|Stream #\d+:\d+/.test(line)) {
             sawInputOpened = true
-            const info = parseStreamInfoFromStderr(stderrHead.join('\n'))
             server.log.info(
               `[recordings-preview] input_opened sessionId=${sessionId} variant=${variant}` +
-              ` elapsedMs=${Date.now() - streamStartMs} video=${info.videoCodec ?? 'pending'}` +
-              ` audio=${info.audioCodec ?? 'none'} ${info.width ?? '?'}x${info.height ?? '?'}`
+              ` elapsedMs=${Date.now() - streamStartMs} video=${detectedVideoCodec ?? 'pending'}` +
+              ` audio=${detectedAudioCodec ?? 'none'} ${detectedWidth ?? '?'}x${detectedHeight ?? '?'}`
             )
+          }
+          // ── Fallback video-only por audio G.711 sobre la MISMA URI ──
+          // El stderr revela el codec de audio (~1-2s), MUCHO antes del atasco de
+          // encode/mux (~6-8s) y del watchdog (25s). Si es pcm_mulaw/pcm_alaw y el
+          // intento A/V aún no produjo primer byte, se mata y se re-lanza la misma
+          // URI sin audio — NO se avanza a otra estrategia RTSP (la URI es válida).
+          if (shouldRestartVideoOnly({
+            audioCodec: detectedAudioCodec, alreadyVideoOnly: attemptVideoOnly,
+            firstByteSent, audioFallbackTried,
+          })) {
+            audioFallbackTried  = true
+            audioRestartPending = true
+            sessionVideoOnly    = true   // los intentos siguientes ya arrancan video-only
+            cameraAudioProblematic.add(session.cameraId)  // y los próximos previews de esta cámara
+            attemptState        = 'terminal'
+            clearFirstByteWatchdog()
+            try { proc.stdout?.unpipe(res) } catch {}
+            server.log.warn(
+              `[recordings-preview] audio_fallback_video_only sessionId=${sessionId} variant=${variant}` +
+              ` audioCodec=${detectedAudioCodec} — reintentando MISMA URI sin audio (G.711 rompe el mux A/V)`
+            )
+            try { proc.kill('SIGTERM') } catch {}
+            killGraceTimer = setTimeout(() => {
+              if (procExited) return
+              try { proc.kill('SIGKILL') } catch {}
+            }, PREVIEW_KILL_GRACE_MS)
           }
           server.log.debug(`[recordings-preview] ffmpeg_stderr sessionId=${sessionId} line=${line.slice(0, 200)}`)
         }
@@ -2312,11 +2373,40 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         )
         if (session.vodProcess === proc) session.vodProcess = undefined
 
+        // ── Reinicio por audio G.711: re-lanzar el MISMO índice en video-only ──
+        // NO avanzar la cadena (la URI es válida: abrió RTSP y trae video). El
+        // guard attemptVideoOnly evita el bucle en el re-intento.
+        if (audioRestartPending) {
+          audioRestartPending = false
+          server.log.info(`[recordings-preview] audio_fallback_restart sessionId=${sessionId} chainIndex=${chainIndex} — misma URI, video-only`)
+          if (!clientGone && previewSessions.has(sessionId)) startAttempt(chainIndex, true)
+          else finish('audio_fallback_cancelled')
+          return
+        }
+
         // El presupuesto total ya terminó la sesión (mató el proceso + respondió
         // error): no reclasificar ni avanzar la cadena — pisaría la categoría
         // FIRST_BYTE_TIMEOUT con UNKNOWN. Sólo cerrar.
         if (deadlineTerminated) {
           finish('deadline_terminated_close')
+          return
+        }
+
+        // Red de seguridad (además de la detección temprana por stderr): si el
+        // intento A/V se cerró SIN primer byte habiendo abierto RTSP con video, y
+        // el audio es G.711, reintentar la MISMA URI en video-only en vez de
+        // avanzar de estrategia (spec: la URI es válida; sólo falla el mux A/V).
+        const videoDecoded = sawInputOpened && detectedVideoCodec != null
+        const audioProblematic = isProblematicPreviewAudio(detectedAudioCodec)
+        if (!firstByteSent && !attemptVideoOnly && !clientGone && previewSessions.has(sessionId)
+            && videoDecoded && audioProblematic) {
+          sessionVideoOnly = true
+          cameraAudioProblematic.add(session.cameraId)
+          server.log.warn(
+            `[recordings-preview] audio_fallback_video_only sessionId=${sessionId} variant=${variant}` +
+            ` audioCodec=${detectedAudioCodec} reason=post_close — misma URI, video-only`
+          )
+          startAttempt(chainIndex, true)
           return
         }
 
@@ -2330,8 +2420,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           // en el detalle para no mostrar "el NVR rechazó la URL" cuando en
           // realidad sólo se agotó el tiempo de SALIDA (track 101 real).
           const drainRace = variantTimedOut && lateByteAfterKill
-          const category = variantTimedOut ? 'FIRST_BYTE_TIMEOUT' : classifyRtspError(stderrTail.join('\n'))
-          const detail   = variantTimedOut
+          // Video decodificado pero sin salida y audio G.711 → causa audio/mux A/V
+          // (no URI rechazada ni timeout de RTSP). Sólo si no se pudo reintentar
+          // video-only (p.ej. cliente desconectado): categoría dedicada y veraz.
+          const audioMuxFailure = isAudioSyncOrMuxFailure({ videoDecoded, firstByteSent, audioProblematic })
+          const category = audioMuxFailure ? 'AUDIO_SYNC_OR_MUX_FAILURE'
+            : variantTimedOut ? 'FIRST_BYTE_TIMEOUT'
+            : classifyRtspError(stderrTail.join('\n'))
+          const detail   = audioMuxFailure
+            ? `video HEVC decodificado pero el mux A/V con audio ${detectedAudioCodec} no produjo salida — usar video-only`
+            : variantTimedOut
             ? `sin primer byte aceptado en ${attemptTimeout}ms` +
               (drainRace ? ` (late byte muxeado a ${firstMuxedByteMs}ms tras kill — drain race, FFmpeg SÍ producía salida)` : '') +
               ` — ${stderrTail.slice(-3).join(' | ').slice(0, 300)}`

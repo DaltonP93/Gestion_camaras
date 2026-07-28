@@ -71,3 +71,19 @@ describe('parseFfprobeJson', () => {
     expect(parseFfprobeJson('not json')).toBeNull()
   })
 })
+
+// Review Codex #120: la línea "Stream #0:1: Audio: pcm_mulaw" puede aparecer tras
+// el banner de FFmpeg (>15 líneas). El parser DEBE reconocerla por línea suelta,
+// no dependiendo de un head capado — así el fallback video-only se habilita.
+describe('parseStreamInfoFromStderr — línea suelta (fix head capado)', () => {
+  it('detecta pcm_mulaw en una sola línea Audio', () => {
+    const info = parseStreamInfoFromStderr('  Stream #0:1: Audio: pcm_mulaw, 8000 Hz, mono, s16')
+    expect(info.audioCodec).toBe('pcm_mulaw')
+  })
+  it('detecta hevc + dimensiones en una sola línea Video', () => {
+    const info = parseStreamInfoFromStderr('  Stream #0:0: Video: hevc (Main), yuvj420p, 1920x1080, 25 fps')
+    expect(info.videoCodec).toBe('hevc')
+    expect(info.width).toBe(1920)
+    expect(info.height).toBe(1080)
+  })
+})
