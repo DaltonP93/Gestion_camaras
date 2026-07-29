@@ -10,12 +10,12 @@ import {
   parseDeviceName, checkPasswordPolicy, checkPasswordHistory, addToPasswordHistory,
   resolveFeaturePermissions,
 } from '../services/totp'
+import { getSecuritySettings } from '../services/security-settings'
+import { sessionsToPrune, accessTokenTtlSeconds } from '../services/security-policy'
 
-const ACCESS_TOKEN_TTL_MS  = 60 * 60 * 1000            // 1 hora
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
-const MAX_FAILED_ATTEMPTS  = 5
-const LOCKOUT_DURATION_MS  = 15 * 60 * 1000            // 15 minutos
+// Lockout/política de contraseña: ahora configurables vía SecuritySettings.
 
 const loginSchema = z.object({
   username: z.string().min(1),
@@ -80,11 +80,15 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       })
     }
 
+    const sec = await getSecuritySettings(server.prisma)
+    const maxAttempts = sec.lockoutMaxAttempts
+    const lockoutMs = sec.lockoutDurationMinutes * 60_000
+
     const passwordValid = await bcrypt.compare(body.password, user.passwordHash)
     if (!passwordValid) {
       const attempts = user.failedLoginAttempts + 1
-      const lockout = attempts >= MAX_FAILED_ATTEMPTS
-        ? { lockedUntil: new Date(Date.now() + LOCKOUT_DURATION_MS) }
+      const lockout = attempts >= maxAttempts
+        ? { lockedUntil: new Date(Date.now() + lockoutMs) }
         : {}
 
       await server.prisma.user.update({
@@ -101,7 +105,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         return reply.status(403).send({
           statusCode: 403,
           error: 'Forbidden',
-          message: `Demasiados intentos. Cuenta bloqueada por ${LOCKOUT_DURATION_MS / 60000} minutos.`,
+          message: `Demasiados intentos. Cuenta bloqueada por ${sec.lockoutDurationMinutes} minutos.`,
           code: 'ACCOUNT_LOCKED',
         })
       }
@@ -109,7 +113,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(401).send({
         statusCode: 401,
         error: 'Unauthorized',
-        message: `Credenciales inválidas (${MAX_FAILED_ATTEMPTS - attempts} intentos restantes)`,
+        message: `Credenciales inválidas (${Math.max(0, maxAttempts - attempts)} intentos restantes)`,
       })
     }
 
@@ -321,7 +325,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     const valid = await bcrypt.compare(currentPassword, user.passwordHash)
     if (!valid) return reply.status(400).send({ message: 'Contraseña actual incorrecta' })
 
-    const policy = checkPasswordPolicy(newPassword)
+    const sec = await getSecuritySettings(server.prisma)
+    const policy = checkPasswordPolicy(newPassword, { minLength: sec.passwordMinLength, requireStrong: sec.requireStrongPassword })
     if (!policy.valid) {
       return reply.status(400).send({ message: 'Contraseña no cumple la política', errors: policy.errors })
     }
@@ -426,7 +431,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     })
 
     const payload = { sub: session.user.id, username: session.user.username, role: session.user.role }
-    const newAccessToken = server.jwt.sign(payload)
+    const sec = await getSecuritySettings(server.prisma)
+    const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtlSeconds(sec.sessionTimeoutMinutes) })
     return reply.send({ accessToken: newAccessToken })
   })
 
@@ -562,7 +568,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(400).send({ message: 'Enlace inválido o expirado' })
     }
 
-    const policy = checkPasswordPolicy(newPassword)
+    const sec = await getSecuritySettings(server.prisma)
+    const policy = checkPasswordPolicy(newPassword, { minLength: sec.passwordMinLength, requireStrong: sec.requireStrongPassword })
     if (!policy.valid) {
       return reply.status(400).send({ message: 'Contraseña no cumple los requisitos', errors: policy.errors })
     }
@@ -625,8 +632,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
 async function completeLogin(server: any, request: any, reply: any, user: any) {
   const payload = { sub: user.id, username: user.username, role: user.role }
+  const sec = await getSecuritySettings(server.prisma)
 
-  const accessToken = server.jwt.sign(payload)
+  // TTL del access token = timeout de sesión configurado (hace REAL el ajuste que
+  // antes sólo vivía en la UI). El refresh conserva su ventana larga.
+  const accessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtlSeconds(sec.sessionTimeoutMinutes) })
   const refreshToken = server.jwt.sign(payload, {
     expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
   })
@@ -642,6 +652,17 @@ async function completeLogin(server: any, request: any, reply: any, user: any) {
       expiresAt:   new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
     },
   })
+
+  // Límite de sesiones concurrentes: revocar las MÁS ANTIGUAS que excedan el máximo.
+  const userSessions = await server.prisma.session.findMany({
+    where: { userId: user.id },
+    select: { id: true, lastUsedAt: true, createdAt: true },
+  })
+  const prune = sessionsToPrune(userSessions, sec.maxSessions)
+  if (prune.length > 0) {
+    await server.prisma.session.deleteMany({ where: { id: { in: prune } } })
+    await AuditAction(server.prisma, user.id, 'SESSION_PRUNED_MAX', null, request, { revoked: prune.length, maxSessions: sec.maxSessions })
+  }
 
   await AuditAction(server.prisma, user.id, 'LOGIN', null, request)
 

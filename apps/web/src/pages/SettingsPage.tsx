@@ -73,9 +73,15 @@ export function SettingsPage() {
   const [hlsLatency, setHlsLatency] = useState('low')
   const [streamQuality, setStreamQuality] = useState('main')
   const [onDemandTimeout, setOnDemandTimeout] = useState(30)
-  const [sessionTimeout, setSessionTimeout] = useState(15)
+  // ── Seguridad (persistida server-side, P0) ──
+  const [sessionTimeout, setSessionTimeout] = useState(60)
   const [maxSessions, setMaxSessions] = useState(5)
   const [requireStrongPassword, setRequireStrongPassword] = useState(true)
+  const [passwordMinLength, setPasswordMinLength] = useState(12)
+  const [lockoutMaxAttempts, setLockoutMaxAttempts] = useState(5)
+  const [lockoutDurationMinutes, setLockoutDurationMinutes] = useState(15)
+  const [mfaRequired, setMfaRequired] = useState(false)
+  const [mfaGracePeriodLogins, setMfaGracePeriodLogins] = useState(3)
   const [timezone, setTimezone] = useState('America/Asuncion')
   const [dateFormat, setDateFormat] = useState('dd/MM/yyyy')
 
@@ -99,7 +105,41 @@ export function SettingsPage() {
       .finally(() => setLoadingAlerts(false))
     // Auto-cargar el historial de entregas al abrir Configuración (orden descendente).
     loadDeliveries(0, 'all')
+    // Cargar ajustes de seguridad persistidos (fuente de verdad, no defaults locales).
+    apiGet<any>('/security/settings')
+      .then((s) => {
+        setSessionTimeout(s.sessionTimeoutMinutes)
+        setMaxSessions(s.maxSessions)
+        setRequireStrongPassword(s.requireStrongPassword)
+        setPasswordMinLength(s.passwordMinLength)
+        setLockoutMaxAttempts(s.lockoutMaxAttempts)
+        setLockoutDurationMinutes(s.lockoutDurationMinutes)
+        setMfaRequired(s.mfaRequired)
+        setMfaGracePeriodLogins(s.mfaGracePeriodLogins)
+      })
+      .catch(() => {})   // non-admin: ignore
   }, [])
+
+  const handleSaveSecurity = async () => {
+    setSaving(true)
+    try {
+      await apiPut('/security/settings', {
+        sessionTimeoutMinutes: sessionTimeout,
+        maxSessions,
+        requireStrongPassword,
+        passwordMinLength,
+        lockoutMaxAttempts,
+        lockoutDurationMinutes,
+        mfaRequired,
+        mfaGracePeriodLogins,
+      })
+      toast.success('Ajustes de seguridad guardados')
+    } catch (err: any) {
+      toast.error(err?.response?.data?.message || 'No se pudieron guardar los ajustes de seguridad')
+    } finally {
+      setSaving(false)
+    }
+  }
 
   const handleSaveAlerts = async () => {
     setSaving(true)
@@ -120,10 +160,9 @@ export function SettingsPage() {
 
   const handleSave = async () => {
     if (tab === 'alertas') return handleSaveAlerts()
-    setSaving(true)
-    await new Promise((r) => setTimeout(r, 600))
-    setSaving(false)
-    toast.success('Configuración guardada')
+    if (tab === 'seguridad') return handleSaveSecurity()
+    // Otras pestañas aún no persisten server-side — no simular un guardado falso.
+    toast('Esta sección todavía no persiste cambios en el servidor.', { icon: 'ℹ️' })
   }
 
   const handleTestEmail = async () => {
@@ -529,32 +568,73 @@ export function SettingsPage() {
               <h3 className="text-sm font-semibold text-surface-100 mb-4">Seguridad y sesiones</h3>
               <div className="space-y-4">
                 <div>
-                  <label className="label">Tiempo de expiración de token (minutos)</label>
+                  <label className="label">Tiempo de expiración de sesión (minutos)</label>
                   <input
                     type="number" min={5} max={1440} value={sessionTimeout}
                     onChange={(e) => setSessionTimeout(Number(e.target.value))}
                     className="input max-w-xs"
                   />
-                  <p className="text-xs text-surface-500 mt-1">El token de acceso expira pasado este tiempo. Requiere rebuild del API para aplicar.</p>
+                  <p className="text-xs text-surface-500 mt-1">TTL del token de acceso. Se aplica en el próximo login/refresh (sin rebuild).</p>
                 </div>
 
                 <div>
                   <label className="label">Máximo de sesiones simultáneas por usuario</label>
                   <input
-                    type="number" min={1} max={20} value={maxSessions}
+                    type="number" min={1} max={50} value={maxSessions}
                     onChange={(e) => setMaxSessions(Number(e.target.value))}
                     className="input max-w-xs"
                   />
+                  <p className="text-xs text-surface-500 mt-1">Al superarlo, se revocan las sesiones más antiguas.</p>
                 </div>
 
-                <div className="border-t border-surface-600 pt-4">
+                <div className="grid grid-cols-2 gap-3 max-w-md">
+                  <div>
+                    <label className="label">Bloqueo tras N intentos fallidos</label>
+                    <input type="number" min={3} max={20} value={lockoutMaxAttempts}
+                      onChange={(e) => setLockoutMaxAttempts(Number(e.target.value))} className="input" />
+                  </div>
+                  <div>
+                    <label className="label">Duración del bloqueo (minutos)</label>
+                    <input type="number" min={1} max={1440} value={lockoutDurationMinutes}
+                      onChange={(e) => setLockoutDurationMinutes(Number(e.target.value))} className="input" />
+                  </div>
+                </div>
+
+                <div className="border-t border-surface-600 pt-4 space-y-3">
+                  <div>
+                    <label className="label">Longitud mínima de contraseña</label>
+                    <input type="number" min={8} max={128} value={passwordMinLength}
+                      onChange={(e) => setPasswordMinLength(Number(e.target.value))} className="input max-w-xs" />
+                    <p className="text-xs text-surface-500 mt-1">Mínimo recomendado: 12. Se aplica al cambiar/restablecer contraseña.</p>
+                  </div>
                   <div className="divide-y divide-surface-700">
                     <Toggle
                       value={requireStrongPassword}
                       onChange={setRequireStrongPassword}
-                      label="Exigir contraseñas seguras (8+ chars, mayúscula, número)"
+                      label="Exigir complejidad (mayúscula, minúscula, número y símbolo)"
                     />
                   </div>
+                </div>
+
+                <div className="border-t border-surface-600 pt-4 space-y-3">
+                  <div className="divide-y divide-surface-700">
+                    <Toggle
+                      value={mfaRequired}
+                      onChange={setMfaRequired}
+                      label="Exigir MFA (segundo factor) a todos los usuarios"
+                    />
+                  </div>
+                  {mfaRequired && (
+                    <div>
+                      <label className="label">Período de gracia para enrolar MFA (nº de inicios de sesión)</label>
+                      <input type="number" min={0} max={20} value={mfaGracePeriodLogins}
+                        onChange={(e) => setMfaGracePeriodLogins(Number(e.target.value))} className="input max-w-xs" />
+                    </div>
+                  )}
+                  <p className="text-xs text-surface-500">
+                    La política MFA se guarda ahora. Su aplicación obligatoria (enrolamiento forzado y desafío
+                    en el login) se habilita en la siguiente entrega de seguridad.
+                  </p>
                 </div>
 
                 <div className="p-3 bg-amber-900/20 border border-amber-800/40 rounded-lg">

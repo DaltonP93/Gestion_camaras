@@ -44,20 +44,14 @@ export async function verifyBackupCode(
 
 // ─── Password policy ──────────────────────────────────────────
 
-export interface PasswordPolicyResult {
-  valid: boolean
-  errors: string[]
-}
-
-export function checkPasswordPolicy(password: string): PasswordPolicyResult {
-  const errors: string[] = []
-  if (password.length < 8)              errors.push('Mínimo 8 caracteres')
-  if (!/[A-Z]/.test(password))          errors.push('Al menos 1 letra mayúscula')
-  if (!/[a-z]/.test(password))          errors.push('Al menos 1 letra minúscula')
-  if (!/[0-9]/.test(password))          errors.push('Al menos 1 número')
-  if (!/[^A-Za-z0-9]/.test(password))   errors.push('Al menos 1 carácter especial (!@#$%...)')
-  return { valid: errors.length === 0, errors }
-}
+// La política de contraseña vive ahora en security-policy.ts (configurable, mín. 12
+// por defecto). Se re-exporta aquí para no romper importadores existentes; acepta
+// opciones { minLength, requireStrong } cargadas desde SecuritySettings.
+export {
+  evaluatePasswordPolicy as checkPasswordPolicy,
+  type PasswordPolicyResult,
+  type PasswordPolicyOptions,
+} from './security-policy'
 
 export async function checkPasswordHistory(
   newPassword: string, historyJson: string | null
