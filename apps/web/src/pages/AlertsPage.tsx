@@ -1,5 +1,5 @@
 // src/pages/AlertsPage.tsx
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { AlertTriangle, CheckCircle2, Bell, Filter, Eye, Square, CheckSquare, Loader2 } from 'lucide-react'
 import { useAlertStore } from '@/stores/alertStore'
 import { apiGet, apiPost, apiPut } from '@/lib/api'
@@ -32,47 +32,95 @@ const TYPE_LABELS: Record<string, string> = {
 
 type FilterTab = 'active' | 'acknowledged' | 'resolved' | 'all'
 
+// El tab de la UI mapea al `status` del backend. active(Nuevas)=unread. Las condiciones
+// server-side son idénticas a /alerts/summary, así los contadores y la lista coinciden.
+const STATUS_BY_TAB: Record<FilterTab, string> = {
+  active: 'unread', acknowledged: 'acknowledged', resolved: 'resolved', all: 'all',
+}
+const PAGE_SIZE = 50
+
+interface AlertsPageResponse { items: Alert[]; total: number; page: number; limit: number }
+
 export function AlertsPage() {
-  const { alerts, setAlerts, summary, refreshSummary, markResolved, markRead } = useAlertStore()
+  const { summary, refreshSummary, eventSeq, markResolved, markRead } = useAlertStore()
   const { user } = useAuthStore()
   const [filter, setFilter]           = useState<FilterTab>('active')
   const [severityFilter, setSeverityFilter] = useState<string>('all')
+  const [page, setPage]               = useState(0)   // 0-indexado (contrato backend)
+  const [items, setItems]             = useState<Alert[]>([])
+  const [total, setTotal]             = useState(0)
   const [isLoading, setIsLoading]     = useState(true)
   const [selected, setSelected]       = useState<Set<string>>(new Set())
   const [bulkBusy, setBulkBusy]       = useState(false)
 
   const isPrivileged = ['ADMIN', 'SUPERVISOR'].includes(user?.role || '')
 
-  const loadAlerts = useCallback(async () => {
+  // Secuencia de petición: descarta respuestas obsoletas (si el usuario cambia de tab/
+  // severidad/página mientras hay una carga en vuelo, sólo la última aplica su estado).
+  const reqIdRef = useRef(0)
+
+  // Carga SERVER-SIDE de la página/tab/severidad actuales. Ya NO se descargan 200 filas
+  // para filtrar en el cliente (eso ocultaba unread fuera de esa ventana).
+  const loadAlerts = useCallback(async (targetPage: number) => {
+    const reqId = ++reqIdRef.current
     setIsLoading(true)
     try {
-      const data = await apiGet<Alert[]>('/alerts?limit=200')
-      setAlerts(data)
+      const params = new URLSearchParams({
+        status: STATUS_BY_TAB[filter],
+        severity: severityFilter,
+        page: String(targetPage),
+        limit: String(PAGE_SIZE),
+      })
+      const data = await apiGet<AlertsPageResponse>(`/alerts?${params.toString()}`)
+      if (reqIdRef.current !== reqId) return   // llegó una carga más nueva: ignorar ésta
+
+      // Si la página quedó fuera de rango tras encoger el conjunto (p.ej. reconocer el
+      // único item de la última página), recargar la última página REAL en vez de dejar
+      // al usuario en una página vacía sin controles de navegación.
+      const lastPage = Math.max(0, Math.ceil(data.total / PAGE_SIZE) - 1)
+      if (data.total > 0 && data.page > lastPage) {
+        void loadAlerts(lastPage)
+        return
+      }
+
+      setItems(data.items)
+      setTotal(data.total)
+      setPage(data.page)
       setSelected(new Set())
     } catch (err: any) {
-      // Un 401 lo maneja el interceptor de axios: refresca el token y
-      // reintenta; si la sesión venció de verdad, dispara auth-expired y
-      // redirige al login. No lo tratamos como error acá — solo evitamos
-      // la promesa rechazada sin manejar (spam en consola). Otros errores sí
-      // se informan.
+      if (reqIdRef.current !== reqId) return
+      // El 401 lo maneja el interceptor de axios (refresh + retry). Otros errores se avisan.
       if (err?.response?.status !== 401) {
         toast.error('No se pudieron cargar las alertas')
       }
     } finally {
-      setIsLoading(false)
+      if (reqIdRef.current === reqId) setIsLoading(false)
     }
-  }, [setAlerts])
+  }, [filter, severityFilter])
 
-  // Al abrir la página, re-sincronizar lista Y contadores server-side (req 7).
-  useEffect(() => { loadAlerts(); void refreshSummary() }, [loadAlerts, refreshSummary])
+  // Recargar al cambiar tab o severidad → siempre desde la página 0 (evita quedar en una
+  // página inexistente de otro filtro). Refresca también los contadores.
+  useEffect(() => { loadAlerts(0); void refreshSummary() }, [filter, severityFilter, loadAlerts, refreshSummary])
+
+  // Ante un evento WS (nueva/resuelta/recuperada) refrescar la PÁGINA ACTUAL y summary,
+  // sin mezclar filas de otros filtros (req 6). Se ignora el primer render (eventSeq=0).
+  useEffect(() => {
+    if (eventSeq === 0) return
+    loadAlerts(page)
+    void refreshSummary()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eventSeq])
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
   const handleAcknowledge = useCallback(async (alert: Alert) => {
     try {
       await apiPost(`/alerts/${alert.id}/read`, {})
-      markRead(alert.id)
+      markRead(alert.id)            // optimismo para campana/otras vistas + summary
       toast.success('Alerta reconocida')
+      await loadAlerts(page)        // la fila abandona la pestaña Nuevas en el servidor
     } catch { toast.error('No se pudo reconocer') }
-  }, [markRead])
+  }, [markRead, loadAlerts, page])
 
   const handleResolve = useCallback(async (alert: Alert) => {
     if (!isPrivileged) return
@@ -80,16 +128,17 @@ export function AlertsPage() {
       await apiPut(`/alerts/${alert.id}/resolve`)
       markResolved(alert.id)
       toast.success('Alerta resuelta')
+      await loadAlerts(page)
     } catch { toast.error('No se pudo resolver') }
-  }, [isPrivileged, markResolved])
+  }, [isPrivileged, markResolved, loadAlerts, page])
 
   // ─── Bulk actions ─────────────────────────────────────────────────────────
   const toggleSelect = (id: string) =>
     setSelected(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s })
 
   const toggleSelectAll = () => {
-    if (selected.size === filtered.length) setSelected(new Set())
-    else setSelected(new Set(filtered.map(a => a.id)))
+    if (selected.size === items.length) setSelected(new Set())
+    else setSelected(new Set(items.map(a => a.id)))
   }
 
   const bulkAcknowledge = async () => {
@@ -98,8 +147,8 @@ export function AlertsPage() {
     try {
       await Promise.allSettled([...selected].map(id => apiPost(`/alerts/${id}/read`, {})))
       selected.forEach(id => markRead(id))
-      setSelected(new Set())
       toast.success(`${selected.size} alerta(s) reconocida(s)`)
+      await loadAlerts(page)
     } finally { setBulkBusy(false) }
   }
 
@@ -109,20 +158,12 @@ export function AlertsPage() {
     try {
       await Promise.allSettled([...selected].map(id => apiPut(`/alerts/${id}/resolve`)))
       selected.forEach(id => markResolved(id))
-      setSelected(new Set())
       toast.success(`${selected.size} alerta(s) resuelta(s)`)
+      await loadAlerts(page)
     } finally { setBulkBusy(false) }
   }
 
-  // ─── Filtering ────────────────────────────────────────────────────────────
-  const filtered = alerts.filter((a) => {
-    if (filter === 'active'       && (a.resolved || a.readAt)) return false
-    if (filter === 'acknowledged' && (a.resolved || !a.readAt)) return false
-    if (filter === 'resolved'     && !a.resolved) return false
-    if (severityFilter !== 'all'  && a.severity !== severityFilter) return false
-    return true
-  })
-
+  // La lista ya viene filtrada y paginada por el servidor: `items` es la vista actual.
   // Contadores AUTORITATIVOS del backend (no del arreglo cargado): Nuevas(unread),
   // Reconocidas(acknowledged), Resueltas(resolved), Todas(total). Semántica única.
   const counts = {
@@ -146,7 +187,7 @@ export function AlertsPage() {
           <h2 className="text-base font-semibold text-surface-100">Alertas del sistema</h2>
           <p className="text-xs text-surface-400 mt-0.5">{counts.active} nuevas · {counts.acknowledged} reconocidas · {counts.resolved} resueltas · {counts.all} totales</p>
         </div>
-        <button onClick={loadAlerts} className="btn-secondary text-xs" disabled={isLoading}>
+        <button onClick={() => { loadAlerts(page); void refreshSummary() }} className="btn-secondary text-xs" disabled={isLoading}>
           Actualizar
         </button>
       </div>
@@ -220,21 +261,21 @@ export function AlertsPage() {
       {/* Lista */}
       <div className="card divide-y divide-surface-700">
         {/* Select-all header */}
-        {!isLoading && filtered.length > 0 && (
+        {!isLoading && items.length > 0 && (
           <div className="flex items-center gap-3 px-4 py-2 bg-surface-800/50">
             <button onClick={toggleSelectAll} className="text-surface-400 hover:text-surface-200 transition-colors">
-              {selected.size === filtered.length && filtered.length > 0
+              {selected.size === items.length && items.length > 0
                 ? <CheckSquare size={13} className="text-brand-400" />
                 : <Square size={13} />
               }
             </button>
-            <span className="text-xs text-surface-500">Seleccionar todas ({filtered.length})</span>
+            <span className="text-xs text-surface-500">Seleccionar todas ({items.length})</span>
           </div>
         )}
 
         {isLoading ? (
           <div className="py-12 text-center text-sm text-surface-500">Cargando alertas...</div>
-        ) : filtered.length === 0 ? (
+        ) : items.length === 0 ? (
           <div className="py-16 text-center">
             <Bell size={28} className="text-surface-700 mx-auto mb-3" />
             <p className="text-sm text-surface-500">
@@ -243,7 +284,7 @@ export function AlertsPage() {
                'Sin alertas en este filtro'}
             </p>
           </div>
-        ) : filtered.map((alert) => {
+        ) : items.map((alert) => {
           const sev        = SEVERITY_CONFIG[alert.severity]
           const isSelected = selected.has(alert.id)
           return (
@@ -339,6 +380,31 @@ export function AlertsPage() {
             </div>
           )
         })}
+
+        {/* Paginación server-side */}
+        {!isLoading && total > PAGE_SIZE && (
+          <div className="px-4 py-3 flex items-center justify-between">
+            <span className="text-xs text-surface-500">
+              Página {page + 1} de {totalPages} · {total} en total
+            </span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => loadAlerts(page - 1)}
+                disabled={page === 0 || isLoading}
+                className="btn-secondary text-xs py-1 px-3 disabled:opacity-40"
+              >
+                ← Anterior
+              </button>
+              <button
+                onClick={() => loadAlerts(page + 1)}
+                disabled={page >= totalPages - 1 || isLoading}
+                className="btn-secondary text-xs py-1 px-3 disabled:opacity-40"
+              >
+                Siguiente →
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

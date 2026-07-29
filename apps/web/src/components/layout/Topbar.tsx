@@ -349,7 +349,7 @@ export function Topbar({ hamburger }: { hamburger?: React.ReactNode }) {
   // Load alert list the first time the panel opens (or if empty on re-open)
   useEffect(() => {
     if (panelOpen && alerts.length === 0) {
-      apiGet<Alert[]>('/alerts?limit=50').then(setAlerts).catch(() => {})
+      apiGet<{ items: Alert[] }>('/alerts?limit=50').then((d) => setAlerts(d.items)).catch(() => {})
     }
   }, [panelOpen])
 

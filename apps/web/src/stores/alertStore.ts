@@ -14,6 +14,10 @@ interface AlertState {
   // Compat: unreadCount = summary.unread (campana/menú). Se mantiene el nombre para
   // no romper consumidores, pero su valor SIEMPRE proviene del summary del backend.
   unreadCount: number
+  // Contador que se incrementa ante CADA evento de alerta llegado por WS (nueva,
+  // resuelta, recuperada). Las vistas paginadas (AlertsPage) lo observan para refrescar
+  // la página ACTUAL desde el servidor, sin mezclar filas de otros filtros (PR A req 6).
+  eventSeq: number
   isLoading: boolean
 
   setAlerts: (alerts: Alert[]) => void
@@ -41,6 +45,7 @@ export const useAlertStore = create<AlertState>((set, get) => ({
   alerts: [],
   summary: EMPTY_SUMMARY,
   unreadCount: 0,
+  eventSeq: 0,
   isLoading: false,
 
   // La lista de la vista actual. YA NO recalcula contadores: cargar una consulta
@@ -67,7 +72,7 @@ export const useAlertStore = create<AlertState>((set, get) => ({
       const alerts = exists
         ? state.alerts.map((a) => (a.id === alert.id ? { ...a, ...alert } : a))
         : [alert, ...state.alerts].slice(0, 200)
-      return { alerts }
+      return { alerts, eventSeq: state.eventSeq + 1 }
     })
     if (countsAsUnread) {
       const icon = SEVERITY_ICONS[alert.severity] || '⚡'
@@ -87,6 +92,7 @@ export const useAlertStore = create<AlertState>((set, get) => ({
       alerts: state.alerts.map((a) =>
         a.id === id ? { ...a, resolved: true, resolvedAt: a.resolvedAt ?? new Date().toISOString() } : a
       ),
+      eventSeq: state.eventSeq + 1,
     }))
     void get().refreshSummary()
   },

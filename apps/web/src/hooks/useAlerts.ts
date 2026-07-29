@@ -9,8 +9,8 @@ export function useAlerts(autoRefresh = false) {
 
   const load = useCallback(async () => {
     try {
-      const data = await apiGet<Alert[]>('/alerts?limit=200')
-      setAlerts(data)
+      const data = await apiGet<{ items: Alert[] }>('/alerts?limit=200')
+      setAlerts(data.items)
     } catch {}
   }, [setAlerts])
 
