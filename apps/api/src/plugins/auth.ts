@@ -24,6 +24,7 @@ declare module 'fastify' {
   interface FastifyInstance {
     authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>
     authorize: (roles: Role[]) => (request: FastifyRequest, reply: FastifyReply) => Promise<void>
+    requireStepUp: (request: FastifyRequest, reply: FastifyReply) => Promise<void>
   }
 }
 
@@ -95,6 +96,28 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
       }
     }
   )
+
+  // Decorator: exigir re-autenticación reciente (step-up MFA) para acciones sensibles.
+  // Debe ir DESPUÉS de authenticate/authorize (usa request.user). Espera el token de
+  // elevación en el header 'x-step-up-token'; si falta o es inválido responde 403 con
+  // code STEP_UP_REQUIRED para que el frontend solicite el segundo factor y reintente.
+  server.decorate('requireStepUp', async (request: FastifyRequest, reply: FastifyReply) => {
+    const raw = request.headers['x-step-up-token']
+    const token = Array.isArray(raw) ? raw[0] : raw
+    const deny = () => reply.status(403).send({
+      statusCode: 403, error: 'Forbidden',
+      message: 'Esta acción requiere una verificación de seguridad adicional',
+      code: 'STEP_UP_REQUIRED',
+    })
+    if (!token) return deny()
+    try {
+      const claims = server.jwt.verify(token) as any
+      const user = request.user as JWTPayload
+      if (claims?.step !== 'elevated' || claims?.sub !== user?.sub) return deny()
+    } catch {
+      return deny()
+    }
+  })
 })
 
 export { authPlugin }

@@ -75,6 +75,7 @@ export interface UserSession {
   createdAt:   string
   expiresAt:   string
   lastUsedAt?: string | null
+  current?:    boolean
 }
 
 export interface User {

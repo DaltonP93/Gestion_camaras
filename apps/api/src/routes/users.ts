@@ -252,9 +252,9 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     return reply.send(user)
   })
 
-  // DELETE /api/users/:id — Eliminar usuario (solo ADMIN)
+  // DELETE /api/users/:id — Eliminar usuario (solo ADMIN, con step-up)
   server.delete('/:id', {
-    preHandler: [server.authorize(['ADMIN'])],
+    preHandler: [server.authorize(['ADMIN']), server.requireStepUp],
   }, async (request, reply) => {
     const { id } = request.params as { id: string }
 
@@ -467,7 +467,7 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
 
   // POST /api/users/:id/reset-2fa — Admin resetea 2FA
   server.post('/:id/reset-2fa', {
-    preHandler: [server.authorize(['ADMIN'])],
+    preHandler: [server.authorize(['ADMIN']), server.requireStepUp],
   }, async (request, reply) => {
     const { id } = request.params as { id: string }
 

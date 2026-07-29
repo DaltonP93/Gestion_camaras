@@ -15,6 +15,9 @@ import { sessionsToPrune, accessTokenTtl, decideMfaGate } from '../services/secu
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
+// Ventana de gracia tras rotar: un refresh concurrente del mismo token (multi-pestaña)
+// dentro de este margen se trata como benigno, no como reutilización maliciosa.
+const REFRESH_REUSE_GRACE_MS = 30 * 1000               // 30 segundos
 // Lockout/política de contraseña: ahora configurables vía SecuritySettings.
 
 const loginSchema = z.object({
@@ -364,6 +367,43 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // ──────────────────────────────────────────────────────────
+  // POST /api/auth/step-up — re-autenticación reciente para acciones sensibles.
+  // Devuelve un token de elevación (5 min) que las rutas protegidas exigen en el
+  // header x-step-up-token. Usa TOTP si el usuario tiene MFA; contraseña si no.
+  // ──────────────────────────────────────────────────────────
+  server.post('/step-up', {
+    preHandler: [server.authenticate],
+    config: { rateLimit: { max: 10, timeWindow: '5 minutes' } },
+  }, async (request, reply) => {
+    const { code, password } = z.object({
+      code:     z.string().min(6).max(8).optional(),
+      password: z.string().min(1).optional(),
+    }).parse(request.body ?? {})
+
+    const user = await server.prisma.user.findUnique({ where: { id: request.user.sub } })
+    if (!user || !user.active) return reply.status(401).send({ message: 'No autorizado' })
+
+    let verified = false
+    if (user.twoFactorEnabled && user.twoFactorSecret) {
+      if (!code) return reply.status(400).send({ message: 'Ingresa el código de tu app autenticadora', code: 'CODE_REQUIRED' })
+      // Sólo TOTP para step-up (los códigos de recuperación se reservan para el login).
+      verified = verifyTotpToken(user.twoFactorSecret, code)
+    } else {
+      if (!password) return reply.status(400).send({ message: 'Ingresa tu contraseña', code: 'PASSWORD_REQUIRED' })
+      verified = await bcrypt.compare(password, user.passwordHash)
+    }
+
+    if (!verified) {
+      await AuditAction(server.prisma, user.id, 'STEP_UP_FAILED', user.id, request)
+      return reply.status(401).send({ message: 'Verificación incorrecta' })
+    }
+
+    const stepUpToken = (server.jwt as any).sign({ sub: user.id, step: 'elevated' }, { expiresIn: '5m' })
+    await AuditAction(server.prisma, user.id, 'STEP_UP_GRANTED', user.id, request)
+    return reply.send({ stepUpToken, expiresInSeconds: 300, method: user.twoFactorEnabled ? 'totp' : 'password' })
+  })
+
+  // ──────────────────────────────────────────────────────────
   // POST /api/auth/2fa/disable — disable 2FA
   // ──────────────────────────────────────────────────────────
   server.post('/2fa/disable', {
@@ -488,13 +528,22 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   }, async (request, reply) => {
     const sessions = await server.prisma.session.findMany({
       where: { userId: request.user.sub },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { lastUsedAt: 'desc' },
       select: {
         id: true, userAgent: true, ipAddress: true, deviceName: true,
         createdAt: true, expiresAt: true, lastUsedAt: true,
+        refreshToken: true, previousRefreshToken: true,
       },
     })
-    return reply.send(sessions)
+    // Marca la sesión ACTUAL comparando (opcionalmente) el refresh token del cliente,
+    // enviado en el header x-refresh-token. Cubre también el token recién rotado.
+    const raw = request.headers['x-refresh-token']
+    const rawToken = Array.isArray(raw) ? raw[0] : raw
+    const currentHash = rawToken ? hashToken(rawToken) : null
+    return reply.send(sessions.map(({ refreshToken, previousRefreshToken, ...s }) => ({
+      ...s,
+      current: !!currentHash && (refreshToken === currentHash || previousRefreshToken === currentHash),
+    })))
   })
 
   // ──────────────────────────────────────────────────────────
@@ -537,27 +586,88 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   // ──────────────────────────────────────────────────────────
   server.post('/refresh', async (request, reply) => {
     const { refreshToken } = refreshSchema.parse(request.body)
+    const presentedHash = hashToken(refreshToken)
+    const now = new Date()
 
     const session = await server.prisma.session.findUnique({
-      where: { refreshToken: hashToken(refreshToken) },
+      where: { refreshToken: presentedHash },
       include: { user: true },
     })
 
-    if (!session || session.expiresAt < new Date() || !session.user.active) {
+    // ── El token presentado es el ACTUAL de una sesión → rotar (con CAS atómico) ──
+    if (session) {
+      if (session.expiresAt < now || !session.user.active) {
+        return reply.status(401).send({
+          statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
+        })
+      }
+
+      const payload = { sub: session.user.id, username: session.user.username, role: session.user.role }
+      const newRefreshToken = (server.jwt as any).sign(
+        { ...payload, jti: crypto.randomUUID() },
+        { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
+      )
+      const newExpiry = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS)
+
+      // Rotación ATÓMICA: sólo triunfa la petición que aún ve `presentedHash` como
+      // token actual (compare-and-swap). El historial del token consumido se registra
+      // en la MISMA transacción, evitando falsos positivos de reutilización.
+      const won = await server.prisma.$transaction(async (tx) => {
+        const r = await tx.session.updateMany({
+          where: { id: session.id, refreshToken: presentedHash },
+          data: {
+            refreshToken: hashToken(newRefreshToken),
+            previousRefreshToken: presentedHash,
+            lastUsedAt: now,
+            expiresAt: newExpiry,
+          },
+        })
+        if (r.count === 0) return false
+        await tx.usedRefreshToken.create({
+          data: { userId: session.userId, tokenHash: presentedHash, sessionId: session.id, expiresAt: newExpiry },
+        })
+        return true
+      })
+
+      if (won) {
+        const sec = await getSecuritySettings(server.prisma)
+        const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
+        return reply.send({ accessToken: newAccessToken, refreshToken: newRefreshToken })
+      }
+      // Perdimos la carrera contra un refresh concurrente del MISMO token (multi-pestaña):
+      // se trata como benigno más abajo por la ventana de gracia.
+    }
+
+    // ── El token NO es el actual: ¿fue consumido antes? (historial de la familia) ──
+    const used = await server.prisma.usedRefreshToken.findUnique({ where: { tokenHash: presentedHash } })
+    if (used) {
+      const withinGrace = now.getTime() - used.usedAt.getTime() < REFRESH_REUSE_GRACE_MS
+      if (withinGrace) {
+        // Refresh concurrente legítimo (misma sesión, otra pestaña). NO se revoca nada;
+        // el cliente debe reintentar con los tokens ya rotados por la petición ganadora.
+        return reply.status(401).send({
+          statusCode: 401, error: 'Unauthorized',
+          message: 'Token rotado por una petición concurrente; reintenta.',
+          code: 'TOKEN_ROTATED',
+        })
+      }
+      // Reutilización de un token viejo fuera de la ventana de gracia → posible robo:
+      // se revoca TODA la familia de sesiones del usuario y su historial de tokens.
+      await server.prisma.$transaction([
+        server.prisma.session.deleteMany({ where: { userId: used.userId } }),
+        server.prisma.usedRefreshToken.deleteMany({ where: { userId: used.userId } }),
+      ])
+      await AuditAction(server.prisma, used.userId, 'REFRESH_TOKEN_REUSE', null, request)
       return reply.status(401).send({
-        statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
+        statusCode: 401, error: 'Unauthorized',
+        message: 'Sesión revocada por reutilización de token. Inicia sesión nuevamente.',
+        code: 'TOKEN_REUSE',
       })
     }
 
-    await server.prisma.session.update({
-      where: { id: session.id },
-      data: { lastUsedAt: new Date() },
+    return reply.status(401).send({
+      statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
     })
-
-    const payload = { sub: session.user.id, username: session.user.username, role: session.user.role }
-    const sec = await getSecuritySettings(server.prisma)
-    const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
-    return reply.send({ accessToken: newAccessToken })
   })
 
   // ──────────────────────────────────────────────────────────
@@ -764,9 +874,10 @@ async function completeLogin(server: any, request: any, reply: any, user: any, e
   // TTL del access token = timeout de sesión configurado (hace REAL el ajuste que
   // antes sólo vivía en la UI). El refresh conserva su ventana larga.
   const accessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
-  const refreshToken = server.jwt.sign(payload, {
-    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
-  })
+  const refreshToken = (server.jwt as any).sign(
+    { ...payload, jti: crypto.randomUUID() },
+    { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
+  )
 
   await server.prisma.session.create({
     data: {

@@ -8,6 +8,7 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { apiGet, apiPost, apiPut, apiDelete } from '@/lib/api'
+import { withStepUp } from '@/lib/stepup'
 import { clsx } from 'clsx'
 import type { User, Role, NVR, Camera, UserPermission } from '@/types'
 import { format, formatDistanceToNow } from 'date-fns'
@@ -355,19 +356,26 @@ export function UsersPage() {
   const handleDelete = async (u: User) => {
     if (!confirm(`¿Eliminar el usuario "${u.username}"? Esta acción no se puede deshacer.`)) return
     try {
-      await apiDelete(`/users/${u.id}`)
+      // Acción sensible: withStepUp solicita verificación adicional si el backend la exige.
+      await withStepUp((h) => apiDelete(`/users/${u.id}`, undefined, h))
       toast.success('Usuario eliminado')
       loadUsers()
-    } catch {}
+    } catch (err: any) {
+      if (err?.message === 'step-up-cancelled') return
+      toast.error(err?.response?.data?.message || 'No se pudo eliminar el usuario')
+    }
   }
 
   const handleReset2FA = async (u: User) => {
     if (!confirm(`¿Deshabilitar el 2FA del usuario "${u.username}"?`)) return
     try {
-      await apiPost(`/users/${u.id}/reset-2fa`, {})
+      await withStepUp((h) => apiPost(`/users/${u.id}/reset-2fa`, {}, h))
       toast.success('2FA deshabilitado para el usuario')
       loadUsers()
-    } catch {}
+    } catch (err: any) {
+      if (err?.message === 'step-up-cancelled') return
+      toast.error(err?.response?.data?.message || 'No se pudo restablecer el 2FA')
+    }
   }
 
   const handleUnlock = async (u: User) => {

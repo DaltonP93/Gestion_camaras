@@ -30,8 +30,8 @@ export const securityRoutes: FastifyPluginAsync = async (server) => {
     return reply.send(settings)
   })
 
-  // PUT /api/security/settings — ADMIN (persistencia REAL + auditoría)
-  server.put('/settings', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+  // PUT /api/security/settings — ADMIN (persistencia REAL + auditoría, con step-up)
+  server.put('/settings', { preHandler: [server.authorize(['ADMIN']), server.requireStepUp] }, async (request, reply) => {
     const data = settingsSchema.parse(request.body)
     const before = await getSecuritySettings(server.prisma)
 

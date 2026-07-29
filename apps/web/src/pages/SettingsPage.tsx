@@ -7,6 +7,7 @@ import {
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
 import { apiGet, apiPut, apiPost } from '@/lib/api'
+import { withStepUp } from '@/lib/stepup'
 import type { AlertSettings } from '@/types'
 import { pickDeliveryTimestamp, formatAsuncionDateTime } from '@/lib/deliveryHistory'
 
@@ -123,7 +124,8 @@ export function SettingsPage() {
   const handleSaveSecurity = async () => {
     setSaving(true)
     try {
-      await apiPut('/security/settings', {
+      // Acción sensible: puede exigir step-up (verificación adicional) en el backend.
+      await withStepUp((h) => apiPut('/security/settings', {
         sessionTimeoutMinutes: sessionTimeout,
         maxSessions,
         requireStrongPassword,
@@ -132,10 +134,12 @@ export function SettingsPage() {
         lockoutDurationMinutes,
         mfaRequired,
         mfaGracePeriodLogins,
-      })
+      }, h))
       toast.success('Ajustes de seguridad guardados')
     } catch (err: any) {
-      toast.error(err?.response?.data?.message || 'No se pudieron guardar los ajustes de seguridad')
+      if (err?.message !== 'step-up-cancelled') {
+        toast.error(err?.response?.data?.message || 'No se pudieron guardar los ajustes de seguridad')
+      }
     } finally {
       setSaving(false)
     }
