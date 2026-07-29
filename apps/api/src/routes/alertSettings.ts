@@ -22,17 +22,23 @@ const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
   server.get('/settings/deliveries', {
     preHandler: [server.authorize(['ADMIN'])],
   }, async (request, reply) => {
-    const { page = '0', limit = '50' } = request.query as Record<string, string>
-    const skip = Number(page) * Number(limit)
+    const { page = '0', limit = '50', status } = request.query as Record<string, string>
+    const take = Math.min(200, Math.max(1, Number(limit) || 50))
+    const pageNum = Math.max(0, Number(page) || 0)
+    const skip = pageNum * take
+    // Filtro por estado (enviados / fallidos / todos). Orden descendente estable
+    // por createdAt (siempre presente, incluso en fallidos que no tienen sentAt).
+    const where = status && status !== 'all' ? { status } : {}
     const [deliveries, total] = await Promise.all([
       server.prisma.notificationDelivery.findMany({
+        where,
         orderBy: { createdAt: 'desc' },
         skip,
-        take: Number(limit),
+        take,
       }),
-      server.prisma.notificationDelivery.count(),
+      server.prisma.notificationDelivery.count({ where }),
     ])
-    return reply.send({ deliveries, total, page: Number(page), limit: Number(limit) })
+    return reply.send({ deliveries, total, page: pageNum, limit: take })
   })
 
   // GET /api/alerts/settings

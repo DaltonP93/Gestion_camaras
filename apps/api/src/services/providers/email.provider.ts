@@ -13,6 +13,7 @@ export interface EmailResult {
   success: boolean
   recipient: string
   error?: string
+  errorCode?: string   // código SMTP/Node (p.ej. EAUTH, ECONNECTION, ETIMEDOUT)
 }
 
 // Derive the correct TLS mode from the configured port — same logic as the
@@ -83,9 +84,9 @@ export async function sendAlertEmail(prisma: PrismaClient, payload: EmailPayload
         await transporter.sendMail(mail)
         return { success: true, recipient }
       } catch (retryErr: any) {
-        return { success: false, recipient, error: retryErr.message || 'Error desconocido al enviar email' }
+        return { success: false, recipient, error: retryErr.message || 'Error desconocido al enviar email', errorCode: retryErr.code }
       }
     }
-    return { success: false, recipient, error: err.message || 'Error desconocido al enviar email' }
+    return { success: false, recipient, error: err.message || 'Error desconocido al enviar email', errorCode: err.code }
   }
 }

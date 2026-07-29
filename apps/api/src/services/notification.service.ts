@@ -156,31 +156,45 @@ export async function sendAlertNotification(
     AUTH_FAILED: 'Fallo de Autenticación',
   }
 
-  // 6. Registrar delivery pendiente
+  const subject = `[VisionCore] ${alert.severity}: ${typeLabels[alert.type] || alert.type}${extra.nvrName ? ` — ${extra.nvrName}` : ''}`
+
+  // 6. Registrar delivery pendiente con TODO el contexto denormalizado (tipo,
+  //    cámara, NVR, asunto) y la marca del intento — así el historial es completo
+  //    aunque la alerta se elimine por retención (P1).
+  const attemptedAt = new Date()
   const delivery = await prisma.notificationDelivery.create({
     data: {
       alertId: alert.id,
       channel: 'email',
       status: 'pending',
       recipient: settings.recipientEmails,
-    },
+      attemptedAt,
+      subject,
+      alertType: alert.type,
+      cameraName: extra.cameraName ?? null,
+      nvrName: extra.nvrName ?? null,
+    } as any,
   })
 
   // 7. Enviar email
   const result = await sendAlertEmail(prisma, {
-    subject: `[VisionCore] ${alert.severity}: ${typeLabels[alert.type] || alert.type}${extra.nvrName ? ` — ${extra.nvrName}` : ''}`,
+    subject,
     html: buildEmailHtml(alert, extra),
     text: buildEmailText(alert, extra),
   })
 
-  // 8. Actualizar registro
+  // 8. Actualizar registro. Los FALLIDOS registran failedAt (no dependen de sentAt)
+  //    y errorCode; se cuenta el intento (attempts) para el historial.
+  const now = new Date()
   await prisma.notificationDelivery.update({
     where: { id: delivery.id },
     data: {
       status: result.success ? 'sent' : 'failed',
       recipient: result.recipient || settings.recipientEmails,
       error: result.error || null,
-      sentAt: result.success ? new Date() : null,
-    },
+      errorCode: (result as any).errorCode ?? null,
+      sentAt: result.success ? now : null,
+      failedAt: result.success ? null : now,
+    } as any,
   })
 }

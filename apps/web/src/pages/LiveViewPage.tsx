@@ -91,6 +91,8 @@ export function LiveViewPage() {
   const [searchParams] = useSearchParams()
   const nvrFilter    = searchParams.get('nvr')
   const cameraFilter = searchParams.get('camera')
+  // Al llegar desde "Ver en vivo" de una cámara, abrirla en 1×1 (foco) directamente.
+  const focusParam   = searchParams.get('focus')
 
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
   const { user } = useAuthStore()
@@ -194,26 +196,32 @@ export function LiveViewPage() {
     const targetNvrId = cam.nvrId
     const nvrCams     = cameras.filter(c => c.nvrId === targetNvrId)
     const camIdx      = nvrCams.findIndex(c => c.id === cameraFilter)
-    const targetPage  = camIdx >= 0 ? Math.floor(camIdx / gridLayout) : 0
-    console.info(`[LiveView] queryCameraResolved cameraId=${cameraFilter} nvrId=${targetNvrId} index=${camIdx} page=${targetPage}`)
+    // Foco 1×1 pedido por el deep-link: la cámara queda SOLA en su página. Con
+    // layout 1 la página objetivo es su índice directo (no floor/gridLayout).
+    const wantFocus       = focusParam === '1' || focusParam === 'true'
+    const effectiveLayout = wantFocus ? 1 : gridLayout
+    const targetPage      = camIdx >= 0 ? Math.floor(camIdx / effectiveLayout) : 0
+    console.info(`[LiveView] queryCameraResolved cameraId=${cameraFilter} nvrId=${targetNvrId} index=${camIdx} page=${targetPage} focus=${wantFocus}`)
 
     // Start highlight immediately so it's visible once the grid settles
     setHighlightCamera(cameraFilter)
     setTimeout(() => setHighlightCamera(null), 4000)
 
-    const needsNvrSwitch  = selectedNVR !== targetNvrId
-    const needsPageSwitch = safePage !== targetPage
+    const needsNvrSwitch    = selectedNVR !== targetNvrId
+    const needsPageSwitch   = safePage !== targetPage
+    const needsLayoutSwitch = wantFocus && gridLayout !== 1
 
-    if (needsNvrSwitch || needsPageSwitch) {
+    if (needsNvrSwitch || needsPageSwitch || needsLayoutSwitch) {
       // Stop all active streams before switching NVR/page — mirrors handleNVRChange/handlePageChange
       stopAllSessions('camera_query').then(() => {
         prevVisibleIds.current = []
+        if (wantFocus) setGridLayout(1)   // abrir en 1×1
         setSelectedNVR(targetNvrId)
         setPage(targetPage)
       })
     }
     // If camera is already visible (same NVR, same page) only the highlight is needed
-  }, [cameras, cameraFilter, gridLayout]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cameras, cameraFilter, gridLayout, focusParam]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     apiGet<{ ffmpegAvailable: boolean; transcodingEnabled: boolean }>('/live-view/capabilities')
