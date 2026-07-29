@@ -67,3 +67,39 @@ export function isDrainRace(opts: {
 export function isCancellation(opts: { clientGone: boolean; sessionAlive: boolean }): boolean {
   return opts.clientGone || !opts.sessionAlive
 }
+
+// Superficie del registro que necesita la decisión de takeover (para testear con un
+// doble sin construir Fastify). La implementa PreviewProcessRegistry.
+export interface TakeoverRegistry {
+  aliveCount(): number
+  terminateAll(reason: string, hooks?: unknown): Promise<void>
+  waitAllExited(timeoutMs: number): Promise<boolean>
+}
+
+export type TakeoverOutcome =
+  | { proceed: true }
+  | { proceed: false; status: number; code: string }
+
+/**
+ * Decisión del TAKEOVER de un segundo GET /stream (req 1, 2, 6, 10). El route llama
+ * ESTA función — no una reimplementación — para que el test la cubra de verdad.
+ *
+ * Si no hay procesos vivos → proceder (spawn). Si los hay: terminar TODOS y esperar
+ * su SALIDA REAL (exit/close) de forma acotada. El siguiente FFmpeg SÓLO puede
+ * crearse cuando aliveCount()===0 tras esa salida real; si al vencer el deadline
+ * sigue vivo alguno (p.ej. SIGKILL enviado pero sin exit todavía), NO se procede:
+ * se responde 503 PREVIOUS_FFMPEG_NOT_REAPED y NUNCA se spawnea un segundo proceso.
+ */
+export async function resolveStreamTakeover(
+  reg: TakeoverRegistry,
+  opts: { reason: string; deadlineMs: number; hooks?: unknown; onTakeoverStart?: (alive: number) => void },
+): Promise<TakeoverOutcome> {
+  if (reg.aliveCount() === 0) return { proceed: true }
+  opts.onTakeoverStart?.(reg.aliveCount())
+  void reg.terminateAll(opts.reason, opts.hooks)
+  const reaped = await reg.waitAllExited(opts.deadlineMs)
+  if (!reaped || reg.aliveCount() > 0) {
+    return { proceed: false, status: 503, code: 'PREVIOUS_FFMPEG_NOT_REAPED' }
+  }
+  return { proceed: true }
+}

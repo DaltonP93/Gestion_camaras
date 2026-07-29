@@ -13,7 +13,7 @@ import path from 'path'
 
 import { decryptNvrPassword as decryptPass } from '../services/credentials'
 import { MemorySessionStore, RedisSessionStore, type SessionStore } from '../services/session-store'
-import { shouldAcceptFirstByte, errorStatusForCategory, isCancellation } from './recordings-preview-state'
+import { shouldAcceptFirstByte, errorStatusForCategory, isCancellation, resolveStreamTakeover } from './recordings-preview-state'
 import {
   maskUrlCredentials, classifyRtspError,
   buildVariantChain as buildVariantChainPure,
@@ -531,27 +531,25 @@ const previewSessions = new Map<string, PreviewSession>()
 // sólo el "actual". Estas funciones centralizan la terminación y el teardown para
 // que ninguna ruta (DELETE, cierre de socket, request_error, sweep) deje huérfanos.
 
-// SIGTERM ahora + SIGKILL de gracia si el hijo ignora la señal. Idempotente por
-// attempt (el registro sólo señaliza a los vivos).
-function scheduleGraceKill(session: PreviewSession, rec: AttemptRecord, log: (m: string) => void) {
-  const t = setTimeout(() => {
-    session.procRegistry?.sigkillIfAlive(rec.attemptId, (r) =>
-      log(`[recordings-preview] sigkill_orphan attemptId=${r.attemptId} pid=${r.pid ?? 'none'} — ignoró SIGTERM`))
-  }, PREVIEW_KILL_GRACE_MS)
-  if (typeof t.unref === 'function') t.unref()
+// Hooks de log para la secuencia idempotente SIGTERM→gracia→SIGKILL del registro.
+function terminateHooks(log: (m: string) => void) {
+  return {
+    onSigterm: (rec: AttemptRecord) =>
+      log(`[recordings-preview] attempt_terminate attemptId=${rec.attemptId} pid=${rec.pid ?? 'none'} reason=${rec.terminationReason ?? 'none'}`),
+    onSigkill: (rec: AttemptRecord) =>
+      log(`[recordings-preview] sigkill_orphan attemptId=${rec.attemptId} pid=${rec.pid ?? 'none'} — ignoró SIGTERM`),
+  }
 }
 
-// Termina TODOS los hijos vivos de la sesión (req 11/14). Devuelve cuántos quedan
-// sin confirmar salida (pendientes de su `close`).
+// Termina TODOS los hijos vivos de la sesión (req 11/14). La secuencia y el timer de
+// SIGKILL los posee el registro (idempotente por attempt). Devuelve cuántos siguen
+// SIN confirmar salida real (exit/close) — pendientes de reaping.
 function terminateAllPreviewChildren(session: PreviewSession, reason: string, log: (m: string) => void): number {
   const reg = session.procRegistry
   if (!reg) return 0
-  const pending = reg.terminateAll((rec) => {
-    log(`[recordings-preview] attempt_terminate sessionId_reason=${reason} attemptId=${rec.attemptId} pid=${rec.pid ?? 'none'}`)
-    scheduleGraceKill(session, rec, log)
-  })
+  void reg.terminateAll(reason, terminateHooks(log))
   session.vodProcess = undefined
-  return pending.length
+  return reg.aliveCount()
 }
 
 // Teardown ORDENADO de una sesión (req 12): closing → bloquear GET → disposers →
@@ -758,10 +756,14 @@ setInterval(() => {
     const reg = session.procRegistry
     if (!reg) continue
     // Reaper de huérfanos: un FFmpeg vivo que ya no es el proceso activo y lleva
-    // demasiado tiempo → SIGKILL (esto es EXACTAMENTE el bug de producción: el
-    // primer FFmpeg de una sessionId con dos GET, que quedó sin dueño).
-    reg.reapOrphans(session.vodProcess, now, PREVIEW_ORPHAN_REAP_MS, (rec) =>
-      console.warn(`[recordings-preview] orphan_ffmpeg_reaped sessionId=${sid} attemptId=${rec.attemptId} pid=${rec.pid ?? 'none'} ageMs=${now - rec.spawnedAt}`))
+    // demasiado tiempo → terminación idempotente (esto es EXACTAMENTE el bug de
+    // producción: el primer FFmpeg de una sessionId con dos GET, que quedó sin dueño).
+    reg.reapOrphans(session.vodProcess, now, PREVIEW_ORPHAN_REAP_MS, 'orphan_sweep', {
+      onSigterm: (rec) =>
+        console.warn(`[recordings-preview] orphan_ffmpeg_reaped sessionId=${sid} attemptId=${rec.attemptId} pid=${rec.pid ?? 'none'} ageMs=${now - rec.spawnedAt}`),
+      onSigkill: (rec) =>
+        console.warn(`[recordings-preview] orphan_ffmpeg_sigkill sessionId=${sid} attemptId=${rec.attemptId} pid=${rec.pid ?? 'none'}`),
+    })
     // Sesión con hijos vivos pero SIN consumidor adjunto por un tiempo → terminar
     // (nadie está leyendo ese MP4; el FFmpeg sólo consume RTSP del NVR).
     if (!session.streamAttached && reg.aliveCount() > 0 &&
@@ -1980,28 +1982,35 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // vez de arrancar un FFmpeg PARALELO (bug P1), se TOMA EL CONTROL: terminar el
     // intento anterior y esperar su salida antes de spawnar el nuevo. Nunca dos
     // FFmpeg vivos para la misma sessionId.
-    if (!session.procRegistry) session.procRegistry = new PreviewProcessRegistry()
+    if (!session.procRegistry) session.procRegistry = new PreviewProcessRegistry({ graceMs: PREVIEW_KILL_GRACE_MS })
     const myGen = (session.streamGeneration = (session.streamGeneration ?? 0) + 1)
-    if (session.procRegistry.aliveCount() > 0) {
-      server.log.info(
-        `[recordings-preview] stream_takeover sessionId=${sessionId} gen=${myGen}` +
-        ` priorAlive=${session.procRegistry.aliveCount()}`
-      )
-      terminateAllPreviewChildren(session, 'stream_takeover', (m) => server.log.info(m))
-      // Esperar (acotado) a que el intento anterior confirme salida — evita
-      // solapar dos FFmpeg contra el mismo RTSP del NVR.
-      const waitDeadline = Date.now() + PREVIEW_KILL_GRACE_MS + 500
-      while (session.procRegistry.aliveCount() > 0 && Date.now() < waitDeadline) {
-        await new Promise((r) => setTimeout(r, 50))
-        // Otro GET aún más nuevo llegó mientras esperábamos → ceder sin spawnar.
-        if (session.streamGeneration !== myGen) {
-          return reply.status(409).send({ message: 'Stream reemplazado por una solicitud más reciente' })
-        }
-      }
-    }
-    // ¿Un GET más nuevo tomó el control mientras terminábamos el anterior? Ceder.
+    // ── Takeover (req 1/2/6/10): terminar el intento anterior y NO spawnear otro
+    // FFmpeg hasta confirmar su SALIDA REAL (exit/close). El route usa la misma
+    // función pura que cubren los tests (resolveStreamTakeover) — sin reimplementar.
+    session.vodProcess = undefined
+    const takeover = await resolveStreamTakeover(session.procRegistry, {
+      reason: 'stream_takeover',
+      deadlineMs: PREVIEW_KILL_GRACE_MS + 500,
+      hooks: terminateHooks((m) => server.log.info(m)),
+      onTakeoverStart: (alive) =>
+        server.log.info(`[recordings-preview] stream_takeover sessionId=${sessionId} gen=${myGen} priorAlive=${alive}`),
+    })
+    // Otro GET aún más nuevo llegó mientras esperábamos → ceder sin spawnar.
     if (session.streamGeneration !== myGen) {
       return reply.status(409).send({ message: 'Stream reemplazado por una solicitud más reciente' })
+    }
+    if (!takeover.proceed) {
+      // HARD GATE: el anterior no confirmó salida al vencer el deadline. NO adquirir
+      // slot, NO hijack, NO spawn — así nunca hay dos FFmpeg vivos para la misma
+      // sessionId, ni transitoriamente.
+      server.log.error(
+        `[recordings-preview] takeover_previous_not_reaped sessionId=${sessionId} gen=${myGen}` +
+        ` stillAlive=${session.procRegistry.aliveCount()} — no se spawnea otro FFmpeg`
+      )
+      return reply.status(takeover.status).send({
+        code: takeover.code,
+        message: 'El proceso de reproducción anterior aún no terminó — reintentá en unos segundos',
+      })
     }
     // La sesión pudo eliminarse (DELETE) durante la espera del takeover.
     if (session.closing || !previewSessions.has(sessionId)) {
@@ -2503,6 +2512,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         exitSignal = signal ?? null
         clearFirstByteWatchdog()
         if (attemptState === 'waiting_first_byte') attemptState = 'terminal'
+        // (4) SALIDA REAL confirmada por el evento del proceso — resuelve la espera
+        // del takeover y cancela cualquier SIGKILL de gracia pendiente. Es lo ÚNICO
+        // que baja aliveCount() (nunca la señal enviada).
+        session.procRegistry?.markExited(attemptRec.attemptId)
         server.log.info(
           `[recordings-preview] ffmpeg_exit sessionId=${sessionId}` +
           ` code=${code} signal=${signal ?? 'none'} variant=${variant} elapsedMs=${Date.now() - streamStartMs}` +

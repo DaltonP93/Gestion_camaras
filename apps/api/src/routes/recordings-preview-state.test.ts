@@ -1,8 +1,9 @@
 // Tests de la lógica pura del ciclo de vida del preview: el gate de "primer byte"
 // (evita aceptar bytes tardíos tras timeout/kill/cierre → MP4 truncado), el mapeo
 // de status HTTP del error, y la clasificación de cancelación vs fallo del NVR.
-import { describe, it, expect } from 'vitest'
-import { shouldAcceptFirstByte, errorStatusForCategory, isCancellation, isDrainRace } from './recordings-preview-state'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { shouldAcceptFirstByte, errorStatusForCategory, isCancellation, isDrainRace, resolveStreamTakeover } from './recordings-preview-state'
+import { PreviewProcessRegistry, type ManagedProc } from '../services/recordings/preview-process-registry'
 
 const base = { state: 'waiting_first_byte' as const, variantTimedOut: false, procExited: false, clientGone: false, responseEnded: false }
 
@@ -80,5 +81,58 @@ describe('isCancellation', () => {
   })
   it('NO es cancelación si el cliente sigue y la sesión vive (fallo real del NVR)', () => {
     expect(isCancellation({ clientGone: false, sessionAlive: true })).toBe(false)
+  })
+})
+
+// REQUISITO 6: dos GET concurrentes al route. resolveStreamTakeover es EXACTAMENTE
+// la función que ejecuta el handler — se prueba contra un PreviewProcessRegistry
+// real con un ChildProcess simulado. spawn = registrar en el registro; sólo se
+// permite tras un takeover que devuelve proceed:true.
+function fakeProc(pid = Math.floor(Math.random() * 1e6)): ManagedProc & { kills: string[] } {
+  return { pid, kills: [] as string[], kill(s?: NodeJS.Signals | number) { this.kills.push(String(s ?? 'SIGTERM')); return true } }
+}
+
+describe('resolveStreamTakeover — dos GET concurrentes al route (req 1, 2, 6)', () => {
+  beforeEach(() => { vi.useFakeTimers() })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('sin procesos vivos → procede directo (primer GET, spawn permitido)', async () => {
+    const reg = new PreviewProcessRegistry({ graceMs: 50 })
+    const d = await resolveStreamTakeover(reg, { reason: 'stream_takeover', deadlineMs: 600 })
+    expect(d.proceed).toBe(true)
+  })
+
+  it('el anterior confirma exit real → el 2.º procede; nunca dos vivos', async () => {
+    const reg = new PreviewProcessRegistry({ graceMs: 50 })
+    let spawnCount = 0
+    const doSpawn = () => { spawnCount++; return reg.register(fakeProc(), 0) }
+    const first = doSpawn()                       // GET #1 spawn
+
+    // GET #2: takeover. El anterior confirma salida real durante la espera.
+    const p = resolveStreamTakeover(reg, { reason: 'stream_takeover', deadlineMs: 600 })
+    await vi.advanceTimersByTimeAsync(10)
+    reg.markExited(first.attemptId); reg.unregister(first.attemptId)
+    const d = await p
+    expect(d.proceed).toBe(true)
+    expect(reg.aliveCount()).toBe(0)
+    if (d.proceed) doSpawn()                       // GET #2 spawn recién ahora
+    expect(spawnCount).toBe(2)
+    expect(reg.aliveCount()).toBe(1)               // exactamente uno vivo, sin solape
+  })
+
+  it('el anterior NO sale → 503 PREVIOUS_FFMPEG_NOT_REAPED y el 2.º NO spawnea', async () => {
+    const reg = new PreviewProcessRegistry({ graceMs: 50 })
+    let spawnCount = 0
+    const doSpawn = () => { spawnCount++; return reg.register(fakeProc(), 0) }
+    doSpawn()                                      // GET #1, nunca emite exit
+
+    const p = resolveStreamTakeover(reg, { reason: 'stream_takeover', deadlineMs: 300 })
+    await vi.advanceTimersByTimeAsync(400)         // vence deadline sin exit real
+    const d = await p
+    expect(d.proceed).toBe(false)
+    if (!d.proceed) { expect(d.status).toBe(503); expect(d.code).toBe('PREVIOUS_FFMPEG_NOT_REAPED') }
+    if (d.proceed) doSpawn()                        // no debe ocurrir
+    expect(spawnCount).toBe(1)                      // el 2.º GET NO llamó spawn
+    expect(reg.aliveCount()).toBe(1)               // nunca hubo dos procesos vivos
   })
 })
