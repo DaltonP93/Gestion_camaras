@@ -5,6 +5,7 @@ import { execSync, spawn } from 'child_process'
 import type { ChildProcess } from 'child_process'
 import type { NVR, Camera } from '@prisma/client'
 import { buildRtspUrl } from './hikvision'
+import { resolveTranscodeProfile, buildTranscodeArgs } from './transcode-profile'
 
 const mediamtxApi = axios.create({
   baseURL: process.env.MEDIAMTX_URL || 'http://mediamtx:9997',
@@ -131,7 +132,7 @@ export function getRtspTimeoutOption(): RtspTimeoutOpt {
   return _rtspTimeoutOpt
 }
 
-export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string): ChildProcess | null {
+export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string, profile: 'grid' | 'focus' = 'grid'): ChildProcess | null {
   const pass: string = (nvr as any).password ?? ''
   if (!pass) {
     console.error(`[transcode] spawn_abort path=${streamPath} reason=PASSWORD_EMPTY (decryptPass returned empty — check NVR_CREDENTIAL_KEY)`)
@@ -147,66 +148,14 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
 
   const rtspOutput = `rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${streamPath}`
 
-  // GOP: force keyframe every TRANSCODE_GOP_SECONDS (default 2s) so HLS segments stay short
-  const fps       = Number(HEVC_TRANSCODE_FPS) || 15
-  const gopFrames = Math.max(1, Math.round(fps * TRANSCODE_GOP_SECONDS))
-
-  // Bitrate / maxrate / bufsize
-  const bitrateNum  = parseInt(HEVC_TRANSCODE_BITRATE) || 1500
-  const bitrateUnit = HEVC_TRANSCODE_BITRATE.replace(/^\d+/, '') || 'k'
-  const bufsize     = TRANSCODE_BUFSIZE_ENV || `${bitrateNum * 2}${bitrateUnit}`
-
   // Detect which RTSP I/O timeout option this FFmpeg build supports.
   // Alpine FFmpeg 8.0.1: -timeout (not -rw_timeout). Detection is cached after first call.
   const rtspTimeoutOpt = getRtspTimeoutOption()
 
-  const args: string[] = [
-    '-rtsp_transport', 'tcp',
-    '-fflags', '+genpts+discardcorrupt',
-    '-use_wallclock_as_timestamps', '1',
-    ...(rtspTimeoutOpt ? [rtspTimeoutOpt, '15000000'] : []),  // 15s RTSP I/O timeout (microseconds)
-    '-reorder_queue_size', '0',
-    '-i', rtspInput,
-    '-an',
-  ]
-
-  // Scale — skip if TRANSCODE_WIDTH=source
-  if (HEVC_TRANSCODE_WIDTH !== 'source') {
-    args.push('-vf', `scale=${HEVC_TRANSCODE_WIDTH}:-2`)
-  }
-
-  args.push(
-    '-r', HEVC_TRANSCODE_FPS,
-    '-c:v', TRANSCODE_ENCODER,
-    '-preset', HEVC_TRANSCODE_PRESET,
-  )
-
-  // -tune zerolatency only valid for libx264/libx265
-  if (TRANSCODE_ENCODER === 'libx264' || TRANSCODE_ENCODER === 'libx265') {
-    args.push('-tune', 'zerolatency')
-  }
-
-  // Browser-compatibility + short GOP for live view
-  args.push(
-    '-pix_fmt', 'yuv420p',
-    '-profile:v', 'main',
-    '-level', '4.1',
-    '-bf', '0',               // no B-frames (already implied by zerolatency but explicit)
-    '-sc_threshold', '0',     // disable scene-change detection to keep GOP regular
-    '-g', String(gopFrames),
-    '-keyint_min', String(gopFrames),
-    // force_key_frames guarantees keyframes every TRANSCODE_GOP_SECONDS regardless of encoder
-    '-force_key_frames', `expr:gte(t,n_forced*${TRANSCODE_GOP_SECONDS})`,
-  )
-
-  args.push(
-    '-b:v', HEVC_TRANSCODE_BITRATE,
-    '-maxrate', TRANSCODE_MAXRATE,
-    '-bufsize', bufsize,
-    '-f', 'rtsp',
-    '-rtsp_transport', 'tcp',
-    rtspOutput,
-  )
+  // Perfil de transcodificación: 'grid' reproduce la config previa (grilla sin cambios);
+  // 'focus' usa LIVE_FOCUS_TRANSCODE_* (1080p por defecto) sólo para el 1×1/foco.
+  const cfg  = resolveTranscodeProfile(profile)
+  const args = buildTranscodeArgs(cfg, { rtspInput, rtspOutput, rtspTimeoutOpt })
 
   // Kill any stale process for this path before spawning a new one
   stopTranscodeProcess(streamPath)
@@ -214,9 +163,9 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   const inputMasked = rtspInput.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
   console.info(`[transcode] spawn_start path=${streamPath} source=${inputMasked}`)
   console.info(
-    `[transcode] spawn_ffmpeg path=${streamPath} encoder=${TRANSCODE_ENCODER}` +
-    ` fps=${HEVC_TRANSCODE_FPS} width=${HEVC_TRANSCODE_WIDTH} gopFrames=${gopFrames}` +
-    ` bitrate=${HEVC_TRANSCODE_BITRATE} maxrate=${TRANSCODE_MAXRATE} bufsize=${bufsize}` +
+    `[transcode] spawn_ffmpeg path=${streamPath} profile=${profile} encoder=${cfg.encoder}` +
+    ` fps=${cfg.fps} width=${cfg.width}` +
+    ` bitrate=${cfg.bitrate} maxrate=${cfg.maxrate}` +
     ` input=${inputMasked}`
   )
   // Log full command for diagnosis (mask password)

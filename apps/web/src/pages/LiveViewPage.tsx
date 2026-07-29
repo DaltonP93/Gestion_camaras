@@ -882,7 +882,7 @@ export function LiveViewPage() {
     }
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main', viewId })
+      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main', viewId, profile: 'focus' })
       // Backend may auto-redirect main→main_h264 (HEVC camera + transcoding enabled).
       // Detect the actual stream type from the response so stop-stream/quality-switch
       // use the correct type key.
@@ -920,6 +920,24 @@ export function LiveViewPage() {
       })
     }
   }, [bumpPlayerKeys, streamCapabilities, focusStreamType])
+
+  // Deep-link ?focus=1: entrar al modo FOCO REAL (calidad principal) una vez que la
+  // cámara objetivo está en su NVR. Antes el deep-link sólo cambiaba a layout 1×1 y la
+  // celda seguía pidiendo el substream (badge "Sub 640×360"); ahora dispara el mismo
+  // camino que el doble clic / pantalla completa, que solicita main/main_h264.
+  const appliedFocusQuery = useRef<string | null>(null)
+  useEffect(() => {
+    const wantFocus = focusParam === '1' || focusParam === 'true'
+    if (!wantFocus || !cameraFilter || cameras.length === 0) return
+    const cam = cameras.find(c => c.id === cameraFilter)
+    if (!cam || selectedNVR !== cam.nvrId) return       // esperar a que el NVR objetivo esté activo
+    if (appliedFocusQuery.current === cameraFilter || focusCamera === cam.id) {
+      appliedFocusQuery.current = cameraFilter
+      return
+    }
+    appliedFocusQuery.current = cameraFilter
+    handleEnterFocus(cam)
+  }, [focusParam, cameraFilter, cameras, selectedNVR, focusCamera, handleEnterFocus])
 
   // ─── Quality switch from VideoPlayer (Baja/Alta/Trans buttons) ─
   const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main' | 'main_h264') => {
@@ -964,7 +982,7 @@ export function LiveViewPage() {
     setFocusStreamType(quality)
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality, viewId })
+      const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality, viewId, profile: 'focus' })
       const actualType: 'sub' | 'main' | 'main_h264' =
         (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
           ? 'main_h264' : quality
@@ -1107,16 +1125,18 @@ export function LiveViewPage() {
               // the stream was blocked before the API call (focusStreamInfo=null).
               const focusType  = focusStreamType
               const focusHls   = isMain ? focusStreamInfo!.hls : (stream?.hls || '')
-              const focusCodec = focusStreamType === 'main' || focusStreamType === 'main_h264'
-                ? cam.mainCodec
-                : cam.subCodec
-              // For transcoded streams the output resolution depends on TRANSCODE_WIDTH env var,
-              // not the camera's native mainResolution — don't show misleading metadata.
-              const focusRes   = focusStreamType === 'main_h264'
-                ? undefined
-                : focusStreamType === 'main'
-                  ? cam.mainResolution
-                  : cam.subResolution
+              // Metadatos REALES del backend cuando están disponibles (PR B): el
+              // start-stream ahora devuelve codec/resolution del stream servido. Para
+              // main_h264 el codec es H.264 y la resolución la de origen del main, así el
+              // badge muestra "Trans H.264 1920×1080" en vez de ocultar la resolución.
+              const info       = focusStreamInfo as any
+              const focusCodec = info?.codec ?? (
+                focusStreamType === 'main' || focusStreamType === 'main_h264' ? cam.mainCodec : cam.subCodec
+              )
+              const focusRes   = info?.resolution ?? (
+                focusStreamType === 'sub' ? cam.subResolution :
+                focusStreamType === 'main' ? cam.mainResolution : undefined
+              )
               const canTryMainStream = focusStreamType === 'sub' && !focusStreamError
               const transcodingAvailable = !!(streamCapabilities?.ffmpegAvailable && streamCapabilities?.transcodingEnabled)
               return (

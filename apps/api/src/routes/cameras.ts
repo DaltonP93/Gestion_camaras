@@ -364,6 +364,9 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+    // profile='focus' habilita el perfil de transcodificación de alta calidad (1080p)
+    // reservado al 1×1/foco; la grilla usa 'grid' (sin cambios).
+    const profile: 'grid' | 'focus' = body?.profile === 'focus' ? 'focus' : 'grid'
 
     if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
       // Registrar rechazo por permiso ANTES de startStream — es la única rama
@@ -375,7 +378,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     server.log.info(`[live] start_stream_requested cameraId=${id} streamType=${streamType} userId=${user.sub}`)
 
-    const result = await startStream(server, user.sub, id, viewId, streamType)
+    const result = await startStream(server, user.sub, id, viewId, streamType, profile)
     if (result.error) {
       if (result.error.code === 'TRANSCODE_LIMIT_REACHED') {
         server.log.warn(`[live] start_stream_failed cameraId=${id} code=TRANSCODE_LIMIT_REACHED streamType=${streamType}`)
@@ -435,6 +438,22 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     }).catch(() => {})
 
     const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+
+    // Metadatos REALES del stream servido (para el badge): el tipo efectivo se deriva del
+    // streamPath (el backend pudo cambiar sub→main o main→main_h264). El codec/resolución
+    // provienen de la sonda persistida por cámara. Para main_h264 (transcodificado) el
+    // codec de salida es H.264; la resolución de origen es la del main.
+    const cam = camera as any
+    const effectiveType: 'sub' | 'main' | 'main_h264' =
+      result.streamPath?.endsWith('_main_h264') ? 'main_h264' :
+      result.streamPath?.endsWith('_main')      ? 'main'      : 'sub'
+    const transcoded = effectiveType === 'main_h264' || result.transcoded === true
+    const codec =
+      transcoded            ? 'H264' :
+      effectiveType === 'main' ? (cam?.mainCodec ?? null) : (cam?.subCodec ?? null)
+    const resolution =
+      effectiveType === 'sub' ? (cam?.subResolution ?? null) : (cam?.mainResolution ?? null)
+
     return reply.send({
       cameraId:   id,
       streamPath: result.streamPath,
@@ -442,6 +461,12 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       webrtc:     result.webrtcUrl,
       channel:    camera?.channel ?? 0,
       nvrName:    camera?.nvr?.name ?? '',
+      // Metadatos reales para la insignia de calidad (PR B).
+      streamType: effectiveType,
+      transcoded,
+      codec,
+      resolution,
+      warning:    result.warning ?? undefined,
     })
   })
 

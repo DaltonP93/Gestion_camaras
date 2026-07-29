@@ -4,6 +4,7 @@
 import type { FastifyInstance } from 'fastify'
 import type { ChildProcess } from 'child_process'
 import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr, getStreamDetails, getActiveTranscodesList, getTranscodeRawStderr, getTranscodeRtspMasked } from './stream'
+import { focusMaxTranscodes } from './transcode-profile'
 import type { NVR, Camera } from '@prisma/client'
 import { decryptNvrPassword as decryptPass } from './credentials'
 
@@ -54,6 +55,9 @@ interface TranscodeSourceRef {
 const transcodeRestarts   = new Map<string, TranscodeRestartInfo>()
 const transcodeSourceInfo = new Map<string, TranscodeSourceRef>()
 const transcodeLastActivity  = new Map<string, number>()  // ms — last viewer heartbeat for this path
+// Perfil ('grid'|'focus') con el que se lanzó cada transcode, para que el supervisor lo
+// reinicie con la MISMA calidad (p.ej. no bajar un foco 1080p a grilla tras un reinicio).
+const transcodeProfileByPath = new Map<string, 'grid' | 'focus'>()
 const SUPERVISOR_GRACE_MS    = 60_000  // restart if viewer was active within this window
 
 const SUPERVISOR_MAX_RESTARTS = 3
@@ -167,6 +171,7 @@ export function pruneStaleSessions(): number {
       transcodeRestarts.delete(session.streamPath)
       transcodeSourceInfo.delete(session.streamPath)
       transcodeLastActivity.delete(session.streamPath)
+      transcodeProfileByPath.delete(session.streamPath)
     }
     if (session.streamType === 'sub') {
       viewCameras.get(vk)?.delete(session.cameraId)
@@ -432,7 +437,7 @@ async function runTranscodeSupervisor(
     return
   }
 
-  const proc = spawnTranscodeProcess(sourceRef.nvr, sourceRef.camera, streamPath)
+  const proc = spawnTranscodeProcess(sourceRef.nvr, sourceRef.camera, streamPath, transcodeProfileByPath.get(streamPath) ?? 'grid')
   if (!proc) {
     console.error(`[supervisor] restart_spawn_failed path=${streamPath} attempt=${info.count}`)
     sessions.delete(transcodeKey)
@@ -479,9 +484,10 @@ export async function startStream(
   cameraId: string,
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
+  profile: 'grid' | 'focus' = 'grid',
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
   try {
-    const result = await startStreamCore(server, userId, cameraId, viewId, streamType)
+    const result = await startStreamCore(server, userId, cameraId, viewId, streamType, profile)
     recordStartResult(userId, result.error)
     return result
   } catch (err) {
@@ -496,6 +502,7 @@ async function startStreamCore(
   cameraId: string,
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
+  profile: 'grid' | 'focus' = 'grid',
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
   const existingKey = sessionKey(userId, cameraId, streamType)
   const hasExisting = sessions.has(existingKey)
@@ -634,11 +641,15 @@ async function startStreamCore(
     }
 
     // ── 3. Check limits (count starting + registered) ────────
+    // El foco puede tener su propio tope (LIVE_FOCUS_MAX_TRANSCODES); si está definido y
+    // es menor, prevalece para no saturar de transcodes 1080p simultáneos.
+    const focusLimit = profile === 'focus' ? focusMaxTranscodes() : null
+    const transLimit = focusLimit !== null ? Math.min(focusLimit, MAX_TRANSCODE_SESSIONS) : MAX_TRANSCODE_SESSIONS
     const activeTrans = getActiveTranscodeCount()
-    if (activeTrans >= MAX_TRANSCODE_SESSIONS) {
-      console.warn(`[transcode] reject cameraId=${cameraId} reason=MAX_TRANSCODE_SESSIONS active=${activeTrans}/${MAX_TRANSCODE_SESSIONS}`)
+    if (activeTrans >= transLimit) {
+      console.warn(`[transcode] reject cameraId=${cameraId} reason=MAX_TRANSCODE_SESSIONS profile=${profile} active=${activeTrans}/${transLimit}`)
       return { hlsUrl: '', webrtcUrl: '', streamPath: '',
-        error: { code: 'TRANSCODE_LIMIT_REACHED', message: `Límite de transcodificaciones alcanzado (máx ${MAX_TRANSCODE_SESSIONS})` } }
+        error: { code: 'TRANSCODE_LIMIT_REACHED', message: `Límite de transcodificaciones alcanzado (máx ${transLimit})` } }
     }
     if (sessions.size >= MAX_STREAMS_GLOBAL) pruneStaleSessions()
     if (sessions.size >= MAX_STREAMS_GLOBAL) {
@@ -664,7 +675,8 @@ async function startStreamCore(
       // Spawn FFmpeg in the API container — MediaMTX container doesn't have FFmpeg
       // spawnTranscodeProcess returns null if password is empty or RTSP URL is invalid.
       // The spawn_abort log in stream.ts explains the reason; show it in the error detail too.
-      const proc = spawnTranscodeProcess(nvr as any, camera as any, streamPath)
+      transcodeProfileByPath.set(streamPath, profile)
+      const proc = spawnTranscodeProcess(nvr as any, camera as any, streamPath, profile)
       if (!proc) {
         transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
         resolveInFlight(false)
@@ -872,6 +884,7 @@ export async function stopStream(
         transcodeRestarts.delete(session.streamPath)
         transcodeSourceInfo.delete(session.streamPath)
         transcodeLastActivity.delete(session.streamPath)
+        transcodeProfileByPath.delete(session.streamPath)
         killedFfmpeg = true
         console.info(`[live] transcode_killed path=${session.streamPath} reason=refcount_zero`)
       } else {
@@ -1047,6 +1060,7 @@ export async function cleanupUserSessions(
         transcodeRestarts.delete(session.streamPath)
         transcodeSourceInfo.delete(session.streamPath)
         transcodeLastActivity.delete(session.streamPath)
+        transcodeProfileByPath.delete(session.streamPath)
         console.info(`[live] transcode_killed path=${session.streamPath} reason=refcount_zero`)
       }
     }
@@ -1137,6 +1151,7 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
       transcodeRestarts.delete(session.streamPath)
       transcodeSourceInfo.delete(session.streamPath)
       transcodeLastActivity.delete(session.streamPath)
+      transcodeProfileByPath.delete(session.streamPath)
     }
     server.log.info(`[stream-manager] idle_removed key=${key} streamType=${session.streamType} view=${session.viewId}`)
   }
