@@ -69,6 +69,10 @@ model Session {
   userId       String
   user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   refreshToken String    @unique
+  // Rotación de refresh tokens (fase 4c): hash del token INMEDIATAMENTE anterior tras
+  // rotar. Si se presenta ese hash (un token ya rotado), es un replay → se revoca toda
+  // la familia de sesiones del usuario (detección de reutilización).
+  previousRefreshToken String? @unique
   userAgent    String?
   ipAddress    String?
   deviceName   String? // Parsed from User-Agent
@@ -78,6 +82,7 @@ model Session {
 
   @@index([userId])
   @@index([expiresAt])
+  @@index([previousRefreshToken])
   @@map("sessions")
 }
 

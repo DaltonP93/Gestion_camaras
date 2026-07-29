@@ -26,16 +26,16 @@ async function refreshAccessToken(): Promise<void> {
   refreshPromise = (async () => {
     const refreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')
     if (!refreshToken) throw new Error('No refresh token')
-    const res = await axios.post<{ accessToken: string }>(
+    const res = await axios.post<{ accessToken: string; refreshToken?: string }>(
       `${BASE_URL}/api/auth/refresh`,
       { refreshToken }
     )
-    // Preserve whichever storage the refresh token came from
-    if (localStorage.getItem('refreshToken')) {
-      localStorage.setItem('accessToken', res.data.accessToken)
-    } else {
-      sessionStorage.setItem('accessToken', res.data.accessToken)
-    }
+    // Preserve whichever storage the refresh token came from. El backend ahora ROTA el
+    // refresh token en cada refresh (fase 4c): hay que persistir el nuevo, o el próximo
+    // refresh presentaría un token ya rotado y se detectaría como reutilización.
+    const store = localStorage.getItem('refreshToken') ? localStorage : sessionStorage
+    store.setItem('accessToken', res.data.accessToken)
+    if (res.data.refreshToken) store.setItem('refreshToken', res.data.refreshToken)
   })().finally(() => { refreshPromise = null })
   return refreshPromise
 }
@@ -140,20 +140,23 @@ export function resolveAssetUrl(url: string | null | undefined): string | null {
 }
 
 // ─── Helpers tipados ──────────────────────────────────────────
-export const apiGet = <T>(url: string, params?: object) =>
-  api.get<T>(url, { params }).then((r) => r.data)
+export const apiGet = <T>(url: string, params?: object, headers?: Record<string, string>) =>
+  api.get<T>(url, { params, ...(headers ? { headers } : {}) }).then((r) => r.data)
 
-export const apiPost = <T>(url: string, data?: object) =>
-  api.post<T>(url, data).then((r) => r.data)
+export const apiPost = <T>(url: string, data?: object, headers?: Record<string, string>) =>
+  api.post<T>(url, data, headers ? { headers } : undefined).then((r) => r.data)
 
-export const apiPut = <T>(url: string, data?: object) =>
-  api.put<T>(url, data).then((r) => r.data)
+export const apiPut = <T>(url: string, data?: object, headers?: Record<string, string>) =>
+  api.put<T>(url, data, headers ? { headers } : undefined).then((r) => r.data)
 
 export const apiPatch = <T>(url: string, data?: object) =>
   api.patch<T>(url, data).then((r) => r.data)
 
-export const apiDelete = <T>(url: string, data?: unknown) =>
-  api.delete<T>(url, data !== undefined ? { data } : undefined).then((r) => r.data)
+export const apiDelete = <T>(url: string, data?: unknown, headers?: Record<string, string>) =>
+  api.delete<T>(url, {
+    ...(data !== undefined ? { data } : {}),
+    ...(headers ? { headers } : {}),
+  }).then((r) => r.data)
 
 export const apiUpload = <T>(url: string, formData: FormData) =>
   api.post<T>(url, formData, {

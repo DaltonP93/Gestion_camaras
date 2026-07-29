@@ -364,6 +364,43 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // ──────────────────────────────────────────────────────────
+  // POST /api/auth/step-up — re-autenticación reciente para acciones sensibles.
+  // Devuelve un token de elevación (5 min) que las rutas protegidas exigen en el
+  // header x-step-up-token. Usa TOTP si el usuario tiene MFA; contraseña si no.
+  // ──────────────────────────────────────────────────────────
+  server.post('/step-up', {
+    preHandler: [server.authenticate],
+    config: { rateLimit: { max: 10, timeWindow: '5 minutes' } },
+  }, async (request, reply) => {
+    const { code, password } = z.object({
+      code:     z.string().min(6).max(8).optional(),
+      password: z.string().min(1).optional(),
+    }).parse(request.body ?? {})
+
+    const user = await server.prisma.user.findUnique({ where: { id: request.user.sub } })
+    if (!user || !user.active) return reply.status(401).send({ message: 'No autorizado' })
+
+    let verified = false
+    if (user.twoFactorEnabled && user.twoFactorSecret) {
+      if (!code) return reply.status(400).send({ message: 'Ingresa el código de tu app autenticadora', code: 'CODE_REQUIRED' })
+      // Sólo TOTP para step-up (los códigos de recuperación se reservan para el login).
+      verified = verifyTotpToken(user.twoFactorSecret, code)
+    } else {
+      if (!password) return reply.status(400).send({ message: 'Ingresa tu contraseña', code: 'PASSWORD_REQUIRED' })
+      verified = await bcrypt.compare(password, user.passwordHash)
+    }
+
+    if (!verified) {
+      await AuditAction(server.prisma, user.id, 'STEP_UP_FAILED', user.id, request)
+      return reply.status(401).send({ message: 'Verificación incorrecta' })
+    }
+
+    const stepUpToken = (server.jwt as any).sign({ sub: user.id, step: 'elevated' }, { expiresIn: '5m' })
+    await AuditAction(server.prisma, user.id, 'STEP_UP_GRANTED', user.id, request)
+    return reply.send({ stepUpToken, expiresInSeconds: 300, method: user.twoFactorEnabled ? 'totp' : 'password' })
+  })
+
+  // ──────────────────────────────────────────────────────────
   // POST /api/auth/2fa/disable — disable 2FA
   // ──────────────────────────────────────────────────────────
   server.post('/2fa/disable', {
@@ -488,13 +525,22 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   }, async (request, reply) => {
     const sessions = await server.prisma.session.findMany({
       where: { userId: request.user.sub },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { lastUsedAt: 'desc' },
       select: {
         id: true, userAgent: true, ipAddress: true, deviceName: true,
         createdAt: true, expiresAt: true, lastUsedAt: true,
+        refreshToken: true, previousRefreshToken: true,
       },
     })
-    return reply.send(sessions)
+    // Marca la sesión ACTUAL comparando (opcionalmente) el refresh token del cliente,
+    // enviado en el header x-refresh-token. Cubre también el token recién rotado.
+    const raw = request.headers['x-refresh-token']
+    const rawToken = Array.isArray(raw) ? raw[0] : raw
+    const currentHash = rawToken ? hashToken(rawToken) : null
+    return reply.send(sessions.map(({ refreshToken, previousRefreshToken, ...s }) => ({
+      ...s,
+      current: !!currentHash && (refreshToken === currentHash || previousRefreshToken === currentHash),
+    })))
   })
 
   // ──────────────────────────────────────────────────────────
@@ -537,27 +583,62 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   // ──────────────────────────────────────────────────────────
   server.post('/refresh', async (request, reply) => {
     const { refreshToken } = refreshSchema.parse(request.body)
+    const presentedHash = hashToken(refreshToken)
 
     const session = await server.prisma.session.findUnique({
-      where: { refreshToken: hashToken(refreshToken) },
+      where: { refreshToken: presentedHash },
       include: { user: true },
     })
 
-    if (!session || session.expiresAt < new Date() || !session.user.active) {
+    if (!session) {
+      // Detección de reutilización: ¿el token presentado es uno YA rotado? Si coincide
+      // con previousRefreshToken de alguna sesión, alguien está reproduciendo un token
+      // viejo (posible robo) → se revoca TODA la familia de sesiones del usuario.
+      const reused = await server.prisma.session.findUnique({
+        where: { previousRefreshToken: presentedHash },
+        select: { userId: true },
+      })
+      if (reused) {
+        await server.prisma.session.deleteMany({ where: { userId: reused.userId } })
+        await AuditAction(server.prisma, reused.userId, 'REFRESH_TOKEN_REUSE', null, request)
+        return reply.status(401).send({
+          statusCode: 401, error: 'Unauthorized',
+          message: 'Sesión revocada por reutilización de token. Inicia sesión nuevamente.',
+          code: 'TOKEN_REUSE',
+        })
+      }
       return reply.status(401).send({
         statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
       })
     }
 
-    await server.prisma.session.update({
-      where: { id: session.id },
-      data: { lastUsedAt: new Date() },
-    })
+    if (session.expiresAt < new Date() || !session.user.active) {
+      return reply.status(401).send({
+        statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
+      })
+    }
 
     const payload = { sub: session.user.id, username: session.user.username, role: session.user.role }
     const sec = await getSecuritySettings(server.prisma)
     const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
-    return reply.send({ accessToken: newAccessToken })
+
+    // Rotación: se emite un refresh token NUEVO y el actual queda registrado como
+    // previousRefreshToken. jti aleatorio para garantizar unicidad del hash.
+    const newRefreshToken = (server.jwt as any).sign(
+      { ...payload, jti: crypto.randomUUID() },
+      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
+    )
+    await server.prisma.session.update({
+      where: { id: session.id },
+      data: {
+        refreshToken: hashToken(newRefreshToken),
+        previousRefreshToken: presentedHash,
+        lastUsedAt: new Date(),
+        expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+      },
+    })
+
+    return reply.send({ accessToken: newAccessToken, refreshToken: newRefreshToken })
   })
 
   // ──────────────────────────────────────────────────────────
@@ -764,9 +845,10 @@ async function completeLogin(server: any, request: any, reply: any, user: any, e
   // TTL del access token = timeout de sesión configurado (hace REAL el ajuste que
   // antes sólo vivía en la UI). El refresh conserva su ventana larga.
   const accessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
-  const refreshToken = server.jwt.sign(payload, {
-    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
-  })
+  const refreshToken = (server.jwt as any).sign(
+    { ...payload, jti: crypto.randomUUID() },
+    { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
+  )
 
   await server.prisma.session.create({
     data: {

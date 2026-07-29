@@ -52,17 +52,22 @@ function PasswordStrength({ password }: { password: string }) {
 function SessionsPanel() {
   const [sessions, setSessions] = useState<UserSession[]>([])
   const [loading, setLoading] = useState(true)
-  const currentRefreshToken = localStorage.getItem('refreshToken')
+  const currentRefreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const data = await apiGet<UserSession[]>('/auth/sessions')
+      // Enviar el refresh token actual para que el backend marque la sesión de ESTE
+      // dispositivo (s.current), en vez de adivinar por orden.
+      const data = await apiGet<UserSession[]>(
+        '/auth/sessions', undefined,
+        currentRefreshToken ? { 'x-refresh-token': currentRefreshToken } : undefined,
+      )
       setSessions(data)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [currentRefreshToken])
 
   useEffect(() => { load() }, [load])
 
@@ -105,7 +110,7 @@ function SessionsPanel() {
         <div className="text-center py-4 text-xs text-surface-500">Sin sesiones activas</div>
       ) : (
         <div className="divide-y divide-surface-700">
-          {sessions.map((s, idx) => (
+          {sessions.map((s) => (
             <div key={s.id} className="flex items-start gap-3 py-3">
               <div className="p-1.5 rounded-lg bg-surface-700 flex-shrink-0">
                 <Monitor size={12} className="text-surface-400" />
@@ -115,7 +120,7 @@ function SessionsPanel() {
                   <span className="text-xs font-medium text-surface-100">
                     {s.deviceName || 'Dispositivo desconocido'}
                   </span>
-                  {idx === 0 && (
+                  {s.current && (
                     <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-green-900/40 text-green-400 border border-green-800/40">
                       Esta sesión
                     </span>
@@ -136,7 +141,7 @@ function SessionsPanel() {
                   )}
                 </div>
               </div>
-              {idx !== 0 && (
+              {!s.current && (
                 <button
                   onClick={() => revokeSession(s.id)}
                   className="p-1 rounded text-surface-500 hover:text-red-400 hover:bg-surface-700 transition-colors flex-shrink-0"
