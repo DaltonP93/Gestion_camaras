@@ -1316,7 +1316,7 @@ function CamerasTab({
                         </button>
                       )}
                       <Link
-                        to={`/live?nvr=${cam.nvrId}`}
+                        to={`/live?nvr=${cam.nvrId}&camera=${cam.id}&focus=1`}
                         className="p-1 rounded text-surface-400 hover:text-green-400 hover:bg-surface-700 transition-colors"
                         title="Ver en vivo"
                       >

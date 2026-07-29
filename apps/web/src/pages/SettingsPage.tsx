@@ -1,5 +1,5 @@
 // src/pages/SettingsPage.tsx
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Fragment } from 'react'
 import {
   Bell, Video, Shield, Server, Globe, Save, RefreshCw,
   Mail, Webhook, CheckCircle2, Send, Lock, Eye, EyeOff
@@ -8,6 +8,7 @@ import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
 import { apiGet, apiPut, apiPost } from '@/lib/api'
 import type { AlertSettings } from '@/types'
+import { pickDeliveryTimestamp, formatAsuncionDateTime } from '@/lib/deliveryHistory'
 
 type Tab = 'alertas' | 'streaming' | 'seguridad' | 'sistema' | 'integraciones'
 
@@ -61,7 +62,12 @@ export function SettingsPage() {
   const [testEmail, setTestEmail] = useState('')
   const [sendingTest, setSendingTest] = useState(false)
   const [deliveries, setDeliveries] = useState<any[]>([])
+  const [deliveriesTotal, setDeliveriesTotal] = useState(0)
+  const [deliveryPage, setDeliveryPage] = useState(0)
+  const [deliveryStatus, setDeliveryStatus] = useState<'all' | 'sent' | 'failed'>('all')
+  const [expandedDelivery, setExpandedDelivery] = useState<string | null>(null)
   const [loadingDeliveries, setLoadingDeliveries] = useState(false)
+  const DELIVERY_PAGE_SIZE = 20
 
   // ── Other tab state ────────────────────────────────────────────
   const [hlsLatency, setHlsLatency] = useState('low')
@@ -91,6 +97,8 @@ export function SettingsPage() {
       })
       .catch(() => {}) // non-admin will get 403, ignore
       .finally(() => setLoadingAlerts(false))
+    // Auto-cargar el historial de entregas al abrir Configuración (orden descendente).
+    loadDeliveries(0, 'all')
   }, [])
 
   const handleSaveAlerts = async () => {
@@ -142,11 +150,15 @@ export function SettingsPage() {
     }
   }
 
-  const loadDeliveries = async () => {
+  const loadDeliveries = async (page = deliveryPage, status = deliveryStatus) => {
     setLoadingDeliveries(true)
     try {
-      const res = await apiGet<{ deliveries: any[] }>('/alerts/settings/deliveries?limit=10')
+      const qs = new URLSearchParams({ page: String(page), limit: String(DELIVERY_PAGE_SIZE) })
+      if (status !== 'all') qs.set('status', status)
+      const res = await apiGet<{ deliveries: any[]; total: number; page: number }>(`/alerts/settings/deliveries?${qs}`)
       setDeliveries(res.deliveries || [])
+      setDeliveriesTotal(res.total || 0)
+      setDeliveryPage(res.page ?? page)
     } catch {
       // non-admin: ignore
     } finally {
@@ -310,39 +322,126 @@ export function SettingsPage() {
 
                   {/* Historial de entregas */}
                   <div className="border-t border-surface-600 pt-4">
-                    <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
                       <h4 className="text-xs font-medium text-surface-400 uppercase tracking-wider flex items-center gap-1.5">
                         <Webhook size={12} /> Historial de entregas
                       </h4>
-                      <button
-                        onClick={loadDeliveries}
-                        disabled={loadingDeliveries}
-                        className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1"
-                      >
-                        {loadingDeliveries ? <RefreshCw size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-                        Cargar
-                      </button>
+                      <div className="flex items-center gap-2">
+                        {/* Filtro enviados / fallidos / todos */}
+                        <div className="flex rounded-md overflow-hidden border border-surface-600">
+                          {(['all', 'sent', 'failed'] as const).map((s) => (
+                            <button
+                              key={s}
+                              onClick={() => { setDeliveryStatus(s); setDeliveryPage(0); loadDeliveries(0, s) }}
+                              className={clsx(
+                                'px-2 py-0.5 text-[11px]',
+                                deliveryStatus === s ? 'bg-brand-600 text-white' : 'text-surface-400 hover:bg-surface-700'
+                              )}
+                            >
+                              {s === 'all' ? 'Todos' : s === 'sent' ? 'Enviados' : 'Fallidos'}
+                            </button>
+                          ))}
+                        </div>
+                        <button
+                          onClick={() => loadDeliveries(deliveryPage, deliveryStatus)}
+                          disabled={loadingDeliveries}
+                          className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1"
+                        >
+                          <RefreshCw size={11} className={loadingDeliveries ? 'animate-spin' : ''} />
+                          Actualizar
+                        </button>
+                      </div>
                     </div>
                     {deliveries.length === 0 && !loadingDeliveries && (
-                      <p className="text-xs text-surface-500 py-2">Presiona "Cargar" para ver las últimas 10 entregas.</p>
+                      <p className="text-xs text-surface-500 py-2">Sin entregas para mostrar. Presiona "Actualizar".</p>
                     )}
                     {deliveries.length > 0 && (
-                      <div className="space-y-1">
-                        {deliveries.map((d: any) => (
-                          <div key={d.id} className="flex items-center gap-2 py-1.5 text-xs border-b border-surface-700">
-                            <span className={clsx(
-                              'w-12 text-center rounded px-1 py-0.5 font-mono text-[10px]',
-                              d.status === 'sent' ? 'bg-green-900/40 text-green-400' :
-                              d.status === 'failed' ? 'bg-red-900/40 text-red-400' :
-                              'bg-surface-700 text-surface-400'
-                            )}>{d.status}</span>
-                            <span className="text-surface-300 flex-1 truncate">{d.recipient || d.channel}</span>
-                            {d.error && <span className="text-red-400 truncate max-w-[200px]" title={d.error}>{d.error}</span>}
-                            <span className="text-surface-500 flex-shrink-0">
-                              {d.sentAt ? new Date(d.sentAt).toLocaleTimeString('es-PY') : '—'}
-                            </span>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-surface-500 text-[10px] uppercase tracking-wider text-left border-b border-surface-700">
+                              <th className="py-1 pr-2 font-medium">Fecha/hora (Asunción)</th>
+                              <th className="py-1 pr-2 font-medium">Estado</th>
+                              <th className="py-1 pr-2 font-medium">Destinatario</th>
+                              <th className="py-1 pr-2 font-medium">Tipo</th>
+                              <th className="py-1 pr-2 font-medium">Cámara / NVR</th>
+                              <th className="py-1 pr-2 font-medium">Int.</th>
+                              <th className="py-1 pr-2 font-medium"></th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {deliveries.map((d: any) => {
+                              const { iso, kind } = pickDeliveryTimestamp(d)
+                              const isOpen = expandedDelivery === d.id
+                              return (
+                                <Fragment key={d.id}>
+                                  <tr className="border-b border-surface-800 hover:bg-surface-800/40">
+                                    {/* Fecha+hora COMPLETA, jamás "—" por sentAt=null en fallidos */}
+                                    <td className="py-1.5 pr-2 text-surface-300 whitespace-nowrap">
+                                      {formatAsuncionDateTime(iso)}
+                                      <span className="text-surface-600 ml-1 text-[9px]">({kind})</span>
+                                    </td>
+                                    <td className="py-1.5 pr-2">
+                                      <span className={clsx(
+                                        'rounded px-1 py-0.5 font-mono text-[10px]',
+                                        d.status === 'sent' ? 'bg-green-900/40 text-green-400' :
+                                        d.status === 'failed' ? 'bg-red-900/40 text-red-400' :
+                                        'bg-surface-700 text-surface-400'
+                                      )}>{d.status}</span>
+                                    </td>
+                                    <td className="py-1.5 pr-2 text-surface-300 max-w-[160px] truncate" title={d.recipient || d.channel}>{d.recipient || d.channel}</td>
+                                    <td className="py-1.5 pr-2 text-surface-400 whitespace-nowrap">{d.alertType || '—'}</td>
+                                    <td className="py-1.5 pr-2 text-surface-400 max-w-[160px] truncate" title={[d.cameraName, d.nvrName].filter(Boolean).join(' · ')}>
+                                      {[d.cameraName, d.nvrName].filter(Boolean).join(' · ') || '—'}
+                                    </td>
+                                    <td className="py-1.5 pr-2 text-surface-400 text-center">{d.attempts ?? 1}</td>
+                                    <td className="py-1.5 pr-2 text-right">
+                                      {(d.error || d.subject || d.errorCode) && (
+                                        <button onClick={() => setExpandedDelivery(isOpen ? null : d.id)} className="text-brand-400 hover:text-brand-300 text-[11px]">
+                                          {isOpen ? 'Ocultar' : 'Detalles'}
+                                        </button>
+                                      )}
+                                    </td>
+                                  </tr>
+                                  {isOpen && (
+                                    <tr className="bg-surface-900/40">
+                                      <td colSpan={7} className="py-2 px-2 text-[11px] text-surface-400 space-y-0.5">
+                                        {d.subject && <div><span className="text-surface-500">Asunto:</span> {d.subject}</div>}
+                                        <div className="flex flex-wrap gap-x-4">
+                                          <span><span className="text-surface-500">Creada:</span> {formatAsuncionDateTime(d.createdAt)}</span>
+                                          <span><span className="text-surface-500">Intento:</span> {formatAsuncionDateTime(d.attemptedAt)}</span>
+                                          <span><span className="text-surface-500">Enviada:</span> {formatAsuncionDateTime(d.sentAt)}</span>
+                                          <span><span className="text-surface-500">Falló:</span> {formatAsuncionDateTime(d.failedAt)}</span>
+                                        </div>
+                                        {(d.errorCode || d.error) && (
+                                          <div className="text-red-400">
+                                            <span className="text-surface-500">Error:</span> {d.errorCode ? `[${d.errorCode}] ` : ''}{d.error}
+                                          </div>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  )}
+                                </Fragment>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                        {/* Paginación */}
+                        <div className="flex items-center justify-between mt-2 text-[11px] text-surface-500">
+                          <span>{deliveriesTotal} entregas · página {deliveryPage + 1} de {Math.max(1, Math.ceil(deliveriesTotal / DELIVERY_PAGE_SIZE))}</span>
+                          <div className="flex gap-1">
+                            <button
+                              disabled={deliveryPage === 0 || loadingDeliveries}
+                              onClick={() => loadDeliveries(deliveryPage - 1, deliveryStatus)}
+                              className="px-2 py-0.5 rounded border border-surface-600 disabled:opacity-40 hover:bg-surface-700"
+                            >Anterior</button>
+                            <button
+                              disabled={(deliveryPage + 1) * DELIVERY_PAGE_SIZE >= deliveriesTotal || loadingDeliveries}
+                              onClick={() => loadDeliveries(deliveryPage + 1, deliveryStatus)}
+                              className="px-2 py-0.5 rounded border border-surface-600 disabled:opacity-40 hover:bg-surface-700"
+                            >Siguiente</button>
                           </div>
-                        ))}
+                        </div>
                       </div>
                     )}
                   </div>

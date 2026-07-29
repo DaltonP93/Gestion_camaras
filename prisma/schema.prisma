@@ -425,8 +425,20 @@ model NotificationDelivery {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 
+  // ── Historial de entregas completo (P1): fecha/hora reales para enviados Y
+  //    fallidos, sin depender de sentAt. Denormalizado desde la alerta al crear
+  //    la entrega (la alerta puede eliminarse por retención). ──
+  attemptedAt DateTime?   // cuándo se intentó el envío
+  failedAt    DateTime?   // cuándo falló (los fallidos ya no dependen de sentAt)
+  errorCode   String?     // código del error SMTP (p.ej. EAUTH, ECONNECTION)
+  subject     String?     // asunto del correo
+  alertType   String?     // tipo de alerta (CAMERA_OFFLINE, …)
+  cameraName  String?
+  nvrName     String?
+
   @@index([alertId])
   @@index([createdAt])
+  @@index([status, createdAt])
   @@map("notification_deliveries")
 }
 
