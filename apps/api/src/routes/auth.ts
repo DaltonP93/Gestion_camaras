@@ -11,7 +11,7 @@ import {
   resolveFeaturePermissions,
 } from '../services/totp'
 import { getSecuritySettings } from '../services/security-settings'
-import { sessionsToPrune, accessTokenTtlSeconds } from '../services/security-policy'
+import { sessionsToPrune, accessTokenTtl } from '../services/security-policy'
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
@@ -432,7 +432,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
     const payload = { sub: session.user.id, username: session.user.username, role: session.user.role }
     const sec = await getSecuritySettings(server.prisma)
-    const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtlSeconds(sec.sessionTimeoutMinutes) })
+    const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
     return reply.send({ accessToken: newAccessToken })
   })
 
@@ -551,7 +551,10 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   }, async (request, reply) => {
     const { token, newPassword } = z.object({
       token:       z.string().min(1),
-      newPassword: z.string().min(10),
+      // Sólo el piso absoluto soportado (8). El mínimo REAL lo impone la política
+      // configurada (evaluatePasswordPolicy) más abajo — así el ajuste persistido es
+      // autoritativo también en el reset (review Codex #129).
+      newPassword: z.string().min(8),
     }).parse(request.body)
 
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
@@ -636,7 +639,7 @@ async function completeLogin(server: any, request: any, reply: any, user: any) {
 
   // TTL del access token = timeout de sesión configurado (hace REAL el ajuste que
   // antes sólo vivía en la UI). El refresh conserva su ventana larga.
-  const accessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtlSeconds(sec.sessionTimeoutMinutes) })
+  const accessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
   const refreshToken = server.jwt.sign(payload, {
     expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
   })

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
-  evaluatePasswordPolicy, sessionsToPrune, accessTokenTtlSeconds, DEFAULT_SECURITY_SETTINGS,
+  evaluatePasswordPolicy, sessionsToPrune, accessTokenTtl, DEFAULT_SECURITY_SETTINGS,
 } from './security-policy'
 
 describe('evaluatePasswordPolicy (P0: mínimo real 12)', () => {
@@ -50,10 +50,12 @@ describe('sessionsToPrune (maxSessions)', () => {
   })
 })
 
-describe('accessTokenTtlSeconds', () => {
-  it('convierte minutos a segundos con límites', () => {
-    expect(accessTokenTtlSeconds(60)).toBe(3600)
-    expect(accessTokenTtlSeconds(1)).toBe(5 * 60)        // clamp inferior 5 min
-    expect(accessTokenTtlSeconds(99999)).toBe(1440 * 60) // clamp superior 24 h
+describe('accessTokenTtl', () => {
+  // Debe ser CADENA de duración ("<m>m"): fast-jwt trata un expiresIn numérico como
+  // milisegundos (review Codex #129 P1).
+  it('devuelve una cadena de minutos con límites', () => {
+    expect(accessTokenTtl(60)).toBe('60m')
+    expect(accessTokenTtl(1)).toBe('5m')       // clamp inferior 5 min
+    expect(accessTokenTtl(99999)).toBe('1440m') // clamp superior 24 h
   })
 })

@@ -92,11 +92,17 @@ export function sessionsToPrune(sessions: readonly SessionLike[], maxSessions: n
   return sorted.slice(max).map((s) => s.id)
 }
 
-/** TTL del access token en segundos a partir de los minutos configurados. */
-export function accessTokenTtlSeconds(sessionTimeoutMinutes: number): number {
+/**
+ * TTL del access token como CADENA de duración ("<minutos>m") a partir de los
+ * minutos configurados, acotado a los límites. Se devuelve string (no número) a
+ * propósito: `@fastify/jwt` v10 (fast-jwt) interpreta un `expiresIn` NUMÉRICO como
+ * MILISEGUNDOS — un número en segundos haría expirar el token en ~ms (review Codex
+ * #129 P1). Toda la base usa strings de duración; mantenemos esa convención.
+ */
+export function accessTokenTtl(sessionTimeoutMinutes: number): string {
   const m = Math.min(
     SECURITY_LIMITS.sessionTimeoutMinutes.max,
     Math.max(SECURITY_LIMITS.sessionTimeoutMinutes.min, Math.floor(sessionTimeoutMinutes) || DEFAULT_SECURITY_SETTINGS.sessionTimeoutMinutes),
   )
-  return m * 60
+  return `${m}m`
 }
