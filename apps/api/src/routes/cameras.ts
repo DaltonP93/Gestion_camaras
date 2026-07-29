@@ -6,6 +6,7 @@ import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSes
 import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
+import { resolveCameraStatus } from '../services/camera-status-truth'
 import { AuditAction } from '../services/audit'
 import CryptoJS from 'crypto-js'
 
@@ -250,6 +251,30 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         hlsUrl,
         webrtcUrl: getWebRtcUrl(streamPath),
       },
+      // Estado EFECTIVO resuelto por la fuente de verdad única (req 11): combina la
+      // observación física del NVR (onlineInNvr + onlineInNvrAt) con las sondas RTSP
+      // recién ejecutadas, aplicando precedencia y TTL. Expone observedAt/source/
+      // stale/expiresAt/finalDecisionReason para auditar por qué se decidió así.
+      effectiveStatus: (() => {
+        const now = Date.now()
+        const r = resolveCameraStatus({
+          onlineInNvr:   (camera as any).onlineInNvr,
+          onlineInNvrAt: (camera as any).onlineInNvrAt ? new Date((camera as any).onlineInNvrAt).getTime() : ((camera as any).lastCheck ? new Date((camera as any).lastCheck).getTime() : null),
+          rtspMainOk:    rtsp.main.ok,
+          rtspSubOk:     rtsp.sub.ok,
+          rtspCheckedAt: now,              // sonda recién ejecutada arriba
+          streamHealthStatus: (camera as any).streamHealthStatus,
+        }, now)
+        return {
+          status:      r.effectiveStatus,
+          online:      r.online,
+          source:      r.source,
+          stale:       r.stale,
+          observedAt:  r.observedAt ? new Date(r.observedAt).toISOString() : null,
+          expiresAt:   r.expiresAt ? new Date(r.expiresAt).toISOString() : null,
+          finalDecisionReason: r.finalDecisionReason,
+        }
+      })(),
     })
   })
 

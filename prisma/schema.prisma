@@ -180,6 +180,12 @@ model Camera {
   // Estado de salud del stream
   streamHealthStatus String   @default("UNKNOWN")
   onlineInNvr        Boolean?
+  // Marca de tiempo de la última observación física del NVR (InputProxy). Permite
+  // aplicar TTL/frescura: un onlineInNvr viejo no debe pesar sobre uno nuevo, y un
+  // onlineInNvr=false reciente prevalece sobre éxitos RTSP antiguos (P0).
+  onlineInNvrAt      DateTime?
+  // Motivo de la última decisión de estado efectivo (diagnóstico/auditoría).
+  statusDecisionReason String?
 
   // ── Configuración de alertas por cámara (TASK 6) ──
   offlineAlertEnabled     Boolean   @default(true)

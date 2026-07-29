@@ -688,8 +688,26 @@ function SummaryTab({ nvr }: { nvr: NVR }) {
 // ─── Camera status helper ─────────────────────────────────────
 
 function camStatusDisplay(cam: CameraType): { color: string; dot: string; label: string } {
+  // FUENTE DE VERDAD (P0): el backend resuelve el estado efectivo aplicando
+  // precedencia + TTL (onlineInNvr=false reciente prevalece sobre éxitos RTSP
+  // viejos). Preferirlo SIEMPRE que venga — no re-derivar desde flags históricos.
+  const eff = (cam as any).effectiveStatus as string | undefined
+  if (eff) {
+    switch (eff) {
+      case 'AUTH_FAILED':     return { color: 'text-red-400',     dot: 'bg-red-500',   label: 'Auth fallida' }
+      case 'OFFLINE':         return { color: 'text-red-400',     dot: 'bg-red-500',   label: 'Sin señal' }
+      case 'STREAM_DEGRADED': return { color: 'text-amber-400',   dot: 'bg-amber-400', label: 'Degradado' }
+      case 'HEALTHY':         return { color: 'text-green-400',   dot: 'bg-green-400', label: 'Online' }
+      case 'UNKNOWN':
+      default:                return { color: 'text-surface-500', dot: 'bg-surface-600', label: 'Sin verificar' }
+    }
+  }
+
   const hs = cam.streamHealthStatus
-  // Per user spec: camera is effectively online if health confirmed OR any RTSP stream responded
+  // Guarda de seguridad (payload sin effectiveStatus): un onlineInNvr=false NO puede
+  // quedar oculto por rtspMainOk/online HISTÓRICOS. El NVR-offline manda.
+  if ((cam as any).onlineInNvr === false) return { color: 'text-red-400', dot: 'bg-red-500', label: 'Sin señal' }
+  // Camera is effectively online only if health confirmed OR any RTSP stream responded.
   const effectiveOnline =
     hs === 'HEALTHY' || hs === 'USING_MAIN_STREAM' ||
     cam.rtspSubOk === true || cam.rtspMainOk === true
@@ -940,9 +958,10 @@ function isapIStatusCell(isapIStatus: string | undefined, camOnlineInNvr: boolea
   if (isapIStatus === 'available') {
     if (camOnlineInNvr === true)  return <span className="text-green-400/70 text-[11px]">Online NVR</span>
     if (camOnlineInNvr === false) {
-      // NVR ISAPI says offline, but RTSP health says online — trust RTSP (NVR status can lag)
-      if (camOnline) return <span className="text-green-400/70 text-[11px]">Online (RTSP)</span>
-      return <span className="text-surface-500 text-[11px]">Offline NVR</span>
+      // El NVR reporta el canal OFFLINE: es autoritativo (P0). Ya NO se muestra
+      // "Online (RTSP)" apoyándose en un éxito RTSP viejo — eso ocultaba caídas
+      // reales (caso Cuenta Pacientes / D15).
+      return <span className="text-red-400 text-[11px]">Offline NVR</span>
     }
     // null = unknown — use RTSP health as proxy
     if (camOnline === true) return <span className="text-green-400/70 text-[11px]">Online (RTSP)</span>

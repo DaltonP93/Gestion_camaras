@@ -193,9 +193,12 @@ export function startHealthWorker(server: FastifyInstance) {
               where: { id: nvr.id },
               data: { online: false },
             })
+            // NVR HTTP caído: todos sus canales quedan offline AHORA — sellar la
+            // observación con onlineInNvrAt para que la frescura sea coherente
+            // (review Codex #126: todo escritor de onlineInNvr sella su timestamp).
             await server.prisma.camera.updateMany({
               where: { nvrId: nvr.id },
-              data: { onlineInNvr: false } as any,
+              data: { onlineInNvr: false, onlineInNvrAt: new Date(), online: false } as any,
             })
           } else {
             // NVR online: resolver alerta si existía
@@ -373,18 +376,28 @@ export function startHealthWorker(server: FastifyInstance) {
               }
             }
 
-            // Only update onlineInNvr — never overwrite RTSP-based online field
-            // here. UNKNOWN quedó excluido de ambas listas (no se toca su estado).
+            // Fuente de verdad (P0): registrar SIEMPRE la marca de observación física
+            // (onlineInNvrAt) para poder aplicar TTL/frescura. UNKNOWN quedó excluido
+            // de ambas listas (no se toca su estado).
+            //   ONLINE  → onlineInNvr:true. NO se fuerza online:true (eso lo confirma
+            //             el validador RTSP); sólo se marca la observación del NVR.
+            //   OFFLINE → onlineInNvr:false Y online:false: un canal que el NVR reporta
+            //             offline NO puede seguir mostrándose "Online (RTSP)" por un
+            //             éxito RTSP viejo. streamHealthStatus lo resuelve el frontend
+            //             con la precedencia (onlineInNvr=false reciente prevalece).
             if (onlineCameraIds.length > 0) {
               await server.prisma.camera.updateMany({
                 where: { id: { in: onlineCameraIds } },
-                data: { onlineInNvr: true, lastCheck: checkedAt } as any,
+                data: { onlineInNvr: true, onlineInNvrAt: checkedAt, lastCheck: checkedAt } as any,
               })
             }
             if (offlineCameraIds.length > 0) {
               await server.prisma.camera.updateMany({
                 where: { id: { in: offlineCameraIds } },
-                data: { onlineInNvr: false, lastCheck: checkedAt } as any,
+                data: {
+                  onlineInNvr: false, onlineInNvrAt: checkedAt, online: false,
+                  statusDecisionReason: 'nvr_reports_offline_recent', lastCheck: checkedAt,
+                } as any,
               })
             }
 

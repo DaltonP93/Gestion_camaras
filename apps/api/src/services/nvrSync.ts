@@ -124,6 +124,9 @@ export async function syncNvrCameraMetadata(
       const statusStr = (cam.status || '').toLowerCase()
       if (isFromInputProxy && (statusStr === 'online' || statusStr === 'offline')) {
         changes.onlineInNvr = statusStr === 'online'
+        // Sellar la observación (frescura coherente con el booleano, review Codex #126).
+        changes.onlineInNvrAt = new Date()
+        if (changes.onlineInNvr === false) changes.online = false
         statusUpdated++
       }
 

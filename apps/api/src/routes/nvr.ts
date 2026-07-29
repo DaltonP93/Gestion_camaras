@@ -10,6 +10,7 @@ import {
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
+import { resolveCameraStatus } from '../services/camera-status-truth'
 import { AuditAction } from '../services/audit'
 import { checkIsapiRecordingSupport, detectProviderFromCapabilities, buildIsapiSearchXml } from '../services/recordingProvider'
 import {
@@ -419,7 +420,29 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       orderBy: { channel: 'asc' },
     })
 
-    return reply.send({ fromNvr: ipCams, fromDb: dbCams })
+    // Estado EFECTIVO resuelto server-side (fuente de verdad única, P0): la tabla
+    // NO debe confiar en rtspMainOk/online HISTÓRICOS cuando el NVR reporta el canal
+    // offline. Adjuntamos la decisión + su motivo/frescura por cámara.
+    const now = Date.now()
+    const dbCamsWithStatus = dbCams.map((c) => {
+      const st = resolveCameraStatus({
+        onlineInNvr:   (c as any).onlineInNvr,
+        onlineInNvrAt: (c as any).onlineInNvrAt ? new Date((c as any).onlineInNvrAt).getTime() : ((c as any).lastCheck ? new Date((c as any).lastCheck).getTime() : null),
+        rtspMainOk:    (c as any).rtspMainOk,
+        rtspSubOk:     (c as any).rtspSubOk,
+        rtspCheckedAt: (c as any).lastRtspCheckAt ? new Date((c as any).lastRtspCheckAt).getTime() : null,
+        streamHealthStatus: (c as any).streamHealthStatus,
+      }, now)
+      return {
+        ...c,
+        effectiveStatus: st.effectiveStatus,
+        effectiveOnline: st.online,
+        statusStale:     st.stale,
+        statusReason:    st.finalDecisionReason,
+      }
+    })
+
+    return reply.send({ fromNvr: ipCams, fromDb: dbCamsWithStatus })
   })
 
   // POST /api/nvrs/:id/sync — Sincronización completa del NVR
@@ -476,6 +499,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             securityStatus: cam.securityStatus,
             online:         onlineInNvr ?? false,
             onlineInNvr:    onlineInNvr,
+            // Sellar la observación del NVR sólo si hubo estado real (no null), para
+            // que la frescura sea coherente con el booleano (review Codex #126).
+            ...(onlineInNvr !== null ? { onlineInNvrAt: new Date() } : {}),
             lastSyncAt:     new Date(),
           },
           update: {
@@ -486,6 +512,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             managementPort: cam.managementPort,
             securityStatus: cam.securityStatus,
             onlineInNvr:    onlineInNvr,
+            ...(onlineInNvr !== null ? { onlineInNvrAt: new Date() } : {}),
             // Only force online=true if NVR confirms; never force to false here —
             // validateAndUpdateCameraHealth sets online=true when RTSP works.
             ...(onlineInNvr === true ? { online: true } : {}),
@@ -663,6 +690,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       const changes: Partial<{
         name: string; ipAddress: string; managementPort: number
         protocol: string; securityStatus: string; onlineInNvr: boolean; channelCode: string; lastSyncAt: Date
+        onlineInNvrAt: Date; online: boolean
       }> = {}
       const changeLog: string[] = []
 
@@ -721,6 +749,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       const statusStr = (cam.status || '').toLowerCase()
       if (isFromInputProxy && (statusStr === 'online' || statusStr === 'offline')) {
         changes.onlineInNvr = statusStr === 'online'
+        // Sellar la observación (frescura coherente con el booleano, review Codex #126).
+        changes.onlineInNvrAt = new Date()
+        if (changes.onlineInNvr === false) changes.online = false
         changeLog.push(`onlineInNvr: ${changes.onlineInNvr}`)
         statusUpdated++
       }
