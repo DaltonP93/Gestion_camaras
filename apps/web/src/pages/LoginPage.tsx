@@ -211,7 +211,7 @@ function TwoFactorForm() {
 
 // ─── Paso 2 (alt): Enrolamiento forzoso de MFA ───────────────
 function MfaEnrollForm() {
-  const { startMfaEnroll, completeMfaEnroll, cancelMfaEnroll, isLoading, mfaEnrollment } = useAuthStore()
+  const { startMfaEnroll, completeMfaEnroll, finishMfaEnroll, cancelMfaEnroll, isLoading, mfaEnrollment } = useAuthStore()
   const navigate = useNavigate()
   const [qrCodeUri, setQrCodeUri] = useState('')
   const [secret, setSecret] = useState('')
@@ -261,7 +261,7 @@ function MfaEnrollForm() {
         >
           Copiar códigos
         </button>
-        <button onClick={() => navigate('/')} className="btn-primary w-full justify-center py-2.5">
+        <button onClick={() => { finishMfaEnroll(); navigate('/') }} className="btn-primary w-full justify-center py-2.5">
           Continuar
         </button>
       </div>

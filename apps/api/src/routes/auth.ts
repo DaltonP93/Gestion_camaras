@@ -130,9 +130,21 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     const gate = decideMfaGate({
       mfaRequired: sec.mfaRequired,
       userHasMfa: user.twoFactorEnabled,
+      forceEnroll: user.forceMfaEnrollment,
       graceLoginsUsed: user.mfaGraceLoginsUsed,
       gracePeriodLogins: sec.mfaGracePeriodLogins,
     })
+
+    // Emite un token de enrolamiento de alcance limitado (sólo /mfa/enroll/*), NO un
+    // access token — no hay acceso normal hasta completar el segundo factor.
+    const sendEnrollmentChallenge = async () => {
+      const enrollToken = (server.jwt as any).sign(
+        { sub: user.id, step: 'mfa-enroll' },
+        { expiresIn: '15m' }
+      )
+      await AuditAction(server.prisma, user.id, 'MFA_ENROLLMENT_REQUIRED', user.id, request)
+      return reply.send({ requiresMfaEnrollment: true, enrollToken })
+    }
 
     if (gate.action === 'challenge') {
       const tempToken = (server.jwt as any).sign(
@@ -144,23 +156,24 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     }
 
     if (gate.action === 'enroll') {
-      // Sin acceso normal hasta completar el segundo factor: token de enrolamiento
-      // de alcance limitado (sólo /mfa/enroll/*), NO un access token.
-      const enrollToken = (server.jwt as any).sign(
-        { sub: user.id, step: 'mfa-enroll' },
-        { expiresIn: '15m' }
-      )
-      await AuditAction(server.prisma, user.id, 'MFA_ENROLLMENT_REQUIRED', user.id, request)
-      return reply.send({ requiresMfaEnrollment: true, enrollToken })
+      return sendEnrollmentChallenge()
     }
 
     if (gate.action === 'grace') {
-      await server.prisma.user.update({
-        where: { id: user.id },
+      // Consumo ATÓMICO del cupo de gracia: el WHERE condicionado a que el contador
+      // siga por debajo del período evita que logins concurrentes reciban todos un
+      // token password-only cuando queda un solo cupo (carrera read-modify-write).
+      const consumed = await server.prisma.user.updateMany({
+        where: { id: user.id, mfaGraceLoginsUsed: { lt: sec.mfaGracePeriodLogins } },
         data: { mfaGraceLoginsUsed: { increment: 1 } },
       })
-      await AuditAction(server.prisma, user.id, 'MFA_GRACE_LOGIN', user.id, request, { graceRemaining: gate.graceRemaining })
-      return completeLogin(server, request, reply, user, { mustEnrollMfa: true, mfaGraceRemaining: gate.graceRemaining })
+      if (consumed.count === 0) {
+        // Otra petición agotó la gracia primero → forzar enrolamiento.
+        return sendEnrollmentChallenge()
+      }
+      const graceRemaining = Math.max(0, sec.mfaGracePeriodLogins - (user.mfaGraceLoginsUsed + 1))
+      await AuditAction(server.prisma, user.id, 'MFA_GRACE_LOGIN', user.id, request, { graceRemaining })
+      return completeLogin(server, request, reply, user, { mustEnrollMfa: true, mfaGraceRemaining: graceRemaining })
     }
 
     return completeLogin(server, request, reply, user)
@@ -275,6 +288,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         twoFactorEnabled: true,
         twoFactorBackupCodes: JSON.stringify(hashedCodes),
         mfaGraceLoginsUsed: 0,
+        forceMfaEnrollment: false,
       },
     })
 
@@ -341,6 +355,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         twoFactorEnabled: true,
         twoFactorBackupCodes: JSON.stringify(hashedCodes),
         mfaGraceLoginsUsed: 0,
+        forceMfaEnrollment: false,
       },
     })
 
@@ -362,6 +377,18 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     const user = await server.prisma.user.findUnique({ where: { id: request.user.sub } })
     if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
     if (!user.twoFactorEnabled) return reply.status(400).send({ message: '2FA no está habilitado' })
+
+    // Bajo política MFA obligatoria no se permite la auto-baja: de lo contrario un
+    // usuario podría desactivar el 2FA y recuperar toda la gracia de rollout en el
+    // siguiente login, esquivando la compuerta de forma repetida. El admin sí puede
+    // restablecerlo (users /reset-2fa), lo que fuerza un re-enrolamiento inmediato.
+    const sec = await getSecuritySettings(server.prisma)
+    if (sec.mfaRequired) {
+      return reply.status(403).send({
+        message: 'La política de seguridad exige MFA: no puedes desactivarlo. Contacta a un administrador.',
+        code: 'MFA_REQUIRED',
+      })
+    }
 
     const passwordValid = await bcrypt.compare(password, user.passwordHash)
     if (!passwordValid) return reply.status(400).send({ message: 'Contraseña incorrecta' })

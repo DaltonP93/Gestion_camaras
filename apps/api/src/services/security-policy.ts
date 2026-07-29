@@ -103,6 +103,8 @@ export type MfaGateAction =
 export interface MfaGateInput {
   mfaRequired: boolean
   userHasMfa: boolean
+  // Enrolamiento forzoso (reset de admin / auto-baja): salta la gracia de rollout.
+  forceEnroll?: boolean
   graceLoginsUsed: number
   gracePeriodLogins: number
 }
@@ -124,6 +126,8 @@ export interface MfaGateDecision {
 export function decideMfaGate(input: MfaGateInput): MfaGateDecision {
   if (input.userHasMfa) return { action: 'challenge', graceRemaining: 0 }
   if (!input.mfaRequired) return { action: 'none', graceRemaining: 0 }
+  // La bandera de enrolamiento forzoso ignora la gracia de rollout (reset admin, etc.).
+  if (input.forceEnroll) return { action: 'enroll', graceRemaining: 0 }
   const period = Math.max(0, Math.floor(input.gracePeriodLogins))
   const used = Math.max(0, Math.floor(input.graceLoginsUsed))
   if (used < period) {

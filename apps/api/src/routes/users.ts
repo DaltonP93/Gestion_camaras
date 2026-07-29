@@ -477,9 +477,17 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
 
     await server.prisma.user.update({
       where: { id },
-      // Fase 4b: además de limpiar el 2FA, se reinicia el contador de gracia para que
-      // el usuario deba re-enrolarse en el próximo login si la política exige MFA.
-      data: { twoFactorEnabled: false, twoFactorSecret: null, twoFactorBackupCodes: null, mfaGraceLoginsUsed: 0 },
+      // Fase 4b: limpiar el 2FA y marcar enrolamiento FORZOSO. No basta con reiniciar
+      // la gracia a 0 — con un período de gracia > 0 eso concedería nuevos inicios
+      // password-only. forceMfaEnrollment obliga a re-enrolar en el próximo login,
+      // con independencia de la gracia de rollout.
+      data: {
+        twoFactorEnabled: false,
+        twoFactorSecret: null,
+        twoFactorBackupCodes: null,
+        mfaGraceLoginsUsed: 0,
+        forceMfaEnrollment: true,
+      },
     })
     // Revocar sesiones activas para forzar el paso por la compuerta MFA al reingresar.
     await server.prisma.session.deleteMany({ where: { userId: id } })

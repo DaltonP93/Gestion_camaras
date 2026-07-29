@@ -23,6 +23,10 @@ interface AuthState {
   // Enrolamiento forzoso de MFA (fase 4b): activo cuando la política exige MFA y el
   // usuario aún no lo tiene con la gracia agotada — no hay acceso hasta completarlo.
   mfaEnrollment: MfaEnrollment | null
+  // Usuario ya autenticado por el enrolamiento pero AÚN no promovido a la sesión:
+  // se retiene hasta que el usuario confirme haber visto sus códigos de recuperación
+  // (si autenticáramos de inmediato, App.tsx redirige y nunca se muestran los códigos).
+  pendingUser: User | null
   // Inicios de gracia restantes tras un login de cortesía (para avisar al usuario).
   mfaGraceRemaining: number | null
 
@@ -31,6 +35,7 @@ interface AuthState {
   cancelTwoFactor: () => void
   startMfaEnroll:    () => Promise<{ secret: string; qrCodeUri: string }>
   completeMfaEnroll: (code: string) => Promise<string[]>
+  finishMfaEnroll:   () => void
   cancelMfaEnroll:   () => void
   logout:        () => Promise<void>
   loadUser:      () => Promise<void>
@@ -61,6 +66,7 @@ export const useAuthStore = create<AuthState>()(
       isLoading: false,
       twoFactorChallenge: null,
       mfaEnrollment: null,
+      pendingUser: null,
       mfaGraceRemaining: null,
 
       login: async (username, password, rememberMe = true) => {
@@ -126,8 +132,10 @@ export const useAuthStore = create<AuthState>()(
         })
       },
 
-      // Verifica el primer código, activa MFA y completa el login (emite tokens).
-      // Devuelve los códigos de recuperación para mostrarlos una única vez.
+      // Verifica el primer código y activa MFA. Persiste los tokens pero NO promueve
+      // aún la sesión (isAuthenticated queda false y mfaEnrollment se mantiene) para
+      // que la pantalla de códigos de recuperación permanezca montada. La promoción
+      // ocurre en finishMfaEnroll, al confirmar el usuario. Devuelve los códigos.
       completeMfaEnroll: async (code) => {
         const { mfaEnrollment } = get()
         if (!mfaEnrollment) throw new Error('Sin enrolamiento MFA activo')
@@ -140,8 +148,7 @@ export const useAuthStore = create<AuthState>()(
           const rememberMe = sessionStorage.getItem('pendingRememberMe') !== '0'
           sessionStorage.removeItem('pendingRememberMe')
           persistTokens(data, rememberMe)
-          set({ user: data.user, isAuthenticated: true, isLoading: false, mfaEnrollment: null })
-          connectWebSocket()
+          set({ isLoading: false, pendingUser: data.user })
           return (data.backupCodes ?? []) as string[]
         } catch (err) {
           set({ isLoading: false })
@@ -149,7 +156,14 @@ export const useAuthStore = create<AuthState>()(
         }
       },
 
-      cancelMfaEnroll: () => set({ mfaEnrollment: null }),
+      // Promueve la sesión tras confirmar los códigos de recuperación.
+      finishMfaEnroll: () => {
+        const { pendingUser } = get()
+        set({ user: pendingUser, isAuthenticated: true, mfaEnrollment: null, pendingUser: null })
+        connectWebSocket()
+      },
+
+      cancelMfaEnroll: () => set({ mfaEnrollment: null, pendingUser: null }),
 
       logout: async () => {
         const refreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')

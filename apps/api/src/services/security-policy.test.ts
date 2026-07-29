@@ -68,6 +68,12 @@ describe('decideMfaGate (enforcement 4b)', () => {
   it('período de gracia 0 → enroll inmediato (estricto)', () => {
     expect(decideMfaGate({ mfaRequired: true, userHasMfa: false, graceLoginsUsed: 0, gracePeriodLogins: 0 }).action).toBe('enroll')
   })
+  it('forceEnroll ignora la gracia restante → enroll', () => {
+    expect(decideMfaGate({ mfaRequired: true, userHasMfa: false, forceEnroll: true, graceLoginsUsed: 0, gracePeriodLogins: 5 }).action).toBe('enroll')
+  })
+  it('forceEnroll sin política no aplica (none)', () => {
+    expect(decideMfaGate({ mfaRequired: false, userHasMfa: false, forceEnroll: true, graceLoginsUsed: 0, gracePeriodLogins: 5 }).action).toBe('none')
+  })
 })
 
 describe('accessTokenTtl', () => {
