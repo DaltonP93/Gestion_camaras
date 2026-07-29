@@ -193,9 +193,12 @@ export function startHealthWorker(server: FastifyInstance) {
               where: { id: nvr.id },
               data: { online: false },
             })
+            // NVR HTTP caído: todos sus canales quedan offline AHORA — sellar la
+            // observación con onlineInNvrAt para que la frescura sea coherente
+            // (review Codex #126: todo escritor de onlineInNvr sella su timestamp).
             await server.prisma.camera.updateMany({
               where: { nvrId: nvr.id },
-              data: { onlineInNvr: false } as any,
+              data: { onlineInNvr: false, onlineInNvrAt: new Date(), online: false } as any,
             })
           } else {
             // NVR online: resolver alerta si existía

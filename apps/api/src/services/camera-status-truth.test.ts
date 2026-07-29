@@ -33,6 +33,18 @@ describe('resolveCameraStatus — precedencia', () => {
     expect(r.finalDecisionReason).toBe('nvr_reports_offline_recent')
   })
 
+  // Review Codex #126 (P1): un AUTH_FAILED VIEJO no debe fijar "Auth fallida" para
+  // siempre tras reparar credenciales — vence y una observación fresca lo supera.
+  it('AUTH_FAILED VENCIDO no prevalece sobre onlineInNvr=true reciente', () => {
+    const r = resolveCameraStatus({
+      ...base, streamHealthStatus: 'AUTH_FAILED', rtspCheckedAt: old,
+      onlineInNvr: true, onlineInNvrAt: recent,
+    }, NOW)
+    expect(r.effectiveStatus).toBe('HEALTHY')
+    expect(r.online).toBe(true)
+    expect(r.finalDecisionReason).toBe('nvr_online_rtsp_unverified')
+  })
+
   it('ambos RTSP fallidos recientes → OFFLINE', () => {
     const r = resolveCameraStatus({ ...base, rtspMainOk: false, rtspSubOk: false, rtspCheckedAt: recent }, NOW)
     expect(r.effectiveStatus).toBe('OFFLINE')

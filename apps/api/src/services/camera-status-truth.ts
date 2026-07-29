@@ -91,8 +91,12 @@ export function resolveCameraStatus(input: CameraStatusInput, nowMs: number): Ca
     finalDecisionReason,
   })
 
-  // 1) AUTH_FAILED gana siempre: credenciales inválidas → la cámara no es usable.
-  if (authFailed) return mk('AUTH_FAILED', false, 'stream_health', rtspAt, 'auth_failed')
+  // 1) AUTH_FAILED gana, PERO sólo si es RECIENTE. streamHealthStatus lo escribe el
+  //    validador RTSP junto con lastRtspCheckAt; el worker de salud no lo limpia, así
+  //    que un AUTH_FAILED viejo NO debe fijar la cámara en "Auth fallida" para siempre
+  //    tras reparar credenciales — debe vencer como cualquier otra evidencia (review
+  //    Codex #126). Si está vencido, se ignora y se evalúan las reglas siguientes.
+  if (authFailed && rtspFresh) return mk('AUTH_FAILED', false, 'stream_health', rtspAt, 'auth_failed')
 
   // 2) OFFLINE confirmado por el NVR (reciente) PREVALECE sobre éxitos RTSP viejos.
   if (nvrOfflineRecent) return mk('OFFLINE', false, 'nvr', nvrAt, 'nvr_reports_offline_recent')

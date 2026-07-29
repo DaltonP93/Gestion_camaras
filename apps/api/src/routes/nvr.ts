@@ -499,6 +499,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             securityStatus: cam.securityStatus,
             online:         onlineInNvr ?? false,
             onlineInNvr:    onlineInNvr,
+            // Sellar la observación del NVR sólo si hubo estado real (no null), para
+            // que la frescura sea coherente con el booleano (review Codex #126).
+            ...(onlineInNvr !== null ? { onlineInNvrAt: new Date() } : {}),
             lastSyncAt:     new Date(),
           },
           update: {
@@ -509,6 +512,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
             managementPort: cam.managementPort,
             securityStatus: cam.securityStatus,
             onlineInNvr:    onlineInNvr,
+            ...(onlineInNvr !== null ? { onlineInNvrAt: new Date() } : {}),
             // Only force online=true if NVR confirms; never force to false here —
             // validateAndUpdateCameraHealth sets online=true when RTSP works.
             ...(onlineInNvr === true ? { online: true } : {}),
@@ -686,6 +690,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       const changes: Partial<{
         name: string; ipAddress: string; managementPort: number
         protocol: string; securityStatus: string; onlineInNvr: boolean; channelCode: string; lastSyncAt: Date
+        onlineInNvrAt: Date; online: boolean
       }> = {}
       const changeLog: string[] = []
 
@@ -744,6 +749,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       const statusStr = (cam.status || '').toLowerCase()
       if (isFromInputProxy && (statusStr === 'online' || statusStr === 'offline')) {
         changes.onlineInNvr = statusStr === 'online'
+        // Sellar la observación (frescura coherente con el booleano, review Codex #126).
+        changes.onlineInNvrAt = new Date()
+        if (changes.onlineInNvr === false) changes.online = false
         changeLog.push(`onlineInNvr: ${changes.onlineInNvr}`)
         statusUpdated++
       }
