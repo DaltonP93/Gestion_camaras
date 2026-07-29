@@ -37,6 +37,9 @@ model User {
   twoFactorEnabled     Boolean @default(false)
   twoFactorSecret      String? @db.Text
   twoFactorBackupCodes String? @db.Text // JSON: hashed recovery codes
+  // Enforcement MFA obligatorio (fase 4b): inicios consumidos del período de gracia
+  // mientras la política exige MFA y el usuario aún no se ha enrolado.
+  mfaGraceLoginsUsed   Int     @default(0)
 
   // Seguridad de contraseña
   passwordChangedAt   DateTime?

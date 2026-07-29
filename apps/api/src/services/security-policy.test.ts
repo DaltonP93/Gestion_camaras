@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
-  evaluatePasswordPolicy, sessionsToPrune, accessTokenTtl, DEFAULT_SECURITY_SETTINGS,
+  evaluatePasswordPolicy, sessionsToPrune, accessTokenTtl, decideMfaGate, DEFAULT_SECURITY_SETTINGS,
 } from './security-policy'
 
 describe('evaluatePasswordPolicy (P0: mínimo real 12)', () => {
@@ -47,6 +47,26 @@ describe('sessionsToPrune (maxSessions)', () => {
       { id: 'c', createdAt: new Date(200) },
     ]
     expect(sessionsToPrune(sessions, 1)).toEqual(['c', 'a'])  // conserva b(300)
+  })
+})
+
+describe('decideMfaGate (enforcement 4b)', () => {
+  it('usuario con MFA → challenge (haya o no política)', () => {
+    expect(decideMfaGate({ mfaRequired: false, userHasMfa: true, graceLoginsUsed: 0, gracePeriodLogins: 3 }).action).toBe('challenge')
+    expect(decideMfaGate({ mfaRequired: true, userHasMfa: true, graceLoginsUsed: 9, gracePeriodLogins: 3 }).action).toBe('challenge')
+  })
+  it('sin política y sin MFA → none', () => {
+    expect(decideMfaGate({ mfaRequired: false, userHasMfa: false, graceLoginsUsed: 0, gracePeriodLogins: 3 }).action).toBe('none')
+  })
+  it('política activa, sin MFA, con gracia → grace y va descontando', () => {
+    expect(decideMfaGate({ mfaRequired: true, userHasMfa: false, graceLoginsUsed: 0, gracePeriodLogins: 3 })).toEqual({ action: 'grace', graceRemaining: 2 })
+    expect(decideMfaGate({ mfaRequired: true, userHasMfa: false, graceLoginsUsed: 2, gracePeriodLogins: 3 })).toEqual({ action: 'grace', graceRemaining: 0 })
+  })
+  it('política activa, sin MFA, gracia agotada → enroll', () => {
+    expect(decideMfaGate({ mfaRequired: true, userHasMfa: false, graceLoginsUsed: 3, gracePeriodLogins: 3 }).action).toBe('enroll')
+  })
+  it('período de gracia 0 → enroll inmediato (estricto)', () => {
+    expect(decideMfaGate({ mfaRequired: true, userHasMfa: false, graceLoginsUsed: 0, gracePeriodLogins: 0 }).action).toBe('enroll')
   })
 })
 

@@ -11,7 +11,7 @@ import {
   resolveFeaturePermissions,
 } from '../services/totp'
 import { getSecuritySettings } from '../services/security-settings'
-import { sessionsToPrune, accessTokenTtl } from '../services/security-policy'
+import { sessionsToPrune, accessTokenTtl, decideMfaGate } from '../services/security-policy'
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
@@ -123,14 +123,44 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       data: { failedLoginAttempts: 0, lockedUntil: null },
     })
 
-    // 2FA required?
-    if (user.twoFactorEnabled) {
+    // ── Compuerta MFA (fase 4b) ──
+    // Decide entre: desafío 2FA (usuario ya enrolado), login de gracia (política
+    // activa, aún con inicios de cortesía), enrolamiento forzoso (gracia agotada) o
+    // login normal (sin política).
+    const gate = decideMfaGate({
+      mfaRequired: sec.mfaRequired,
+      userHasMfa: user.twoFactorEnabled,
+      graceLoginsUsed: user.mfaGraceLoginsUsed,
+      gracePeriodLogins: sec.mfaGracePeriodLogins,
+    })
+
+    if (gate.action === 'challenge') {
       const tempToken = (server.jwt as any).sign(
         { sub: user.id, step: '2fa' },
         { expiresIn: '5m' }
       )
       await AuditAction(server.prisma, user.id, 'LOGIN_2FA_REQUIRED', user.id, request)
       return reply.send({ requiresTwoFactor: true, tempToken })
+    }
+
+    if (gate.action === 'enroll') {
+      // Sin acceso normal hasta completar el segundo factor: token de enrolamiento
+      // de alcance limitado (sólo /mfa/enroll/*), NO un access token.
+      const enrollToken = (server.jwt as any).sign(
+        { sub: user.id, step: 'mfa-enroll' },
+        { expiresIn: '15m' }
+      )
+      await AuditAction(server.prisma, user.id, 'MFA_ENROLLMENT_REQUIRED', user.id, request)
+      return reply.send({ requiresMfaEnrollment: true, enrollToken })
+    }
+
+    if (gate.action === 'grace') {
+      await server.prisma.user.update({
+        where: { id: user.id },
+        data: { mfaGraceLoginsUsed: { increment: 1 } },
+      })
+      await AuditAction(server.prisma, user.id, 'MFA_GRACE_LOGIN', user.id, request, { graceRemaining: gate.graceRemaining })
+      return completeLogin(server, request, reply, user, { mustEnrollMfa: true, mfaGraceRemaining: gate.graceRemaining })
     }
 
     return completeLogin(server, request, reply, user)
@@ -244,11 +274,78 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       data: {
         twoFactorEnabled: true,
         twoFactorBackupCodes: JSON.stringify(hashedCodes),
+        mfaGraceLoginsUsed: 0,
       },
     })
 
     await AuditAction(server.prisma, user.id, 'TWO_FA_ENABLED', user.id, request)
     return reply.send({ message: '2FA habilitado', backupCodes: plainCodes })
+  })
+
+  // ──────────────────────────────────────────────────────────
+  // Enrolamiento forzoso de MFA (fase 4b) — con enrollToken de alcance limitado
+  // que emite el login cuando la política exige MFA y la gracia está agotada.
+  // ──────────────────────────────────────────────────────────
+  const verifyEnrollToken = (raw: string): { sub: string } | null => {
+    try {
+      const p: any = server.jwt.verify(raw)
+      return p && p.step === 'mfa-enroll' ? { sub: p.sub } : null
+    } catch { return null }
+  }
+
+  // POST /api/auth/mfa/enroll/start — genera secreto + QR (no activa aún)
+  server.post('/mfa/enroll/start', {
+    config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+  }, async (request, reply) => {
+    const { enrollToken } = z.object({ enrollToken: z.string().min(1) }).parse(request.body)
+    const claims = verifyEnrollToken(enrollToken)
+    if (!claims) return reply.status(401).send({ message: 'Token de enrolamiento inválido o expirado' })
+
+    const user = await server.prisma.user.findUnique({
+      where: { id: claims.sub },
+      select: { id: true, username: true, active: true, twoFactorEnabled: true },
+    })
+    if (!user || !user.active) return reply.status(401).send({ message: 'No autorizado' })
+    if (user.twoFactorEnabled) return reply.status(400).send({ message: '2FA ya está habilitado' })
+
+    const secret = generateTotpSecret()
+    const qrCodeUri = await getTotpQrCodeUri(secret, user.username)
+    await server.prisma.user.update({ where: { id: user.id }, data: { twoFactorSecret: secret } })
+    return reply.send({ secret, qrCodeUri })
+  })
+
+  // POST /api/auth/mfa/enroll/complete — verifica código, activa 2FA y emite tokens
+  server.post('/mfa/enroll/complete', {
+    config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+  }, async (request, reply) => {
+    const { enrollToken, code } = z.object({
+      enrollToken: z.string().min(1),
+      code:        z.string().min(6).max(6),
+    }).parse(request.body)
+    const claims = verifyEnrollToken(enrollToken)
+    if (!claims) return reply.status(401).send({ message: 'Token de enrolamiento inválido o expirado' })
+
+    const user = await server.prisma.user.findUnique({ where: { id: claims.sub } })
+    if (!user || !user.active) return reply.status(401).send({ message: 'No autorizado' })
+    if (user.twoFactorEnabled) return reply.status(400).send({ message: '2FA ya está habilitado' })
+    if (!user.twoFactorSecret) return reply.status(400).send({ message: 'Inicia el enrolamiento primero' })
+    if (!verifyTotpToken(user.twoFactorSecret, code)) {
+      return reply.status(400).send({ message: 'Código incorrecto' })
+    }
+
+    const plainCodes = generateBackupCodes()
+    const hashedCodes = await hashBackupCodes(plainCodes)
+    await server.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        twoFactorEnabled: true,
+        twoFactorBackupCodes: JSON.stringify(hashedCodes),
+        mfaGraceLoginsUsed: 0,
+      },
+    })
+
+    await AuditAction(server.prisma, user.id, 'MFA_ENROLLED', user.id, request, { forced: true })
+    return completeLogin(server, request, reply, user, { backupCodes: plainCodes, mfaEnrolled: true })
   })
 
   // ──────────────────────────────────────────────────────────
@@ -633,7 +730,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
 // ─── Shared login completion ──────────────────────────────────
 
-async function completeLogin(server: any, request: any, reply: any, user: any) {
+async function completeLogin(server: any, request: any, reply: any, user: any, extra: Record<string, unknown> = {}) {
   const payload = { sub: user.id, username: user.username, role: user.role }
   const sec = await getSecuritySettings(server.prisma)
 
@@ -676,5 +773,6 @@ async function completeLogin(server: any, request: any, reply: any, user: any) {
       id: user.id, username: user.username,
       fullName: user.fullName, email: user.email, role: user.role,
     },
+    ...extra,
   })
 }

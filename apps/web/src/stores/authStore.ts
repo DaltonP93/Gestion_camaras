@@ -10,15 +10,28 @@ interface TwoFactorChallenge {
   username: string
 }
 
+interface MfaEnrollment {
+  enrollToken: string
+  username: string
+}
+
 interface AuthState {
   user: User | null
   isAuthenticated: boolean
   isLoading: boolean
   twoFactorChallenge: TwoFactorChallenge | null
+  // Enrolamiento forzoso de MFA (fase 4b): activo cuando la política exige MFA y el
+  // usuario aún no lo tiene con la gracia agotada — no hay acceso hasta completarlo.
+  mfaEnrollment: MfaEnrollment | null
+  // Inicios de gracia restantes tras un login de cortesía (para avisar al usuario).
+  mfaGraceRemaining: number | null
 
   login:         (username: string, password: string, rememberMe?: boolean) => Promise<void>
   verify2FA:     (code: string) => Promise<void>
   cancelTwoFactor: () => void
+  startMfaEnroll:    () => Promise<{ secret: string; qrCodeUri: string }>
+  completeMfaEnroll: (code: string) => Promise<string[]>
+  cancelMfaEnroll:   () => void
   logout:        () => Promise<void>
   loadUser:      () => Promise<void>
   hasRole:       (...roles: User['role'][]) => boolean
@@ -28,6 +41,18 @@ interface AuthState {
   canConfigureNVR:   () => boolean
 }
 
+// Guarda los tokens en el almacenamiento elegido y fija el header Authorization.
+function persistTokens(data: { accessToken: string; refreshToken: string }, rememberMe: boolean) {
+  const storage = rememberMe ? localStorage : sessionStorage
+  storage.setItem('accessToken', data.accessToken)
+  storage.setItem('refreshToken', data.refreshToken)
+  if (!rememberMe) {
+    localStorage.removeItem('accessToken')
+    localStorage.removeItem('refreshToken')
+  }
+  api.defaults.headers.common.Authorization = `Bearer ${data.accessToken}`
+}
+
 export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({
@@ -35,6 +60,8 @@ export const useAuthStore = create<AuthState>()(
       isAuthenticated: false,
       isLoading: false,
       twoFactorChallenge: null,
+      mfaEnrollment: null,
+      mfaGraceRemaining: null,
 
       login: async (username, password, rememberMe = true) => {
         set({ isLoading: true })
@@ -48,16 +75,18 @@ export const useAuthStore = create<AuthState>()(
             return
           }
 
-          const storage = rememberMe ? localStorage : sessionStorage
-          storage.setItem('accessToken', data.accessToken)
-          storage.setItem('refreshToken', data.refreshToken)
-          if (!rememberMe) {
-            // Clear localStorage tokens if user explicitly chose not to remember
-            localStorage.removeItem('accessToken')
-            localStorage.removeItem('refreshToken')
+          if (data.requiresMfaEnrollment) {
+            // Enrolamiento forzoso: aún no hay tokens de acceso, sólo enrollToken.
+            sessionStorage.setItem('pendingRememberMe', rememberMe ? '1' : '0')
+            set({ mfaEnrollment: { enrollToken: data.enrollToken, username }, isLoading: false })
+            return
           }
-          api.defaults.headers.common.Authorization = `Bearer ${data.accessToken}`
-          set({ user: data.user, isAuthenticated: true, isLoading: false, twoFactorChallenge: null })
+
+          persistTokens(data, rememberMe)
+          set({
+            user: data.user, isAuthenticated: true, isLoading: false, twoFactorChallenge: null,
+            mfaGraceRemaining: data.mustEnrollMfa ? (data.mfaGraceRemaining ?? 0) : null,
+          })
           connectWebSocket()
         } catch (err) {
           set({ isLoading: false })
@@ -77,14 +106,7 @@ export const useAuthStore = create<AuthState>()(
           })
           const rememberMe = sessionStorage.getItem('pendingRememberMe') !== '0'
           sessionStorage.removeItem('pendingRememberMe')
-          const storage = rememberMe ? localStorage : sessionStorage
-          storage.setItem('accessToken', data.accessToken)
-          storage.setItem('refreshToken', data.refreshToken)
-          if (!rememberMe) {
-            localStorage.removeItem('accessToken')
-            localStorage.removeItem('refreshToken')
-          }
-          api.defaults.headers.common.Authorization = `Bearer ${data.accessToken}`
+          persistTokens(data, rememberMe)
           set({ user: data.user, isAuthenticated: true, isLoading: false, twoFactorChallenge: null })
           connectWebSocket()
         } catch (err) {
@@ -94,6 +116,40 @@ export const useAuthStore = create<AuthState>()(
       },
 
       cancelTwoFactor: () => set({ twoFactorChallenge: null }),
+
+      // Enrolamiento forzoso de MFA — genera secreto + QR con el enrollToken.
+      startMfaEnroll: async () => {
+        const { mfaEnrollment } = get()
+        if (!mfaEnrollment) throw new Error('Sin enrolamiento MFA activo')
+        return apiPost<{ secret: string; qrCodeUri: string }>('/auth/mfa/enroll/start', {
+          enrollToken: mfaEnrollment.enrollToken,
+        })
+      },
+
+      // Verifica el primer código, activa MFA y completa el login (emite tokens).
+      // Devuelve los códigos de recuperación para mostrarlos una única vez.
+      completeMfaEnroll: async (code) => {
+        const { mfaEnrollment } = get()
+        if (!mfaEnrollment) throw new Error('Sin enrolamiento MFA activo')
+        set({ isLoading: true })
+        try {
+          const data = await apiPost<any>('/auth/mfa/enroll/complete', {
+            enrollToken: mfaEnrollment.enrollToken,
+            code,
+          })
+          const rememberMe = sessionStorage.getItem('pendingRememberMe') !== '0'
+          sessionStorage.removeItem('pendingRememberMe')
+          persistTokens(data, rememberMe)
+          set({ user: data.user, isAuthenticated: true, isLoading: false, mfaEnrollment: null })
+          connectWebSocket()
+          return (data.backupCodes ?? []) as string[]
+        } catch (err) {
+          set({ isLoading: false })
+          throw err
+        }
+      },
+
+      cancelMfaEnroll: () => set({ mfaEnrollment: null }),
 
       logout: async () => {
         const refreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')

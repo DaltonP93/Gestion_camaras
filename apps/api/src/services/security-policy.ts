@@ -92,6 +92,46 @@ export function sessionsToPrune(sessions: readonly SessionLike[], maxSessions: n
   return sorted.slice(max).map((s) => s.id)
 }
 
+// ─── Enforcement MFA (fase 4b) ────────────────────────────────
+
+export type MfaGateAction =
+  | 'none'      // sin 2FA y sin política: login normal
+  | 'challenge' // el usuario tiene 2FA: pedir segundo factor
+  | 'grace'     // política activa, sin 2FA, aún con inicios de gracia: permitir pero exigir enrolamiento
+  | 'enroll'    // política activa, sin 2FA y gracia agotada: bloquear tokens normales hasta enrolar
+
+export interface MfaGateInput {
+  mfaRequired: boolean
+  userHasMfa: boolean
+  graceLoginsUsed: number
+  gracePeriodLogins: number
+}
+
+export interface MfaGateDecision {
+  action: MfaGateAction
+  graceRemaining: number   // inicios de gracia que quedarán tras ESTE login (0 en 'enroll'/'challenge'/'none')
+}
+
+/**
+ * Decide qué hacer en el login respecto al segundo factor. Puro y determinista.
+ *
+ * - Si el usuario ya tiene MFA → siempre 'challenge' (haya o no política).
+ * - Si la política NO exige MFA y el usuario no lo tiene → 'none'.
+ * - Si la política exige MFA y el usuario no lo tiene:
+ *     · quedan inicios de gracia → 'grace' (se consumirá uno).
+ *     · gracia agotada (o período 0) → 'enroll' (enrolamiento forzoso).
+ */
+export function decideMfaGate(input: MfaGateInput): MfaGateDecision {
+  if (input.userHasMfa) return { action: 'challenge', graceRemaining: 0 }
+  if (!input.mfaRequired) return { action: 'none', graceRemaining: 0 }
+  const period = Math.max(0, Math.floor(input.gracePeriodLogins))
+  const used = Math.max(0, Math.floor(input.graceLoginsUsed))
+  if (used < period) {
+    return { action: 'grace', graceRemaining: period - used - 1 }
+  }
+  return { action: 'enroll', graceRemaining: 0 }
+}
+
 /**
  * TTL del access token como CADENA de duración ("<minutos>m") a partir de los
  * minutos configurados, acotado a los límites. Se devuelve string (no número) a
