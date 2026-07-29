@@ -1,20 +1,33 @@
 // src/stores/alertStore.ts
 import { create } from 'zustand'
 import toast from 'react-hot-toast'
-import type { Alert } from '@/types'
+import { apiGet } from '@/lib/api'
+import type { Alert, AlertSummary } from '@/types'
 
+// FUENTE DE VERDAD ÚNICA de contadores (P1): el `summary` viene SIEMPRE del backend
+// (/alerts/summary), no de contar el arreglo `alerts` (que cada pantalla llena con
+// una consulta distinta). `alerts` es SÓLO la lista de la vista actual; los
+// contadores (campana, menú, dashboard, tabs) salen de `summary`.
 interface AlertState {
   alerts: Alert[]
+  summary: AlertSummary
+  // Compat: unreadCount = summary.unread (campana/menú). Se mantiene el nombre para
+  // no romper consumidores, pero su valor SIEMPRE proviene del summary del backend.
   unreadCount: number
   isLoading: boolean
 
   setAlerts: (alerts: Alert[]) => void
-  setUnreadCount: (count: number) => void
+  setSummary: (summary: AlertSummary) => void
+  refreshSummary: () => Promise<void>
   addAlert: (alert: Alert) => void
   resolveById: (id: string) => void
   markResolved: (id: string) => void
   markRead: (id: string) => void
   markAllRead: () => void
+}
+
+const EMPTY_SUMMARY: AlertSummary = {
+  unread: 0, acknowledged: 0, pending: 0, resolved: 0, total: 0, criticalPending: 0,
 }
 
 const SEVERITY_ICONS: Record<string, string> = {
@@ -26,27 +39,35 @@ const SEVERITY_ICONS: Record<string, string> = {
 
 export const useAlertStore = create<AlertState>((set, get) => ({
   alerts: [],
+  summary: EMPTY_SUMMARY,
   unreadCount: 0,
   isLoading: false,
 
-  setAlerts: (alerts) => {
-    const unreadCount = alerts.filter((a) => !a.resolved && !a.readAt).length
-    set({ alerts, unreadCount })
+  // La lista de la vista actual. YA NO recalcula contadores: cargar una consulta
+  // filtrada (p.ej. sólo activas, o sólo resueltas) no debe redefinir la campana.
+  setAlerts: (alerts) => set({ alerts }),
+
+  setSummary: (summary) => set({ summary, unreadCount: summary.unread }),
+
+  // Re-sincroniza los contadores desde el backend. Se llama al montar cada pantalla,
+  // tras cada evento WS y tras cada acción (leer/resolver) → todos los contadores
+  // quedan consistentes sin depender de qué arreglo se cargó por última vez.
+  refreshSummary: async () => {
+    try {
+      const summary = await apiGet<AlertSummary>('/alerts/summary')
+      set({ summary, unreadCount: summary.unread })
+    } catch { /* mantener el último summary conocido */ }
   },
 
-  setUnreadCount: (count) => set({ unreadCount: count }),
-
   addAlert: (alert) => {
-    // El contador sólo cuenta no-leídas Y no-resueltas: un registro de recuperación
-    // (CAMERA_RECOVERED, resolved+read) llega por WS pero NO debe inflar la campana.
+    // Un registro de recuperación (resolved+read) llega por WS pero NO es "nueva".
     const countsAsUnread = !alert.resolved && !alert.readAt
     set((state) => {
-      // dedup por id (evita duplicar si ya llegó por polling)
       const exists = state.alerts.some((a) => a.id === alert.id)
       const alerts = exists
         ? state.alerts.map((a) => (a.id === alert.id ? { ...a, ...alert } : a))
         : [alert, ...state.alerts].slice(0, 200)
-      return { alerts, unreadCount: state.unreadCount + (countsAsUnread && !exists ? 1 : 0) }
+      return { alerts }
     })
     if (countsAsUnread) {
       const icon = SEVERITY_ICONS[alert.severity] || '⚡'
@@ -55,58 +76,46 @@ export const useAlertStore = create<AlertState>((set, get) => ({
         duration: alert.severity === 'CRITICAL' ? 10000 : 5000,
       })
     }
+    // Contadores autoritativos desde el backend (mantiene campana/dashboard/tabs).
+    void get().refreshSummary()
   },
 
-  // Resolución empujada por el servidor (evento WS alert_resolved): marca resuelta
-  // y baja el contador sin recargar.
+  // Resolución empujada por el servidor (WS alert_resolved): actualizar la lista y
+  // re-sincronizar contadores.
   resolveById: (id) => {
-    set((state) => {
-      const alert = state.alerts.find((a) => a.id === id)
-      const wasUnread = alert && !alert.readAt && !alert.resolved
-      return {
-        alerts: state.alerts.map((a) =>
-          a.id === id ? { ...a, resolved: true, resolvedAt: a.resolvedAt ?? new Date().toISOString() } : a
-        ),
-        unreadCount: wasUnread ? Math.max(0, state.unreadCount - 1) : state.unreadCount,
-      }
-    })
+    set((state) => ({
+      alerts: state.alerts.map((a) =>
+        a.id === id ? { ...a, resolved: true, resolvedAt: a.resolvedAt ?? new Date().toISOString() } : a
+      ),
+    }))
+    void get().refreshSummary()
   },
 
   markResolved: (id) => {
-    set((state) => {
-      const alert = state.alerts.find((a) => a.id === id)
-      const wasUnread = alert && !alert.readAt && !alert.resolved
-      return {
-        alerts: state.alerts.map((a) =>
-          a.id === id
-            ? { ...a, resolved: true, resolvedAt: new Date().toISOString(), readAt: a.readAt ?? new Date().toISOString() }
-            : a
-        ),
-        unreadCount: wasUnread ? Math.max(0, state.unreadCount - 1) : state.unreadCount,
-      }
-    })
+    set((state) => ({
+      alerts: state.alerts.map((a) =>
+        a.id === id
+          ? { ...a, resolved: true, resolvedAt: new Date().toISOString(), readAt: a.readAt ?? new Date().toISOString() }
+          : a
+      ),
+    }))
+    void get().refreshSummary()
   },
 
   markRead: (id) => {
-    set((state) => {
-      const alert = state.alerts.find((a) => a.id === id)
-      const wasUnread = alert && !alert.readAt && !alert.resolved
-      return {
-        alerts: state.alerts.map((a) =>
-          a.id === id && !a.readAt ? { ...a, readAt: new Date().toISOString() } : a
-        ),
-        unreadCount: wasUnread ? Math.max(0, state.unreadCount - 1) : state.unreadCount,
-      }
-    })
+    set((state) => ({
+      alerts: state.alerts.map((a) =>
+        a.id === id && !a.readAt ? { ...a, readAt: new Date().toISOString() } : a
+      ),
+    }))
+    void get().refreshSummary()
   },
 
   markAllRead: () => {
     const now = new Date().toISOString()
     set((state) => ({
-      alerts: state.alerts.map((a) =>
-        a.readAt || a.resolved ? a : { ...a, readAt: now }
-      ),
-      unreadCount: 0,
+      alerts: state.alerts.map((a) => (a.readAt || a.resolved ? a : { ...a, readAt: now })),
     }))
+    void get().refreshSummary()
   },
 }))

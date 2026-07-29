@@ -1,7 +1,24 @@
 // apps/api/src/routes/alerts.ts
 import type { FastifyPluginAsync } from 'fastify'
+import { deriveAlertSummary } from '../services/alert-summary'
 
 export const alertRoutes: FastifyPluginAsync = async (server) => {
+  // GET /api/alerts/summary — contadores ÚNICOS server-side (fuente de verdad).
+  // Reemplaza el conteo client-side sobre un arreglo compartido. Semántica:
+  //   unread(Nuevas) = !resolved && readAt=null; acknowledged(Reconocidas) =
+  //   !resolved && readAt!=null; pending = unread+acknowledged; resolved; total;
+  //   criticalPending = pendiente y severidad HIGH/CRITICAL. Campana/menú = unread,
+  //   Dashboard = pending.
+  server.get('/summary', { preHandler: [server.authenticate] }, async (_req, reply) => {
+    const [unread, acknowledged, resolved, criticalPending] = await Promise.all([
+      server.prisma.alert.count({ where: { resolved: false, readAt: null } }),
+      server.prisma.alert.count({ where: { resolved: false, readAt: { not: null } } }),
+      server.prisma.alert.count({ where: { resolved: true } }),
+      server.prisma.alert.count({ where: { resolved: false, severity: { in: ['HIGH', 'CRITICAL'] } } }),
+    ])
+    return reply.send(deriveAlertSummary({ unread, acknowledged, resolved, criticalPending }))
+  })
+
   // GET /api/alerts — listar alertas con filtros opcionales
   // ?status=unread   → no leídas y no resueltas
   // ?status=active   → no resueltas (todas)

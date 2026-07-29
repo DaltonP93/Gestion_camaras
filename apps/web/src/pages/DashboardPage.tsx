@@ -1,5 +1,5 @@
 // src/pages/DashboardPage.tsx
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   Video, Server, HardDrive, Bell, Activity,
@@ -10,17 +10,10 @@ import { useAlertStore } from '@/stores/alertStore'
 import { useAuthStore } from '@/stores/authStore'
 import { apiGet } from '@/lib/api'
 import { clsx } from 'clsx'
-import type { NVRStatus, Alert } from '@/types'
+import type { NVRStatus, DashboardOverview, Alert } from '@/types'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { format, subHours } from 'date-fns'
+import { format } from 'date-fns'
 import { es } from 'date-fns/locale'
-
-// Datos simulados de actividad para el gráfico
-const mockActivity = Array.from({ length: 24 }, (_, i) => ({
-  time: format(subHours(new Date(), 23 - i), 'HH:mm'),
-  cámaras: Math.floor(Math.random() * 20) + 110,
-  alertas: Math.floor(Math.random() * 5),
-}))
 
 function StatCard({
   icon, label, value, sub, subColor, to
@@ -45,24 +38,39 @@ function StatCard({
 }
 
 export function DashboardPage() {
-  const { nvrs, cameras, loadNVRs, loadCameras, loadNVRStatus, nvrStatuses } = useCameraStore()
-  const { alerts, setAlerts } = useAlertStore()
+  const { nvrs, loadNVRs, loadCameras, loadNVRStatus, nvrStatuses } = useCameraStore()
+  const { refreshSummary } = useAlertStore()
   const { user } = useAuthStore()
+  // Resumen ÚNICO server-side (P1): totales de cámaras, alertas y actividad REAL.
+  const [overview, setOverview] = useState<DashboardOverview | null>(null)
+  // Lista de alertas recientes SOLO para este widget — estado local, NO el arreglo
+  // global compartido (que causaba contadores contradictorios entre pantallas).
+  const [recentAlerts, setRecentAlerts] = useState<Alert[]>([])
+
+  const loadOverview = () => apiGet<DashboardOverview>('/dashboard/overview').then(setOverview).catch(() => {})
 
   useEffect(() => {
     loadNVRs()
     loadCameras()
-    apiGet<Alert[]>('/alerts?status=active&limit=200').then(setAlerts).catch(() => {})
+    loadOverview()
+    apiGet<Alert[]>('/alerts?status=active&limit=8').then(setRecentAlerts).catch(() => {})
+    void refreshSummary()   // mantiene campana/menú consistentes al entrar al Dashboard
   }, [])
 
   useEffect(() => {
     nvrs.forEach((nvr) => loadNVRStatus(nvr.id))
   }, [nvrs])
 
-  const totalCameras = nvrs.reduce((acc, n) => acc + n.channels, 0)
-  const onlineCameras = cameras.filter((c) => c.online).length
-  const activeAlerts = alerts.filter((a) => !a.resolved)
-  const criticalAlerts = activeAlerts.filter((a) => ['HIGH', 'CRITICAL'].includes(a.severity))
+  // Contadores desde el resumen server-side — NO desde un arreglo compartido.
+  const totalCameras  = overview?.cameras.total ?? 0
+  const onlineCameras = overview?.cameras.online ?? 0
+  const pendingAlerts  = overview?.alerts.pending ?? 0
+  const criticalPending = overview?.alerts.criticalPending ?? 0
+  // Serie temporal REAL de alertas por hora (reemplaza Math.random).
+  const activityData = (overview?.activity ?? []).map((b) => ({
+    time: format(new Date(b.hourStart), 'HH:mm'),
+    alertas: b.alerts,
+  }))
   const avgDiskUsage = nvrs.length > 0
     ? Math.round(Object.values(nvrStatuses).reduce((acc, s) => acc + s.diskUsage, 0) / Math.max(Object.keys(nvrStatuses).length, 1))
     : 0
@@ -106,14 +114,14 @@ export function DashboardPage() {
         />
         <StatCard
           icon={<Bell size={16} />}
-          label="Alertas activas"
-          value={activeAlerts.length}
+          label="Alertas pendientes"
+          value={pendingAlerts}
           sub={
-            criticalAlerts.length > 0
-              ? `${criticalAlerts.length} críticas/altas`
-              : activeAlerts.length > 0 ? 'Revisar alertas' : 'Todo OK'
+            criticalPending > 0
+              ? `${criticalPending} críticas/altas`
+              : pendingAlerts > 0 ? 'Revisar alertas' : 'Todo OK'
           }
-          subColor={criticalAlerts.length > 0 ? 'text-red-400' : activeAlerts.length > 0 ? 'text-amber-400' : 'text-green-400'}
+          subColor={criticalPending > 0 ? 'text-red-400' : pendingAlerts > 0 ? 'text-amber-400' : 'text-green-400'}
           to="/alerts"
         />
       </div>
@@ -122,26 +130,26 @@ export function DashboardPage() {
       <div className="card p-4">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h3 className="text-sm font-medium text-surface-100">Actividad últimas 24h</h3>
-            <p className="text-xs text-surface-400 mt-0.5">Cámaras activas y alertas generadas</p>
+            <h3 className="text-sm font-medium text-surface-100">Alertas últimas 24h</h3>
+            <p className="text-xs text-surface-400 mt-0.5">Alertas generadas por hora (datos reales)</p>
           </div>
           <Activity size={14} className="text-surface-500" />
         </div>
         <ResponsiveContainer width="100%" height={140}>
-          <AreaChart data={mockActivity} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
+          <AreaChart data={activityData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
             <defs>
-              <linearGradient id="camGrad" x1="0" y1="0" x2="0" y2="1">
+              <linearGradient id="alertGrad" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%" stopColor="#e51d1d" stopOpacity={0.3} />
                 <stop offset="95%" stopColor="#e51d1d" stopOpacity={0} />
               </linearGradient>
             </defs>
             <XAxis dataKey="time" tick={{ fill: '#6e7681', fontSize: 10 }} tickLine={false} axisLine={false} interval={5} />
-            <YAxis tick={{ fill: '#6e7681', fontSize: 10 }} tickLine={false} axisLine={false} />
+            <YAxis allowDecimals={false} tick={{ fill: '#6e7681', fontSize: 10 }} tickLine={false} axisLine={false} />
             <Tooltip
               contentStyle={{ background: '#21262d', border: '1px solid #30363d', borderRadius: 8, fontSize: 12 }}
               labelStyle={{ color: '#c9d1d9' }}
             />
-            <Area type="monotone" dataKey="cámaras" stroke="#e51d1d" strokeWidth={2} fill="url(#camGrad)" />
+            <Area type="monotone" dataKey="alertas" stroke="#e51d1d" strokeWidth={2} fill="url(#alertGrad)" />
           </AreaChart>
         </ResponsiveContainer>
       </div>
@@ -232,7 +240,7 @@ export function DashboardPage() {
             <Link to="/alerts" className="text-xs text-brand-400 hover:text-brand-300">Ver todas →</Link>
           </div>
           <div className="divide-y divide-surface-700 max-h-64 overflow-auto">
-            {alerts.slice(0, 8).map((alert) => (
+            {recentAlerts.slice(0, 8).map((alert) => (
               <div key={alert.id} className="px-4 py-3 flex items-start gap-3">
                 {alert.resolved ? (
                   <CheckCircle2 size={14} className="text-green-400 mt-0.5 flex-shrink-0" />
@@ -251,7 +259,7 @@ export function DashboardPage() {
                 </div>
               </div>
             ))}
-            {alerts.length === 0 && (
+            {recentAlerts.length === 0 && (
               <div className="px-4 py-6 text-center text-sm text-green-400">
                 ✓ Sin alertas activas
               </div>
