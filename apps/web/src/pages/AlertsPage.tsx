@@ -1,5 +1,5 @@
 // src/pages/AlertsPage.tsx
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { AlertTriangle, CheckCircle2, Bell, Filter, Eye, Square, CheckSquare, Loader2 } from 'lucide-react'
 import { useAlertStore } from '@/stores/alertStore'
 import { apiGet, apiPost, apiPut } from '@/lib/api'
@@ -55,9 +55,14 @@ export function AlertsPage() {
 
   const isPrivileged = ['ADMIN', 'SUPERVISOR'].includes(user?.role || '')
 
+  // Secuencia de petición: descarta respuestas obsoletas (si el usuario cambia de tab/
+  // severidad/página mientras hay una carga en vuelo, sólo la última aplica su estado).
+  const reqIdRef = useRef(0)
+
   // Carga SERVER-SIDE de la página/tab/severidad actuales. Ya NO se descargan 200 filas
   // para filtrar en el cliente (eso ocultaba unread fuera de esa ventana).
   const loadAlerts = useCallback(async (targetPage: number) => {
+    const reqId = ++reqIdRef.current
     setIsLoading(true)
     try {
       const params = new URLSearchParams({
@@ -67,17 +72,29 @@ export function AlertsPage() {
         limit: String(PAGE_SIZE),
       })
       const data = await apiGet<AlertsPageResponse>(`/alerts?${params.toString()}`)
+      if (reqIdRef.current !== reqId) return   // llegó una carga más nueva: ignorar ésta
+
+      // Si la página quedó fuera de rango tras encoger el conjunto (p.ej. reconocer el
+      // único item de la última página), recargar la última página REAL en vez de dejar
+      // al usuario en una página vacía sin controles de navegación.
+      const lastPage = Math.max(0, Math.ceil(data.total / PAGE_SIZE) - 1)
+      if (data.total > 0 && data.page > lastPage) {
+        void loadAlerts(lastPage)
+        return
+      }
+
       setItems(data.items)
       setTotal(data.total)
       setPage(data.page)
       setSelected(new Set())
     } catch (err: any) {
+      if (reqIdRef.current !== reqId) return
       // El 401 lo maneja el interceptor de axios (refresh + retry). Otros errores se avisan.
       if (err?.response?.status !== 401) {
         toast.error('No se pudieron cargar las alertas')
       }
     } finally {
-      setIsLoading(false)
+      if (reqIdRef.current === reqId) setIsLoading(false)
     }
   }, [filter, severityFilter])
 
