@@ -477,8 +477,20 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
 
     await server.prisma.user.update({
       where: { id },
-      data: { twoFactorEnabled: false, twoFactorSecret: null, twoFactorBackupCodes: null },
+      // Fase 4b: limpiar el 2FA y marcar enrolamiento FORZOSO. No basta con reiniciar
+      // la gracia a 0 — con un período de gracia > 0 eso concedería nuevos inicios
+      // password-only. forceMfaEnrollment obliga a re-enrolar en el próximo login,
+      // con independencia de la gracia de rollout.
+      data: {
+        twoFactorEnabled: false,
+        twoFactorSecret: null,
+        twoFactorBackupCodes: null,
+        mfaGraceLoginsUsed: 0,
+        forceMfaEnrollment: true,
+      },
     })
+    // Revocar sesiones activas para forzar el paso por la compuerta MFA al reingresar.
+    await server.prisma.session.deleteMany({ where: { userId: id } })
 
     await AuditAction(server.prisma, request.user.sub, 'TWO_FA_RESET_BY_ADMIN', id, request)
     return reply.send({ message: '2FA del usuario ha sido deshabilitado' })

@@ -37,6 +37,13 @@ model User {
   twoFactorEnabled     Boolean @default(false)
   twoFactorSecret      String? @db.Text
   twoFactorBackupCodes String? @db.Text // JSON: hashed recovery codes
+  // Enforcement MFA obligatorio (fase 4b): inicios consumidos del período de gracia
+  // mientras la política exige MFA y el usuario aún no se ha enrolado.
+  mfaGraceLoginsUsed   Int     @default(0)
+  // Fuerza el enrolamiento en el próximo login independientemente de la gracia de
+  // despliegue (p. ej. reset de admin por pérdida de dispositivo, o auto-baja de 2FA).
+  // La gracia es un concepto de ROLLOUT; esta bandera es un "debe enrolar ya".
+  forceMfaEnrollment   Boolean @default(false)
 
   // Seguridad de contraseña
   passwordChangedAt   DateTime?
