@@ -53,7 +53,7 @@ export function DashboardPage() {
     loadNVRs()
     loadCameras()
     loadOverview()
-    apiGet<Alert[]>('/alerts?status=active&limit=8').then(setRecentAlerts).catch(() => {})
+    apiGet<{ items: Alert[] }>('/alerts?status=active&limit=8').then((d) => setRecentAlerts(d.items)).catch(() => {})
     void refreshSummary()   // mantiene campana/menú consistentes al entrar al Dashboard
   }, [])
 
