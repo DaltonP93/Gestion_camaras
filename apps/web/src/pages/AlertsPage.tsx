@@ -33,7 +33,7 @@ const TYPE_LABELS: Record<string, string> = {
 type FilterTab = 'active' | 'acknowledged' | 'resolved' | 'all'
 
 export function AlertsPage() {
-  const { alerts, setAlerts, markResolved, markRead } = useAlertStore()
+  const { alerts, setAlerts, summary, refreshSummary, markResolved, markRead } = useAlertStore()
   const { user } = useAuthStore()
   const [filter, setFilter]           = useState<FilterTab>('active')
   const [severityFilter, setSeverityFilter] = useState<string>('all')
@@ -63,7 +63,8 @@ export function AlertsPage() {
     }
   }, [setAlerts])
 
-  useEffect(() => { loadAlerts() }, [loadAlerts])
+  // Al abrir la página, re-sincronizar lista Y contadores server-side (req 7).
+  useEffect(() => { loadAlerts(); void refreshSummary() }, [loadAlerts, refreshSummary])
 
   const handleAcknowledge = useCallback(async (alert: Alert) => {
     try {
@@ -122,15 +123,17 @@ export function AlertsPage() {
     return true
   })
 
+  // Contadores AUTORITATIVOS del backend (no del arreglo cargado): Nuevas(unread),
+  // Reconocidas(acknowledged), Resueltas(resolved), Todas(total). Semántica única.
   const counts = {
-    active:       alerts.filter(a => !a.resolved && !a.readAt).length,
-    acknowledged: alerts.filter(a => !a.resolved && !!a.readAt).length,
-    resolved:     alerts.filter(a => a.resolved).length,
-    all:          alerts.length,
+    active:       summary.unread,
+    acknowledged: summary.acknowledged,
+    resolved:     summary.resolved,
+    all:          summary.total,
   }
 
   const tabs: Array<{ id: FilterTab; label: string }> = [
-    { id: 'active',       label: 'Activas' },
+    { id: 'active',       label: 'Nuevas' },
     { id: 'acknowledged', label: 'Reconocidas' },
     { id: 'resolved',     label: 'Resueltas' },
     { id: 'all',          label: 'Todas' },
@@ -141,7 +144,7 @@ export function AlertsPage() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-base font-semibold text-surface-100">Alertas del sistema</h2>
-          <p className="text-xs text-surface-400 mt-0.5">{counts.active} activas · {counts.acknowledged} reconocidas</p>
+          <p className="text-xs text-surface-400 mt-0.5">{counts.active} nuevas · {counts.acknowledged} reconocidas · {counts.resolved} resueltas · {counts.all} totales</p>
         </div>
         <button onClick={loadAlerts} className="btn-secondary text-xs" disabled={isLoading}>
           Actualizar

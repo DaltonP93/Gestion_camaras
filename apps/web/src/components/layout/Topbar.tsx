@@ -332,19 +332,18 @@ function NotificationPanel({ onClose }: { onClose: () => void }) {
 // ─── Topbar ───────────────────────────────────────────────────────────────────
 export function Topbar({ hamburger }: { hamburger?: React.ReactNode }) {
   const location = useLocation()
-  const { alerts, setAlerts, unreadCount, setUnreadCount } = useAlertStore()
+  const { alerts, setAlerts, unreadCount, refreshSummary } = useAlertStore()
   const { nvrs, loadNVRs, loadCameras } = useCameraStore()
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
   const bellRef = useRef<HTMLDivElement>(null)
 
-  // Load NVRs and fetch initial unread count from API
+  // Load NVRs and fetch the authoritative counters from the backend summary.
+  // La campana = summary.unread (fuente única); ya NO se recalcula desde la lista.
   useEffect(() => {
     if (nvrs.length === 0) loadNVRs()
-    apiGet<{ count: number }>('/alerts/unread-count')
-      .then(({ count }) => setUnreadCount(count))
-      .catch(() => {})
+    void refreshSummary()
   }, [])
 
   // Load alert list the first time the panel opens (or if empty on re-open)

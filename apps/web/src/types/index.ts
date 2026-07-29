@@ -353,6 +353,24 @@ export interface Recording {
   playbackURI?: string
 }
 
+// Resumen ÚNICO de contadores (server-side). Fuente de verdad de campana/menú
+// (unread), Dashboard (pending) y AlertsPage.
+export interface AlertSummary {
+  unread: number
+  acknowledged: number
+  pending: number
+  resolved: number
+  total: number
+  criticalPending: number
+}
+
+export interface DashboardOverview {
+  cameras: { total: number; online: number }
+  nvrs: { total: number; online: number }
+  alerts: AlertSummary
+  activity: { hourStart: string; alerts: number }[]
+}
+
 export interface Alert {
   id: string
   nvrId?: string
