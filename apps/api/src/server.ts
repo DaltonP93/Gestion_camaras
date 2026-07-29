@@ -19,6 +19,7 @@ import { recordingRoutes, logPreviewStartupConfig } from './routes/recordings'
 import { userRoutes } from './routes/users'
 import { alertRoutes } from './routes/alerts'
 import { dashboardRoutes } from './routes/dashboard'
+import { securityRoutes } from './routes/security'
 import { wsHandler } from './routes/websocket'
 import viewsPlugin from './routes/views'
 import appearancePlugin from './routes/appearance'
@@ -170,6 +171,7 @@ async function main() {
   await server.register(userRoutes, { prefix: '/api/users' })
   await server.register(alertRoutes, { prefix: '/api/alerts' })
   await server.register(dashboardRoutes, { prefix: '/api/dashboard' })
+  await server.register(securityRoutes, { prefix: '/api/security' })
   await server.register(viewsPlugin, { prefix: '/api/views' })
   await server.register(appearancePlugin, { prefix: '/api/appearance' })
   await server.register(profileRoutes, { prefix: '/api/profile' })

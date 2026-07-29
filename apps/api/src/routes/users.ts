@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 import { checkPasswordPolicy, addToPasswordHistory, resolveFeaturePermissions } from '../services/totp'
+import { getSecuritySettings } from '../services/security-settings'
 
 const createUserSchema = z.object({
   username: z.string().min(3).max(50),
@@ -180,6 +181,14 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(409).send({ message: 'Username o email ya en uso' })
     }
 
+    // Aplicar la política de contraseña configurada también al alta por ADMIN
+    // (antes se aceptaba cualquier contraseña de 8+, saltándose el mínimo real).
+    const sec = await getSecuritySettings(server.prisma)
+    const policy = checkPasswordPolicy(data.password, { minLength: sec.passwordMinLength, requireStrong: sec.requireStrongPassword })
+    if (!policy.valid) {
+      return reply.status(400).send({ message: 'Contraseña no cumple la política', errors: policy.errors })
+    }
+
     const passwordHash = await bcrypt.hash(data.password, 12)
     const { password: _, ...userData } = data
 
@@ -217,7 +226,8 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     const updateData: any = { ...data }
 
     if (data.password) {
-      const policy = checkPasswordPolicy(data.password)
+      const sec = await getSecuritySettings(server.prisma)
+      const policy = checkPasswordPolicy(data.password, { minLength: sec.passwordMinLength, requireStrong: sec.requireStrongPassword })
       if (!policy.valid) {
         return reply.status(400).send({ message: 'Contraseña no cumple la política', errors: policy.errors })
       }

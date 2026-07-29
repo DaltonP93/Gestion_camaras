@@ -528,6 +528,23 @@ model LicensePlateEvent {
 }
 
 // ─── Configuración de alertas y correo ───────────────────────
+model SecuritySettings {
+  id                     String   @id @default("singleton")
+  passwordMinLength      Int      @default(12)
+  requireStrongPassword  Boolean  @default(true)
+  sessionTimeoutMinutes  Int      @default(60)   // TTL del access token
+  maxSessions            Int      @default(5)    // sesiones concurrentes por usuario
+  lockoutMaxAttempts     Int      @default(5)
+  lockoutDurationMinutes Int      @default(15)
+  // Política MFA — persistida ahora; su enforcement llega en la fase siguiente.
+  mfaRequired            Boolean  @default(false)
+  mfaGracePeriodLogins   Int      @default(3)
+  updatedAt              DateTime @updatedAt
+  updatedBy              String?
+
+  @@map("security_settings")
+}
+
 model AlertSettings {
   id              String   @id @default("singleton")
   emailEnabled    Boolean  @default(false)
