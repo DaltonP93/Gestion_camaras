@@ -26,16 +26,26 @@ async function refreshAccessToken(): Promise<void> {
   refreshPromise = (async () => {
     const refreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')
     if (!refreshToken) throw new Error('No refresh token')
-    const res = await axios.post<{ accessToken: string; refreshToken?: string }>(
-      `${BASE_URL}/api/auth/refresh`,
-      { refreshToken }
-    )
-    // Preserve whichever storage the refresh token came from. El backend ahora ROTA el
-    // refresh token en cada refresh (fase 4c): hay que persistir el nuevo, o el próximo
-    // refresh presentaría un token ya rotado y se detectaría como reutilización.
-    const store = localStorage.getItem('refreshToken') ? localStorage : sessionStorage
-    store.setItem('accessToken', res.data.accessToken)
-    if (res.data.refreshToken) store.setItem('refreshToken', res.data.refreshToken)
+    try {
+      const res = await axios.post<{ accessToken: string; refreshToken?: string }>(
+        `${BASE_URL}/api/auth/refresh`,
+        { refreshToken }
+      )
+      // Preserve whichever storage the refresh token came from. El backend ahora ROTA el
+      // refresh token en cada refresh (fase 4c): hay que persistir el nuevo, o el próximo
+      // refresh presentaría un token ya rotado y se detectaría como reutilización.
+      const store = localStorage.getItem('refreshToken') ? localStorage : sessionStorage
+      store.setItem('accessToken', res.data.accessToken)
+      if (res.data.refreshToken) store.setItem('refreshToken', res.data.refreshToken)
+    } catch (err: any) {
+      // TOKEN_ROTATED: otra pestaña refrescó concurrentemente y ya dejó un accessToken
+      // fresco en el storage compartido. No cerramos sesión: reutilizamos ese token.
+      if (err?.response?.data?.code === 'TOKEN_ROTATED') {
+        const fresh = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
+        if (fresh) return
+      }
+      throw err
+    }
   })().finally(() => { refreshPromise = null })
   return refreshPromise
 }
@@ -81,7 +91,10 @@ api.interceptors.response.use(
     const originalRequest = error.config as any
     const url = originalRequest?.url || ''
 
-    const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh')
+    // /auth/step-up gestiona su propio 401 (código incorrecto): NO debe disparar un
+    // refresh + reintento, que duplicaría el intento fallido y gastaría 2 slots del
+    // rate-limit por cada verificación errónea.
+    const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh') || url.includes('/auth/step-up')
     // Estos endpoints manejan sus propios errores — no mostrar toast global
     const isSilentEndpoint = url.includes('/nvrs/test-connection') || url.includes('/nvrs/detect') || url.includes('/alerts/settings/test-email')
     // /auth/me se llama en cada recarga de página — un 500/error de red no debe mostrar

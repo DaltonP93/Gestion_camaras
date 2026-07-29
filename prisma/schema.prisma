@@ -86,6 +86,23 @@ model Session {
   @@map("sessions")
 }
 
+// Historial de refresh tokens ya consumidos (fase 4c). Permite detectar la
+// reutilización de CUALQUIER token viejo de la familia (no sólo el inmediatamente
+// anterior) y aplicar una ventana de gracia para refrescos concurrentes (multi-pestaña)
+// antes de tratar un token como robado. Se conserva hasta que expira la familia.
+model UsedRefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  sessionId String?
+  usedAt    DateTime @default(now())
+  expiresAt DateTime
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("used_refresh_tokens")
+}
+
 // ─── NVRs Hikvision ──────────────────────────────────────────
 model NVR {
   id                       String    @id @default(cuid())

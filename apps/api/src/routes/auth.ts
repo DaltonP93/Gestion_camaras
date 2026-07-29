@@ -15,6 +15,9 @@ import { sessionsToPrune, accessTokenTtl, decideMfaGate } from '../services/secu
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
+// Ventana de gracia tras rotar: un refresh concurrente del mismo token (multi-pestaña)
+// dentro de este margen se trata como benigno, no como reutilización maliciosa.
+const REFRESH_REUSE_GRACE_MS = 30 * 1000               // 30 segundos
 // Lockout/política de contraseña: ahora configurables vía SecuritySettings.
 
 const loginSchema = z.object({
@@ -584,61 +587,87 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   server.post('/refresh', async (request, reply) => {
     const { refreshToken } = refreshSchema.parse(request.body)
     const presentedHash = hashToken(refreshToken)
+    const now = new Date()
 
     const session = await server.prisma.session.findUnique({
       where: { refreshToken: presentedHash },
       include: { user: true },
     })
 
-    if (!session) {
-      // Detección de reutilización: ¿el token presentado es uno YA rotado? Si coincide
-      // con previousRefreshToken de alguna sesión, alguien está reproduciendo un token
-      // viejo (posible robo) → se revoca TODA la familia de sesiones del usuario.
-      const reused = await server.prisma.session.findUnique({
-        where: { previousRefreshToken: presentedHash },
-        select: { userId: true },
-      })
-      if (reused) {
-        await server.prisma.session.deleteMany({ where: { userId: reused.userId } })
-        await AuditAction(server.prisma, reused.userId, 'REFRESH_TOKEN_REUSE', null, request)
+    // ── El token presentado es el ACTUAL de una sesión → rotar (con CAS atómico) ──
+    if (session) {
+      if (session.expiresAt < now || !session.user.active) {
         return reply.status(401).send({
-          statusCode: 401, error: 'Unauthorized',
-          message: 'Sesión revocada por reutilización de token. Inicia sesión nuevamente.',
-          code: 'TOKEN_REUSE',
+          statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
         })
       }
+
+      const payload = { sub: session.user.id, username: session.user.username, role: session.user.role }
+      const newRefreshToken = (server.jwt as any).sign(
+        { ...payload, jti: crypto.randomUUID() },
+        { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
+      )
+      const newExpiry = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS)
+
+      // Rotación ATÓMICA: sólo triunfa la petición que aún ve `presentedHash` como
+      // token actual (compare-and-swap). El historial del token consumido se registra
+      // en la MISMA transacción, evitando falsos positivos de reutilización.
+      const won = await server.prisma.$transaction(async (tx) => {
+        const r = await tx.session.updateMany({
+          where: { id: session.id, refreshToken: presentedHash },
+          data: {
+            refreshToken: hashToken(newRefreshToken),
+            previousRefreshToken: presentedHash,
+            lastUsedAt: now,
+            expiresAt: newExpiry,
+          },
+        })
+        if (r.count === 0) return false
+        await tx.usedRefreshToken.create({
+          data: { userId: session.userId, tokenHash: presentedHash, sessionId: session.id, expiresAt: newExpiry },
+        })
+        return true
+      })
+
+      if (won) {
+        const sec = await getSecuritySettings(server.prisma)
+        const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
+        return reply.send({ accessToken: newAccessToken, refreshToken: newRefreshToken })
+      }
+      // Perdimos la carrera contra un refresh concurrente del MISMO token (multi-pestaña):
+      // se trata como benigno más abajo por la ventana de gracia.
+    }
+
+    // ── El token NO es el actual: ¿fue consumido antes? (historial de la familia) ──
+    const used = await server.prisma.usedRefreshToken.findUnique({ where: { tokenHash: presentedHash } })
+    if (used) {
+      const withinGrace = now.getTime() - used.usedAt.getTime() < REFRESH_REUSE_GRACE_MS
+      if (withinGrace) {
+        // Refresh concurrente legítimo (misma sesión, otra pestaña). NO se revoca nada;
+        // el cliente debe reintentar con los tokens ya rotados por la petición ganadora.
+        return reply.status(401).send({
+          statusCode: 401, error: 'Unauthorized',
+          message: 'Token rotado por una petición concurrente; reintenta.',
+          code: 'TOKEN_ROTATED',
+        })
+      }
+      // Reutilización de un token viejo fuera de la ventana de gracia → posible robo:
+      // se revoca TODA la familia de sesiones del usuario y su historial de tokens.
+      await server.prisma.$transaction([
+        server.prisma.session.deleteMany({ where: { userId: used.userId } }),
+        server.prisma.usedRefreshToken.deleteMany({ where: { userId: used.userId } }),
+      ])
+      await AuditAction(server.prisma, used.userId, 'REFRESH_TOKEN_REUSE', null, request)
       return reply.status(401).send({
-        statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
+        statusCode: 401, error: 'Unauthorized',
+        message: 'Sesión revocada por reutilización de token. Inicia sesión nuevamente.',
+        code: 'TOKEN_REUSE',
       })
     }
 
-    if (session.expiresAt < new Date() || !session.user.active) {
-      return reply.status(401).send({
-        statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
-      })
-    }
-
-    const payload = { sub: session.user.id, username: session.user.username, role: session.user.role }
-    const sec = await getSecuritySettings(server.prisma)
-    const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
-
-    // Rotación: se emite un refresh token NUEVO y el actual queda registrado como
-    // previousRefreshToken. jti aleatorio para garantizar unicidad del hash.
-    const newRefreshToken = (server.jwt as any).sign(
-      { ...payload, jti: crypto.randomUUID() },
-      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
-    )
-    await server.prisma.session.update({
-      where: { id: session.id },
-      data: {
-        refreshToken: hashToken(newRefreshToken),
-        previousRefreshToken: presentedHash,
-        lastUsedAt: new Date(),
-        expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
-      },
+    return reply.status(401).send({
+      statusCode: 401, error: 'Unauthorized', message: 'Refresh token inválido o expirado',
     })
-
-    return reply.send({ accessToken: newAccessToken, refreshToken: newRefreshToken })
   })
 
   // ──────────────────────────────────────────────────────────
