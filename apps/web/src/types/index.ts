@@ -248,6 +248,13 @@ export interface Camera {
   consecutiveFailures?: number
   streamHealthStatus?: StreamHealthStatus
   onlineInNvr?: boolean
+  onlineInNvrAt?: string
+  // Estado efectivo resuelto server-side (fuente de verdad única, P0). Cuando viene,
+  // la tabla lo usa en vez de re-derivar desde flags históricos.
+  effectiveStatus?: 'AUTH_FAILED' | 'OFFLINE' | 'STREAM_DEGRADED' | 'HEALTHY' | 'UNKNOWN'
+  effectiveOnline?: boolean
+  statusStale?: boolean
+  statusReason?: string
   rtspUrl?: string
   hlsPath?: string
   ptzEnabled: boolean

@@ -10,6 +10,7 @@ import {
 } from '../services/hikvision'
 import { publishAllStreams } from '../services/stream'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
+import { resolveCameraStatus } from '../services/camera-status-truth'
 import { AuditAction } from '../services/audit'
 import { checkIsapiRecordingSupport, detectProviderFromCapabilities, buildIsapiSearchXml } from '../services/recordingProvider'
 import {
@@ -419,7 +420,29 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       orderBy: { channel: 'asc' },
     })
 
-    return reply.send({ fromNvr: ipCams, fromDb: dbCams })
+    // Estado EFECTIVO resuelto server-side (fuente de verdad única, P0): la tabla
+    // NO debe confiar en rtspMainOk/online HISTÓRICOS cuando el NVR reporta el canal
+    // offline. Adjuntamos la decisión + su motivo/frescura por cámara.
+    const now = Date.now()
+    const dbCamsWithStatus = dbCams.map((c) => {
+      const st = resolveCameraStatus({
+        onlineInNvr:   (c as any).onlineInNvr,
+        onlineInNvrAt: (c as any).onlineInNvrAt ? new Date((c as any).onlineInNvrAt).getTime() : ((c as any).lastCheck ? new Date((c as any).lastCheck).getTime() : null),
+        rtspMainOk:    (c as any).rtspMainOk,
+        rtspSubOk:     (c as any).rtspSubOk,
+        rtspCheckedAt: (c as any).lastRtspCheckAt ? new Date((c as any).lastRtspCheckAt).getTime() : null,
+        streamHealthStatus: (c as any).streamHealthStatus,
+      }, now)
+      return {
+        ...c,
+        effectiveStatus: st.effectiveStatus,
+        effectiveOnline: st.online,
+        statusStale:     st.stale,
+        statusReason:    st.finalDecisionReason,
+      }
+    })
+
+    return reply.send({ fromNvr: ipCams, fromDb: dbCamsWithStatus })
   })
 
   // POST /api/nvrs/:id/sync — Sincronización completa del NVR
