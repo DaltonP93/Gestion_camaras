@@ -1999,6 +1999,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     if (session.streamGeneration !== myGen) {
       return reply.status(409).send({ message: 'Stream reemplazado por una solicitud más reciente' })
     }
+    // La sesión pudo eliminarse (DELETE) o expirar (TTL) durante la espera del
+    // takeover. Esto tiene PRIORIDAD sobre el 503 retriable: no tiene sentido pedir
+    // reintentar una sesión que ya no existe — responder 410 (review Codex #125).
+    if (session.closing || !previewSessions.has(sessionId)) {
+      return reply.status(410).send({ message: 'Sesión de preview cancelada' })
+    }
     if (!takeover.proceed) {
       // HARD GATE: el anterior no confirmó salida al vencer el deadline. NO adquirir
       // slot, NO hijack, NO spawn — así nunca hay dos FFmpeg vivos para la misma
@@ -2011,10 +2017,6 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         code: takeover.code,
         message: 'El proceso de reproducción anterior aún no terminó — reintentá en unos segundos',
       })
-    }
-    // La sesión pudo eliminarse (DELETE) durante la espera del takeover.
-    if (session.closing || !previewSessions.has(sessionId)) {
-      return reply.status(410).send({ message: 'Sesión de preview cancelada' })
     }
 
     const { rtspUrl, rtspMasked, strategy } = session
