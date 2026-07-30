@@ -9,7 +9,7 @@ import toast from 'react-hot-toast'
 import { apiGet, apiPut, apiPost } from '@/lib/api'
 import { withStepUp } from '@/lib/stepup'
 import type { AlertSettings } from '@/types'
-import { pickDeliveryTimestamp, formatAsuncionDateTime } from '@/lib/deliveryHistory'
+import { pickDeliveryTimestamp, formatAsuncionDateTime, isBackfilled } from '@/lib/deliveryHistory'
 
 type Tab = 'alertas' | 'streaming' | 'seguridad' | 'sistema' | 'integraciones'
 
@@ -431,6 +431,12 @@ export function SettingsPage() {
                                         d.status === 'failed' ? 'bg-red-900/40 text-red-400' :
                                         'bg-surface-700 text-surface-400'
                                       )}>{d.status}</span>
+                                      {isBackfilled(d) && (
+                                        <span
+                                          className="ml-1 rounded px-1 py-0.5 font-mono text-[9px] bg-amber-900/40 text-amber-400"
+                                          title="Registro reconstruido desde la alerta por la migración de backfill; el envío no está verificado."
+                                        >backfill</span>
+                                      )}
                                     </td>
                                     <td className="py-1.5 pr-2 text-surface-300 max-w-[160px] truncate" title={d.recipient || d.channel}>{d.recipient || d.channel}</td>
                                     <td className="py-1.5 pr-2 text-surface-400 whitespace-nowrap">{d.alertType || '—'}</td>

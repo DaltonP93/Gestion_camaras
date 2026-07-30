@@ -11,6 +11,15 @@ export interface DeliveryRecord {
   failedAt?: string | null
   attemptedAt?: string | null
   createdAt?: string | null
+  source?: string | null   // 'live' (envío real) | 'backfill' (reconstruido por migración)
+}
+
+/**
+ * True si la fila fue RECONSTRUIDA por el backfill (0030) y no proviene de un envío
+ * real verificado. La UI la marca como tal para no confundirla con una entrega real.
+ */
+export function isBackfilled(d: DeliveryRecord): boolean {
+  return d.source === 'backfill'
 }
 
 export type DeliveryTimeKind = 'sent' | 'failed' | 'attempted' | 'created'
