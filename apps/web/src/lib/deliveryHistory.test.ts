@@ -1,5 +1,17 @@
 import { describe, it, expect } from 'vitest'
-import { pickDeliveryTimestamp, formatAsuncionDateTime } from './deliveryHistory'
+import { pickDeliveryTimestamp, formatAsuncionDateTime, isBackfilled } from './deliveryHistory'
+
+describe('isBackfilled — distingue reconstruido de envío real (PR C)', () => {
+  it('source=backfill → true', () => {
+    expect(isBackfilled({ status: 'sent', source: 'backfill' })).toBe(true)
+  })
+  it('source=live → false', () => {
+    expect(isBackfilled({ status: 'sent', source: 'live' })).toBe(false)
+  })
+  it('sin source (filas previas) → false', () => {
+    expect(isBackfilled({ status: 'sent' })).toBe(false)
+  })
+})
 
 describe('pickDeliveryTimestamp — los fallidos NO caen a "—" (P1)', () => {
   it('enviado usa sentAt', () => {

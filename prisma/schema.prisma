@@ -65,20 +65,20 @@ model User {
 
 // ─── Sesiones JWT ────────────────────────────────────────────
 model Session {
-  id           String    @id @default(cuid())
-  userId       String
-  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  refreshToken String    @unique
+  id                   String    @id @default(cuid())
+  userId               String
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken         String    @unique
   // Rotación de refresh tokens (fase 4c): hash del token INMEDIATAMENTE anterior tras
   // rotar. Si se presenta ese hash (un token ya rotado), es un replay → se revoca toda
   // la familia de sesiones del usuario (detección de reutilización).
-  previousRefreshToken String? @unique
-  userAgent    String?
-  ipAddress    String?
-  deviceName   String? // Parsed from User-Agent
-  lastUsedAt   DateTime?
-  expiresAt    DateTime
-  createdAt    DateTime  @default(now())
+  previousRefreshToken String?   @unique
+  userAgent            String?
+  ipAddress            String?
+  deviceName           String? // Parsed from User-Agent
+  lastUsedAt           DateTime?
+  expiresAt            DateTime
+  createdAt            DateTime  @default(now())
 
   @@index([userId])
   @@index([expiresAt])
@@ -207,20 +207,20 @@ model Camera {
   consecutiveFailures Int       @default(0)
 
   // Estado de salud del stream
-  streamHealthStatus String   @default("UNKNOWN")
-  onlineInNvr        Boolean?
+  streamHealthStatus   String    @default("UNKNOWN")
+  onlineInNvr          Boolean?
   // Marca de tiempo de la última observación física del NVR (InputProxy). Permite
   // aplicar TTL/frescura: un onlineInNvr viejo no debe pesar sobre uno nuevo, y un
   // onlineInNvr=false reciente prevalece sobre éxitos RTSP antiguos (P0).
-  onlineInNvrAt      DateTime?
+  onlineInNvrAt        DateTime?
   // Motivo de la última decisión de estado efectivo (diagnóstico/auditoría).
   statusDecisionReason String?
 
   // ── Configuración de alertas por cámara (TASK 6) ──
   offlineAlertEnabled     Boolean   @default(true)
   streamErrorAlertEnabled Boolean   @default(true)
-  offlineConfirmSec       Int       @default(90)   // confirmar CAMERA_OFFLINE tras N segundos
-  recoveryConfirmSec      Int       @default(120)  // confirmar recuperación tras N segundos
+  offlineConfirmSec       Int       @default(90) // confirmar CAMERA_OFFLINE tras N segundos
+  recoveryConfirmSec      Int       @default(120) // confirmar recuperación tras N segundos
   offlineSeverity         String    @default("HIGH")
   streamErrorSeverity     String    @default("MEDIUM")
   sendEmailOnOffline      Boolean   @default(true)
@@ -230,12 +230,12 @@ model Camera {
 
   // ── Evidencia REAL del pipeline de streaming (no confiar en rtspMainOk/subOk
   //    indefinidamente) — alimentan la detección de CAMERA_STREAM_ERROR ──
-  lastStreamSuccessAt  DateTime?   // éxito REAL verificado (HLS/frames)
-  lastStreamStartAcceptedAt DateTime?  // start-stream ACEPTADO (no prueba frames)
-  lastStreamFailureAt  DateTime?
-  lastMediaMtxReadyAt  DateTime?
-  lastHlsSuccessAt     DateTime?
-  lastStreamErrorCode  String?
+  lastStreamSuccessAt       DateTime? // éxito REAL verificado (HLS/frames)
+  lastStreamStartAcceptedAt DateTime? // start-stream ACEPTADO (no prueba frames)
+  lastStreamFailureAt       DateTime?
+  lastMediaMtxReadyAt       DateTime?
+  lastHlsSuccessAt          DateTime?
+  lastStreamErrorCode       String?
 
   // Legado / compatibilidad
   rtspUrl    String?
@@ -457,17 +457,28 @@ model NotificationDelivery {
   // ── Historial de entregas completo (P1): fecha/hora reales para enviados Y
   //    fallidos, sin depender de sentAt. Denormalizado desde la alerta al crear
   //    la entrega (la alerta puede eliminarse por retención). ──
-  attemptedAt DateTime?   // cuándo se intentó el envío
-  failedAt    DateTime?   // cuándo falló (los fallidos ya no dependen de sentAt)
-  errorCode   String?     // código del error SMTP (p.ej. EAUTH, ECONNECTION)
-  subject     String?     // asunto del correo
-  alertType   String?     // tipo de alerta (CAMERA_OFFLINE, …)
+  attemptedAt DateTime? // cuándo se intentó el envío
+  failedAt    DateTime? // cuándo falló (los fallidos ya no dependen de sentAt)
+  errorCode   String? // código del error SMTP (p.ej. EAUTH, ECONNECTION)
+  subject     String? // asunto del correo
+  alertType   String? // tipo de alerta (CAMERA_OFFLINE, …)
   cameraName  String?
   nvrName     String?
+
+  // ── Procedencia del registro (PR C) ──
+  //   'live'     = creado por el envío real (notification.service). Valor por defecto.
+  //   'backfill' = registro RECONSTRUIDO desde la alerta por la migración de backfill
+  //                (0030); su envío/entrega NO está verificado — usar para no inflar
+  //                métricas de "enviados" reales (filtrar por source='live').
+  source       String    @default("live")
+  //   Marca de cuándo el backfill tocó la fila (enriqueció columnas NULL o la creó).
+  //   NULL en filas 'live' nunca tocadas por el backfill.
+  backfilledAt DateTime?
 
   @@index([alertId])
   @@index([createdAt])
   @@index([status, createdAt])
+  @@index([source])
   @@map("notification_deliveries")
 }
 
@@ -561,8 +572,8 @@ model SecuritySettings {
   id                     String   @id @default("singleton")
   passwordMinLength      Int      @default(12)
   requireStrongPassword  Boolean  @default(true)
-  sessionTimeoutMinutes  Int      @default(60)   // TTL del access token
-  maxSessions            Int      @default(5)    // sesiones concurrentes por usuario
+  sessionTimeoutMinutes  Int      @default(60) // TTL del access token
+  maxSessions            Int      @default(5) // sesiones concurrentes por usuario
   lockoutMaxAttempts     Int      @default(5)
   lockoutDurationMinutes Int      @default(15)
   // Política MFA — persistida ahora; su enforcement llega en la fase siguiente.
