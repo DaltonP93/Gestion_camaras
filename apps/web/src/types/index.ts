@@ -513,15 +513,38 @@ export interface AppearanceSettings {
   id: string
   siteName: string
   logoText: string
+  // ── Legacy (se mantienen; el motor de tokens los normaliza a V2) ──
   primaryColor: string
   accentColor: string
   theme: 'dark' | 'darker' | 'midnight'
-  sidebarWidth: 'compact' | 'normal'
+  sidebarWidth: 'compact' | 'normal' | 'wide'
   showNVRsInSidebar: boolean
   customCss?: string
   logoUrl?: string
   sidebarLogoUrl?: string
   faviconUrl?: string
   updatedAt: string
+  // ── V2: sistema de tokens (todos opcionales/nulos; se derivan del legacy) ──
+  themeMode?: 'light' | 'dark' | 'darker' | 'midnight' | 'system' | null
+  fontFamily?: string | null
+  fontScale?: number | null
+  density?: 'compact' | 'normal' | 'comfortable' | null
+  borderRadius?: 'none' | 'sm' | 'md' | 'lg' | 'xl' | null
+  shadowLevel?: 'none' | 'sm' | 'md' | 'lg' | null
+  componentHeight?: number | null
+  backgroundColor?: string | null
+  surfaceColor?: string | null
+  surfaceRaisedColor?: string | null
+  borderColor?: string | null
+  textPrimaryColor?: string | null
+  textSecondaryColor?: string | null
+  textMutedColor?: string | null
+  successColor?: string | null
+  warningColor?: string | null
+  dangerColor?: string | null
+  informationColor?: string | null
+  offlineColor?: string | null
+  recordingColor?: string | null
+  analyticsColor?: string | null
 }
 

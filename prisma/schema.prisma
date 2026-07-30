@@ -427,6 +427,7 @@ model AppearanceSettings {
   id                String   @id @default("singleton")
   siteName          String   @default("VisionCore")
   logoText          String   @default("VisionCore")
+  // ── Legacy (se conservan; el motor de tokens los normaliza a V2) ──
   primaryColor      String   @default("#e51d1d")
   accentColor       String   @default("#c41616")
   theme             String   @default("dark")
@@ -437,6 +438,29 @@ model AppearanceSettings {
   sidebarLogoUrl    String?  @db.Text
   faviconUrl        String?  @db.Text
   updatedAt         DateTime @updatedAt
+
+  // ── V2: sistema de tokens (todos nullable; null ⇒ derivar del legacy) ──
+  themeMode          String? // light | dark | darker | midnight | system
+  fontFamily         String?
+  fontScale          Float?
+  density            String? // compact | normal | comfortable
+  borderRadius       String? // none | sm | md | lg | xl
+  shadowLevel        String? // none | sm | md | lg
+  componentHeight    Int?
+  backgroundColor    String?
+  surfaceColor       String?
+  surfaceRaisedColor String?
+  borderColor        String?
+  textPrimaryColor   String?
+  textSecondaryColor String?
+  textMutedColor     String?
+  successColor       String?
+  warningColor       String?
+  dangerColor        String?
+  informationColor   String?
+  offlineColor       String?
+  recordingColor     String?
+  analyticsColor     String?
 
   @@map("appearance_settings")
 }

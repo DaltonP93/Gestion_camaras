@@ -27,10 +27,44 @@
   --surface-750: 27 32 40;
   --surface-800: 22 27 34;
   --surface-900: 13 17 23;
+
+  /* ── Tokens V2 (--vc-*) — valores por defecto (tema dark). ──
+     El motor de tokens (lib/appearanceTokens) los sobrescribe en runtime.
+     Se declaran aquí para que existan antes de cargar la configuración
+     (SSR/primer render / login) y para consumo directo con var(--vc-*). */
+  --vc-background: #0d1117;
+  --vc-surface: #161b22;
+  --vc-surface-raised: #21262d;
+  --vc-surface-overlay: #1b2028;
+  --vc-border: #30363d;
+  --vc-border-strong: #484f58;
+  --vc-text-primary: #f0f6fc;
+  --vc-text-secondary: #b1bac4;
+  --vc-text-muted: #6e7681;
+  --vc-primary: #e51d1d;
+  --vc-accent: #c41616;
+  --vc-success: #2ea043;
+  --vc-warning: #d29922;
+  --vc-danger: #f85149;
+  --vc-information: #388bfd;
+  --vc-offline: #6e7681;
+  --vc-recording: #f85149;
+  --vc-analytics: #a371f7;
+  --vc-radius: 8px;
+  --vc-component-height: 38px;
+  --vc-sidebar-width: 260px;
+  --vc-font-family: 'Inter', system-ui, sans-serif;
+  --vc-font-scale: 1;
 }
 
 @layer base {
   * { box-sizing: border-box; }
+
+  /* Escala tipográfica global: font-scale multiplica el tamaño base (rem).
+     Con el default (--vc-font-scale: 1) el resultado es 16px → sin cambio visual. */
+  html {
+    font-size: calc(16px * var(--vc-font-scale, 1));
+  }
 
   html, body, #root {
     height: 100%;
@@ -38,7 +72,7 @@
     padding: 0;
     background-color: #0d1117;
     color: #f0f6fc;
-    font-family: 'Inter', system-ui, sans-serif;
+    font-family: var(--vc-font-family, 'Inter', system-ui, sans-serif);
     -webkit-font-smoothing: antialiased;
   }
 

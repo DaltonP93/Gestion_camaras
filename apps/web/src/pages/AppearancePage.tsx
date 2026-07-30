@@ -9,7 +9,7 @@ import { useAppearanceStore } from '@/stores/appearanceStore'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
 import type { AppearanceSettings } from '@/types'
-import { invalidateAppearanceCache, applyAppearanceToDocument } from '@/hooks/useAppearance'
+import { applyAppearanceToDocument } from '@/hooks/useAppearance'
 
 // ─── Constants ───────────────────────────────────────────────
 const THEMES = [
@@ -274,32 +274,9 @@ function PreviewCard({ settings }: { settings: AppearanceSettings }) {
   )
 }
 
-// ─── Apply appearance settings to the live document ──────────
-function applyAppearance(s: AppearanceSettings) {
-  // Page title
-  if (s.siteName) document.title = s.siteName
-
-  // Favicon
-  const resolvedFavicon = resolveAssetUrl(s.faviconUrl)
-  if (resolvedFavicon) {
-    let link = document.querySelector<HTMLLinkElement>("link[rel~='icon']")
-    if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link) }
-    link.href = resolvedFavicon
-  }
-
-  // Custom CSS injection
-  const styleId = 'visioncore-custom-css'
-  let style = document.getElementById(styleId) as HTMLStyleElement | null
-  if (!style) { style = document.createElement('style'); style.id = styleId; document.head.appendChild(style) }
-  style.textContent = s.customCss || ''
-
-  // CSS variables for primary/accent colors (override Tailwind brand palette)
-  const root = document.documentElement
-  if (s.primaryColor) {
-    root.style.setProperty('--brand-500', s.primaryColor)
-    root.style.setProperty('--brand-600', s.accentColor || s.primaryColor)
-  }
-}
+// Aplicación al documento: delega en el motor único (lib/appearanceTokens vía
+// hooks/useAppearance). Ya no hay un aplicador local con su propia fórmula.
+const applyAppearance = applyAppearanceToDocument
 
 // ─── Main component ───────────────────────────────────────────
 type Tab = 'branding' | 'apariencia' | 'sidebar' | 'advanced'
@@ -337,8 +314,9 @@ export function AppearancePage() {
       const updated = await apiPut<AppearanceSettings>('/appearance', settings)
       setSaved(updated)
       setSettings(updated)
-      invalidateAppearanceCache()
-      applyAppearanceToDocument(updated)
+      // applyGlobal aplica al documento (motor único) Y actualiza el store que
+      // leen Sidebar/Login, por lo que el branding se refleja sin recargar.
+      applyGlobal(updated)
       toast.success('Apariencia guardada')
     } catch {
       toast.error('Error al guardar apariencia')
@@ -373,6 +351,7 @@ export function AppearancePage() {
       const clean: AppearanceSettings = { ...DEFAULTS, ...updated, customCss: '', logoUrl: '', sidebarLogoUrl: '', faviconUrl: '' }
       setSaved(clean)
       setSettings(clean)
+      applyGlobal(clean)
       toast.success('Valores restaurados a predeterminados')
     } catch {
       toast.error('Error al restaurar valores')
