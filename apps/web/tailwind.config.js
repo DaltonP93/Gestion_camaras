@@ -29,6 +29,37 @@ export default {
           800: 'rgb(var(--surface-800) / <alpha-value>)',
           900: 'rgb(var(--surface-900) / <alpha-value>)',
         },
+        // Tokens V2 (--vc-*). Consumo directo: bg-vc-surface, text-vc-primary, etc.
+        // El motor los emite como hex, por eso sin sintaxis /<alpha-value>.
+        vc: {
+          background: 'var(--vc-background)',
+          surface: 'var(--vc-surface)',
+          'surface-raised': 'var(--vc-surface-raised)',
+          'surface-overlay': 'var(--vc-surface-overlay)',
+          border: 'var(--vc-border)',
+          'border-strong': 'var(--vc-border-strong)',
+          'text-primary': 'var(--vc-text-primary)',
+          'text-secondary': 'var(--vc-text-secondary)',
+          'text-muted': 'var(--vc-text-muted)',
+          primary: 'var(--vc-primary)',
+          accent: 'var(--vc-accent)',
+          success: 'var(--vc-success)',
+          warning: 'var(--vc-warning)',
+          danger: 'var(--vc-danger)',
+          information: 'var(--vc-information)',
+          offline: 'var(--vc-offline)',
+          recording: 'var(--vc-recording)',
+          analytics: 'var(--vc-analytics)',
+        },
+      },
+      borderRadius: {
+        vc: 'var(--vc-radius)',
+      },
+      width: {
+        'vc-sidebar': 'var(--vc-sidebar-width)',
+      },
+      height: {
+        vc: 'var(--vc-component-height)',
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
