@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveGridProfile, buildTranscodeArgs } from './transcode-profile'
+import { resolveGridProfile, buildTranscodeArgs, deriveOutputResolution } from './transcode-profile'
 
 const IO = { rtspInput: 'rtsp://in/101', rtspOutput: 'rtsp://out/path', rtspTimeoutOpt: '-timeout' }
 const pair = (args: string[], flag: string) => args[args.indexOf(flag) + 1]
@@ -34,5 +34,33 @@ describe('buildTranscodeArgs (puro, idéntico al comportamiento previo)', () => 
   it('sin rtspTimeoutOpt no agrega la opción de timeout', () => {
     const args = buildTranscodeArgs(resolveGridProfile({}), { ...IO, rtspTimeoutOpt: null })
     expect(args).not.toContain('-timeout')
+  })
+})
+
+describe('deriveOutputResolution (metadatos reales del transcodificado, P2)', () => {
+  const grid = resolveGridProfile({})  // width 1280
+  it('1920x1080 escalado a 1280 → 1280x720 (aspecto preservado, alto par)', () => {
+    expect(deriveOutputResolution('1920x1080', grid)).toBe('1280x720')
+  })
+  it('acepta el separador × (unicode)', () => {
+    expect(deriveOutputResolution('1920×1080', grid)).toBe('1280x720')
+  })
+  it('4K 3840x2160 a 1280 → 1280x720 (no devuelve la nativa 4K, no engaña)', () => {
+    expect(deriveOutputResolution('3840x2160', grid)).toBe('1280x720')
+  })
+  it('width=source → resolución de la fuente tal cual', () => {
+    expect(deriveOutputResolution('1920x1080', resolveGridProfile({ TRANSCODE_WIDTH: 'source' }))).toBe('1920x1080')
+  })
+  it('alto redondeado a múltiplo de 2 (scale=-2)', () => {
+    // 1280x960 → outW=1280, outH=960 ya par
+    expect(deriveOutputResolution('1280x960', grid)).toBe('1280x960')
+    // 1000x563 a 1280 → outH = round(563*1280/1000/2)*2 = round(360.32)... = 720
+    expect(deriveOutputResolution('1000x563', grid)).toBe('1280x720')
+  })
+  it('fuente ausente o inválida → null (no rompe la respuesta)', () => {
+    expect(deriveOutputResolution(null, grid)).toBeNull()
+    expect(deriveOutputResolution(undefined, grid)).toBeNull()
+    expect(deriveOutputResolution('desconocida', grid)).toBeNull()
+    expect(deriveOutputResolution('', grid)).toBeNull()
   })
 })

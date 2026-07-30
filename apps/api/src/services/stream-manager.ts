@@ -6,6 +6,7 @@ import type { ChildProcess } from 'child_process'
 import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr, getStreamDetails, getActiveTranscodesList, getTranscodeRawStderr, getTranscodeRtspMasked } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import { decryptNvrPassword as decryptPass } from './credentials'
+import { resolveGridProfile } from './transcode-profile'
 
 // Límites configurables
 const MAX_STREAMS_PER_USER   = Number(process.env.MAX_STREAMS_PER_USER   || 32)
@@ -70,11 +71,17 @@ const TRANSCODE_KILL_REASONS = new Set([
   'exit_fullscreen',
 ])
 
+// Desglose de cupos de transcodificación: activos (sesiones main_h264 registradas),
+// iniciando (paths en waitForHlsReady aún sin registrar) y total (lo que cuenta contra
+// el límite). Expuesto para el diagnóstico ADMIN y el contrato de TRANSCODE_LIMIT_REACHED.
+export function getTranscodeCounts(): { active: number; starting: number; total: number; max: number } {
+  const active   = Array.from(sessions.values()).filter(s => s.streamType === 'main_h264').length
+  const starting = Array.from(transcodeInFlight.values()).filter(f => f.state === 'starting').length
+  return { active, starting, total: active + starting, max: MAX_TRANSCODE_SESSIONS }
+}
+
 function getActiveTranscodeCount(): number {
-  // Count registered sessions + paths currently starting (not yet registered)
-  const registered = Array.from(sessions.values()).filter(s => s.streamType === 'main_h264').length
-  const starting   = Array.from(transcodeInFlight.values()).filter(f => f.state === 'starting').length
-  return registered + starting
+  return getTranscodeCounts().total
 }
 
 interface StreamSession {
@@ -634,11 +641,17 @@ async function startStreamCore(
     }
 
     // ── 3. Check limits (count starting + registered) ────────
-    const activeTrans = getActiveTranscodeCount()
-    if (activeTrans >= MAX_TRANSCODE_SESSIONS) {
-      console.warn(`[transcode] reject cameraId=${cameraId} reason=MAX_TRANSCODE_SESSIONS active=${activeTrans}/${MAX_TRANSCODE_SESSIONS}`)
+    const counts = getTranscodeCounts()
+    if (counts.total >= MAX_TRANSCODE_SESSIONS) {
+      console.warn(`[transcode] reject cameraId=${cameraId} reason=MAX_TRANSCODE_SESSIONS active=${counts.active} starting=${counts.starting} max=${counts.max}`)
+      const startingTxt = counts.starting ? `, ${counts.starting} iniciando` : ''
       return { hlsUrl: '', webrtcUrl: '', streamPath: '',
-        error: { code: 'TRANSCODE_LIMIT_REACHED', message: `Límite de transcodificaciones alcanzado (máx ${MAX_TRANSCODE_SESSIONS})` } }
+        // El contrato incluye el desglose para que el frontend muestre el cupo real
+        // (activeCount/startingCount/maxTranscodes) en vez de "Error desconocido".
+        error: { code: 'TRANSCODE_LIMIT_REACHED',
+          message: `Límite de transcodificaciones alcanzado (${counts.active}/${counts.max} activas${startingTxt})`,
+          activeCount: counts.active, startingCount: counts.starting, maxTranscodes: counts.max,
+          current: counts.active, max: counts.max } as any }
     }
     if (sessions.size >= MAX_STREAMS_GLOBAL) pruneStaleSessions()
     if (sessions.size >= MAX_STREAMS_GLOBAL) {
@@ -1231,6 +1244,67 @@ export async function getTranscodesDiagnostic(): Promise<Array<{
       mediaMtxPublisherActive: details?.active === true,
     }
   }))
+}
+
+// Diagnóstico ADMIN de CUPOS de transcodificación — identifica exactamente qué ocupa
+// cada cupo contra MAX_TRANSCODE_SESSIONS, sin secretos (sólo IDs, tiempos y perfil).
+// El `reason` explica por qué la fila cuenta contra el límite (proceso vivo, iniciando,
+// o sesión registrada sin proceso). cameraName lo resuelve la ruta (necesita DB).
+export interface TranscodeSlot {
+  cameraId:      string
+  userId:        string
+  viewId:        string
+  streamPath:    string
+  pid:           number | undefined
+  processAlive:  boolean
+  startedAt:     Date
+  lastHeartbeat: Date
+  profile:       { width: string; fps: string; bitrate: string; encoder: string }
+  reason:        string
+}
+
+export function getTranscodeSlots(): {
+  maxTranscodes:      number
+  activeProcessCount: number
+  startingCount:      number
+  slots:              TranscodeSlot[]
+} {
+  const counts = getTranscodeCounts()
+  const procByPath = new Map(getActiveTranscodesList().map(p => [p.streamPath, p]))
+  const cfg = resolveGridProfile()
+  const profile = { width: cfg.width, fps: cfg.fps, bitrate: cfg.bitrate, encoder: cfg.encoder }
+
+  const slots: TranscodeSlot[] = Array.from(sessions.values())
+    .filter(s => s.streamType === 'main_h264')
+    .map(s => {
+      const proc     = procByPath.get(s.streamPath)
+      const alive    = proc?.alive ?? false
+      const inFlight = transcodeInFlight.get(s.streamPath)
+      const reason = alive
+        ? 'proceso FFmpeg activo con sesión registrada'
+        : inFlight?.state === 'starting'
+          ? 'iniciando — esperando manifest HLS'
+          : 'sesión registrada sin proceso FFmpeg vivo (posible reinicio del supervisor)'
+      return {
+        cameraId:      s.cameraId,
+        userId:        s.userId,
+        viewId:        s.viewId,
+        streamPath:    s.streamPath,
+        pid:           proc?.pid,
+        processAlive:  alive,
+        startedAt:     s.startedAt,
+        lastHeartbeat: s.lastHeartbeat,
+        profile,
+        reason,
+      }
+    })
+
+  return {
+    maxTranscodes:      counts.max,
+    activeProcessCount: counts.active,
+    startingCount:      counts.starting,
+    slots,
+  }
 }
 
 // Estado global de streams (para panel admin)

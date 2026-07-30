@@ -2,6 +2,7 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus, getStreamDetails } from '../services/stream'
+import { resolveGridProfile, deriveOutputResolution } from '../services/transcode-profile'
 import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary, recordStreamOutcome } from '../services/stream-manager'
 import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
@@ -448,12 +449,19 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const codec =
       transcoded            ? 'H264' :
       effectiveType === 'main' ? (cam?.mainCodec ?? null) : (cam?.subCodec ?? null)
-    // No etiquetar el transcodificado (main_h264) con la resolución NATIVA: FFmpeg escala
-    // la salida (≠ origen), así que declararla engañaría (un 4K servido a 1920 mostraría
-    // "4K"). Se omite hasta poder derivar/sondear la resolución REAL de salida (Codex #133).
+    // Perfil aplicado al transcode (grilla). Para main_h264 derivamos la resolución de
+    // SALIDA real a partir del perfil (escala a `width` preservando el aspecto de la
+    // fuente main) en vez de devolver null permanentemente o la resolución nativa (que
+    // engañaría: un 4K servido a 1280 no es 4K). También exponemos fps/bitrate reales.
+    const gridCfg = resolveGridProfile()
     const resolution =
-      effectiveType === 'sub'  ? (cam?.subResolution ?? null) :
-      effectiveType === 'main' ? (cam?.mainResolution ?? null) : null
+      effectiveType === 'sub'       ? (cam?.subResolution ?? null) :
+      effectiveType === 'main'      ? (cam?.mainResolution ?? null) :
+      /* main_h264 */                 deriveOutputResolution(cam?.mainResolution, gridCfg)
+    // fps/bitrate: reales del perfil sólo para el transcodificado (para 'main'/'sub' el
+    // NVR manda su propio encoding y no lo sondeamos aquí).
+    const fps     = transcoded ? Number(gridCfg.fps) || null : null
+    const bitrate = transcoded ? gridCfg.bitrate : null
 
     return reply.send({
       cameraId:   id,
@@ -467,6 +475,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       transcoded,
       codec,
       resolution,
+      fps,
+      bitrate,
       warning:    result.warning ?? undefined,
     })
   })

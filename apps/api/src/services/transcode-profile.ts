@@ -34,6 +34,28 @@ export function resolveGridProfile(env: Env = process.env): TranscodeProfileConf
   }
 }
 
+// Deriva la resolución de SALIDA real del transcode a partir del perfil aplicado y la
+// resolución de la FUENTE (p.ej. "1920x1080"). El transcode escala a `width` preservando
+// el aspecto (scale=width:-2 → alto par). Devuelve "WxH", o null si no se puede derivar.
+// Con width='source' (sin escalado) devuelve la resolución de la fuente tal cual.
+export function deriveOutputResolution(
+  sourceResolution: string | null | undefined,
+  cfg: TranscodeProfileConfig,
+): string | null {
+  if (!sourceResolution) return null
+  const m = /^(\d+)\s*[x×]\s*(\d+)$/i.exec(sourceResolution.trim())
+  if (!m) return null
+  const srcW = Number(m[1])
+  const srcH = Number(m[2])
+  if (!srcW || !srcH) return null
+  if (cfg.width === 'source') return `${srcW}x${srcH}`
+  const outW = Number(cfg.width)
+  if (!outW) return null
+  // scale=outW:-2 → alto proporcional redondeado al múltiplo de 2 más cercano.
+  const outH = Math.round((srcH * outW) / srcW / 2) * 2
+  return `${outW}x${outH}`
+}
+
 export interface TranscodeIo {
   rtspInput: string
   rtspOutput: string
