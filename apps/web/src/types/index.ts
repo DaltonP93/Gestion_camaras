@@ -284,6 +284,11 @@ export interface StreamInfo {
   webrtc: string
   channel: number
   nvrName: string
+  // Metadatos reales del stream servido (PR B) — para el badge de calidad.
+  streamType?: 'sub' | 'main' | 'main_h264'
+  transcoded?: boolean
+  codec?: string | null
+  resolution?: string | null
   warning?: { code: string; message: string }
 }
 

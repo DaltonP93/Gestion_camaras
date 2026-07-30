@@ -435,6 +435,26 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     }).catch(() => {})
 
     const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
+
+    // Metadatos REALES del stream servido (para el badge): el tipo efectivo se deriva del
+    // streamPath (el backend pudo cambiar sub→main o main→main_h264). El codec/resolución
+    // provienen de la sonda persistida por cámara. Para main_h264 (transcodificado) el
+    // codec de salida es H.264; la resolución de origen es la del main.
+    const cam = camera as any
+    const effectiveType: 'sub' | 'main' | 'main_h264' =
+      result.streamPath?.endsWith('_main_h264') ? 'main_h264' :
+      result.streamPath?.endsWith('_main')      ? 'main'      : 'sub'
+    const transcoded = effectiveType === 'main_h264' || result.transcoded === true
+    const codec =
+      transcoded            ? 'H264' :
+      effectiveType === 'main' ? (cam?.mainCodec ?? null) : (cam?.subCodec ?? null)
+    // No etiquetar el transcodificado (main_h264) con la resolución NATIVA: FFmpeg escala
+    // la salida (≠ origen), así que declararla engañaría (un 4K servido a 1920 mostraría
+    // "4K"). Se omite hasta poder derivar/sondear la resolución REAL de salida (Codex #133).
+    const resolution =
+      effectiveType === 'sub'  ? (cam?.subResolution ?? null) :
+      effectiveType === 'main' ? (cam?.mainResolution ?? null) : null
+
     return reply.send({
       cameraId:   id,
       streamPath: result.streamPath,
@@ -442,6 +462,12 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       webrtc:     result.webrtcUrl,
       channel:    camera?.channel ?? 0,
       nvrName:    camera?.nvr?.name ?? '',
+      // Metadatos reales para la insignia de calidad (PR B).
+      streamType: effectiveType,
+      transcoded,
+      codec,
+      resolution,
+      warning:    result.warning ?? undefined,
     })
   })
 
