@@ -882,7 +882,7 @@ export function LiveViewPage() {
     }
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main', viewId, profile: 'focus' })
+      const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main', viewId })
       // Backend may auto-redirect main→main_h264 (HEVC camera + transcoding enabled).
       // Detect the actual stream type from the response so stop-stream/quality-switch
       // use the correct type key.
@@ -929,6 +929,11 @@ export function LiveViewPage() {
   useEffect(() => {
     const wantFocus = focusParam === '1' || focusParam === 'true'
     if (!wantFocus || !cameraFilter || cameras.length === 0) return
+    // Esperar a que las capacidades de streaming estén resueltas ANTES de entrar al foco:
+    // con capabilities=null, handleEnterFocus trataría una cámara HEVC como
+    // "sin transcodificación" y mostraría CODEC_UNSUPPORTED de forma permanente (el ref
+    // appliedFocusQuery impediría reintentar cuando lleguen las capacidades). (Codex #133)
+    if (!streamCapabilities) return
     const cam = cameras.find(c => c.id === cameraFilter)
     if (!cam || selectedNVR !== cam.nvrId) return       // esperar a que el NVR objetivo esté activo
     if (appliedFocusQuery.current === cameraFilter || focusCamera === cam.id) {
@@ -937,7 +942,7 @@ export function LiveViewPage() {
     }
     appliedFocusQuery.current = cameraFilter
     handleEnterFocus(cam)
-  }, [focusParam, cameraFilter, cameras, selectedNVR, focusCamera, handleEnterFocus])
+  }, [focusParam, cameraFilter, cameras, selectedNVR, focusCamera, handleEnterFocus, streamCapabilities])
 
   // ─── Quality switch from VideoPlayer (Baja/Alta/Trans buttons) ─
   const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main' | 'main_h264') => {
@@ -982,7 +987,7 @@ export function LiveViewPage() {
     setFocusStreamType(quality)
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality, viewId, profile: 'focus' })
+      const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality, viewId })
       const actualType: 'sub' | 'main' | 'main_h264' =
         (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
           ? 'main_h264' : quality

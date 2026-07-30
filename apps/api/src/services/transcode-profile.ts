@@ -1,10 +1,13 @@
-// Perfiles de transcodificación (PR B). Extrae la construcción de argumentos FFmpeg a
-// una función PURA y añade un perfil exclusivo de FOCO (1×1) de mayor calidad, separado
-// del perfil de grilla. El perfil 'grid' reproduce EXACTAMENTE la configuración previa
-// (TRANSCODE_*), de modo que la grilla 3×3/4×4 no cambia; sólo el foco puede pedir 1080p.
+// Construcción de argumentos de FFmpeg para live (PR B). Extrae a una función PURA la
+// creación de args del transcode de grilla — misma configuración que antes (TRANSCODE_*),
+// de modo que el comportamiento de la grilla NO cambia; sólo queda testeable.
+//
+// NOTA: el perfil de transcode de FOCO (1080p, LIVE_FOCUS_*) se DIFIERE a un PR aparte:
+// requiere aislar la identidad del path/proceso main_h264 por perfil (hoy foco y fallback
+// de grilla comparten getTranscodedStreamPath) y validación de CPU/memoria en un NVR real.
 
 export interface TranscodeProfileConfig {
-  width: string       // '1280' | '1920' | 'source' (sin escalado)
+  width: string       // '1280' | 'source' (sin escalado)
   fps: string         // '15'
   bitrate: string     // '1500k'
   maxrate: string
@@ -31,43 +34,13 @@ export function resolveGridProfile(env: Env = process.env): TranscodeProfileConf
   }
 }
 
-// Perfil de FOCO (1×1) — usa LIVE_FOCUS_TRANSCODE_* con defaults de mayor calidad. NO se
-// aplica a las grillas. Encoder/preset/gop se heredan de la grilla salvo override.
-export function resolveFocusProfile(env: Env = process.env): TranscodeProfileConfig {
-  const grid = resolveGridProfile(env)
-  const bitrate = env.LIVE_FOCUS_TRANSCODE_BITRATE || '3500k'
-  return {
-    width:      env.LIVE_FOCUS_TRANSCODE_WIDTH || '1920',
-    fps:        env.LIVE_FOCUS_TRANSCODE_FPS || '20',
-    bitrate,
-    maxrate:    env.LIVE_FOCUS_TRANSCODE_MAXRATE || bitrate,
-    bufsize:    env.LIVE_FOCUS_TRANSCODE_BUFSIZE || '',
-    preset:     env.LIVE_FOCUS_TRANSCODE_PRESET || grid.preset,
-    encoder:    grid.encoder,
-    gopSeconds: grid.gopSeconds,
-  }
-}
-
-export function resolveTranscodeProfile(profile: 'grid' | 'focus', env: Env = process.env): TranscodeProfileConfig {
-  return profile === 'focus' ? resolveFocusProfile(env) : resolveGridProfile(env)
-}
-
-// Límite de transcodificaciones simultáneas de foco (separado del límite general).
-export function focusMaxTranscodes(env: Env = process.env): number | null {
-  const raw = env.LIVE_FOCUS_MAX_TRANSCODES
-  if (raw === undefined || raw === '') return null
-  const n = Number.parseInt(raw, 10)
-  return Number.isFinite(n) && n >= 0 ? n : null
-}
-
 export interface TranscodeIo {
   rtspInput: string
   rtspOutput: string
   rtspTimeoutOpt: string | null   // p.ej. '-timeout' o '-rw_timeout', o null si no soportado
 }
 
-// Construcción PURA de los argumentos de FFmpeg. Idéntica a la previa para el perfil de
-// grilla; parametriza width/fps/bitrate/maxrate/bufsize/preset/encoder/gop por perfil.
+// Construcción PURA de los argumentos de FFmpeg. Idéntica a la previa.
 export function buildTranscodeArgs(cfg: TranscodeProfileConfig, io: TranscodeIo): string[] {
   const fps = Number(cfg.fps) || 15
   const gopFrames = Math.max(1, Math.round(fps * cfg.gopSeconds))
@@ -86,8 +59,6 @@ export function buildTranscodeArgs(cfg: TranscodeProfileConfig, io: TranscodeIo)
     '-an',
   ]
 
-  // Escalado — se omite si width='source' (usa la resolución nativa del main). Nunca se
-  // hace upscale del sub: el foco parte SIEMPRE del main (canal 01).
   if (cfg.width !== 'source') {
     args.push('-vf', `scale=${cfg.width}:-2`)
   }

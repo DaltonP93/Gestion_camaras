@@ -5,7 +5,7 @@ import { execSync, spawn } from 'child_process'
 import type { ChildProcess } from 'child_process'
 import type { NVR, Camera } from '@prisma/client'
 import { buildRtspUrl } from './hikvision'
-import { resolveTranscodeProfile, buildTranscodeArgs } from './transcode-profile'
+import { resolveGridProfile, buildTranscodeArgs } from './transcode-profile'
 
 const mediamtxApi = axios.create({
   baseURL: process.env.MEDIAMTX_URL || 'http://mediamtx:9997',
@@ -132,7 +132,7 @@ export function getRtspTimeoutOption(): RtspTimeoutOpt {
   return _rtspTimeoutOpt
 }
 
-export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string, profile: 'grid' | 'focus' = 'grid'): ChildProcess | null {
+export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: string): ChildProcess | null {
   const pass: string = (nvr as any).password ?? ''
   if (!pass) {
     console.error(`[transcode] spawn_abort path=${streamPath} reason=PASSWORD_EMPTY (decryptPass returned empty — check NVR_CREDENTIAL_KEY)`)
@@ -152,9 +152,9 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   // Alpine FFmpeg 8.0.1: -timeout (not -rw_timeout). Detection is cached after first call.
   const rtspTimeoutOpt = getRtspTimeoutOption()
 
-  // Perfil de transcodificación: 'grid' reproduce la config previa (grilla sin cambios);
-  // 'focus' usa LIVE_FOCUS_TRANSCODE_* (1080p por defecto) sólo para el 1×1/foco.
-  const cfg  = resolveTranscodeProfile(profile)
+  // Configuración de transcodificación de grilla (misma que la previa; ahora en función
+  // pura y testeable). El perfil de foco 1080p se difiere a un PR aparte.
+  const cfg  = resolveGridProfile()
   const args = buildTranscodeArgs(cfg, { rtspInput, rtspOutput, rtspTimeoutOpt })
 
   // Kill any stale process for this path before spawning a new one
@@ -163,7 +163,7 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   const inputMasked = rtspInput.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
   console.info(`[transcode] spawn_start path=${streamPath} source=${inputMasked}`)
   console.info(
-    `[transcode] spawn_ffmpeg path=${streamPath} profile=${profile} encoder=${cfg.encoder}` +
+    `[transcode] spawn_ffmpeg path=${streamPath} encoder=${cfg.encoder}` +
     ` fps=${cfg.fps} width=${cfg.width}` +
     ` bitrate=${cfg.bitrate} maxrate=${cfg.maxrate}` +
     ` input=${inputMasked}`

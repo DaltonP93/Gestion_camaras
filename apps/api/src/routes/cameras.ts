@@ -364,9 +364,6 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
-    // profile='focus' habilita el perfil de transcodificación de alta calidad (1080p)
-    // reservado al 1×1/foco; la grilla usa 'grid' (sin cambios).
-    const profile: 'grid' | 'focus' = body?.profile === 'focus' ? 'focus' : 'grid'
 
     if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
       // Registrar rechazo por permiso ANTES de startStream — es la única rama
@@ -378,7 +375,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     server.log.info(`[live] start_stream_requested cameraId=${id} streamType=${streamType} userId=${user.sub}`)
 
-    const result = await startStream(server, user.sub, id, viewId, streamType, profile)
+    const result = await startStream(server, user.sub, id, viewId, streamType)
     if (result.error) {
       if (result.error.code === 'TRANSCODE_LIMIT_REACHED') {
         server.log.warn(`[live] start_stream_failed cameraId=${id} code=TRANSCODE_LIMIT_REACHED streamType=${streamType}`)
@@ -451,8 +448,12 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const codec =
       transcoded            ? 'H264' :
       effectiveType === 'main' ? (cam?.mainCodec ?? null) : (cam?.subCodec ?? null)
+    // No etiquetar el transcodificado (main_h264) con la resolución NATIVA: FFmpeg escala
+    // la salida (≠ origen), así que declararla engañaría (un 4K servido a 1920 mostraría
+    // "4K"). Se omite hasta poder derivar/sondear la resolución REAL de salida (Codex #133).
     const resolution =
-      effectiveType === 'sub' ? (cam?.subResolution ?? null) : (cam?.mainResolution ?? null)
+      effectiveType === 'sub'  ? (cam?.subResolution ?? null) :
+      effectiveType === 'main' ? (cam?.mainResolution ?? null) : null
 
     return reply.send({
       cameraId:   id,
