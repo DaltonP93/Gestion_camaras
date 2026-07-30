@@ -41,6 +41,22 @@ describe('classifyRtspError — 400', () => {
   })
 })
 
+describe('classifyRtspError — audio vs video decoder (no falso CODEC_UNSUPPORTED)', () => {
+  it('decoder de AUDIO ausente ⇒ AUDIO_STREAM_INVALID (no CODEC_UNSUPPORTED)', () => {
+    expect(classifyRtspError('Decoder (codec pcm_alaw) not found for input stream #0:1')).toBe('AUDIO_STREAM_INVALID')
+    expect(classifyRtspError('Could not find codec parameters for stream 1 (Audio: pcm_mulaw)')).toBe('AUDIO_STREAM_INVALID')
+    expect(classifyRtspError('could not find codec, Audio: aac')).toBe('AUDIO_STREAM_INVALID')
+  })
+  it('decoder de VIDEO ausente sigue siendo CODEC_UNSUPPORTED', () => {
+    expect(classifyRtspError('Decoder (codec hevc) not found for input stream #0:0, Video: hevc')).toBe('CODEC_UNSUPPORTED')
+    expect(classifyRtspError('No supported streams, Video: h264')).toBe('CODEC_UNSUPPORTED')
+  })
+  it('mensaje genérico sin indicio de audio permanece CODEC_UNSUPPORTED', () => {
+    expect(classifyRtspError('Output file does not contain any stream: no supported streams')).toBe('CODEC_UNSUPPORTED')
+    expect(classifyRtspError('Invalid data found when processing input')).toBe('CODEC_UNSUPPORTED')
+  })
+})
+
 describe('buildPlaybackAttemptPlan — respeta el playhead', () => {
   // Bloque 09:00–09:30, playhead solicitado 09:22.
   const BLOCK_START = '20260716T090000Z', PLAYHEAD = new Date('2026-07-16T09:22:00Z'), BLOCK_END = new Date('2026-07-16T09:30:00Z')

@@ -74,6 +74,9 @@ export function SettingsPage() {
   const [hlsLatency, setHlsLatency] = useState('low')
   const [streamQuality, setStreamQuality] = useState('main')
   const [onDemandTimeout, setOnDemandTimeout] = useState(30)
+  // Política de audio predeterminada del sistema (persistida server-side).
+  const [recordingsAudioMode, setRecordingsAudioMode] = useState<'auto' | 'enabled' | 'disabled'>('auto')
+  const [savingAudioMode, setSavingAudioMode] = useState(false)
   // ── Seguridad (persistida server-side, P0) ──
   const [sessionTimeout, setSessionTimeout] = useState(60)
   const [maxSessions, setMaxSessions] = useState(5)
@@ -85,6 +88,28 @@ export function SettingsPage() {
   const [mfaGracePeriodLogins, setMfaGracePeriodLogins] = useState(3)
   const [timezone, setTimezone] = useState('America/Asuncion')
   const [dateFormat, setDateFormat] = useState('dd/MM/yyyy')
+
+  // Cargar la política de audio global (persistida) una vez.
+  useEffect(() => {
+    apiGet<{ recordingsAudioMode: 'auto' | 'enabled' | 'disabled' }>('/recordings/settings/audio', {})
+      .then((s) => { if (s?.recordingsAudioMode) setRecordingsAudioMode(s.recordingsAudioMode) })
+      .catch(() => { /* opcional */ })
+  }, [])
+
+  const saveRecordingsAudioMode = async (mode: 'auto' | 'enabled' | 'disabled') => {
+    const prev = recordingsAudioMode
+    setRecordingsAudioMode(mode)
+    setSavingAudioMode(true)
+    try {
+      await apiPut('/recordings/settings/audio', { recordingsAudioMode: mode })
+      toast.success('Política de audio guardada')
+    } catch {
+      setRecordingsAudioMode(prev)
+      toast.error('No se pudo guardar la política de audio')
+    } finally {
+      setSavingAudioMode(false)
+    }
+  }
 
   useEffect(() => {
     apiGet<AlertSettings>('/alerts/settings')
@@ -558,6 +583,25 @@ export function SettingsPage() {
                     className="input max-w-xs"
                   />
                   <p className="text-xs text-surface-500 mt-1">Tiempo antes de cerrar un stream si nadie lo está viendo.</p>
+                </div>
+
+                <div className="max-w-xs">
+                  <label className="label">Política predeterminada de audio (Grabaciones)</label>
+                  <select
+                    value={recordingsAudioMode}
+                    disabled={savingAudioMode}
+                    onChange={(e) => saveRecordingsAudioMode(e.target.value as 'auto' | 'enabled' | 'disabled')}
+                    className="input"
+                  >
+                    <option value="auto">Automática</option>
+                    <option value="enabled">Con audio</option>
+                    <option value="disabled">Solo video</option>
+                  </select>
+                  <p className="text-xs text-surface-500 mt-1">
+                    Valor por defecto para el audio de reproducción de grabaciones. Se puede
+                    sobrescribir por NVR y por cámara. "Solo video" es útil donde el audio no
+                    está autorizado, no está cableado o permanece desactivado en las cámaras.
+                  </p>
                 </div>
 
                 <div className="p-3 bg-surface-900 rounded-lg">

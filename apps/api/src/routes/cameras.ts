@@ -25,6 +25,8 @@ const cameraUpdateSchema = z.object({
   ptzEnabled:    z.boolean().optional(),
   active:        z.boolean().optional(),
   preferredStream: z.enum(['main', 'sub']).optional(),
+  // Audio de reproducción (precedencia camera→nvr→system→auto). null = heredar.
+  audioMode:     z.enum(['auto', 'enabled', 'disabled']).nullable().optional(),
 })
 
 const ptzSchema = z.object({

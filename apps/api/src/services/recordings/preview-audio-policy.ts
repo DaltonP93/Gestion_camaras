@@ -69,3 +69,137 @@ export function isAudioSyncOrMuxFailure(ev: {
 }): boolean {
   return ev.videoDecoded && !ev.firstByteSent && ev.audioProblematic
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POLÍTICA DE AUDIO GENERAL (audioMode = auto | enabled | disabled)
+//
+// Política general aplicable a TODAS las cámaras, NVR y bloques de grabación.
+// NO hay excepciones por cameraId/canal/modelo/nombre. Un audio ausente,
+// desactivado, vacío, none, unknown, sin decoder o incompatible NUNCA debe
+// impedir la reproducción del video: si el video es válido, se reproduce
+// automáticamente sin audio.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type AudioMode = 'auto' | 'enabled' | 'disabled'
+
+/** Normaliza un valor arbitrario a un AudioMode válido (o null si no lo es). */
+export function normalizeAudioMode(v: unknown): AudioMode | null {
+  if (v === 'auto' || v === 'enabled' || v === 'disabled') return v
+  return null
+}
+
+/**
+ * Resuelve el modo EFECTIVO según la precedencia:
+ *   camera.audioMode → nvr.audioMode → system.recordingsAudioMode → 'auto'
+ * Cada nivel puede ser null/ausente (hereda del siguiente). Nunca hardcodea
+ * identidades: sólo consume los modos configurados.
+ */
+export function resolveEffectiveAudioMode(chain: {
+  camera?: unknown
+  nvr?: unknown
+  system?: unknown
+}): AudioMode {
+  return (
+    normalizeAudioMode(chain.camera) ??
+    normalizeAudioMode(chain.nvr) ??
+    normalizeAudioMode(chain.system) ??
+    'auto'
+  )
+}
+
+/** Motivos posibles de la decisión de audio del preview. */
+export type PreviewAudioReason =
+  | 'configured_disabled'
+  | 'no_audio_stream'
+  | 'audio_codec_none'
+  | 'audio_codec_unknown'
+  | 'audio_decoder_unavailable'
+  | 'audio_mux_incompatible'
+  | 'known_video_only_camera'
+  | 'audio_usable'
+
+export interface PreviewAudioDecision {
+  includeAudio: boolean
+  videoOnly: boolean
+  reason: PreviewAudioReason
+}
+
+/** Información conocida de la pista de audio (de ffprobe o del stderr en vivo). */
+export interface AudioStreamInfo {
+  /** ¿Se detectó una pista de audio en el contenedor? */
+  present?: boolean
+  /** codecName reportado (puede ser 'none' | 'unknown' | '' | null). */
+  codecName?: string | null
+  /** La pista existe pero está marcada como desactivada/deshabilitada. */
+  disabled?: boolean
+  /** Faltan parámetros necesarios para decodificar/muxear (sample_rate, etc.). */
+  parametersIncomplete?: boolean
+}
+
+/** Evidencia extraída del stderr de FFmpeg durante el intento en curso. */
+export interface StderrAudioEvidence {
+  /** No hay decoder de AUDIO disponible ("decoder ... not found" para la pista de audio). */
+  audioDecoderUnavailable?: boolean
+  /** El audio impide abrir/generar el mux (o A/V no produjo salida con video ya decodificado). */
+  audioMuxIncompatible?: boolean
+}
+
+/** Perfil aprendido de una cámara (evidencia estable de video-only). */
+export interface KnownCameraAudioProfile {
+  videoOnly?: boolean
+  detectedAudioCodec?: string | null
+}
+
+const NONE_TOKENS = new Set(['none', 'null', 'nil', 'na', 'n/a'])
+
+/**
+ * DECISIÓN CENTRAL Y ÚNICA de la política de audio del preview.
+ *
+ * Colapsa el modo efectivo + la info de la pista + la evidencia del stderr + el
+ * perfil conocido de la cámara en una única decisión {includeAudio, videoOnly,
+ * reason}. Esta función es PURA: no toca FFmpeg, ni la DB, ni el DOM. Todo el
+ * resto del sistema (constructor de args, clasificador de error, logs) debe
+ * derivar su comportamiento de aquí, sin reimplementar la lógica.
+ *
+ * @param configuredMode  modo YA resuelto por precedencia (resolveEffectiveAudioMode)
+ */
+export function resolvePreviewAudioPolicy(opts: {
+  configuredMode: AudioMode
+  audioStream?: AudioStreamInfo | null
+  stderrEvidence?: StderrAudioEvidence | null
+  knownCameraProfile?: KnownCameraAudioProfile | null
+}): PreviewAudioDecision {
+  const videoOnly = (reason: PreviewAudioReason): PreviewAudioDecision =>
+    ({ includeAudio: false, videoOnly: true, reason })
+
+  // 1) disabled: nunca intentar audio, aunque el RTSP lo anuncie. -an directo.
+  if (opts.configuredMode === 'disabled') return videoOnly('configured_disabled')
+
+  // 2) Perfil conocido estable: la cámara ya demostró requerir video-only.
+  if (opts.knownCameraProfile?.videoOnly) return videoOnly('known_video_only_camera')
+
+  // 3) Evidencia dura del stderr (fallback reactivo): decoder o mux de audio.
+  if (opts.stderrEvidence?.audioDecoderUnavailable) return videoOnly('audio_decoder_unavailable')
+  if (opts.stderrEvidence?.audioMuxIncompatible) return videoOnly('audio_mux_incompatible')
+
+  // 4) Inspección de la pista de audio (ffprobe / stderr).
+  //   audioStream === undefined ⇒ AÚN NO inspeccionado (p.ej. primer spawn sin
+  //   ffprobe): en auto/enabled se intenta A/V y el fallback reactivo cubre fallos.
+  //   audioStream === null / {present:false} ⇒ inspeccionado y AUSENTE ⇒ video-only.
+  const a = opts.audioStream
+  if (a === undefined) return { includeAudio: true, videoOnly: false, reason: 'audio_usable' }
+  if (a === null || a.present === false || a.disabled) return videoOnly('no_audio_stream')
+
+  const codec = (a.codecName ?? '').trim().toLowerCase()
+  //   - codec vacío/null ⇒ tratado como 'none'.
+  if (codec === '' || NONE_TOKENS.has(codec)) return videoOnly('audio_codec_none')
+  if (codec === 'unknown') return videoOnly('audio_codec_unknown')
+  //   - G.711 μ-law/A-law y afines: el pipeline A/V no los muxea ⇒ incompatible.
+  if (isProblematicPreviewAudio(codec)) return videoOnly('audio_mux_incompatible')
+  //   - parámetros incompletos: no se puede muxear con garantías.
+  if (a.parametersIncomplete) return videoOnly('audio_mux_incompatible')
+
+  // 5) Audio presente, habilitado y utilizable ⇒ incluir audio.
+  //    (auto y enabled coinciden aquí; el fallback reactivo cubre fallos en runtime.)
+  return { includeAudio: true, videoOnly: false, reason: 'audio_usable' }
+}

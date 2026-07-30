@@ -1431,6 +1431,7 @@ export function RecordingsPage() {
       errorMsg: null,
       vodProgress: null,
       mimeType: null,
+      noAudio: false,
     } : s))
 
     try {
@@ -1540,11 +1541,19 @@ export function RecordingsPage() {
           NVR_OFFLINE_OR_TIMEOUT:         'El NVR no responde (timeout / conexión rechazada).',
           RTSP_OPEN_FAILED:               'No se pudo abrir RTSP de reproducción.',
           RTSP_PLAYBACK_URI_REJECTED:     'El NVR rechazó la URL de reproducción. VisionCore intentó las estrategias compatibles sin recibir video.',
-          CODEC_UNSUPPORTED:              'Codec no soportado. Probá convertir a H.264.',
+          CODEC_UNSUPPORTED:              'Codec de video no soportado. Probá convertir a H.264.',
+          // Fallos EXCLUSIVOS de audio: el preview intenta automáticamente
+          // video-only. Estos mensajes sólo se muestran si video-only TAMPOCO
+          // produjo video (no son problemas de códec de video → sin retry H.264).
+          AUDIO_SYNC_OR_MUX_FAILURE:      'La grabación no pudo reproducirse. La pista de audio no es compatible y el intento sin audio tampoco produjo video.',
+          AUDIO_STREAM_INVALID:           'La grabación no pudo reproducirse. La pista de audio no es compatible y el intento sin audio tampoco produjo video.',
         }
-        // H.264 transcode only fixes codec problems — never retry it for
-        // bandwidth/auth/track/offline failures
-        const isCodecIssue = !category || category === 'CODEC_UNSUPPORTED' || category === 'UNKNOWN'
+        // H.264 transcode only fixes VIDEO codec problems — never retry it for
+        // bandwidth/auth/track/offline NI para fallos exclusivos de audio (esos
+        // se resuelven con video-only en el backend, no transcodificando video).
+        const AUDIO_CATEGORIES = new Set(['AUDIO_SYNC_OR_MUX_FAILURE', 'AUDIO_STREAM_INVALID'])
+        const isCodecIssue = (!category || category === 'CODEC_UNSUPPORTED' || category === 'UNKNOWN')
+          && !AUDIO_CATEGORIES.has(category ?? '')
 
         // Auto-retry with H.264 only when the failure is codec-related —
         // transcoding can't fix auth/track/offline errors
@@ -1593,11 +1602,25 @@ export function RecordingsPage() {
         // falsamente a los 5 s, mostrando error y luego reproduciendo.
         if (globalPlayingRef.current) armStallTimer(slotIndex, sessionId)
       }
+      let noAudioChecked = false
       const onPlaying = () => {
         if (slotKeysRef.current[slotIndex] !== myKey) return
         clearStall()
         console.info(`[recordings-ui] preview_playing slot=${slotIndex} sessionId=${sessionId}`)
         setSlotStatusIfCurrent('playing')
+        // Fetch único: ¿el backend cayó a video-only? → badge discreto "Sin audio"
+        // (el video reproduce normalmente; NO es un error).
+        if (!noAudioChecked) {
+          noAudioChecked = true
+          apiGet<{ videoOnly?: boolean | null }>(`/recordings/preview/${sessionId}/status`, {})
+            .then((st) => {
+              if (slotKeysRef.current[slotIndex] !== myKey) return
+              if (st.videoOnly) {
+                setSlots(prev => prev.map((s, i) => i === slotIndex ? { ...s, noAudio: true } : s))
+              }
+            })
+            .catch(() => { /* status opcional: si falla, sin badge */ })
+        }
       }
       const onTimeUpdate = () => {
         if (vid.currentTime > 0) { clearStall(); setSlotStatusIfCurrent('playing') }
@@ -2320,6 +2343,12 @@ export function RecordingsPage() {
                       {slot.status === 'playing' && (
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-green-700/60 text-green-300">● Play</span>
                       )}
+                      {slot.noAudio && isLiveSlot(slot.status) && (
+                        <span
+                          className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-300"
+                          title="La grabación no tiene audio compatible; se reproduce sin audio."
+                        >Sin audio</span>
+                      )}
                       {slot.status === 'ready' && (
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-surface-700/70 text-surface-300">Pausado</span>
                       )}
@@ -2459,7 +2488,10 @@ export function RecordingsPage() {
 
                     {slot.status === 'error' && (() => {
                       const errCategory = errorCategoryBySlotRef.current[idx] ?? null
-                      const showH264 = !errCategory || errCategory === 'CODEC_UNSUPPORTED' || errCategory === 'UNKNOWN'
+                      // H.264 sólo corrige códec de VIDEO. Nunca para fallos de audio
+                      // (el backend ya cae a video-only) ni para límites/auth/offline.
+                      const isAudioCat = errCategory === 'AUDIO_SYNC_OR_MUX_FAILURE' || errCategory === 'AUDIO_STREAM_INVALID'
+                      const showH264 = (!errCategory || errCategory === 'CODEC_UNSUPPORTED' || errCategory === 'UNKNOWN') && !isAudioCat
                       const retryLabel = errCategory === 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
                         ? 'Reintentar cuando haya sesión libre'
                         : 'Reintentar'

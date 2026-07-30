@@ -44,6 +44,9 @@ export interface PlaybackSlot {
   errorMsg: string | null
   vodProgress: { outTimeSec: number; expectedDurationSec: number } | null
   mimeType: string | null
+  // El preview se está reproduciendo sin audio (fallback video-only del backend):
+  // badge discreto "Sin audio". No es un error.
+  noAudio?: boolean
 }
 
 export function emptySlot(slotIndex: number): PlaybackSlot {

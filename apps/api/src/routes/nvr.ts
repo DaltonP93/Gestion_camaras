@@ -46,6 +46,8 @@ const nvrSchema = z.object({
   channels: z.number().int().min(1).max(256),
   hddCount: z.number().int().min(1).max(16).default(1),
   location: z.string().optional(),
+  // Audio de reproducción a nivel NVR (heredado por sus cámaras). null = heredar del global.
+  audioMode: z.enum(['auto', 'enabled', 'disabled']).nullable().optional(),
 })
 
 export const nvrRoutes: FastifyPluginAsync = async (server) => {
