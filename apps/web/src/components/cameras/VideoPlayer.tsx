@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { hlsRetryDecision } from './hlsRetryPolicy'
+import { shouldShowCodecUnsupported } from './codecSupport'
 
 export type CameraPlaybackErrorCode =
   | 'NVR_OFFLINE'
@@ -114,7 +115,10 @@ interface Props {
   streamType?: 'sub' | 'main' | 'main_h264'
   streamCodec?: string        // e.g. "hevc", "h264"
   streamResolution?: string   // e.g. "1920×1080", "640×360"
+  streamFps?: number | null       // fps real (transcodificado) — se muestra en el badge si existe
+  streamBitrate?: string | null   // bitrate real (transcodificado) — se muestra en el badge si existe
   transcodingAvailable?: boolean
+  qualitySwitchBusy?: boolean  // deshabilita Baja/Alta/Trans mientras hay un cambio en vuelo
   objectFit?: 'cover' | 'contain'  // default: 'contain'
 }
 
@@ -137,7 +141,10 @@ export function VideoPlayer({
   streamType,
   streamCodec,
   streamResolution,
+  streamFps,
+  streamBitrate,
   transcodingAvailable,
+  qualitySwitchBusy,
   objectFit = 'contain',
 }: Props) {
   // Whether the current stream is the transcoded (HEVC→H.264) variant
@@ -419,12 +426,16 @@ export function VideoPlayer({
 
       {/* Error overlay — muestra causa técnica real */}
       {(status === 'error' || !!activeError || (error && status !== 'playing')) && (() => {
-        const isHevcMain = streamType === 'main' && (
-          activeError?.code === 'CODEC_UNSUPPORTED' ||
-          (streamCodec || '').toLowerCase().includes('hevc') ||
-          (streamCodec || '').toLowerCase().includes('h.265') ||
-          (streamCodec || '').toLowerCase().includes('h265')
-        )
+        // Sólo declaramos "H.265 no compatible" ante una señal REAL de códec (error
+        // clasificado CODEC_UNSUPPORTED o detalle incompatible de hls.js), NUNCA por el
+        // mero hecho de que streamCodec sea HEVC: un 404/500/timeout/manifest temporal
+        // sobre un HEVC reproducible ya no dispara este overlay (P1).
+        const hlsDetail = activeError?.technicalDetail?.split('/').pop()?.trim()
+        const isHevcMain = shouldShowCodecUnsupported({
+          streamType,
+          errorCode: activeError?.code,
+          hlsErrorDetail: hlsDetail,
+        })
         const isLimitReached = activeError?.code === 'TRANSCODE_LIMIT_REACHED'
         return (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-surface-900/95 gap-2 px-3">
@@ -531,6 +542,8 @@ export function VideoPlayer({
               {isTranscoded ? 'Trans' : streamType === 'main' ? 'Main' : 'Sub'}
               {streamResolution && ` ${formatResolution(streamResolution)}`}
               {isTranscoded ? ' H.264' : streamCodec ? ` ${formatBadgeCodec(streamCodec)}` : ''}
+              {streamFps ? ` ${streamFps}fps` : ''}
+              {streamBitrate ? ` ${streamBitrate}` : ''}
             </span>
           )}
         </div>
@@ -574,7 +587,8 @@ export function VideoPlayer({
           <div className="flex bg-black/60 rounded overflow-hidden">
             <button
               onClick={() => onQualitySwitch('sub')}
-              className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
+              disabled={qualitySwitchBusy}
+              className={clsx('text-[9px] px-1.5 py-0.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
                 streamType === 'sub' ? 'bg-brand-600 text-white' : 'text-surface-300 hover:text-white')}
               title="Baja calidad (substream H.264)"
             >
@@ -582,7 +596,8 @@ export function VideoPlayer({
             </button>
             <button
               onClick={() => onQualitySwitch('main')}
-              className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
+              disabled={qualitySwitchBusy}
+              className={clsx('text-[9px] px-1.5 py-0.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
                 streamType === 'main' ? 'bg-brand-600 text-white' : 'text-surface-300 hover:text-white')}
               title="Alta calidad (stream principal)"
             >
@@ -591,7 +606,8 @@ export function VideoPlayer({
             {transcodingAvailable && (
               <button
                 onClick={() => onQualitySwitch('main_h264')}
-                className={clsx('text-[9px] px-1.5 py-0.5 transition-colors',
+                disabled={qualitySwitchBusy}
+                className={clsx('text-[9px] px-1.5 py-0.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
                   isTranscoded ? 'bg-purple-700 text-white' : 'text-purple-300 hover:text-white')}
                 title="Transcodificado H.264"
               >

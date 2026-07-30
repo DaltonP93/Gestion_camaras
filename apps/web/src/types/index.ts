@@ -289,6 +289,8 @@ export interface StreamInfo {
   transcoded?: boolean
   codec?: string | null
   resolution?: string | null
+  fps?: number | null       // fps real (del perfil aplicado) para el transcodificado
+  bitrate?: string | null   // bitrate real (del perfil aplicado) para el transcodificado
   warning?: { code: string; message: string }
 }
 

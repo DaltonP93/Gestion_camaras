@@ -5,6 +5,7 @@ import {
   getActiveSessions,
   getAdminSessionsSummary,
   getTranscodesDiagnostic,
+  getTranscodeSlots,
   MAX_TRANSCODE_SESSIONS,
 } from '../services/stream-manager'
 import { isTranscodeProcessAlive } from '../services/stream'
@@ -69,6 +70,47 @@ export const adminRoutes: FastifyPluginAsync = async (server) => {
         ffmpegAlive:           procs.filter(p => p.alive).length,
         maxTranscodeSessions:  MAX_TRANSCODE_SESSIONS,
       },
+    })
+  })
+
+  // GET /api/admin/diagnostics/transcodes
+  // Diagnóstico de CUPOS de transcodificación: identifica exactamente qué ocupa cada
+  // cupo contra maxTranscodes. Sin secretos (IDs, tiempos, perfil y motivo). Enriquece
+  // cada slot con el nombre de la cámara desde la DB.
+  server.get('/diagnostics/transcodes', { preHandler: [server.authorize(['ADMIN'])] }, async (_request, reply) => {
+    const diag = getTranscodeSlots()
+    const now  = Date.now()
+
+    // Resolver nombres de cámara en un solo query.
+    const cameraIds = [...new Set(diag.slots.map(s => s.cameraId))]
+    const cameras = cameraIds.length
+      ? await server.prisma.camera.findMany({
+          where: { id: { in: cameraIds } },
+          select: { id: true, name: true, nvr: { select: { name: true } } },
+        })
+      : []
+    const nameById = new Map(cameras.map(c => [c.id, { cameraName: c.name, nvrName: c.nvr?.name ?? null }]))
+
+    return reply.send({
+      maxTranscodes:      diag.maxTranscodes,
+      activeProcessCount: diag.activeProcessCount,
+      startingCount:      diag.startingCount,
+      slots: diag.slots.map(s => ({
+        cameraId:      s.cameraId,
+        cameraName:    nameById.get(s.cameraId)?.cameraName ?? null,
+        nvrName:       nameById.get(s.cameraId)?.nvrName ?? null,
+        userId:        s.userId,
+        viewId:        s.viewId,
+        streamPath:    s.streamPath,
+        pid:           s.pid,
+        processAlive:  s.processAlive,
+        startedAt:     s.startedAt,
+        lastHeartbeat: s.lastHeartbeat,
+        ageSeconds:    Math.round((now - s.startedAt.getTime()) / 1000),
+        idleSeconds:   Math.round((now - s.lastHeartbeat.getTime()) / 1000),
+        profile:       s.profile,
+        reason:        s.reason,
+      })),
     })
   })
 }

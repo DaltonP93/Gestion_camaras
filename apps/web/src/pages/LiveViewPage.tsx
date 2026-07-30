@@ -11,6 +11,8 @@ import { PTZControls } from '@/components/cameras/PTZControls'
 import { CameraDiagnosticModal } from '@/components/cameras/CameraDiagnosticModal'
 import { useAuthStore } from '@/stores/authStore'
 import { apiGet, apiPost } from '@/lib/api'
+import { parseStreamError, parseRetryAfterMs } from '@/lib/streamErrors'
+import { createQualitySwitchController } from '@/components/cameras/qualitySwitchController'
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
 
@@ -125,6 +127,9 @@ export function LiveViewPage() {
   const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
   const [streamCapabilities, setStreamCapabilities] = useState<{ ffmpegAvailable: boolean; transcodingEnabled: boolean } | null>(null)
+  // Single-flight del cambio de calidad: deshabilita Baja/Alta/Trans mientras hay un
+  // POST start-stream en vuelo para la cámara en foco (P1: evita POST duplicados).
+  const [qualitySwitchBusy, setQualitySwitchBusy] = useState(false)
 
   // playerKeys forces VideoPlayer remount (new HLS instance) when incremented for a camera
   const [playerKeys, setPlayerKeys] = useState<Record<string, number>>({})
@@ -145,6 +150,11 @@ export function LiveViewPage() {
   const activeSessions = useRef<Set<string>>(new Set())
   // Track pending start-stream requests to avoid double-firing
   const pendingStarts  = useRef<Set<string>>(new Set())
+  // Controlador single-flight del cambio de calidad (mutex + secuencia por cámara).
+  // Instancia por montaje para no filtrar estado entre navegaciones.
+  const qualityCtl     = useRef(createQualitySwitchController())
+  // Backoff Retry-After por cámara tras un 429 de límite en el cambio de calidad.
+  const qualityRetryUntil = useRef<Record<string, number>>({})
   // Stagger timers so we can cancel them on navigation
   const staggerTimers  = useRef<ReturnType<typeof setTimeout>[]>([])
   // Track when page became hidden to decide whether to reconcile on unhide
@@ -897,26 +907,21 @@ export function LiveViewPage() {
       setFocusStreamInfo(info)
       bumpPlayerKeys([camera.id])
     } catch (err: any) {
-      const body = err?.response?.data || {}
-      const errCodeMap: Record<string, CameraPlaybackError['code']> = {
-        CODEC_UNSUPPORTED_HEVC:  'CODEC_UNSUPPORTED',
-        AUTH_FAILED:             'AUTH_FAILED',
-        OFFLINE:                 'CAMERA_OFFLINE',
-        MEDIA_SERVER_ERROR:      'MEDIAMTX_NOT_READY',
-        RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
-        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
-        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
-        TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
-      }
-      const mappedCode = (errCodeMap[body.error] || 'UNKNOWN') as CameraPlaybackError['code']
-      if (mappedCode === 'TRANSCODE_LIMIT_REACHED') {
+      // Contrato unificado: lee body.code ?? body.error (antes leía body.error y un 429
+      // de límite caía en "Error desconocido").
+      const parsed = parseStreamError(
+        err?.response?.data || {},
+        err?.response?.status,
+        'Error al iniciar stream principal',
+      )
+      if (parsed.code === 'TRANSCODE_LIMIT_REACHED') {
         console.info(`[live-ui] transcode_limit_reached cameraId=${camera.id}`)
         console.info(`[live-ui] fallback_to_substream cameraId=${camera.id} reason=transcode_limit_reached — user can click 'Usar baja calidad'`)
       }
       setFocusStreamError({
-        code: mappedCode,
-        message: body.message || 'Error al iniciar stream principal',
-        technicalDetail: body.details,
+        code: parsed.code,
+        message: parsed.message,
+        technicalDetail: parsed.technicalDetail,
       })
     }
   }, [bumpPlayerKeys, streamCapabilities, focusStreamType])
@@ -947,75 +952,104 @@ export function LiveViewPage() {
   // ─── Quality switch from VideoPlayer (Baja/Alta/Trans buttons) ─
   const handleQualitySwitch = useCallback(async (quality: 'sub' | 'main' | 'main_h264') => {
     if (!focusCamera) return
+    const cam = focusCamera
 
-    if (quality === 'sub') {
-      // Explicitly switching back to sub — stop both main streams so FFmpeg is killed.
-      console.info(`[LiveView] qualitySwitch cameraId=${focusCamera} from=${focusStreamType} to=sub reason=switch_to_sub`)
-      console.info(`[live-ui] fallback_to_substream cameraId=${focusCamera} reason=user_selected_low_quality prevType=${focusStreamType}`)
-      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main',      reason: 'switch_to_sub' }).catch(() => {})
-      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main_h264', reason: 'switch_to_sub' }).catch(() => {})
-      setFocusStreamInfo(null)
-      setFocusStreamError(null)
-      setFocusStreamType('sub')
-      bumpPlayerKeys([focusCamera])
+    // Retry-After: si un 429 previo pidió esperar, ignorar clics hasta que expire.
+    const retryUntil = qualityRetryUntil.current[cam]
+    if (retryUntil && Date.now() < retryUntil) {
+      console.info(`[live-ui] quality_switch_throttled cameraId=${cam} quality=${quality} until=${retryUntil}`)
       return
     }
 
-    if (quality === focusStreamType) {
-      // Same type — this is a retry. Remount the player without killing FFmpeg.
-      // The supervisor keeps FFmpeg alive; a fresh HLS.js instance will reconnect.
-      console.info(`[LiveView] qualitySwitch retry cameraId=${focusCamera} type=${quality} — remounting player only`)
-      setFocusStreamError(null)
-      bumpPlayerKeys([focusCamera])
+    // Single-flight: clic del mismo tipo pendiente → se ignora; otro tipo → supersede.
+    const decision = qualityCtl.current.request(cam, quality)
+    if (decision.action === 'ignore') {
+      console.info(`[live-ui] quality_switch_ignored cameraId=${cam} quality=${quality} reason=same-pending`)
       return
     }
-
-    // Switching to a different type (e.g. sub→main, main→main_h264, main_h264→main)
-    const prevType = focusStreamType
-    console.info(`[LiveView] qualitySwitch cameraId=${focusCamera} from=${prevType} to=${quality}`)
-
-    // Only stop 'main' session — never stop 'main_h264' here because:
-    // a) On HEVC cameras, 'main' redirects to 'main_h264' anyway (same FFmpeg).
-    // b) Stopping main_h264 kills FFmpeg, then start-stream immediately re-spawns it
-    //    causing the "closing existing publisher" duplicate in MediaMTX.
-    if (prevType === 'main') {
-      apiPost(`/cameras/${focusCamera}/stop-stream`, { streamType: 'main', reason: 'quality_switch' }).catch(() => {})
-    }
-
-    setFocusStreamInfo(null)
-    setFocusStreamError(null)
-    setFocusStreamType(quality)
+    const seq = decision.seq
+    setQualitySwitchBusy(true)
 
     try {
-      const info = await apiPost<StreamInfo>(`/cameras/${focusCamera}/start-stream`, { streamType: quality, viewId })
-      const actualType: 'sub' | 'main' | 'main_h264' =
-        (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
-          ? 'main_h264' : quality
-      if (actualType !== quality) {
-        console.info(`[LiveView] qualitySwitch redirect cameraId=${focusCamera} requested=${quality} actual=${actualType}`)
-        setFocusStreamType(actualType)
+      if (quality === 'sub') {
+        // Explicitly switching back to sub — stop both main streams so FFmpeg is killed.
+        console.info(`[LiveView] qualitySwitch cameraId=${cam} from=${focusStreamType} to=sub reason=switch_to_sub`)
+        console.info(`[live-ui] fallback_to_substream cameraId=${cam} reason=user_selected_low_quality prevType=${focusStreamType}`)
+        apiPost(`/cameras/${cam}/stop-stream`, { streamType: 'main',      reason: 'switch_to_sub' }).catch(() => {})
+        apiPost(`/cameras/${cam}/stop-stream`, { streamType: 'main_h264', reason: 'switch_to_sub' }).catch(() => {})
+        setFocusStreamInfo(null)
+        setFocusStreamError(null)
+        setFocusStreamType('sub')
+        bumpPlayerKeys([cam])
+        return
       }
-      setFocusStreamInfo(info)
-      bumpPlayerKeys([focusCamera])
-    } catch (err: any) {
-      const body = err?.response?.data || {}
-      const errCodeMap: Record<string, CameraPlaybackError['code']> = {
-        CODEC_UNSUPPORTED_HEVC:  'CODEC_UNSUPPORTED',
-        AUTH_FAILED:             'AUTH_FAILED',
-        OFFLINE:                 'CAMERA_OFFLINE',
-        MEDIA_SERVER_ERROR:      'MEDIAMTX_NOT_READY',
-        RTSP_MAIN_NOT_FOUND:     'RTSP_CHANNEL_NOT_FOUND',
-        TRANSCODE_NOT_READY:     'TRANSCODE_NOT_READY',
-        TRANSCODE_PROCESS_EXITED:'TRANSCODE_PROCESS_EXITED',
-        TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',
+
+      if (quality === focusStreamType) {
+        // Same type — this is a retry. Remount the player without killing FFmpeg.
+        // The supervisor keeps FFmpeg alive; a fresh HLS.js instance will reconnect.
+        // No relanzamos main_h264 si ya hay una sesión reutilizable del mismo tipo.
+        console.info(`[LiveView] qualitySwitch retry cameraId=${cam} type=${quality} — remounting player only`)
+        setFocusStreamError(null)
+        bumpPlayerKeys([cam])
+        return
       }
-      setFocusStreamError({
-        code: (errCodeMap[body.error] || 'UNKNOWN') as any,
-        message: body.message || `Error al iniciar stream ${quality === 'main_h264' ? 'transcodificado' : 'principal'}`,
-        technicalDetail: body.details,
-      })
+
+      // Switching to a different type (e.g. sub→main, main→main_h264, main_h264→main)
+      const prevType = focusStreamType
+      console.info(`[LiveView] qualitySwitch cameraId=${cam} from=${prevType} to=${quality}`)
+
+      // Only stop 'main' session — never stop 'main_h264' here because:
+      // a) On HEVC cameras, 'main' redirects to 'main_h264' anyway (same FFmpeg).
+      // b) Stopping main_h264 kills FFmpeg, then start-stream immediately re-spawns it
+      //    causing the "closing existing publisher" duplicate in MediaMTX.
+      if (prevType === 'main') {
+        apiPost(`/cameras/${cam}/stop-stream`, { streamType: 'main', reason: 'quality_switch' }).catch(() => {})
+      }
+
+      setFocusStreamInfo(null)
+      setFocusStreamError(null)
+      setFocusStreamType(quality)
+
+      try {
+        const info = await apiPost<StreamInfo>(`/cameras/${cam}/start-stream`, { streamType: quality, viewId })
+        // Descarta respuestas tardías de una selección anterior (llegadas fuera de orden).
+        if (!qualityCtl.current.isCurrent(cam, seq)) {
+          console.info(`[live-ui] quality_switch_stale_response cameraId=${cam} seq=${seq} quality=${quality} — descartada`)
+          return
+        }
+        const actualType: 'sub' | 'main' | 'main_h264' =
+          (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
+            ? 'main_h264' : quality
+        if (actualType !== quality) {
+          console.info(`[LiveView] qualitySwitch redirect cameraId=${cam} requested=${quality} actual=${actualType}`)
+          setFocusStreamType(actualType)
+        }
+        setFocusStreamInfo(info)
+        bumpPlayerKeys([cam])
+      } catch (err: any) {
+        // Un error tardío de una selección superada tampoco debe pisar la vigente.
+        if (!qualityCtl.current.isCurrent(cam, seq)) return
+        const parsed = parseStreamError(
+          err?.response?.data || {},
+          err?.response?.status,
+          `Error al iniciar stream ${quality === 'main_h264' ? 'transcodificado' : 'principal'}`,
+        )
+        if (parsed.isLimit) {
+          // Respeta Retry-After del backend (429) antes de permitir otro intento.
+          const retryMs = parseRetryAfterMs(err?.response?.headers?.['retry-after'])
+          qualityRetryUntil.current[cam] = Date.now() + retryMs
+        }
+        setFocusStreamError({
+          code: parsed.code,
+          message: parsed.message,
+          technicalDetail: parsed.technicalDetail,
+        })
+      }
+    } finally {
+      qualityCtl.current.settle(cam, seq)
+      setQualitySwitchBusy(qualityCtl.current.isPending(cam))
     }
-  }, [focusCamera, focusStreamType, bumpPlayerKeys])
+  }, [focusCamera, focusStreamType, bumpPlayerKeys, viewId])
 
   // ─── Exit fullscreen/focus view ──────────────────────────────
   // On return from fullscreen, stop the focus camera and restart the grid cameras.
@@ -1142,6 +1176,8 @@ export function LiveViewPage() {
                 focusStreamType === 'sub' ? cam.subResolution :
                 focusStreamType === 'main' ? cam.mainResolution : undefined
               )
+              const focusFps     = info?.fps ?? null
+              const focusBitrate = info?.bitrate ?? null
               const canTryMainStream = focusStreamType === 'sub' && !focusStreamError
               const transcodingAvailable = !!(streamCapabilities?.ffmpegAvailable && streamCapabilities?.transcodingEnabled)
               return (
@@ -1168,14 +1204,18 @@ export function LiveViewPage() {
                     streamType={focusType}
                     streamCodec={focusCodec}
                     streamResolution={focusRes}
+                    streamFps={focusFps}
+                    streamBitrate={focusBitrate}
                     transcodingAvailable={transcodingAvailable}
+                    qualitySwitchBusy={qualitySwitchBusy}
                   />
                   {/* Intentar alta calidad — visible button when watching sub in focus */}
                   {canTryMainStream && (
                     <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20">
                       <button
                         onClick={() => handleQualitySwitch('main')}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-black/70 text-surface-200 text-xs hover:bg-black/90 transition-colors border border-surface-600/50"
+                        disabled={qualitySwitchBusy}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-black/70 text-surface-200 text-xs hover:bg-black/90 transition-colors border border-surface-600/50 disabled:opacity-50 disabled:cursor-not-allowed"
                         title="Intentar stream principal HD (puede ser H.265 en algunas cámaras)"
                       >
                         ↑ Intentar alta calidad
