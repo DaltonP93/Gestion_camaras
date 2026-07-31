@@ -187,3 +187,140 @@ describe('resolvePreviewAudioPolicy — decisión central', () => {
     expect(resolvePreviewAudioPolicy({ configuredMode: 'enabled', audioStream: { present: true, codecName: 'none' } }).videoOnly).toBe(true)
   })
 })
+
+// ─── Fallback reactivo derivado de la política (fix Box 4) ────────────────────
+
+import { detectAudioStderrEvidence, decideReactiveAudioRestart } from './preview-audio-policy'
+
+describe('detectAudioStderrEvidence — distingue audio de video', () => {
+  it('detecta la pista de audio y su codec (incl. none/unknown)', () => {
+    expect(detectAudioStderrEvidence('Stream #0:1: Audio: none').audioCodec).toBe('none')
+    expect(detectAudioStderrEvidence('Stream #0:1: Audio: unknown').audioCodec).toBe('unknown')
+    expect(detectAudioStderrEvidence('Stream #0:1: Audio: aac (LC)').audioCodec).toBe('aac')
+  })
+  it('marca audioStreamSeen aunque el codec venga vacío', () => {
+    const ev = detectAudioStderrEvidence('Stream #0:1: Audio: ')
+    expect(ev.audioStreamSeen).toBe(true)
+  })
+  it('reconoce decoder de audio ausente para none/unknown', () => {
+    expect(detectAudioStderrEvidence('No decoder found for codec none').audioDecoderUnavailable).toBe(true)
+    expect(detectAudioStderrEvidence('no decoder found for: none').audioDecoderUnavailable).toBe(true)
+    expect(detectAudioStderrEvidence('Decoder (codec pcm_alaw) not found for input stream #0:1').audioDecoderUnavailable).toBe(true)
+  })
+  it('NO marca decoder de audio cuando el problema es de VIDEO', () => {
+    const ev = detectAudioStderrEvidence('Decoder (codec hevc) not found for input stream #0:0, Video: hevc')
+    expect(ev.audioDecoderUnavailable).toBe(false)
+  })
+  it('detecta parámetros de audio incompletos', () => {
+    expect(detectAudioStderrEvidence('Could not find codec parameters for stream 1 (Audio: pcm_mulaw)').audioParametersIncomplete).toBe(true)
+  })
+})
+
+describe('decideReactiveAudioRestart — deriva de resolvePreviewAudioPolicy', () => {
+  const base = { attemptVideoOnly: false, firstByteSent: false, audioFallbackTried: false, configuredMode: 'auto' as const }
+
+  it('Audio: none ⇒ restart video-only (el bug de Box 4)', () => {
+    const r = decideReactiveAudioRestart({ ...base, detectedAudioCodec: 'none', audioStreamSeen: true, stderrText: 'Stream #0:1: Audio: none' })
+    expect(r.restart).toBe(true)
+    expect(r.decision?.reason).toBe('audio_codec_none')
+    expect(r.stableAudioEvidence).toBe(true)
+  })
+  it('Audio: unknown ⇒ restart video-only', () => {
+    const r = decideReactiveAudioRestart({ ...base, detectedAudioCodec: 'unknown', audioStreamSeen: true, stderrText: 'Stream #0:1: Audio: unknown' })
+    expect(r.restart).toBe(true)
+    expect(r.decision?.reason).toBe('audio_codec_unknown')
+  })
+  it('codec de audio vacío ⇒ restart (audio_codec_none)', () => {
+    const r = decideReactiveAudioRestart({ ...base, detectedAudioCodec: null, audioStreamSeen: true, stderrText: 'Stream #0:1: Audio: ' })
+    expect(r.restart).toBe(true)
+    expect(r.decision?.reason).toBe('audio_codec_none')
+  })
+  it('no decoder found for: none ⇒ restart (decoder de audio)', () => {
+    const r = decideReactiveAudioRestart({ ...base, detectedAudioCodec: null, audioStreamSeen: false, stderrText: 'no decoder found for: none' })
+    expect(r.restart).toBe(true)
+    expect(r.decision?.reason).toBe('audio_decoder_unavailable')
+  })
+  it('G.711 sigue disparando restart (regresión)', () => {
+    const r = decideReactiveAudioRestart({ ...base, detectedAudioCodec: 'pcm_mulaw', audioStreamSeen: true, stderrText: 'Stream #0:1: Audio: pcm_mulaw' })
+    expect(r.restart).toBe(true)
+    expect(r.decision?.reason).toBe('audio_mux_incompatible')
+  })
+  it('AAC válido NO dispara restart', () => {
+    const r = decideReactiveAudioRestart({ ...base, detectedAudioCodec: 'aac', audioStreamSeen: true, stderrText: 'Stream #0:1: Audio: aac (LC)' })
+    expect(r.restart).toBe(false)
+    expect(r.decision?.reason).toBe('audio_usable')
+  })
+  it('sin evidencia de audio todavía ⇒ NO restart', () => {
+    const r = decideReactiveAudioRestart({ ...base, detectedAudioCodec: null, audioStreamSeen: false, stderrText: 'ffmpeg version ... Input #0, rtsp' })
+    expect(r.restart).toBe(false)
+  })
+  it('guardas: ya video-only / ya first byte / ya reintentado ⇒ NO restart', () => {
+    const ev = { detectedAudioCodec: 'none', audioStreamSeen: true, stderrText: 'Audio: none', configuredMode: 'auto' as const }
+    expect(decideReactiveAudioRestart({ ...ev, attemptVideoOnly: true, firstByteSent: false, audioFallbackTried: false }).restart).toBe(false)
+    expect(decideReactiveAudioRestart({ ...ev, attemptVideoOnly: false, firstByteSent: true, audioFallbackTried: false }).restart).toBe(false)
+    expect(decideReactiveAudioRestart({ ...ev, attemptVideoOnly: false, firstByteSent: false, audioFallbackTried: true }).restart).toBe(false)
+  })
+  it('un decoder faltante de VIDEO no marca evidencia estable de audio', () => {
+    const r = decideReactiveAudioRestart({ ...base, detectedAudioCodec: null, audioStreamSeen: false, stderrText: 'Decoder (codec hevc) not found, Video: hevc' })
+    expect(r.stableAudioEvidence).toBe(false)
+  })
+})
+
+describe('máquina de stderr simulada (HEVC + Audio: none) — un único fallback', () => {
+  // Simula el consumo línea-a-línea del handler real, acumulando el tail y
+  // manteniendo el estado del intento; verifica un ÚNICO restart por evidencia.
+  it('HEVC + Audio: none ⇒ exactamente un restart en la misma URI', () => {
+    const lines = [
+      'ffmpeg version 6.0 Copyright (c) 2000-2023',
+      'Input #0, rtsp, from ...:',
+      'Stream #0:0: Video: hevc (Main), yuv420p, 1920x1080, 25 fps',
+      'Stream #0:1: Audio: none',
+      'Output #0, mp4, to pipe:1:',
+    ]
+    let tail = ''
+    let audioSeen = false
+    let detectedAudioCodec: string | null = null
+    let attemptVideoOnly = false
+    let firstByteSent = false
+    let audioFallbackTried = false
+    let restarts = 0
+
+    for (const line of lines) {
+      tail += line + '\n'
+      const info = detectAudioStderrEvidence(line)
+      if (info.audioStreamSeen) audioSeen = true
+      if (info.audioCodec) detectedAudioCodec = info.audioCodec
+      const r = decideReactiveAudioRestart({
+        configuredMode: 'auto', detectedAudioCodec, audioStreamSeen: audioSeen,
+        stderrText: tail, attemptVideoOnly, firstByteSent, audioFallbackTried,
+      })
+      if (r.restart) {
+        restarts++
+        audioFallbackTried = true       // marca: no vuelve a disparar
+        attemptVideoOnly   = true       // el relanzamiento es video-only
+      }
+    }
+    // Múltiples chunks de stderr NO disparan más de un fallback.
+    expect(restarts).toBe(1)
+    // El VIDEO (hevc) fue reconocido, así que no es un problema de video.
+    expect(detectedAudioCodec).toBe('none')
+  })
+
+  it('H.264 + Audio: none ⇒ un restart (video-only reproduce)', () => {
+    let tail = 'Input #0\nStream #0:0: Video: h264, 1280x720\nStream #0:1: Audio: none\n'
+    const r = decideReactiveAudioRestart({
+      configuredMode: 'auto', detectedAudioCodec: 'none', audioStreamSeen: true,
+      stderrText: tail, attemptVideoOnly: false, firstByteSent: false, audioFallbackTried: false,
+    })
+    expect(r.restart).toBe(true)
+  })
+
+  it('audioMode=disabled: el arranque ya es video-only (no aplica reactivo)', () => {
+    // En disabled el intento arranca video-only (attemptVideoOnly=true) ⇒ guarda.
+    const r = decideReactiveAudioRestart({
+      configuredMode: 'disabled', detectedAudioCodec: 'aac', audioStreamSeen: true,
+      stderrText: 'Audio: aac', attemptVideoOnly: true, firstByteSent: false, audioFallbackTried: false,
+    })
+    expect(r.restart).toBe(false)
+  })
+})

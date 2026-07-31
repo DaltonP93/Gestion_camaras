@@ -203,3 +203,128 @@ export function resolvePreviewAudioPolicy(opts: {
   //    (auto y enabled coinciden aquí; el fallback reactivo cubre fallos en runtime.)
   return { includeAudio: true, videoOnly: false, reason: 'audio_usable' }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FALLBACK REACTIVO derivado de la política central (no de una lista de codecs).
+//
+// El fallback reactivo del preview NO debe depender sólo de isProblematicPreviewAudio
+// (que reconoce G.711 pero NO none/unknown/vacío/sin-decoder). Debe construir la
+// evidencia de audio desde el stderr y delegar la DECISIÓN en resolvePreviewAudioPolicy.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Extrae evidencia de AUDIO desde el texto de stderr de FFmpeg, distinguiendo
+ * explícitamente el stream de audio del de video ("no decoder found" NO puede
+ * asumirse global). Trabaja sobre el tail acumulado (multilinea).
+ */
+export function detectAudioStderrEvidence(stderrText: string): {
+  audioStreamSeen: boolean
+  audioCodec: string | null
+  audioDecoderUnavailable: boolean
+  audioMuxIncompatible: boolean
+  audioParametersIncomplete: boolean
+  audioTrackDisabled: boolean
+} {
+  const t = stderrText || ''
+  // Línea de stream de audio: "Stream #0:1: Audio: <codec>" (codec puede faltar).
+  const audioLineRe = /stream #\d+:\d+(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*audio:\s*([a-z0-9_]+)?/i
+  const audioLineMatch = t.match(audioLineRe)
+  const audioStreamSeen = !!audioLineMatch
+  const audioCodec = audioLineMatch && audioLineMatch[1] ? audioLineMatch[1].toLowerCase() : null
+
+  // Indicadores audio-scoped (mencionan codec de audio, "none"/"unknown", o "Audio:").
+  const AUDIO_TOKENS = /(pcm_?mulaw|pcm_?alaw|g\.?711|ulaw|alaw|\baac\b|\bopus\b|\bmp2\b|\bmp3\b|\bac3\b|audio:)/i
+  const VIDEO_TOKENS = /(video:|hevc|h\.?265|h\.?264|\bavc\b|mpeg4)/i
+
+  // decoder de audio ausente:
+  //   - "no decoder found for: none" / "No decoder found for codec none|unknown"
+  //   - "Decoder (codec X) not found ... " scoped a audio y NO a video.
+  let audioDecoderUnavailable = false
+  if (/(no decoder (?:found )?for(?: codec)?:?\s*(?:none|unknown)\b)/i.test(t)) audioDecoderUnavailable = true
+  for (const raw of t.split('\n')) {
+    const line = raw.trim()
+    if (!/decoder[^\n]*not found|not found[^\n]*decoder/i.test(line)) continue
+    if (VIDEO_TOKENS.test(line)) continue // decoder de VIDEO → no es evidencia de audio
+    if (AUDIO_TOKENS.test(line) || /\b(none|unknown)\b/i.test(line)) audioDecoderUnavailable = true
+  }
+
+  // parámetros de codec de audio incompletos.
+  const audioParametersIncomplete =
+    /could not find codec parameters[^\n]*\(?\s*audio/i.test(t) ||
+    /(audio:[^\n]*)could not find codec parameters/i.test(t)
+
+  // audio que impide muxear (tag/encoder para el stream de audio).
+  let audioMuxIncompatible = false
+  for (const raw of t.split('\n')) {
+    const line = raw.trim()
+    if (VIDEO_TOKENS.test(line)) continue
+    if (/could not find tag for codec[^\n]*stream #\d+:\d+/i.test(line) && AUDIO_TOKENS.test(line)) audioMuxIncompatible = true
+    if (/automatic encoder selection failed[^\n]*audio/i.test(line)) audioMuxIncompatible = true
+  }
+
+  const audioTrackDisabled = /audio[^\n]*\b(disabled|deshabilitad)/i.test(t)
+
+  return {
+    audioStreamSeen, audioCodec,
+    audioDecoderUnavailable, audioMuxIncompatible, audioParametersIncomplete, audioTrackDisabled,
+  }
+}
+
+/**
+ * DECISIÓN del fallback reactivo, derivada de resolvePreviewAudioPolicy (no de
+ * una lista de codecs). Aplica las guardas del intento en curso.
+ *
+ * restart=true ⇒ hay que matar el intento A/V y relanzar la MISMA URI en
+ * video-only. `stableAudioEvidence` indica si la evidencia es estable de audio
+ * (para marcar la cámara como problemática) — nunca por timeout/auth/red/URI.
+ */
+export function decideReactiveAudioRestart(opts: {
+  configuredMode: AudioMode
+  /** codec de audio ya detectado por el parser de streams (o null). */
+  detectedAudioCodec: string | null
+  /** ¿se vio una línea "Audio:" en el stderr? (aunque el codec sea vacío). */
+  audioStreamSeen: boolean
+  /** tail de stderr acumulado, para detectar decoder/params de audio. */
+  stderrText: string
+  attemptVideoOnly: boolean
+  firstByteSent: boolean
+  audioFallbackTried: boolean
+  knownProblematic?: boolean
+}): { restart: boolean; decision: PreviewAudioDecision | null; stableAudioEvidence: boolean } {
+  // Guardas: no reintentar si ya es video-only, ya hubo primer byte, o ya se reintentó.
+  if (opts.attemptVideoOnly || opts.firstByteSent || opts.audioFallbackTried) {
+    return { restart: false, decision: null, stableAudioEvidence: false }
+  }
+
+  const ev = detectAudioStderrEvidence(opts.stderrText)
+  const codec = opts.detectedAudioCodec ?? ev.audioCodec
+  const audioSeen = opts.audioStreamSeen || ev.audioStreamSeen || codec != null
+
+  // audioStream: undefined = aún sin evidencia de audio (no forzar video-only);
+  // definido cuando se vio la pista o su codec.
+  const audioStream: AudioStreamInfo | undefined = audioSeen
+    ? { present: true, codecName: codec, disabled: ev.audioTrackDisabled || undefined, parametersIncomplete: ev.audioParametersIncomplete || undefined }
+    : undefined
+
+  const stderrEvidence: StderrAudioEvidence = {
+    audioDecoderUnavailable: ev.audioDecoderUnavailable || undefined,
+    audioMuxIncompatible: ev.audioMuxIncompatible || undefined,
+  }
+
+  const decision = resolvePreviewAudioPolicy({
+    configuredMode: opts.configuredMode,
+    audioStream,
+    stderrEvidence,
+    knownCameraProfile: { videoOnly: opts.knownProblematic },
+  })
+
+  // Sólo estable si la causa es de AUDIO (no configured_disabled/known, que no son
+  // "aprendizaje" de una cámara concreta por evidencia de codec).
+  const AUDIO_EVIDENCE_REASONS = new Set<PreviewAudioReason>([
+    'no_audio_stream', 'audio_codec_none', 'audio_codec_unknown',
+    'audio_decoder_unavailable', 'audio_mux_incompatible',
+  ])
+  const stableAudioEvidence = decision.videoOnly && AUDIO_EVIDENCE_REASONS.has(decision.reason)
+
+  return { restart: decision.videoOnly, decision, stableAudioEvidence }
+}
