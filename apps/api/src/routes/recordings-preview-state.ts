@@ -43,6 +43,11 @@ export function errorStatusForCategory(category: string): number {
     // Video decodifica pero el mux A/V (G.711) no produce salida — se sirve
     // video-only; si aun así falla es un error del pipeline, no del NVR.
     case 'AUDIO_SYNC_OR_MUX_FAILURE':      return 502
+    // Audio inválido (none/unknown/sin decoder): NO es un fallo de video. El
+    // preview cae a video-only; sólo llega aquí si video-only tampoco produjo
+    // salida, así que se trata como problema del pipeline (502), nunca 4xx de
+    // "códec no soportado" que dispararía un retry H.264 indebido.
+    case 'AUDIO_STREAM_INVALID':           return 502
     default:                               return 502
   }
 }

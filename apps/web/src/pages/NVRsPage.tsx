@@ -12,10 +12,12 @@ import { format } from 'date-fns'
 interface NVRFormData {
   name: string; model: string; ipAddress: string; port: number; rtspPort: number
   username: string; password: string; channels: number; hddCount: number; location: string
+  // '' = heredar del global; caso contrario override por NVR.
+  audioMode: '' | 'auto' | 'enabled' | 'disabled'
 }
 const EMPTY: NVRFormData = {
   name: '', model: '', ipAddress: '', port: 80, rtspPort: 554,
-  username: 'admin', password: '', channels: 16, hddCount: 1, location: '',
+  username: 'admin', password: '', channels: 16, hddCount: 1, location: '', audioMode: '',
 }
 
 type TestStatus = 'idle' | 'testing' | 'ok' | 'fail' | 'warn'
@@ -77,6 +79,7 @@ export function NVRsPage() {
       name: nvr.name, model: nvr.model, ipAddress: nvr.ipAddress, port: nvr.port,
       rtspPort: nvr.rtspPort, username: nvr.username || 'admin', password: '',
       channels: nvr.channels, hddCount: nvr.hddCount, location: nvr.location || '',
+      audioMode: nvr.audioMode ?? '',
     })
     resetTest()
     setShowModal(true)
@@ -213,11 +216,13 @@ export function NVRsPage() {
     setIsSaving(true)
     try {
       if (editingNVR) {
-        const payload: Partial<NVRFormData> = { ...form }
+        const payload: Record<string, unknown> = { ...form }
         // Solo enviar password si fue realmente escrita (no vacío, no máscara)
-        if (!payload.password?.trim()) {
+        if (!(payload.password as string)?.trim()) {
           delete payload.password
         }
+        // '' = heredar del global → null en el backend (enum no acepta '').
+        payload.audioMode = form.audioMode === '' ? null : form.audioMode
         await apiPut(`/nvrs/${editingNVR.id}`, payload)
         // Si se guardó nueva contraseña, limpiar el flag de decrypt error
         if (payload.password) {
@@ -229,7 +234,9 @@ export function NVRsPage() {
         }
         toast.success('NVR actualizado')
       } else {
-        const created = await apiPost<{ id: string; name: string }>('/nvrs', form)
+        const created = await apiPost<{ id: string; name: string }>('/nvrs', {
+          ...form, audioMode: form.audioMode === '' ? null : form.audioMode,
+        })
         setShowModal(false)
         loadNVRs()
         toast.success(`NVR "${created.name}" agregado — sincronizando cámaras en segundo plano...`)
@@ -724,6 +731,20 @@ export function NVRsPage() {
                 <div>
                   <label className="label">Ubicación</label>
                   <input className="input" placeholder="Edificio A, Piso 2..." value={form.location} onChange={f('location')} />
+                </div>
+                <div>
+                  <label className="label">Audio de reproducción</label>
+                  <select
+                    className="input"
+                    value={form.audioMode}
+                    onChange={(e) => setForm((prev) => ({ ...prev, audioMode: e.target.value as NVRFormData['audioMode'] }))}
+                  >
+                    <option value="">Heredar (global)</option>
+                    <option value="auto">Automático</option>
+                    <option value="enabled">Habilitado</option>
+                    <option value="disabled">Deshabilitado (solo video)</option>
+                  </select>
+                  <p className="text-xs text-surface-500 mt-1">Aplica a las cámaras de este NVR salvo override por cámara.</p>
                 </div>
               </div>
             </div>

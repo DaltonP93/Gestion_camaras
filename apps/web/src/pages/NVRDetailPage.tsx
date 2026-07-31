@@ -1054,6 +1054,21 @@ function CamerasTab({
     }
   }
 
+  const [savingAudioId, setSavingAudioId] = useState<string | null>(null)
+  const handleSaveCameraAudioMode = async (camId: string, value: string) => {
+    setSavingAudioId(camId)
+    try {
+      // '' = heredar del NVR/global → null (el enum del backend no acepta '').
+      await apiPut(`/cameras/${camId}`, { audioMode: value === '' ? null : value })
+      toast.success('Audio de reproducción actualizado')
+      onRefresh()
+    } catch {
+      toast.error('No se pudo actualizar el audio')
+    } finally {
+      setSavingAudioId(null)
+    }
+  }
+
   const handleIsapDebug = async () => {
     setShowDebug(true)
     setIsapDebug(null)
@@ -1185,7 +1200,7 @@ function CamerasTab({
         <table className="w-full text-xs min-w-[900px]">
           <thead>
             <tr className="border-b border-surface-700 bg-surface-800/50">
-              {['Canal', 'Nombre', 'IP / Puerto', 'Protocolo', 'Estado', 'NVR/ISAPI', 'Codec', 'Resolución', 'Última validación', 'Acciones'].map(h => (
+              {['Canal', 'Nombre', 'IP / Puerto', 'Protocolo', 'Estado', 'NVR/ISAPI', 'Codec', 'Resolución', 'Última validación', 'Audio', 'Acciones'].map(h => (
                 <th key={h} className="text-left px-3 py-2 text-surface-400 font-medium whitespace-nowrap">{h}</th>
               ))}
             </tr>
@@ -1288,6 +1303,20 @@ function CamerasTab({
                   </td>
                   <td className="px-3 py-2 text-surface-400 whitespace-nowrap">{resolution}</td>
                   <td className="px-3 py-2 text-surface-500 whitespace-nowrap" title={lastError || undefined}>{lastCheck}</td>
+                  <td className="px-3 py-2">
+                    <select
+                      className="bg-surface-900 border border-surface-600 rounded px-1.5 py-1 text-[11px] text-surface-200 disabled:opacity-50"
+                      value={(cam as any).audioMode ?? ''}
+                      disabled={!isAdmin || savingAudioId === cam.id}
+                      title="Audio de reproducción (heredar del NVR/global por defecto)"
+                      onChange={(e) => handleSaveCameraAudioMode(cam.id, e.target.value)}
+                    >
+                      <option value="">Heredar</option>
+                      <option value="auto">Automático</option>
+                      <option value="enabled">Habilitado</option>
+                      <option value="disabled">Solo video</option>
+                    </select>
+                  </td>
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-1">
                       <button

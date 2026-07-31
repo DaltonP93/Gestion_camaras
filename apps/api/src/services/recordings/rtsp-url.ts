@@ -24,9 +24,18 @@ export function classifyRtspError(text: string): string {
   if (/rtsp\/\d\.\d\s+400|server returned 400|400 bad request|(?:describe|setup|play|options|teardown|method[^:\n]*)\s+failed:\s*400/.test(t))
                                                                        return 'RTSP_PLAYBACK_URI_REJECTED'
   if (/401|unauthorized|credenciales/.test(t))                        return 'RTSP_AUTH_OR_TRACK_DENIED'
+  // Codec/decoder ANTES del genérico "not found": una línea "Decoder (codec X)
+  // not found" es un problema de códec, NO un 404 RTSP de pista. Hay que
+  // distinguir si corresponde al AUDIO o al VIDEO (spec): un audio
+  // none/unknown/sin decoder NO debe reportarse como CODEC_UNSUPPORTED de video
+  // — el preview cae a video-only y el video se reproduce igual.
+  const isDecoderIssue = /(decoder[^\n]*not found|could not find codec parameters|no supported streams|invalid data found|could not find codec)/.test(t)
+  const mentionsAudio  = /(audio:|pcm_?mulaw|pcm_?alaw|g\.?711|ulaw|alaw|\baac\b|\bopus\b|\bmp2\b|\bmp3\b|\bac3\b)/.test(t)
+  const mentionsVideo  = /(video:|hevc|h\.?265|h\.?264|\bavc\b|mpeg4)/.test(t)
+  if (isDecoderIssue && mentionsAudio && !mentionsVideo)              return 'AUDIO_STREAM_INVALID'
+  if (isDecoderIssue)                                                 return 'CODEC_UNSUPPORTED'
   if (/404|not found|no encontrado/.test(t))                          return 'RTSP_TRACK_NOT_FOUND'
   if (/connection refused|conexi.n rechazada|timed? ?out|timeout/.test(t)) return 'NVR_OFFLINE_OR_TIMEOUT'
-  if (/no supported streams|invalid data found|could not find codec/.test(t)) return 'CODEC_UNSUPPORTED'
   if (/could not open|open context|error opening input/.test(t))      return 'RTSP_OPEN_FAILED'
   return 'UNKNOWN'
 }

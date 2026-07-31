@@ -26,6 +26,7 @@ import {
 import { planStartupBudget } from '../services/recordings/preview-budget'
 import {
   isProblematicPreviewAudio, shouldRestartVideoOnly, isAudioSyncOrMuxFailure,
+  resolveEffectiveAudioMode, resolvePreviewAudioPolicy, type AudioMode,
 } from '../services/recordings/preview-audio-policy'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
@@ -411,6 +412,11 @@ interface PreviewSession {
   // toggle main/sub × name/size sobre una única base.
   attemptPlan?:    PlaybackAttempt[]
   channel?:        number
+  // Modo de audio EFECTIVO resuelto por precedencia camera→nvr→system→auto.
+  effectiveAudioMode?: AudioMode
+  // El intento que produjo el primer byte fue video-only (sin audio). Permite al
+  // frontend mostrar un badge discreto "Sin audio" cuando el fallback funcionó.
+  videoOnly?: boolean
 }
 
 // Perfil de compatibilidad aprendido POR NVR (en memoria). Una estrategia que
@@ -430,6 +436,27 @@ const nvrPlaybackProfiles = new Map<string, NvrPlaybackProfile>()
 // detectado, los previews siguientes arrancan directo en video-only. En memoria
 // (se pierde al reiniciar el API — se vuelve a aprender en el 1er bloque).
 const cameraAudioProblematic = new Set<string>()
+// Caché corta del modo de audio global (system): evita un SELECT por cada
+// preview/start. Se refresca cada RECORDINGS_AUDIO_MODE_TTL_MS.
+const RECORDINGS_AUDIO_MODE_TTL_MS = 30_000
+let systemAudioModeCache: { value: AudioMode; expiresAt: number } | null = null
+async function getSystemRecordingsAudioMode(prisma: any): Promise<AudioMode> {
+  const now = Date.now()
+  if (systemAudioModeCache && systemAudioModeCache.expiresAt > now) return systemAudioModeCache.value
+  let value: AudioMode = 'auto'
+  try {
+    const s = await prisma.recordingsSettings.findUnique({ where: { id: 'singleton' } })
+    value = resolveEffectiveAudioMode({ system: s?.recordingsAudioMode })
+  } catch {
+    value = 'auto'
+  }
+  systemAudioModeCache = { value, expiresAt: now + RECORDINGS_AUDIO_MODE_TTL_MS }
+  return value
+}
+/** Invalida la caché del modo global (llamar tras guardar RecordingsSettings). */
+export function invalidateSystemAudioModeCache(): void {
+  systemAudioModeCache = null
+}
 // TTL del marcaje "sin soporte de substream": tras este tiempo se vuelve a probar
 // (evita bloquear sub permanentemente por un 400 puntual). En memoria: se pierde
 // al reiniciar el API.
@@ -1144,6 +1171,31 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
   } else {
     server.log.info('[recordings] download_token_store backend=memory')
   }
+
+  // ─── Política de audio a nivel SYSTEM (singleton) ───────────────────────────
+  // GET /api/recordings/settings/audio — modo de audio predeterminado del sistema.
+  server.get('/settings/audio', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR', 'AUDITOR'])] }, async (_request, reply) => {
+    const s = await server.prisma.recordingsSettings.findUnique({ where: { id: 'singleton' } })
+    return reply.send({ recordingsAudioMode: resolveEffectiveAudioMode({ system: s?.recordingsAudioMode }) })
+  })
+
+  // PUT /api/recordings/settings/audio — set del modo global (ADMIN).
+  server.put('/settings/audio', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
+    const body = z.object({
+      recordingsAudioMode: z.enum(['auto', 'enabled', 'disabled']),
+    }).parse(request.body)
+    const s = await server.prisma.recordingsSettings.upsert({
+      where:  { id: 'singleton' },
+      create: { id: 'singleton', recordingsAudioMode: body.recordingsAudioMode },
+      update: { recordingsAudioMode: body.recordingsAudioMode },
+    })
+    invalidateSystemAudioModeCache()
+    await AuditAction(server.prisma, request.user.sub, 'RECORDINGS_AUDIO_MODE_UPDATED', 'singleton', request, {
+      recordingsAudioMode: s.recordingsAudioMode,
+    }).catch(() => {})
+    server.log.info(`[recordings] recordings_audio_mode_updated mode=${s.recordingsAudioMode} by=${request.user.sub}`)
+    return reply.send({ recordingsAudioMode: s.recordingsAudioMode })
+  })
 
   // GET /api/recordings/search
   server.get('/search', { preHandler: [server.authenticate] }, async (request, reply) => {
@@ -1933,12 +1985,27 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       ` urlFingerprint=${urlFingerprint(rtspMasked)}`
     )
 
+    // Política de audio EFECTIVA (precedencia camera → nvr → system → auto).
+    // Política GENERAL: sin excepciones por cámara/canal/modelo/nombre.
+    const systemAudioMode = await getSystemRecordingsAudioMode(server.prisma)
+    const effectiveAudioMode = resolveEffectiveAudioMode({
+      camera: (camera as any).audioMode,
+      nvr:    (camera.nvr as any).audioMode,
+      system: systemAudioMode,
+    })
+    server.log.info(
+      `[recordings-preview] preview_audio_policy sessionId=${sessionId} cameraId=${body.cameraId}` +
+      ` configuredCamera=${(camera as any).audioMode ?? 'inherit'} configuredNvr=${(camera.nvr as any).audioMode ?? 'inherit'}` +
+      ` configuredSystem=${systemAudioMode} effectiveMode=${effectiveAudioMode}`
+    )
+
     previewSessions.set(sessionId, {
       streamToken, userId: user.sub, createdAt: Date.now(), expiresAt,
       rtspUrl, rtspMasked, cameraId: body.cameraId, nvrId: camera.nvr.id, slotIndex: body.slotIndex,
       startTime: body.startTime, endTime: body.endTime,
       forceTranscode, strategy, detectedCodec, canPlayHevcMp4,
       attemptPlan, channel: camera.channel,
+      effectiveAudioMode,
       // Probe failure (e.g. 401 on the playback track) — pre-seed the category
       // so the frontend can show the real cause if the stream also fails
       errorCategory: probeErrorCategory,
@@ -2103,9 +2170,22 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // un intento A/V que ya se sabe incompatible). Optimización codec-aware: si YA
     // se detectó audio problemático en esta cámara (bloque anterior), arrancar el
     // primer intento directo en video-only (primer byte ~5,5s en vez de 25s).
-    let sessionVideoOnly = cameraAudioProblematic.has(session.cameraId)
+    // Decisión inicial de audio vía la política CENTRAL (única fuente de verdad).
+    // Sin ffprobe en el preview, audioStream es "no inspeccionado" (undefined):
+    //   - disabled ⇒ video-only desde el primer intento (-an), sin gastar A/V.
+    //   - auto/enabled ⇒ intentar A/V salvo perfil conocido video-only; el
+    //     fallback reactivo por stderr cubre el audio incompatible en runtime.
+    const effectiveAudioMode: AudioMode = session.effectiveAudioMode ?? 'auto'
+    const initialAudioDecision = resolvePreviewAudioPolicy({
+      configuredMode: effectiveAudioMode,
+      knownCameraProfile: { videoOnly: cameraAudioProblematic.has(session.cameraId) },
+    })
+    let sessionVideoOnly = initialAudioDecision.videoOnly
     if (sessionVideoOnly) {
-      server.log.info(`[recordings-preview] preview_video_only_known sessionId=${sessionId} cameraId=${session.cameraId} — audio G.711 conocido, arranque video-only`)
+      server.log.info(
+        `[recordings-preview] preview_video_only_start sessionId=${sessionId} cameraId=${session.cameraId}` +
+        ` effectiveMode=${effectiveAudioMode} videoOnlyReason=${initialAudioDecision.reason}`
+      )
     }
     let currentProc: ChildProcess | null = null
     // Limpieza del intento activo (timers + estado terminal), invocable desde
@@ -2411,8 +2491,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             clearFirstByteWatchdog()
             try { proc.stdout?.unpipe(res) } catch {}
             server.log.warn(
-              `[recordings-preview] audio_fallback_video_only sessionId=${sessionId} variant=${variant}` +
-              ` audioCodec=${detectedAudioCodec} — reintentando MISMA URI sin audio (G.711 rompe el mux A/V)`
+              `[recordings-preview] preview_audio_fallback sessionId=${sessionId} cameraId=${session.cameraId}` +
+              ` variant=${variant} audioCodec=${detectedAudioCodec} effectiveMode=${effectiveAudioMode}` +
+              ` — reintentando MISMA URI sin audio (audio incompatible con el mux A/V)`
             )
             try { proc.kill('SIGTERM') } catch {}
             killGraceTimer = setTimeout(() => {
@@ -2472,6 +2553,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         sendHeadersOnce()
         firstByteSent = true
         session.hadFirstByte  = true
+        // Registrar si el intento que funcionó fue video-only (para el badge).
+        session.videoOnly     = attemptVideoOnly
         // A working variant wipes any error state from earlier attempts
         session.errorCategory = undefined
         session.errorDetail   = undefined
@@ -2778,6 +2861,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         detail:        session.errorDetail ?? null,
         stderrTail:    (session.stderrTail ?? []).slice(-10).join(' | ').slice(0, 600) || null,
         hadFirstByte:  session.hadFirstByte ?? null,
+        videoOnly:     session.videoOnly ?? null,
+        effectiveAudioMode: session.effectiveAudioMode ?? null,
         // legacy fields
         errorCategory: session.errorCategory ?? null,
         errorDetail:   session.errorDetail ?? null,

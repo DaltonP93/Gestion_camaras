@@ -180,6 +180,8 @@ export interface NVR {
   location?: string
   active: boolean
   online: boolean
+  // Audio de reproducción a nivel NVR (heredado por sus cámaras). null = heredar del global.
+  audioMode?: 'auto' | 'enabled' | 'disabled' | null
   lastSeen?: string
   lastSyncAt?: string
   lastRtspOkAt?: string
@@ -232,6 +234,8 @@ export interface Camera {
   managementPort?: number
   securityStatus?: string
   preferredStream?: 'main' | 'sub'
+  // Audio de reproducción (precedencia camera→nvr→system→auto). null = heredar.
+  audioMode?: 'auto' | 'enabled' | 'disabled' | null
   mainRtspPath?: string
   subRtspPath?: string
   mainCodec?: string

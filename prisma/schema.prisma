@@ -130,6 +130,9 @@ model NVR {
   lastError                String?
   isapIStatus              String?   @default("unknown") // available | no_permission | unsupported | error | unknown
   recordingProvider        String    @default("ISAPI")
+  // Política de audio de reproducción a nivel NVR (heredada por sus cámaras salvo
+  // override por cámara). null = heredar del global. auto | enabled | disabled.
+  audioMode                String?
   supportsIsapiRecording   Boolean?
   supportsSdkRecording     Boolean   @default(false)
   recordingCapabilityAt    DateTime?
@@ -186,6 +189,9 @@ model Camera {
 
   // Stream config
   preferredStream String  @default("sub") // main | sub
+  // Política de audio de reproducción (precedencia: camera → nvr → system → auto).
+  // null = heredar del NVR/global. auto | enabled | disabled.
+  audioMode       String? // auto | enabled | disabled
   mainRtspPath    String? // /Streaming/Channels/101
   subRtspPath     String? // /Streaming/Channels/102
 
@@ -607,6 +613,18 @@ model SecuritySettings {
   updatedBy              String?
 
   @@map("security_settings")
+}
+
+// ─── Configuración de grabaciones (singleton, nivel "system") ────────────────
+model RecordingsSettings {
+  id                   String   @id @default("singleton")
+  // Política de audio predeterminada del sistema para el preview de grabaciones.
+  // auto | enabled | disabled. Es el último eslabón de la precedencia antes de
+  // 'auto'. "disabled" es útil donde el audio no está autorizado/cableado.
+  recordingsAudioMode  String   @default("auto")
+  updatedAt            DateTime @updatedAt
+
+  @@map("recordings_settings")
 }
 
 model AlertSettings {
