@@ -25,8 +25,9 @@ import {
 } from '../services/recordings/rtsp-url'
 import { planStartupBudget } from '../services/recordings/preview-budget'
 import {
-  isProblematicPreviewAudio, shouldRestartVideoOnly, isAudioSyncOrMuxFailure,
+  isAudioSyncOrMuxFailure,
   resolveEffectiveAudioMode, resolvePreviewAudioPolicy, type AudioMode,
+  decideReactiveAudioRestart, detectAudioStderrEvidence,
 } from '../services/recordings/preview-audio-policy'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
@@ -2410,6 +2411,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       let detectedVideoCodec: string | null = null
       let detectedWidth:  number | null = null
       let detectedHeight: number | null = null
+      let audioStreamSeen = false         // se vio una línea "Audio:" (aunque el codec sea vacío)
       let audioFallbackTried = false      // ya se reintentó esta URI en video-only
       let audioRestartPending = false     // el 'close' debe re-lanzar el MISMO índice video-only
       const clearFirstByteWatchdog = () => {
@@ -2465,6 +2467,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             if (info.width  != null) detectedWidth  = info.width
             if (info.height != null) detectedHeight = info.height
           }
+          // ¿Se vio la pista de audio? (aunque el codec venga vacío: "Audio: ").
+          if (!audioStreamSeen && detectAudioStderrEvidence(line).audioStreamSeen) audioStreamSeen = true
           // TASK 3 — marcar input_opened y el primer stream de video/audio detectado.
           if (!sawInputOpened && /Input #\d+|Stream #\d+:\d+/.test(line)) {
             sawInputOpened = true
@@ -2474,26 +2478,35 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
               ` audio=${detectedAudioCodec ?? 'none'} ${detectedWidth ?? '?'}x${detectedHeight ?? '?'}`
             )
           }
-          // ── Fallback video-only por audio G.711 sobre la MISMA URI ──
-          // El stderr revela el codec de audio (~1-2s), MUCHO antes del atasco de
-          // encode/mux (~6-8s) y del watchdog (25s). Si es pcm_mulaw/pcm_alaw y el
-          // intento A/V aún no produjo primer byte, se mata y se re-lanza la misma
-          // URI sin audio — NO se avanza a otra estrategia RTSP (la URI es válida).
-          if (shouldRestartVideoOnly({
-            audioCodec: detectedAudioCodec, alreadyVideoOnly: attemptVideoOnly,
-            firstByteSent, audioFallbackTried,
-          })) {
+          // ── Fallback video-only sobre la MISMA URI, derivado de la política ──
+          // La decisión NO depende de una lista de codecs (que sólo reconocía
+          // G.711): se construye la evidencia de audio del stderr (codec, none,
+          // unknown, vacío, sin decoder, params) y se delega en
+          // resolvePreviewAudioPolicy. El stderr revela el audio ~1-2s, mucho
+          // antes del atasco de encode/mux (~6-8s) y del watchdog (25s). NO se
+          // avanza de estrategia RTSP (la URI es válida) — se relanza sin audio.
+          const reactive = decideReactiveAudioRestart({
+            configuredMode: effectiveAudioMode,
+            detectedAudioCodec, audioStreamSeen,
+            stderrText: stderrTail.join('\n'),
+            attemptVideoOnly, firstByteSent, audioFallbackTried,
+            knownProblematic: cameraAudioProblematic.has(session.cameraId),
+          })
+          if (reactive.restart) {
             audioFallbackTried  = true
             audioRestartPending = true
             sessionVideoOnly    = true   // los intentos siguientes ya arrancan video-only
-            cameraAudioProblematic.add(session.cameraId)  // y los próximos previews de esta cámara
+            // Sólo "aprender" la cámara ante evidencia ESTABLE de audio (nunca por
+            // timeout/auth/red/URI: esos ni siquiera producen una razón de audio).
+            if (reactive.stableAudioEvidence) cameraAudioProblematic.add(session.cameraId)
             attemptState        = 'terminal'
             clearFirstByteWatchdog()
             try { proc.stdout?.unpipe(res) } catch {}
             server.log.warn(
               `[recordings-preview] preview_audio_fallback sessionId=${sessionId} cameraId=${session.cameraId}` +
-              ` variant=${variant} audioCodec=${detectedAudioCodec} effectiveMode=${effectiveAudioMode}` +
-              ` — reintentando MISMA URI sin audio (audio incompatible con el mux A/V)`
+              ` variant=${variant} audioCodec=${detectedAudioCodec ?? 'none'} effectiveMode=${effectiveAudioMode}` +
+              ` reason=${reactive.decision?.reason ?? 'n/a'} stable=${reactive.stableAudioEvidence}` +
+              ` — reintentando MISMA URI sin audio`
             )
             try { proc.kill('SIGTERM') } catch {}
             killGraceTimer = setTimeout(() => {
@@ -2653,17 +2666,27 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
         // Red de seguridad (además de la detección temprana por stderr): si el
         // intento A/V se cerró SIN primer byte habiendo abierto RTSP con video, y
-        // el audio es G.711, reintentar la MISMA URI en video-only en vez de
-        // avanzar de estrategia (spec: la URI es válida; sólo falla el mux A/V).
+        // el audio es inválido/incompatible (none/unknown/vacío/sin-decoder/G.711),
+        // reintentar la MISMA URI en video-only en vez de avanzar de estrategia
+        // (spec: la URI es válida; sólo falla el audio del mux A/V). Se deriva de
+        // la política central, no de una lista de codecs.
         const videoDecoded = sawInputOpened && detectedVideoCodec != null
-        const audioProblematic = isProblematicPreviewAudio(detectedAudioCodec)
+        const postClose = decideReactiveAudioRestart({
+          configuredMode: effectiveAudioMode,
+          detectedAudioCodec, audioStreamSeen,
+          stderrText: stderrTail.join('\n'),
+          attemptVideoOnly, firstByteSent, audioFallbackTried: false,
+          knownProblematic: cameraAudioProblematic.has(session.cameraId),
+        })
+        // "audio problemático" = la política decidió video-only por causa de audio.
+        const audioProblematic = postClose.restart
         if (!firstByteSent && !attemptVideoOnly && canContinue()
             && videoDecoded && audioProblematic) {
           sessionVideoOnly = true
-          cameraAudioProblematic.add(session.cameraId)
+          if (postClose.stableAudioEvidence) cameraAudioProblematic.add(session.cameraId)
           server.log.warn(
             `[recordings-preview] audio_fallback_video_only sessionId=${sessionId} variant=${variant}` +
-            ` audioCodec=${detectedAudioCodec} reason=post_close — misma URI, video-only`
+            ` audioCodec=${detectedAudioCodec ?? 'none'} reason=post_close:${postClose.decision?.reason ?? 'n/a'} — misma URI, video-only`
           )
           startAttempt(chainIndex, true)
           return
