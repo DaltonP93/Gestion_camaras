@@ -27,7 +27,7 @@ import { planStartupBudget } from '../services/recordings/preview-budget'
 import {
   isAudioSyncOrMuxFailure,
   resolveEffectiveAudioMode, resolvePreviewAudioPolicy, type AudioMode,
-  decideReactiveAudioRestart, detectAudioStderrEvidence, makeStderrLineBuffer,
+  decideReactiveAudioRestart, createAudioEvidenceTracker, makeStderrLineBuffer,
 } from '../services/recordings/preview-audio-policy'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
@@ -2414,6 +2414,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       let audioStreamSeen = false         // se vio una línea "Audio:" (aunque el codec sea vacío)
       let audioFallbackTried = false      // ya se reintentó esta URI en video-only
       let audioRestartPending = false     // el 'close' debe re-lanzar el MISMO índice video-only
+      // Registro de streams + evidencia de audio CON ESTADO, vivo durante TODO el
+      // intento. No se reconstruye desde stderrTail (capado a 30 líneas): la
+      // declaración "Stream #0:0: Video: hevc" puede haber sido evictada y aun
+      // así un error de decoder posterior debe seguir atribuyéndose a VIDEO.
+      const audioEvidence = createAudioEvidenceTracker()
       const clearFirstByteWatchdog = () => {
         if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null }
         if (killGraceTimer) { clearTimeout(killGraceTimer); killGraceTimer = null }
@@ -2472,8 +2477,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             if (info.width  != null) detectedWidth  = info.width
             if (info.height != null) detectedHeight = info.height
           }
-          // ¿Se vio la pista de audio? (aunque el codec venga vacío: "Audio: ").
-          if (!audioStreamSeen && detectAudioStderrEvidence(line).audioStreamSeen) audioStreamSeen = true
+          // Alimentar el tracker CON ESTADO con la MISMA línea reconstruida: mantiene
+          // el registro de streams y resuelve la evidencia pendiente (errores de
+          // decoder llegados ANTES de la declaración del stream).
+          audioEvidence.push(line)
+          const evSnapshot = audioEvidence.evidence()
+          if (evSnapshot.audioStreamSeen) audioStreamSeen = true
           // TASK 3 — marcar input_opened y el primer stream de video/audio detectado.
           if (!sawInputOpened && /Input #\d+|Stream #\d+:\d+/.test(line)) {
             sawInputOpened = true
@@ -2493,7 +2502,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           const reactive = decideReactiveAudioRestart({
             configuredMode: effectiveAudioMode,
             detectedAudioCodec, audioStreamSeen,
-            stderrText: stderrTail.join('\n'),
+            evidence: evSnapshot,
             attemptVideoOnly, firstByteSent, audioFallbackTried,
             knownProblematic: cameraAudioProblematic.has(session.cameraId),
           })
@@ -2697,7 +2706,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         const postClose = decideReactiveAudioRestart({
           configuredMode: effectiveAudioMode,
           detectedAudioCodec, audioStreamSeen,
-          stderrText: stderrTail.join('\n'),
+          evidence: audioEvidence.evidence(),
           attemptVideoOnly, firstByteSent, audioFallbackTried: false,
           knownProblematic: cameraAudioProblematic.has(session.cameraId),
         })

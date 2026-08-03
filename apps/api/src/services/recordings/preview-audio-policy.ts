@@ -213,107 +213,236 @@ export function resolvePreviewAudioPolicy(opts: {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Extrae evidencia de AUDIO desde el texto de stderr de FFmpeg. Distingue
- * audio de video por **correlación de índice de stream** (#prog:idx), NO por una
- * allow-list de codecs — reconoce cualquier codec presente o futuro (adpcm,
- * g726, g722, speex, opus, pcm, aac, …). Como respaldo para líneas de error sin
- * índice, usa una deny-list acotada de codecs de VIDEO. Trabaja sobre el tail
- * acumulado (multilinea), por lo que la definición del stream y el error de
- * decoder pueden llegar en chunks/orden distintos.
+ * Tipo de stream declarado por FFmpeg.
  */
-export function detectAudioStderrEvidence(stderrText: string): {
+export type StreamKind = 'audio' | 'video'
+
+/** Instantánea de evidencia de audio/video acumulada durante UN intento FFmpeg. */
+export interface AudioEvidenceSnapshot {
   audioStreamSeen: boolean
   audioCodec: string | null
   audioDecoderUnavailable: boolean
   audioMuxIncompatible: boolean
   audioParametersIncomplete: boolean
   audioTrackDisabled: boolean
-} {
-  const t = stderrText || ''
+  /** Error de decoder atribuido al VIDEO: mantiene CODEC_UNSUPPORTED, nunca fallback de audio. */
+  videoDecoderUnavailable: boolean
+  /** Errores aún NO atribuibles a audio ni a video: permanecen NEUTRALES. */
+  unresolvedDecoderErrors: number
+}
 
-  // 1) Mapa de streams declarados: "Stream #0:1: Audio: <codec>" / "...: Video: <codec>".
-  //    Se indexa por clave completa "0:1" y por índice numérico "1" (respaldo).
-  type StreamType = 'audio' | 'video'
-  const streams = new Map<string, { type: StreamType; codec: string | null }>()
+// Deny-list ACOTADA de codecs de VIDEO. Ya NO alcanza por sí sola para inferir
+// audio "por descarte": sólo sirve para descartar como video un codec que fue
+// extraído de un campo EXPLÍCITO de codec.
+const VIDEO_CODEC_RE = /^(hevc|h265|h\.265|h264|h\.264|avc1?|mpeg4|mpeg2video|mpeg1video|mjpeg|vp8|vp9|av1|h263|theora|prores|dvvideo|rawvideo)$/i
+
+// Palabras que NUNCA son un nombre de codec. Red de seguridad adicional: los
+// patrones de extracción ya son estructuralmente explícitos, pero este filtro
+// garantiza que un cambio futuro no reintroduzca capturas como "input".
+const NON_CODEC_WORDS = new Set([
+  'input', 'output', 'stream', 'streams', 'decoder', 'encoder', 'error', 'errors',
+  'id', 'with', 'for', 'codec', 'codecs', 'parameters', 'parameter', 'opening',
+  'open', 'while', 'the', 'and', 'in', 'on', 'of', 'to', 'from', 'found', 'not',
+  'file', 'index', 'type', 'data', 'invalid', 'unsupported', 'failed', 'selection',
+])
+
+/**
+ * Extrae el nombre de codec SÓLO desde formatos explícitos y verificables.
+ *
+ * NO existe ninguna extracción genérica tipo "for X": la frase
+ * "Error while opening decoder for input stream #0:0" NO contiene un codec, y
+ * capturar "input" como codec provocaba clasificar un fallo de VIDEO como audio.
+ */
+export function extractExplicitCodec(line: string): string | null {
+  const m =
+    // Decoder (codec adpcm_g726le) not found for input stream #0:1
+    line.match(/\(codec\s+([a-z0-9_.]+)\s*\)/i) ||
+    // No decoder found for codec adpcm_g726le
+    line.match(/\bno decoder found for codec[:\s]+([a-z0-9_.]+)/i) ||
+    // No decoder found for: none
+    line.match(/\bno decoder found for:\s*([a-z0-9_.]+)/i) ||
+    // Unsupported codec: adpcm_g726le   (NO matchea "Unsupported codec with id 98 ...")
+    line.match(/\bunsupported codec:\s*([a-z0-9_.]+)/i) ||
+    // codec 'adpcm_g726le'
+    line.match(/\bcodec\s+'([a-z0-9_.]+)'/i) ||
+    // Could not find tag for codec adpcm_g726le in stream #1
+    line.match(/\bcould not find tag for codec\s+([a-z0-9_.]+)/i)
+  if (!m) return null
+  const codec = m[1].toLowerCase()
+  if (NON_CODEC_WORDS.has(codec)) return null
+  return codec
+}
+
+/** ¿Este nombre de codec corresponde a VIDEO? */
+export function isVideoCodecName(codec: string | null | undefined): boolean {
+  return !!codec && VIDEO_CODEC_RE.test(codec)
+}
+
+// Declaración de stream: "Stream #0:1: Audio: adpcm_g726le" / "Stream #0:0: Video: hevc"
+const STREAM_DECL_RE = /\bstream #(\d+):(\d+)(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*(video|audio):\s*([a-z0-9_.]+)?/i
+// Errores relevantes.
+const DECODER_ERR_RE = /decoder[^\n]*not found|not found[^\n]*decoder|\bno decoder\b[^\n]*\bfor\b|error while opening decoder|could not open decoder|unsupported codec/i
+const CODEC_PARAMS_RE = /could not find codec parameters/i
+const MUX_TAG_RE = /could not find tag for codec|automatic encoder selection failed/i
+
+interface PendingEvidence { decoder: boolean; params: boolean; mux: boolean }
+
+/**
+ * Tracker CON ESTADO de evidencia de audio para UN intento FFmpeg.
+ *
+ * Mantiene un registro persistente de streams declarados que vive todo el
+ * intento y NO depende del stderrTail (que se capa a 30 líneas y puede evictar
+ * la declaración). Además guarda evidencia PENDIENTE por índice de stream
+ * cuando el error llega ANTES de la declaración, y la resuelve al declararse.
+ *
+ * Regla central: un fallo sólo se considera de AUDIO si
+ *   (A) el índice referido está en el registro con type === 'audio'; o
+ *   (B) la línea trae contexto explícito "(Audio: ...)" / "Audio: ..."; o
+ *   (C) hay un codec extraído de un campo EXPLÍCITO y ese codec no es de video.
+ * Nunca se infiere audio porque una palabra no esté en la deny-list de video.
+ * Lo no resuelto queda NEUTRAL (ni audio ni video) y no dispara nada.
+ */
+export function createAudioEvidenceTracker() {
+  const streamRegistry = new Map<string, { type: StreamKind; codec: string | null }>()
+  const pending = new Map<string, PendingEvidence>()
+
   let audioStreamSeen = false
   let audioCodec: string | null = null
-  const declRe = /stream #(\d+):(\d+)(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*(video|audio):\s*([a-z0-9_]+)?/ig
-  let dm: RegExpExecArray | null
-  while ((dm = declRe.exec(t)) !== null) {
-    const prog = dm[1], idx = dm[2]
-    const type = dm[3].toLowerCase() as StreamType
-    const codec = dm[4] ? dm[4].toLowerCase() : null
-    const entry = { type, codec }
-    streams.set(`${prog}:${idx}`, entry)
-    if (!streams.has(idx)) streams.set(idx, entry) // respaldo numérico (1er programa)
-    if (type === 'audio') {
-      audioStreamSeen = true
-      if (audioCodec == null && codec) audioCodec = codec
-    }
-  }
-
-  // Deny-list ACOTADA de codecs de VIDEO (conjunto estable en playback de NVR).
-  // Todo lo que NO sea video se considera potencialmente audio (sin allow-list).
-  const isVideoCodec = (c: string | null): boolean =>
-    !!c && /^(hevc|h265|h\.265|h264|h\.264|avc1?|mpeg4|mpeg2video|mjpeg|vp8|vp9|av1|h263)$/i.test(c)
-
-  // Resuelve el tipo de stream al que apunta una línea de error.
-  const refTypeOf = (line: string): StreamType | null => {
-    // Pista inline explícita "(Audio: ...)" / "(Video: ...)".
-    if (/\(audio[:\s)]/i.test(line)) return 'audio'
-    if (/\(video[:\s)]/i.test(line)) return 'video'
-    // Referencia por índice "#0:1".
-    const full = line.match(/#(\d+):(\d+)/)
-    if (full) { const e = streams.get(`${full[1]}:${full[2]}`); if (e) return e.type }
-    // Referencia por índice numérico "stream 1".
-    const num = line.match(/\bstream #?(\d+)\b/i)
-    if (num) { const e = streams.get(num[1]); if (e) return e.type }
-    return null
-  }
-
-  // Extrae el codec nombrado en una línea de error ("(codec X)" / "for codec X" / "for: X").
-  const codecInLine = (line: string): string | null => {
-    const m =
-      line.match(/\(codec\s+([a-z0-9_]+)\)/i) ||
-      line.match(/for(?:\s+codec)?:?\s+([a-z0-9_]+)\b/i) ||
-      line.match(/unsupported codec[^\n]*?\b([a-z0-9_]+)\b\s*$/i)
-    return m ? m[1].toLowerCase() : null
-  }
-
   let audioDecoderUnavailable = false
   let audioMuxIncompatible = false
   let audioParametersIncomplete = false
+  let audioTrackDisabled = false
+  let videoDecoderUnavailable = false
 
-  for (const raw of t.split('\n')) {
-    const line = raw.trim()
-    if (!line) continue
-
-    const isDecoderErr = /decoder[^\n]*not found|not found[^\n]*decoder|no decoder[^\n]*for|error while opening decoder|could not open decoder|unsupported codec/i.test(line)
-    const isCodecParams = /could not find codec parameters/i.test(line)
-    const isMuxTag = /could not find tag for codec|automatic encoder selection failed/i.test(line)
-    if (!isDecoderErr && !isCodecParams && !isMuxTag) continue
-
-    // Tipo del stream referido: correlación por índice/inline; si no hay, por codec.
-    let type = refTypeOf(line)
-    if (type == null) {
-      const c = codecInLine(line)
-      if (isVideoCodec(c)) type = 'video'
-      else if (c && c !== 'none' && c !== 'unknown') type = 'audio' // codec no-video ⇒ audio
-      else if (/\b(none|unknown)\b/i.test(line)) type = 'audio'     // "for: none"/"unknown"
+  const applyResolved = (kind: StreamKind, e: PendingEvidence) => {
+    if (kind === 'audio') {
+      if (e.decoder) audioDecoderUnavailable = true
+      if (e.params) audioParametersIncomplete = true
+      if (e.mux) audioMuxIncompatible = true
+    } else if (e.decoder) {
+      videoDecoderUnavailable = true
     }
-    if (type !== 'audio') continue // video o indeterminado no-audio ⇒ no evidencia de audio
-
-    if (isDecoderErr) audioDecoderUnavailable = true
-    if (isCodecParams) audioParametersIncomplete = true
-    if (isMuxTag) audioMuxIncompatible = true
   }
 
-  const audioTrackDisabled = /audio[^\n]*\b(disabled|deshabilitad)/i.test(t)
+  const resolvePendingFor = (keys: string[], kind: StreamKind) => {
+    for (const k of keys) {
+      const e = pending.get(k)
+      if (!e) continue
+      pending.delete(k)
+      applyResolved(kind, e)
+    }
+  }
+
+  /** Claves de referencia de stream mencionadas en una línea de error. */
+  const refKeysOf = (line: string): string[] => {
+    const full = line.match(/#(\d+):(\d+)/)
+    if (full) return [`${full[1]}:${full[2]}`, `num:${full[2]}`]
+    const num = line.match(/\bstream #?(\d+)\b/i)
+    if (num) return [`num:${num[1]}`]
+    return []
+  }
+
+  /** Contexto explícito de audio/video EN la línea (no en todo el texto). */
+  const inlineKindOf = (line: string): StreamKind | null => {
+    if (/\(\s*audio\s*[:,)]/i.test(line) || /\baudio:\s*\S/i.test(line)) return 'audio'
+    if (/\(\s*video\s*[:,)]/i.test(line) || /\bvideo:\s*\S/i.test(line)) return 'video'
+    return null
+  }
 
   return {
-    audioStreamSeen, audioCodec,
-    audioDecoderUnavailable, audioMuxIncompatible, audioParametersIncomplete, audioTrackDisabled,
+    /** Consume UNA línea de stderr ya reconstruida. */
+    push(rawLine: string): void {
+      const line = (rawLine || '').trim()
+      if (!line) return
+
+      // 1) Declaración de stream → registro persistente + resolución de pendientes.
+      const decl = line.match(STREAM_DECL_RE)
+      if (decl) {
+        const prog = decl[1], idx = decl[2]
+        const kind = decl[3].toLowerCase() as StreamKind
+        const codec = decl[4] ? decl[4].toLowerCase() : null
+        const entry = { type: kind, codec }
+        streamRegistry.set(`${prog}:${idx}`, entry)
+        if (!streamRegistry.has(`num:${idx}`)) streamRegistry.set(`num:${idx}`, entry)
+        if (kind === 'audio') {
+          audioStreamSeen = true
+          if (audioCodec == null && codec) audioCodec = codec
+          if (/\b(disabled|deshabilitad)/i.test(line)) audioTrackDisabled = true
+        }
+        resolvePendingFor([`${prog}:${idx}`, `num:${idx}`], kind)
+        return
+      }
+
+      // 2) ¿Es una línea de error relevante?
+      const isDecoderErr = DECODER_ERR_RE.test(line)
+      const isCodecParams = CODEC_PARAMS_RE.test(line)
+      const isMuxTag = MUX_TAG_RE.test(line)
+      if (!isDecoderErr && !isCodecParams && !isMuxTag) {
+        // Pista de audio marcada como desactivada, con contexto de audio explícito.
+        if (inlineKindOf(line) === 'audio' && /\b(disabled|deshabilitad)/i.test(line)) {
+          audioTrackDisabled = true
+        }
+        return
+      }
+
+      const ev: PendingEvidence = { decoder: isDecoderErr, params: isCodecParams, mux: isMuxTag }
+      const keys = refKeysOf(line)
+
+      // (A) Registro por índice — la fuente más fiable.
+      for (const k of keys) {
+        const reg = streamRegistry.get(k)
+        if (reg) { applyResolved(reg.type, ev); return }
+      }
+
+      // (B) Contexto explícito en la propia línea.
+      const inline = inlineKindOf(line)
+      if (inline) { applyResolved(inline, ev); return }
+
+      // (C) Codec extraído de un campo EXPLÍCITO de codec.
+      const codec = extractExplicitCodec(line)
+      if (codec) {
+        applyResolved(isVideoCodecName(codec) ? 'video' : 'audio', ev)
+        return
+      }
+
+      // NEUTRAL: no se puede atribuir a audio ni a video. Si hay índice, queda
+      // PENDIENTE hasta que llegue la declaración; si no, se descarta.
+      if (keys.length > 0) {
+        const key = keys[0]
+        const prev = pending.get(key)
+        pending.set(key, prev
+          ? { decoder: prev.decoder || ev.decoder, params: prev.params || ev.params, mux: prev.mux || ev.mux }
+          : ev)
+      }
+    },
+
+    /** Instantánea de la evidencia acumulada. */
+    evidence(): AudioEvidenceSnapshot {
+      return {
+        audioStreamSeen, audioCodec,
+        audioDecoderUnavailable, audioMuxIncompatible, audioParametersIncomplete,
+        audioTrackDisabled, videoDecoderUnavailable,
+        unresolvedDecoderErrors: pending.size,
+      }
+    },
+
+    /** Copia del registro de streams (diagnóstico/tests). */
+    streams(): Map<string, { type: StreamKind; codec: string | null }> {
+      return new Map(streamRegistry)
+    },
   }
+}
+
+/**
+ * Versión PURA sobre texto multilinea: alimenta un tracker nuevo y devuelve la
+ * evidencia. Útil para tests y para clasificar un tail acumulado. En el camino
+ * caliente del preview se usa el tracker CON ESTADO por intento, porque el tail
+ * puede haber evictado la declaración del stream.
+ */
+export function detectAudioStderrEvidence(stderrText: string): AudioEvidenceSnapshot {
+  const tracker = createAudioEvidenceTracker()
+  for (const line of (stderrText || '').split('\n')) tracker.push(line)
+  return tracker.evidence()
 }
 
 /**
@@ -330,8 +459,13 @@ export function decideReactiveAudioRestart(opts: {
   detectedAudioCodec: string | null
   /** ¿se vio una línea "Audio:" en el stderr? (aunque el codec sea vacío). */
   audioStreamSeen: boolean
-  /** tail de stderr acumulado, para detectar decoder/params de audio. */
-  stderrText: string
+  /**
+   * Evidencia del tracker CON ESTADO del intento (preferido): sobrevive al
+   * capado del tail, por lo que la declaración del stream nunca se pierde.
+   */
+  evidence?: AudioEvidenceSnapshot
+  /** Alternativa: tail de stderr acumulado (se deriva una evidencia efímera). */
+  stderrText?: string
   attemptVideoOnly: boolean
   firstByteSent: boolean
   audioFallbackTried: boolean
@@ -342,7 +476,7 @@ export function decideReactiveAudioRestart(opts: {
     return { restart: false, decision: null, stableAudioEvidence: false }
   }
 
-  const ev = detectAudioStderrEvidence(opts.stderrText)
+  const ev = opts.evidence ?? detectAudioStderrEvidence(opts.stderrText ?? '')
   const codec = opts.detectedAudioCodec ?? ev.audioCodec
   const audioSeen = opts.audioStreamSeen || ev.audioStreamSeen || codec != null
 

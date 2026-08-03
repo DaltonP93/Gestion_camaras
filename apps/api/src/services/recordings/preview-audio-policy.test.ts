@@ -452,3 +452,220 @@ describe('detectAudioStderrEvidence — correlación (codec-agnóstica)', () => 
     }
   })
 })
+
+// ─── P2 Codex (3ª ronda): evidencia NEUTRAL + streamRegistry con estado ───────
+
+import { createAudioEvidenceTracker, extractExplicitCodec } from './preview-audio-policy'
+import { classifyRtspError } from './rtsp-url'
+import { PreviewProcessRegistry } from './preview-process-registry'
+
+/**
+ * Simula el camino REAL de la ruta: buffer de líneas + tracker CON ESTADO por
+ * intento + decisión reactiva. `tailCap` reproduce el capado de stderrTail para
+ * demostrar que el registro de streams NO depende del tail.
+ */
+function runAttempt(chunks: string[], opts: { configuredMode?: 'auto' | 'enabled' | 'disabled'; tailCap?: number } = {}) {
+  const configuredMode = opts.configuredMode ?? 'auto'
+  const tailCap = opts.tailCap ?? 30
+  const buf = makeStderrLineBuffer()
+  const tracker = createAudioEvidenceTracker()
+  const tail: string[] = []
+  let audioStreamSeen = false
+  let detectedAudioCodec: string | null = null
+  let attemptVideoOnly = false
+  let audioFallbackTried = false
+  let restarts = 0
+  let learnedCamera = false          // cameraAudioProblematic.add(...)
+  const feed = (line: string) => {
+    const l = line.trim()
+    if (!l) return
+    tail.push(l); if (tail.length > tailCap) tail.shift()
+    tracker.push(l)
+    const ev = tracker.evidence()
+    if (ev.audioStreamSeen) audioStreamSeen = true
+    if (ev.audioCodec) detectedAudioCodec = ev.audioCodec
+    const r = decideReactiveAudioRestart({
+      configuredMode, detectedAudioCodec, audioStreamSeen,
+      evidence: ev, attemptVideoOnly, firstByteSent: false, audioFallbackTried,
+    })
+    if (r.restart) {
+      restarts++
+      audioFallbackTried = true
+      attemptVideoOnly = true
+      if (r.stableAudioEvidence) learnedCamera = true
+    }
+  }
+  for (const c of chunks) for (const l of buf.push(c)) feed(l)
+  const resid = buf.flush(); if (resid) feed(resid)
+  return { restarts, learnedCamera, evidence: tracker.evidence(), tail, streams: tracker.streams() }
+}
+
+describe('P2-3 test 1 — error ANTES de la declaración permanece NEUTRAL', () => {
+  const ERR = 'Error while opening decoder for input stream #0:0'
+
+  it('sin declaración todavía: sin evidencia de audio, sin fallback, sin aprender la cámara', () => {
+    const r = runAttempt([ERR + '\n'])
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.evidence.videoDecoderUnavailable).toBe(false)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(1) // queda PENDIENTE, no clasificado
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+  })
+
+  it('cuando luego llega "Stream #0:0: Video: hevc": se resuelve como VIDEO', () => {
+    const r = runAttempt([ERR + '\n', 'Stream #0:0: Video: hevc\n'])
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(0)
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+    // Y la categoría de error sigue siendo de VIDEO.
+    expect(classifyRtspError(`${ERR}\nStream #0:0: Video: hevc`)).toBe('CODEC_UNSUPPORTED')
+  })
+})
+
+describe('P2-3 test 2 — error antes de la declaración de AUDIO se resuelve al declararse', () => {
+  it('#0:1 sin declaración ⇒ neutral; luego Audio: adpcm_g726le ⇒ fallback una sola vez', () => {
+    const r = runAttempt([
+      'Error while opening decoder for input stream #0:1\n',
+      'Stream #0:1: Audio: adpcm_g726le\n',
+    ])
+    expect(r.evidence.audioDecoderUnavailable).toBe(true)
+    expect(r.restarts).toBe(1)
+    expect(r.learnedCamera).toBe(true)
+  })
+})
+
+describe('P2-3 test 3 — el registro de streams sobrevive al capado del tail', () => {
+  it('declaración de VIDEO evictada del tail: el error de #0:0 sigue siendo video', () => {
+    const filler = Array.from({ length: 8 }, (_, i) => `frame log line ${i}\n`)
+    const r = runAttempt(
+      ['Stream #0:0: Video: hevc\n', ...filler, 'Decoder (codec hevc) not found for input stream #0:0\n'],
+      { tailCap: 3 },
+    )
+    // La declaración YA no está en el tail…
+    expect(r.tail.join('\n')).not.toContain('Stream #0:0: Video: hevc')
+    // …pero sigue en el registro persistente y el error se atribuye a VIDEO.
+    expect(r.streams.get('0:0')?.type).toBe('video')
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.restarts).toBe(0)
+  })
+
+  it('declaración de AUDIO evictada del tail: el error de #0:1 sigue siendo audio', () => {
+    const filler = Array.from({ length: 8 }, (_, i) => `frame log line ${i}\n`)
+    const r = runAttempt(
+      ['Stream #0:1: Audio: adpcm_g726le\n', ...filler, 'Error while opening decoder for input stream #0:1\n'],
+      { tailCap: 3 },
+    )
+    expect(r.streams.get('0:1')?.type).toBe('audio')
+    expect(r.evidence.audioDecoderUnavailable).toBe(true)
+    expect(r.restarts).toBe(1)
+  })
+})
+
+describe('P2-3 test 4 — palabras genéricas NUNCA son codecName', () => {
+  it('extractExplicitCodec rechaza input/stream/output/decoder/error', () => {
+    expect(extractExplicitCodec('Error while opening decoder for input stream #0:0')).toBeNull()
+    expect(extractExplicitCodec('Error while opening decoder for output stream #0:1')).toBeNull()
+    expect(extractExplicitCodec('could not open decoder for stream 1')).toBeNull()
+    expect(extractExplicitCodec('Unsupported codec with id 98 for input stream #0:1')).toBeNull()
+    for (const w of ['input', 'stream', 'output', 'decoder', 'error']) {
+      expect(extractExplicitCodec(`No decoder found for codec ${w}`), w).toBeNull()
+    }
+  })
+  it('sí extrae codecs desde campos explícitos y verificables', () => {
+    expect(extractExplicitCodec('Decoder (codec adpcm_g726le) not found for input stream #0:1')).toBe('adpcm_g726le')
+    expect(extractExplicitCodec('No decoder found for codec adpcm_g726le')).toBe('adpcm_g726le')
+    expect(extractExplicitCodec('no decoder found for: none')).toBe('none')
+    expect(extractExplicitCodec('Unsupported codec: speex')).toBe('speex')
+    expect(extractExplicitCodec('Could not find tag for codec pcm_alaw in stream #1')).toBe('pcm_alaw')
+  })
+})
+
+describe('P2-3 tests 5/6 — correlación por índice manda', () => {
+  it('5. "(codec adpcm_g726le) not found ... #0:1" con #0:1 = audio ⇒ fallback video-only', () => {
+    const r = runAttempt([
+      'Stream #0:0: Video: hevc\nStream #0:1: Audio: adpcm_g726le\n',
+      'Decoder (codec adpcm_g726le) not found for input stream #0:1\n',
+    ])
+    expect(r.restarts).toBe(1)
+    expect(r.evidence.audioDecoderUnavailable).toBe(true)
+  })
+  it('6. el MISMO mensaje para #0:0 = video ⇒ CODEC_UNSUPPORTED, sin fallback', () => {
+    const r = runAttempt([
+      'Stream #0:0: Video: hevc\n',
+      'Decoder (codec hevc) not found for input stream #0:0\n',
+    ])
+    expect(r.restarts).toBe(0)
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(classifyRtspError('Stream #0:0: Video: hevc\nDecoder (codec hevc) not found for input stream #0:0'))
+      .toBe('CODEC_UNSUPPORTED')
+  })
+  it('el registro gana sobre el codec: error con codec de audio pero índice de VIDEO ⇒ video', () => {
+    const r = runAttempt([
+      'Stream #0:0: Video: hevc\n',
+      'Decoder (codec adpcm_g726le) not found for input stream #0:0\n',
+    ])
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.restarts).toBe(0)
+  })
+})
+
+describe('P2-3 test 7 — error sin índice y sin codec explícito ⇒ neutral', () => {
+  it('no clasifica, no dispara fallback, no aprende', () => {
+    const r = runAttempt(['Error while opening decoder\n', 'could not open decoder\n'])
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.evidence.videoDecoderUnavailable).toBe(false)
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+  })
+})
+
+describe('P2-3 tests 8/9/10/11 — no regresión y aprendizaje seguro', () => {
+  it('8. Box 4: HEVC + "Audio: none" conserva el fallback correcto', () => {
+    const r = runAttempt(['Stream #0:0: Video: hevc\nStream #0:1: Audio: none\n'])
+    expect(r.restarts).toBe(1)
+    expect(r.learnedCamera).toBe(true)
+  })
+  it('9. AAC válido no dispara fallback', () => {
+    const r = runAttempt(['Stream #0:0: Video: h264\nStream #0:1: Audio: aac (LC), 16000 Hz\n'])
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+  })
+  it('10. múltiples chunks/eventos ⇒ un solo fallback', () => {
+    const r = runAttempt([
+      'Stream #0:0: Video: hev', 'c\nStream #0:1: Aud', 'io: none\n',
+      'more a\n', 'more b\n', 'Output #0, mp4\n',
+    ])
+    expect(r.restarts).toBe(1)
+  })
+  it('11. no se aprende la cámara con evidencia pendiente/neutral', () => {
+    // Error pendiente que nunca se resuelve ⇒ jamás se marca la cámara.
+    const r = runAttempt(['Error while opening decoder for input stream #0:3\n', 'Output #0, mp4\n'])
+    expect(r.learnedCamera).toBe(false)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(1)
+  })
+})
+
+describe('P2-3 test 12 — el intento previo se termina y recolecta antes del relanzamiento', () => {
+  it('aliveCount()==0 antes de relanzar video-only sobre la misma URI', async () => {
+    const reg = new PreviewProcessRegistry()
+    const killed: string[] = []
+    const fakeProc: any = { pid: 4242, kill: (sig: string) => { killed.push(sig); return true } }
+    const rec = reg.register(fakeProc, Date.now())
+
+    // Evidencia de audio ⇒ decisión de fallback.
+    const r = runAttempt(['Stream #0:0: Video: hevc\nStream #0:1: Audio: none\n'])
+    expect(r.restarts).toBe(1)
+
+    // Terminación idempotente del intento A/V y recolección real del proceso.
+    const term = reg.terminate(rec.attemptId, 'audio_fallback', { onSigterm: () => {}, onSigkill: () => {} })
+    reg.markExited(rec.attemptId)          // exit/close real del proceso
+    await term
+    expect(killed[0]).toBe('SIGTERM')
+    // Sólo AHORA puede relanzarse: no quedan hijos vivos (cero huérfanos).
+    expect(reg.aliveCount()).toBe(0)
+  })
+})
