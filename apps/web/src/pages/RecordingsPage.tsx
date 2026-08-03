@@ -197,6 +197,60 @@ export function RecordingsPage() {
     apiDelete(ep).catch(() => {})
   }
 
+  /**
+   * Espera a que el NVR libere capacidad para una sesión encolada. Sondea el
+   * estado hasta que el backend la promueve y devuelve el streamUrl, o null si
+   * la espera terminó (cancelada por el usuario, slot reemplazado o expirada).
+   *
+   * La cola NO puede lograr simultaneidad cuando el NVR sólo concede una sesión:
+   * simplemente evita el error y arranca sola en cuanto hay cupo.
+   */
+  const waitForPlaybackCapacity = async (
+    slotIndex: number, sessionId: string, myKey: string,
+  ): Promise<string | null> => {
+    const POLL_MS = 2_500
+    const MAX_WAIT_MS = 10 * 60 * 1000
+    const started = Date.now()
+    while (Date.now() - started < MAX_WAIT_MS) {
+      await new Promise(r => setTimeout(r, POLL_MS))
+      // El slot cambió (cancelar, cerrar, otro playhead, otro layout) → abandonar.
+      if (slotKeysRef.current[slotIndex] !== myKey) {
+        console.info(`[recordings-ui] preview_queue_abandoned slot=${slotIndex} sessionId=${sessionId}`)
+        deleteSessionOnce('preview', sessionId)
+        return null
+      }
+      try {
+        const st = await apiGet<{
+          status?: string; streamUrl?: string; queuePosition?: number | null
+          capacity?: { activeCount: number; effectiveLimit: number }
+        }>(`/recordings/preview/${sessionId}/status`, {})
+        if (st.status === 'ready' && st.streamUrl) {
+          console.info(`[recordings-ui] preview_queue_promoted slot=${slotIndex} sessionId=${sessionId}`)
+          return st.streamUrl
+        }
+        if (st.status === 'queued') {
+          setSlots(prev => prev.map((s, i) => i === slotIndex && s.sessionId === sessionId ? {
+            ...s,
+            queue: {
+              position: st.queuePosition ?? s.queue?.position ?? 1,
+              nvrName: s.queue?.nvrName ?? s.nvrName ?? null,
+              activeCount: st.capacity?.activeCount ?? s.queue?.activeCount ?? 0,
+              effectiveLimit: st.capacity?.effectiveLimit ?? s.queue?.effectiveLimit ?? 1,
+            },
+          } : s))
+          continue
+        }
+        // Cualquier otro estado (error/activa) corta la espera.
+        return null
+      } catch {
+        return null   // la sesión desapareció
+      }
+    }
+    console.info(`[recordings-ui] preview_queue_timeout slot=${slotIndex} sessionId=${sessionId}`)
+    deleteSessionOnce('preview', sessionId)
+    return null
+  }
+
   // Keep refs in sync
   useEffect(() => { slotsRef.current = slots }, [slots])
   useEffect(() => { globalPlayingRef.current = globalPlaying }, [globalPlaying])
@@ -1435,7 +1489,13 @@ export function RecordingsPage() {
     } : s))
 
     try {
-      const result = await apiPost<{ sessionId: string; streamUrl: string }>(
+      const result = await apiPost<{
+        sessionId: string
+        streamUrl?: string
+        status?: 'ready' | 'queued'
+        queuePosition?: number | null
+        capacity?: { nvrName?: string | null; activeCount: number; effectiveLimit: number }
+      }>(
         '/recordings/preview/start',
         {
           cameraId:       rec.cameraId,
@@ -1470,7 +1530,33 @@ export function RecordingsPage() {
       }
       if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
 
-      const { sessionId, streamUrl } = result
+      const { sessionId } = result
+
+      // ── Capacidad del NVR: la sesión quedó EN COLA ──────────────────────────
+      // El NVR limita cuántas reproducciones concede a la vez. No es un error:
+      // se muestra "En espera" y se sondea hasta que el backend la promueve.
+      let streamUrl = result.streamUrl
+      if (result.status === 'queued' || !streamUrl) {
+        console.info(
+          `[recordings-ui] preview_queued slot=${slotIndex} sessionId=${sessionId}` +
+          ` position=${result.queuePosition ?? '?'} active=${result.capacity?.activeCount ?? '?'}` +
+          `/${result.capacity?.effectiveLimit ?? '?'}`
+        )
+        setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+          ...s, status: 'queued', sessionId, sessionType: 'preview', errorMsg: null,
+          queue: {
+            position: result.queuePosition ?? 1,
+            nvrName: result.capacity?.nvrName ?? s.nvrName ?? null,
+            activeCount: result.capacity?.activeCount ?? 0,
+            effectiveLimit: result.capacity?.effectiveLimit ?? 1,
+          },
+        } : s))
+
+        const promotedUrl = await waitForPlaybackCapacity(slotIndex, sessionId, myKey)
+        if (!promotedUrl) return          // cancelada, reemplazada o expirada
+        streamUrl = promotedUrl
+      }
+
       // Track when this preview starts (video.currentTime = 0 → effectiveMs)
       previewStartTimesRef.current[slotIndex] = effectiveMs
 
@@ -2370,6 +2456,9 @@ export function RecordingsPage() {
                       {slot.status === 'waiting_next_recording' && (
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-brand-800/60 text-brand-300">Esperando…</span>
                       )}
+                      {slot.status === 'queued' && (
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-amber-800/60 text-amber-300">En espera</span>
+                      )}
                       <span className="flex-1" />
                       {slot.cameraId && (
                         <button
@@ -2463,6 +2552,28 @@ export function RecordingsPage() {
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/40 pointer-events-none">
                         <Loader2 size={20} className="text-brand-400 animate-spin" />
                         <p className="text-[10px] text-surface-300">Preparando origen de grabación…</p>
+                      </div>
+                    )}
+
+                    {/* Espera de capacidad del NVR. NO es un error: el dispositivo
+                        limita cuántas reproducciones concede a la vez y la cámara
+                        arranca sola cuando se libera una. */}
+                    {slot.status === 'queued' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/70 px-3">
+                        <Loader2 size={18} className="text-amber-400 animate-spin flex-shrink-0" />
+                        <p className="text-[10px] text-surface-200 text-center">
+                          Esperando una sesión de reproducción disponible
+                          {slot.queue?.nvrName ? ` en ${slot.queue.nvrName}` : ''}.
+                        </p>
+                        <p className="text-[9px] text-surface-400 text-center">
+                          Posición {slot.queue?.position ?? 1} · {slot.queue?.activeCount ?? 0}/{slot.queue?.effectiveLimit ?? 1} en uso
+                        </p>
+                        <button
+                          onClick={e => { e.stopPropagation(); stopSlot(idx) }}
+                          className="mt-0.5 text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300 transition-colors"
+                        >
+                          Cancelar espera
+                        </button>
                       </div>
                     )}
 

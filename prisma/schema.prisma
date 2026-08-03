@@ -133,6 +133,10 @@ model NVR {
   // Política de audio de reproducción a nivel NVR (heredada por sus cámaras salvo
   // override por cámara). null = heredar del global. auto | enabled | disabled.
   audioMode                String?
+  // Máximo de sesiones de reproducción histórica concurrentes que concede ESTE
+  // NVR. null = auto (hereda el default global). El dispositivo responde 453
+  // Not Enough Bandwidth al excederlo: es un límite físico, no de VisionCore.
+  maxConcurrentPlaybackSessions Int?
   supportsIsapiRecording   Boolean?
   supportsSdkRecording     Boolean   @default(false)
   recordingCapabilityAt    DateTime?
@@ -622,6 +626,11 @@ model RecordingsSettings {
   // auto | enabled | disabled. Es el último eslabón de la precedencia antes de
   // 'auto'. "disabled" es útil donde el audio no está autorizado/cableado.
   recordingsAudioMode  String   @default("auto")
+  // Máximo de sesiones de reproducción histórica CONCURRENTES por NVR, por
+  // defecto. Los NVR responden 453 Not Enough Bandwidth al excederlo; el límite
+  // es del dispositivo. Se sobrescribe por NVR con
+  // NVR.maxConcurrentPlaybackSessions. 1 es el valor seguro.
+  recordingsDefaultMaxConcurrentPerNvr Int @default(1)
   updatedAt            DateTime @updatedAt
 
   @@map("recordings_settings")

@@ -29,6 +29,9 @@ import {
   resolveEffectiveAudioMode, resolvePreviewAudioPolicy, type AudioMode,
   decideReactiveAudioRestart, createAudioEvidenceTracker, makeStderrLineBuffer,
 } from '../services/recordings/preview-audio-policy'
+import {
+  NvrPlaybackAdmissionController, isNvrCapacityCategory,
+} from '../services/recordings/nvr-playback-admission'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
 import { PreviewProcessRegistry, type AttemptRecord } from '../services/recordings/preview-process-registry'
@@ -457,6 +460,24 @@ async function getSystemRecordingsAudioMode(prisma: any): Promise<AudioMode> {
 /** Invalida la caché del modo global (llamar tras guardar RecordingsSettings). */
 export function invalidateSystemAudioModeCache(): void {
   systemAudioModeCache = null
+  systemMaxConcurrentCache = null
+}
+
+// Caché corta del máximo global de reproducciones concurrentes por NVR.
+let systemMaxConcurrentCache: { value: number; expiresAt: number } | null = null
+async function getSystemDefaultMaxConcurrentPerNvr(prisma: any): Promise<number> {
+  const now = Date.now()
+  if (systemMaxConcurrentCache && systemMaxConcurrentCache.expiresAt > now) return systemMaxConcurrentCache.value
+  let value = 1
+  try {
+    const s = await prisma.recordingsSettings.findUnique({ where: { id: 'singleton' } })
+    const n = Number(s?.recordingsDefaultMaxConcurrentPerNvr)
+    if (Number.isFinite(n) && n > 0) value = Math.min(64, Math.floor(n))
+  } catch {
+    value = 1
+  }
+  systemMaxConcurrentCache = { value, expiresAt: now + RECORDINGS_AUDIO_MODE_TTL_MS }
+  return value
 }
 // TTL del marcaje "sin soporte de substream": tras este tiempo se vuelve a probar
 // (evita bloquear sub permanentemente por un 400 puntual). En memoria: se pierde
@@ -590,6 +611,17 @@ function terminatePreviewSession(sessionId: string, session: PreviewSession, rea
     for (const d of [...session.disposers]) { try { d() } catch { /* noop */ } }
     session.disposers.clear()
   }
+  // Capacidad del NVR: soltar el lease Y la solicitud en cola. Cubre cancelar,
+  // cerrar el slot, cambiar de playhead/búsqueda/layout, salir de Grabaciones y
+  // el shutdown. Una solicitud cancelada NUNCA debe iniciarse después.
+  if (admission.cancelQueued({ nvrId: session.nvrId, sessionId, reason })) {
+    log(
+      `[recordings-preview] nvr_playback_queue_cancelled nvrId=${session.nvrId} sessionId=${sessionId}` +
+      ` cameraId=${session.cameraId} reason=${reason} queuedCount=${admission.queuedCount(session.nvrId)}`
+    )
+  }
+  promotedSessions.delete(sessionId)
+  releasePlaybackLease(session.nvrId, sessionId, reason)
   const pending = terminateAllPreviewChildren(session, reason, log)  // (12c)
   if (pending > 0) {                           // (12e) confirmar, o marcar pendiente
     log(`[recordings-preview] cleanup_pending sessionId=${sessionId} reason=${reason} pendingChildren=${pending}`)
@@ -613,7 +645,6 @@ const PREVIEW_PROBE_ENABLED = process.env.RECORDINGS_PREVIEW_PROBE === 'true'
 
 const MAX_PREVIEW_PER_NVR = Math.max(1, parseInt(process.env.RECORDINGS_MAX_PREVIEW_PER_NVR || '1', 10) || 1)
 const PREVIEW_START_STAGGER_MS = Math.max(0, parseInt(process.env.RECORDINGS_PREVIEW_START_STAGGER_MS || '1200', 10) || 1200)
-const PREVIEW_QUEUE_WAIT_MAX_MS = 30_000
 // Watchdog de PRIMER BYTE por variante RTSP. Si FFmpeg no produce stdout dentro
 // de este plazo (el NVR aceptó el socket pero no envía video ni cierra), se lo
 // mata y se avanza a la siguiente variante. Sin esto, un FFmpeg colgado bloquea
@@ -690,56 +721,43 @@ export function logPreviewStartupConfig(log: (msg: string) => void, gitCommit: s
   }
 }
 
-interface NvrPreviewState { active: number; lastStartAt: number; queue: Array<() => void> }
-const nvrPreviewStates = new Map<string, NvrPreviewState>()
+// ─── Admisión de reproducción por NVR (leases + cola) ────────────────────────
+// Reemplaza la antigua cola BLOQUEANTE por NVR (que hacía esperar al GET /stream
+// y devolvía 503 al vencer). Ahora la capacidad se decide en POST /preview/start
+// y la sesión sin cupo queda EN COLA, con posición y cancelación explícitas.
+export const admission = new NvrPlaybackAdmissionController({
+  safeDefaultLimit: MAX_PREVIEW_PER_NVR,
+  cooldownMs: Math.max(0, parseInt(process.env.RECORDINGS_NVR_CAPACITY_COOLDOWN_MS || '', 10) || 120_000),
+})
 
-function getNvrPreviewState(nvrId: string): NvrPreviewState {
-  let st = nvrPreviewStates.get(nvrId)
-  if (!st) { st = { active: 0, lastStartAt: 0, queue: [] }; nvrPreviewStates.set(nvrId, st) }
-  return st
-}
+/** Sesiones promovidas desde la cola y aún no consumidas por su GET /stream. */
+const promotedSessions = new Set<string>()
 
-/** Wait for a free preview slot on this NVR (bounded), enforce stagger, and
- *  return a release function — or null when the wait cap expires with the
- *  slot still busy. Returning null (instead of opening an extra FFmpeg)
- *  guarantees MAX_PREVIEW_PER_NVR is a hard limit. */
-async function acquireNvrPreviewSlot(
-  nvrId: string, slotIndex: number, log: (msg: string) => void
-): Promise<(() => void) | null> {
-  const st = getNvrPreviewState(nvrId)
-  const waitStart = Date.now()
+/** Logger inyectado por las rutas para los eventos de capacidad. */
+let releaseLeaseLogger: ((msg: string) => void) | null = null
 
-  while (st.active >= MAX_PREVIEW_PER_NVR) {
-    if (Date.now() - waitStart >= PREVIEW_QUEUE_WAIT_MAX_MS) {
-      log(`[recordings-preview] nvr_preview_queue_timeout nvrId=${nvrId} slot=${slotIndex} active=${st.active} waitedMs=${Date.now() - waitStart}`)
-      return null
-    }
-    log(`[recordings-preview] nvr_preview_queue nvrId=${nvrId} slot=${slotIndex} queued=${st.queue.length + 1} active=${st.active}`)
-    await new Promise<void>(resolve => {
-      st.queue.push(resolve)
-      // Safety: also wake up periodically in case a release was missed
-      setTimeout(resolve, 2_000)
-    })
-  }
-
-  // Stagger consecutive starts against the same NVR
-  const sinceLast = Date.now() - st.lastStartAt
-  if (sinceLast < PREVIEW_START_STAGGER_MS) {
-    await new Promise(r => setTimeout(r, PREVIEW_START_STAGGER_MS - sinceLast))
-  }
-
-  st.active++
-  st.lastStartAt = Date.now()
-  log(`[recordings-preview] nvr_preview_acquired nvrId=${nvrId} slot=${slotIndex} active=${st.active}`)
-
-  let released = false
-  return () => {
-    if (released) return
-    released = true
-    st.active = Math.max(0, st.active - 1)
-    log(`[recordings-preview] nvr_preview_released nvrId=${nvrId} active=${st.active}`)
-    const next = st.queue.shift()
-    if (next) next()
+/**
+ * Libera el lease de capacidad de una sesión y promueve la cola. IDEMPOTENTE:
+ * múltiples eventos exit/close/error liberan y promueven UNA sola vez. Se
+ * invoca cuando el proceso FFmpeg ya no puede emitir bytes (salió y fue
+ * recolectado), o en el teardown ordenado de la sesión.
+ */
+export function releasePlaybackLease(nvrId: string, sessionId: string, reason: string): void {
+  const r = admission.release({ nvrId, sessionId, reason })
+  if (!r.released) return
+  releaseLeaseLogger?.(
+    `[recordings-preview] nvr_playback_lease_released nvrId=${nvrId} sessionId=${sessionId}` +
+    ` reason=${reason} durationMs=${r.durationMs ?? 0}` +
+    ` activeCount=${admission.activeCount(nvrId)} queuedCount=${admission.queuedCount(nvrId)}` +
+    ` effectiveLimit=${admission.effectiveLimitFor(nvrId)}`
+  )
+  for (const p of r.promoted) {
+    promotedSessions.add(p.sessionId)
+    releaseLeaseLogger?.(
+      `[recordings-preview] nvr_playback_queue_promoted nvrId=${nvrId} sessionId=${p.sessionId}` +
+      ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${Date.now() - p.queuedAt}` +
+      ` activeCount=${admission.activeCount(nvrId)} queuedCount=${admission.queuedCount(nvrId)}`
+    )
   }
 }
 
@@ -2017,10 +2035,62 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       startTime: body.startTime, endTime: body.endTime, sessionId, mode: 'preview',
     }).catch(() => {})
 
-    return reply.send({
+    // ── Admisión por capacidad del NVR ──────────────────────────────────────
+    // El límite es del DISPOSITIVO. Si no hay cupo, la sesión queda EN COLA y se
+    // devuelve estado 'queued' (no un error): no se abre FFmpeg contra un NVR
+    // saturado y la UI puede mostrar "en espera" con posición y cancelación.
+    releaseLeaseLogger = (m) => server.log.info(m)
+    admission.setGlobalDefaultLimit(await getSystemDefaultMaxConcurrentPerNvr(server.prisma))
+    admission.configureNvr(camera.nvr.id, (camera.nvr as any).maxConcurrentPlaybackSessions ?? null)
+
+    const decision = admission.acquire({
+      nvrId: camera.nvr.id,
       sessionId,
-      streamUrl: `/api/recordings/preview/${sessionId}/stream?token=${streamToken}`,
+      userId: user.sub,
+      cameraId: body.cameraId,
+      cameraName: camera.name,
+      slotIndex: body.slotIndex,
+    })
+
+    const streamUrl = `/api/recordings/preview/${sessionId}/stream?token=${streamToken}`
+    const capacity = {
+      nvrId: camera.nvr.id,
+      nvrName: camera.nvr.name,
+      activeCount: decision.activeCount,
+      queuedCount: decision.queuedCount,
+      configuredLimit: decision.configuredLimit,
+      effectiveLimit: decision.effectiveLimit,
+    }
+
+    if (!decision.granted) {
+      server.log.info(
+        `[recordings-preview] nvr_playback_request_queued nvrId=${camera.nvr.id} sessionId=${sessionId}` +
+        ` cameraId=${body.cameraId} userId=${user.sub} queuePosition=${decision.position}` +
+        ` activeCount=${decision.activeCount} queuedCount=${decision.queuedCount}` +
+        ` configuredLimit=${decision.configuredLimit ?? 'auto'} effectiveLimit=${decision.effectiveLimit}`
+      )
+      return reply.send({
+        status: 'queued',
+        sessionId,
+        expiresAt: new Date(expiresAt).toISOString(),
+        queuePosition: decision.position,
+        estimatedRetryAfterSec: decision.estimatedRetryAfterSec,
+        capacity,
+      })
+    }
+
+    server.log.info(
+      `[recordings-preview] nvr_playback_lease_acquired nvrId=${camera.nvr.id} sessionId=${sessionId}` +
+      ` cameraId=${body.cameraId} userId=${user.sub} activeCount=${decision.activeCount}` +
+      ` queuedCount=${decision.queuedCount} configuredLimit=${decision.configuredLimit ?? 'auto'}` +
+      ` effectiveLimit=${decision.effectiveLimit}`
+    )
+    return reply.send({
+      status: 'ready',
+      sessionId,
+      streamUrl,
       expiresAt: new Date(expiresAt).toISOString(),
+      capacity,
     })
   })
 
@@ -2112,39 +2182,41 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       'pipe:1',
     ]
 
-    // Per-NVR concurrency: wait for a free playback slot + stagger before
-    // opening another RTSP playback session against the same NVR
-    const releaseNvrSlot = await acquireNvrPreviewSlot(
-      session.nvrId, session.slotIndex, (msg) => server.log.info(msg)
-    )
-
-    if (!releaseNvrSlot) {
-      // Hard limit: never open an extra FFmpeg against a saturated NVR.
-      // Record the category so the frontend shows the session-limit message.
-      session.errorCategory = 'NVR_BANDWIDTH_OR_SESSION_LIMIT'
-      session.errorDetail   = `Cola de previews del NVR llena (max=${MAX_PREVIEW_PER_NVR}) — timeout de ${PREVIEW_QUEUE_WAIT_MAX_MS}ms`
-      session.hadFirstByte  = false
-      retainFailedPreview(sessionId, session, (m) => server.log.info(m))
-      server.log.warn(
-        `[recordings-preview] nvr_preview_rejected_453 nvrId=${session.nvrId}` +
-        ` cameraId=${session.cameraId} slot=${session.slotIndex} reason=queue_timeout`
+    // Capacidad por NVR: el lease YA se concedió en POST /preview/start (o la
+    // sesión quedó en cola y el cliente no debería estar aquí todavía). No se
+    // bloquea la petición esperando cupo: eso producía un 503 técnico en vez de
+    // un estado "en espera" manejable por la UI.
+    if (!admission.hasLease(session.nvrId, sessionId)) {
+      const pos = admission.queuePositionOf(session.nvrId, sessionId)
+      server.log.info(
+        `[recordings-preview] stream_without_lease sessionId=${sessionId} nvrId=${session.nvrId}` +
+        ` queuePosition=${pos ?? 'none'}`
       )
-      return reply.status(503).send({ message: 'El NVR no tiene sesiones de reproducción libres' })
+      return reply.status(409).send({
+        message: 'La reproducción está en espera de capacidad en el NVR',
+        code: 'PLAYBACK_QUEUED',
+        queuePosition: pos,
+      })
     }
+    // Liberador del lease: idempotente y ligado a la recolección del proceso.
+    const releaseNvrSlot = (reason: string) => releasePlaybackLease(session.nvrId, sessionId, reason)
 
     // Session may have been deleted while waiting in the queue
     if (!previewSessions.has(sessionId)) {
-      releaseNvrSlot()
+      releaseNvrSlot('session_removed')
       return reply.status(410).send({ message: 'Sesión de preview cancelada' })
     }
-    // (10/13) Revalidar la propiedad DESPUÉS del await de acquireNvrPreviewSlot:
+    // (10/13) Revalidar la propiedad tras las esperas asíncronas previas:
     // otro GET pudo tomar el control (bump de streamGeneration) o la sesión pudo
     // entrar en cierre mientras esperábamos el slot del NVR. Sin esto, un handler
     // obsoleto haría hijack + spawn igual (con MAX_PREVIEW_PER_NVR>1, DOS FFmpeg
     // para la misma sesión; con el default, ocuparía el único slot). Liberar el
     // slot recién adquirido antes de ceder (review Codex #124).
     if (session.streamGeneration !== myGen || session.closing) {
-      releaseNvrSlot()
+      // Takeover: un GET MÁS NUEVO de la MISMA sesión toma el control. El lease
+      // pertenece a la sesión, no a este handler: NO liberarlo aquí o se le
+      // quitaría el cupo al handler nuevo (y otra solicitud podría robarlo).
+      // Si la sesión está cerrándose, el teardown libera por su cuenta.
       server.log.info(`[recordings-preview] stream_superseded_after_slot sessionId=${sessionId} gen=${myGen} current=${session.streamGeneration ?? 'none'} closing=${!!session.closing}`)
       return reply.status(409).send({ message: 'Stream reemplazado por una solicitud más reciente' })
     }
@@ -2245,7 +2317,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         `[recordings-preview] stream_closed sessionId=${sessionId}` +
         ` reason=${reason} elapsedMs=${elapsedMs} hadFirstByte=${firstByteSent}`
       )
-      releaseNvrSlot()
+      // El lease se libera SÓLO si seguimos siendo el dueño del stream: si un
+      // GET más nuevo tomó el control de la MISMA sesión, el cupo sigue siendo
+      // suyo. El fallback A/V → video-only y la continuidad entre bloques
+      // reutilizan la misma sesión, así que conservan el lease.
+      if (session.streamGeneration === myGen) releaseNvrSlot(reason)
       // Este consumidor se va: soltar la marca SÓLO si seguimos siendo el dueño
       // (un GET más nuevo puede haberla re-tomado). Deregistrar el disposer propio.
       if (session.streamGeneration === myGen) session.streamAttached = false
@@ -2594,6 +2670,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         sendHeadersOnce()
         firstByteSent = true
         session.hadFirstByte  = true
+        // Esta sesión reproduce DE VERDAD: cuenta como "sana" para calcular la
+        // reducción temporal de capacidad si otra recibe 453.
+        admission.markFirstByte({ nvrId: session.nvrId, sessionId })
+        admission.attachProcess({ nvrId: session.nvrId, sessionId, pid: proc.pid ?? null, alive: true })
         // Registrar si el intento que funcionó fue video-only (para el badge).
         session.videoOnly     = attemptVideoOnly
         // A working variant wipes any error state from earlier attempts
@@ -2791,12 +2871,38 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           )
           server.log.info(`[recordings-preview] rtsp_variant_failed sessionId=${sessionId} variant=${variant}`)
 
-          // Advance the chain — except on offline/timeout, where every
-          // further attempt would just burn the 60 s RTSP timeout again
+          // Advance the chain — except on offline/timeout, where every further
+          // attempt would just burn the 60 s RTSP timeout again, y except on
+          // 453/capacidad: un "Not Enough Bandwidth" es una condición del NVR
+          // COMPLETO, no de la forma de la URI. Reintentar nvr_rewritten,
+          // nvr_original o sub_full dentro de la misma solicitud sólo genera
+          // más FFmpeg fallidos y más presión sobre un NVR ya saturado.
+          const capacityExhausted = isNvrCapacityCategory(category)
           const advance =
             chainIndex + 1 < attemptChain.length &&
             category !== 'NVR_OFFLINE_OR_TIMEOUT' &&
+            !capacityExhausted &&
             !clientGone
+          if (capacityExhausted) {
+            server.log.warn(
+              `[recordings-preview] nvr_playback_453_detected sessionId=${sessionId}` +
+              ` nvrId=${session.nvrId} cameraId=${session.cameraId} variant=${variant}` +
+              ` reason=chain_stopped remainingVariants=${attemptChain.length - chainIndex - 1}`
+            )
+            // Reducción TEMPORAL de capacidad: el límite efectivo baja, como
+            // máximo, a la cantidad de sesiones que YA reproducían bien. No se
+            // marca el NVR offline ni se aprende el límite permanentemente.
+            const before = admission.effectiveLimitFor(session.nvrId)
+            const cap = admission.report453({ nvrId: session.nvrId, sessionId })
+            if (cap.reduced) {
+              server.log.warn(
+                `[recordings-preview] nvr_playback_capacity_reduced nvrId=${session.nvrId}` +
+                ` sessionId=${sessionId} effectiveLimit=${cap.effectiveLimit} previousLimit=${before}` +
+                ` cooldownUntil=${new Date(cap.cooldownUntil).toISOString()}` +
+                ` activeCount=${admission.activeCount(session.nvrId)}`
+              )
+            }
+          }
           if (advance) {
             setTimeout(() => {
               // (13) Sólo avanzar la cadena si SEGUIMOS siendo el dueño del stream.
@@ -2933,6 +3039,40 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       }
       if (session.errorCategory) {
         server.log.info(`[recordings-preview] status_error sessionId=${sessionId} category=${session.errorCategory}`)
+      }
+      // ── Capacidad del NVR: en cola / promovida ──────────────────────────────
+      // Mientras la sesión espera cupo devuelve 'queued' con su posición; al ser
+      // promovida devuelve 'ready' con el streamUrl para que el cliente arranque
+      // solo, sin intervención del usuario.
+      const queuePosition = admission.queuePositionOf(session.nvrId, sessionId)
+      if (queuePosition != null) {
+        return reply.send({
+          ok: true,
+          status: 'queued',
+          queuePosition,
+          capacity: {
+            nvrId: session.nvrId,
+            activeCount: admission.activeCount(session.nvrId),
+            queuedCount: admission.queuedCount(session.nvrId),
+            effectiveLimit: admission.effectiveLimitFor(session.nvrId),
+            configuredLimit: admission.configuredLimitFor(session.nvrId),
+          },
+        })
+      }
+      if (promotedSessions.has(sessionId) && !session.hadFirstByte) {
+        promotedSessions.delete(sessionId)
+        return reply.send({
+          ok: true,
+          status: 'ready',
+          streamUrl: `/api/recordings/preview/${sessionId}/stream?token=${session.streamToken}`,
+          capacity: {
+            nvrId: session.nvrId,
+            activeCount: admission.activeCount(session.nvrId),
+            queuedCount: admission.queuedCount(session.nvrId),
+            effectiveLimit: admission.effectiveLimitFor(session.nvrId),
+            configuredLimit: admission.configuredLimitFor(session.nvrId),
+          },
+        })
       }
       return reply.send({
         ok:            !session.errorCategory,
@@ -3092,11 +3232,30 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       action: 'diagnostics_playback', recordingId: body.recordingId ?? null, mode: body.mode ?? PLAYBACK_STREAM_MODE,
     }).catch(() => {})
 
-    // Mismo límite de concurrencia por NVR que el preview normal; siempre se libera.
-    const releaseNvrSlot = await acquireNvrPreviewSlot(camera.nvr.id, -1, (m) => server.log.info(m))
-    if (!releaseNvrSlot) {
-      return reply.status(503).send({ code: 'NVR_BUSY', message: 'El NVR no tiene sesiones de reproducción libres para diagnosticar ahora.' })
+    // Mismo control de capacidad por NVR que el preview normal; siempre se libera.
+    // El diagnóstico NO se encola: si no hay cupo se informa de inmediato, para
+    // no dejar a un ADMIN esperando detrás de reproducciones de usuarios.
+    releaseLeaseLogger = (m) => server.log.info(m)
+    admission.setGlobalDefaultLimit(await getSystemDefaultMaxConcurrentPerNvr(server.prisma))
+    admission.configureNvr(camera.nvr.id, (camera.nvr as any).maxConcurrentPlaybackSessions ?? null)
+    const diagSessionId = `diag_${crypto.randomBytes(8).toString('hex')}`
+    const diagDecision = admission.acquire({
+      nvrId: camera.nvr.id, sessionId: diagSessionId, userId: request.user.sub,
+      cameraId: camera.id, cameraName: camera.name, slotIndex: -1,
+    })
+    if (!diagDecision.granted) {
+      admission.cancelQueued({ nvrId: camera.nvr.id, sessionId: diagSessionId, reason: 'diagnostics_no_capacity' })
+      return reply.status(503).send({
+        code: 'NVR_BUSY',
+        message: 'El NVR no tiene sesiones de reproducción libres para diagnosticar ahora.',
+        capacity: {
+          activeCount: diagDecision.activeCount,
+          effectiveLimit: diagDecision.effectiveLimit,
+          configuredLimit: diagDecision.configuredLimit,
+        },
+      })
     }
+    const releaseNvrSlot = () => releasePlaybackLease(camera.nvr.id, diagSessionId, 'diagnostics_done')
 
     const timeoutMs   = body.perStrategyTimeoutMs ?? 25000
     const transports: RtspTransport[] = body.transports ?? ['tcp']
