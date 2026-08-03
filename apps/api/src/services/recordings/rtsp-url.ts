@@ -29,7 +29,7 @@ export function classifyRtspError(text: string): string {
   // distinguir si corresponde al AUDIO o al VIDEO (spec): un audio
   // none/unknown/sin decoder NO debe reportarse como CODEC_UNSUPPORTED de video
   // — el preview cae a video-only y el video se reproduce igual.
-  const isDecoderIssue = /(decoder[^\n]*not found|could not find codec parameters|no supported streams|invalid data found|could not find codec)/.test(t)
+  const isDecoderIssue = /(decoder[^\n]*not found|no decoder found|error while opening decoder|could not open decoder|unsupported codec|could not find codec parameters|no supported streams|invalid data found|could not find codec)/.test(t)
   const mentionsAudio  = /(audio:|pcm_?mulaw|pcm_?alaw|g\.?711|ulaw|alaw|\baac\b|\bopus\b|\bmp2\b|\bmp3\b|\bac3\b)/.test(t)
   const mentionsVideo  = /(video:|hevc|h\.?265|h\.?264|\bavc\b|mpeg4)/.test(t)
   if (isDecoderIssue && mentionsAudio && !mentionsVideo)              return 'AUDIO_STREAM_INVALID'
