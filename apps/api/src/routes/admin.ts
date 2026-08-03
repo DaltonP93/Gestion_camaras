@@ -9,6 +9,7 @@ import {
   MAX_TRANSCODE_SESSIONS,
 } from '../services/stream-manager'
 import { isTranscodeProcessAlive } from '../services/stream'
+import { admission } from './recordings'
 
 export const adminRoutes: FastifyPluginAsync = async (server) => {
   // GET /api/admin/debug/transcodes
@@ -77,6 +78,66 @@ export const adminRoutes: FastifyPluginAsync = async (server) => {
   // Diagnóstico de CUPOS de transcodificación: identifica exactamente qué ocupa cada
   // cupo contra maxTranscodes. Sin secretos (IDs, tiempos, perfil y motivo). Enriquece
   // cada slot con el nombre de la cámara desde la DB.
+  // GET /api/admin/diagnostics/recording-playback-capacity
+  // Capacidad de reproducción histórica por NVR: leases activos y cola de espera.
+  // Los NVR limitan cuántas sesiones RTSP de playback conceden a la vez (453 Not
+  // Enough Bandwidth). Sin contraseñas, URI RTSP, tokens ni IP.
+  server.get('/diagnostics/recording-playback-capacity', {
+    preHandler: [server.authorize(['ADMIN'])],
+  }, async (_request, reply) => {
+    const snapshot = admission.snapshot()
+
+    // Resolver nombres de NVR y de cámara en dos queries.
+    const nvrIds = snapshot.map(n => n.nvrId)
+    const cameraIds = [...new Set(snapshot.flatMap(n => [
+      ...n.active.map(a => a.cameraId), ...n.queue.map(q => q.cameraId),
+    ]))]
+    const [nvrs, cameras] = await Promise.all([
+      nvrIds.length
+        ? server.prisma.nVR.findMany({ where: { id: { in: nvrIds } }, select: { id: true, name: true } })
+        : Promise.resolve([]),
+      cameraIds.length
+        ? server.prisma.camera.findMany({ where: { id: { in: cameraIds } }, select: { id: true, name: true } })
+        : Promise.resolve([]),
+    ])
+    const nvrNameById = new Map(nvrs.map(n => [n.id, n.name]))
+    const camNameById = new Map(cameras.map(c => [c.id, c.name]))
+
+    return reply.send({
+      generatedAt: new Date().toISOString(),
+      nvrs: snapshot.map(n => ({
+        nvrId: n.nvrId,
+        nvrName: nvrNameById.get(n.nvrId) ?? null,
+        configuredLimit: n.configuredLimit,
+        effectiveLimit: n.effectiveLimit,
+        temporaryCapacityReduction: n.temporaryCapacityReduction,
+        activeCount: n.activeCount,
+        queuedCount: n.queuedCount,
+        last453At: n.last453At ? new Date(n.last453At).toISOString() : null,
+        cooldownUntil: n.cooldownUntil ? new Date(n.cooldownUntil).toISOString() : null,
+        active: n.active.map(a => ({
+          sessionId: a.sessionId,
+          cameraId: a.cameraId,
+          cameraName: a.cameraName ?? camNameById.get(a.cameraId) ?? null,
+          userId: a.userId,
+          slotIndex: a.slotIndex,
+          pid: a.pid,
+          processAlive: a.processAlive,
+          acquiredAt: new Date(a.acquiredAt).toISOString(),
+          firstByteAt: a.firstByteAt ? new Date(a.firstByteAt).toISOString() : null,
+        })),
+        queue: n.queue.map(q => ({
+          sessionId: q.sessionId,
+          cameraId: q.cameraId,
+          cameraName: q.cameraName ?? camNameById.get(q.cameraId) ?? null,
+          userId: q.userId,
+          position: q.position,
+          queuedAt: new Date(q.queuedAt).toISOString(),
+        })),
+      })),
+    })
+  })
+
   server.get('/diagnostics/transcodes', { preHandler: [server.authorize(['ADMIN'])] }, async (_request, reply) => {
     const diag = getTranscodeSlots()
     const now  = Date.now()

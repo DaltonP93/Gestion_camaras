@@ -24,10 +24,13 @@ export type PlaybackLayout = '1x1' | '2x2' | '3x3' | '4x4'
 // waiting_next_recording = terminó el bloque y hay un hueco hasta el siguiente;
 // en multicámara el slot ESPERA a que el reloj global llegue al siguiente bloque
 // (sin adelantar el reloj) y arranca solo — una única transición, sin clic manual.
+// queued = el NVR no tiene sesiones de reproducción libres; la cámara espera
+// turno. NO es un error: el dispositivo limita cuántos playbacks concede a la
+// vez y VisionCore la promueve automáticamente cuando se libera capacidad.
 export type SlotStatus =
   | 'empty' | 'idle' | 'loading' | 'buffering' | 'playing'
   | 'ready' | 'stalled' | 'error' | 'no_recording'
-  | 'waiting_next_recording'
+  | 'waiting_next_recording' | 'queued'
 
 export interface PlaybackSlot {
   slotIndex: number
@@ -47,6 +50,13 @@ export interface PlaybackSlot {
   // El preview se está reproduciendo sin audio (fallback video-only del backend):
   // badge discreto "Sin audio". No es un error.
   noAudio?: boolean
+  // Espera de capacidad del NVR (status 'queued'): posición y ocupación actual.
+  queue?: {
+    position: number
+    nvrName: string | null
+    activeCount: number
+    effectiveLimit: number
+  } | null
 }
 
 export function emptySlot(slotIndex: number): PlaybackSlot {
