@@ -27,7 +27,7 @@ import { planStartupBudget } from '../services/recordings/preview-budget'
 import {
   isAudioSyncOrMuxFailure,
   resolveEffectiveAudioMode, resolvePreviewAudioPolicy, type AudioMode,
-  decideReactiveAudioRestart, detectAudioStderrEvidence,
+  decideReactiveAudioRestart, detectAudioStderrEvidence, makeStderrLineBuffer,
 } from '../services/recordings/preview-audio-policy'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
@@ -2449,10 +2449,15 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         }, PREVIEW_KILL_GRACE_MS)
       }, attemptTimeout)
 
-      proc.stderr?.on('data', (chunk: Buffer) => {
-        for (const raw of chunk.toString().split('\n')) {
-          const line = maskUrlCredentials(raw.trim())
-          if (!line) continue
+      // Reensamblado de líneas: Node NO garantiza que los chunks coincidan con
+      // líneas. Se acumula el residual y sólo se procesan líneas COMPLETAS; el
+      // resto (última línea sin '\n') queda en carry hasta el próximo chunk o el
+      // flush en close/exit. La MISMA línea reconstruida alimenta el parser de
+      // streams, la detección de audio, stderrTail, la clasificación y los logs.
+      const stderrBuf = makeStderrLineBuffer()
+      const processStderrLine = (rawLine: string, allowRestart: boolean) => {
+          const line = maskUrlCredentials(rawLine.trim())
+          if (!line) return
           stderrTail.push(line)
           if (stderrTail.length > 30) stderrTail.shift()
           // ── Detección de codecs por LÍNEA ACTUAL (no sobre el head capado a 15) ──
@@ -2492,7 +2497,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             attemptVideoOnly, firstByteSent, audioFallbackTried,
             knownProblematic: cameraAudioProblematic.has(session.cameraId),
           })
-          if (reactive.restart) {
+          // El flush del residual en close/exit NO debe intentar matar/relanzar
+          // (el proceso ya terminó): la red post-close se encarga con la evidencia
+          // ya acumulada. Por eso allowRestart=false en ese caso.
+          if (allowRestart && reactive.restart) {
             audioFallbackTried  = true
             audioRestartPending = true
             sessionVideoOnly    = true   // los intentos siguientes ya arrancan video-only
@@ -2515,7 +2523,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
             }, PREVIEW_KILL_GRACE_MS)
           }
           server.log.debug(`[recordings-preview] ffmpeg_stderr sessionId=${sessionId} line=${line.slice(0, 200)}`)
-        }
+      }
+
+      // Flush del residual final (línea sin '\n' al cerrar). No dispara restart.
+      const flushStderrCarry = () => {
+        const resid = stderrBuf.flush()
+        if (resid) processStderrLine(resid, false)
+      }
+
+      // Sólo se procesan líneas COMPLETAS reensambladas (buffer compartido); el
+      // residual queda pendiente hasta el próximo chunk o el flush en close.
+      proc.stderr?.on('data', (chunk: Buffer) => {
+        for (const l of stderrBuf.push(chunk.toString())) processStderrLine(l, true)
       })
 
       // TASK 3 — -progress (fd 3): primer frame codificado + progreso periódico.
@@ -2626,6 +2645,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       proc.on('close', () => {
         if (closeHandled) return
         closeHandled = true
+        // Procesar el residual de stderr (última línea sin '\n') ANTES de
+        // clasificar / decidir el fallback post-close, para no perder una
+        // evidencia de audio que llegó en el último fragmento sin salto.
+        flushStderrCarry()
         const code = exitCode
         const elapsedMs = Date.now() - streamStartMs
         server.log.info(

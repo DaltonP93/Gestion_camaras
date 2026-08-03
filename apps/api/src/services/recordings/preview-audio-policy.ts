@@ -213,9 +213,13 @@ export function resolvePreviewAudioPolicy(opts: {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Extrae evidencia de AUDIO desde el texto de stderr de FFmpeg, distinguiendo
- * explícitamente el stream de audio del de video ("no decoder found" NO puede
- * asumirse global). Trabaja sobre el tail acumulado (multilinea).
+ * Extrae evidencia de AUDIO desde el texto de stderr de FFmpeg. Distingue
+ * audio de video por **correlación de índice de stream** (#prog:idx), NO por una
+ * allow-list de codecs — reconoce cualquier codec presente o futuro (adpcm,
+ * g726, g722, speex, opus, pcm, aac, …). Como respaldo para líneas de error sin
+ * índice, usa una deny-list acotada de codecs de VIDEO. Trabaja sobre el tail
+ * acumulado (multilinea), por lo que la definición del stream y el error de
+ * decoder pueden llegar en chunks/orden distintos.
  */
 export function detectAudioStderrEvidence(stderrText: string): {
   audioStreamSeen: boolean
@@ -226,40 +230,82 @@ export function detectAudioStderrEvidence(stderrText: string): {
   audioTrackDisabled: boolean
 } {
   const t = stderrText || ''
-  // Línea de stream de audio: "Stream #0:1: Audio: <codec>" (codec puede faltar).
-  const audioLineRe = /stream #\d+:\d+(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*audio:\s*([a-z0-9_]+)?/i
-  const audioLineMatch = t.match(audioLineRe)
-  const audioStreamSeen = !!audioLineMatch
-  const audioCodec = audioLineMatch && audioLineMatch[1] ? audioLineMatch[1].toLowerCase() : null
 
-  // Indicadores audio-scoped (mencionan codec de audio, "none"/"unknown", o "Audio:").
-  const AUDIO_TOKENS = /(pcm_?mulaw|pcm_?alaw|g\.?711|ulaw|alaw|\baac\b|\bopus\b|\bmp2\b|\bmp3\b|\bac3\b|audio:)/i
-  const VIDEO_TOKENS = /(video:|hevc|h\.?265|h\.?264|\bavc\b|mpeg4)/i
-
-  // decoder de audio ausente:
-  //   - "no decoder found for: none" / "No decoder found for codec none|unknown"
-  //   - "Decoder (codec X) not found ... " scoped a audio y NO a video.
-  let audioDecoderUnavailable = false
-  if (/(no decoder (?:found )?for(?: codec)?:?\s*(?:none|unknown)\b)/i.test(t)) audioDecoderUnavailable = true
-  for (const raw of t.split('\n')) {
-    const line = raw.trim()
-    if (!/decoder[^\n]*not found|not found[^\n]*decoder/i.test(line)) continue
-    if (VIDEO_TOKENS.test(line)) continue // decoder de VIDEO → no es evidencia de audio
-    if (AUDIO_TOKENS.test(line) || /\b(none|unknown)\b/i.test(line)) audioDecoderUnavailable = true
+  // 1) Mapa de streams declarados: "Stream #0:1: Audio: <codec>" / "...: Video: <codec>".
+  //    Se indexa por clave completa "0:1" y por índice numérico "1" (respaldo).
+  type StreamType = 'audio' | 'video'
+  const streams = new Map<string, { type: StreamType; codec: string | null }>()
+  let audioStreamSeen = false
+  let audioCodec: string | null = null
+  const declRe = /stream #(\d+):(\d+)(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*(video|audio):\s*([a-z0-9_]+)?/ig
+  let dm: RegExpExecArray | null
+  while ((dm = declRe.exec(t)) !== null) {
+    const prog = dm[1], idx = dm[2]
+    const type = dm[3].toLowerCase() as StreamType
+    const codec = dm[4] ? dm[4].toLowerCase() : null
+    const entry = { type, codec }
+    streams.set(`${prog}:${idx}`, entry)
+    if (!streams.has(idx)) streams.set(idx, entry) // respaldo numérico (1er programa)
+    if (type === 'audio') {
+      audioStreamSeen = true
+      if (audioCodec == null && codec) audioCodec = codec
+    }
   }
 
-  // parámetros de codec de audio incompletos.
-  const audioParametersIncomplete =
-    /could not find codec parameters[^\n]*\(?\s*audio/i.test(t) ||
-    /(audio:[^\n]*)could not find codec parameters/i.test(t)
+  // Deny-list ACOTADA de codecs de VIDEO (conjunto estable en playback de NVR).
+  // Todo lo que NO sea video se considera potencialmente audio (sin allow-list).
+  const isVideoCodec = (c: string | null): boolean =>
+    !!c && /^(hevc|h265|h\.265|h264|h\.264|avc1?|mpeg4|mpeg2video|mjpeg|vp8|vp9|av1|h263)$/i.test(c)
 
-  // audio que impide muxear (tag/encoder para el stream de audio).
+  // Resuelve el tipo de stream al que apunta una línea de error.
+  const refTypeOf = (line: string): StreamType | null => {
+    // Pista inline explícita "(Audio: ...)" / "(Video: ...)".
+    if (/\(audio[:\s)]/i.test(line)) return 'audio'
+    if (/\(video[:\s)]/i.test(line)) return 'video'
+    // Referencia por índice "#0:1".
+    const full = line.match(/#(\d+):(\d+)/)
+    if (full) { const e = streams.get(`${full[1]}:${full[2]}`); if (e) return e.type }
+    // Referencia por índice numérico "stream 1".
+    const num = line.match(/\bstream #?(\d+)\b/i)
+    if (num) { const e = streams.get(num[1]); if (e) return e.type }
+    return null
+  }
+
+  // Extrae el codec nombrado en una línea de error ("(codec X)" / "for codec X" / "for: X").
+  const codecInLine = (line: string): string | null => {
+    const m =
+      line.match(/\(codec\s+([a-z0-9_]+)\)/i) ||
+      line.match(/for(?:\s+codec)?:?\s+([a-z0-9_]+)\b/i) ||
+      line.match(/unsupported codec[^\n]*?\b([a-z0-9_]+)\b\s*$/i)
+    return m ? m[1].toLowerCase() : null
+  }
+
+  let audioDecoderUnavailable = false
   let audioMuxIncompatible = false
+  let audioParametersIncomplete = false
+
   for (const raw of t.split('\n')) {
     const line = raw.trim()
-    if (VIDEO_TOKENS.test(line)) continue
-    if (/could not find tag for codec[^\n]*stream #\d+:\d+/i.test(line) && AUDIO_TOKENS.test(line)) audioMuxIncompatible = true
-    if (/automatic encoder selection failed[^\n]*audio/i.test(line)) audioMuxIncompatible = true
+    if (!line) continue
+
+    const isDecoderErr = /decoder[^\n]*not found|not found[^\n]*decoder|no decoder[^\n]*for|error while opening decoder|could not open decoder|unsupported codec/i.test(line)
+    const isCodecParams = /could not find codec parameters/i.test(line)
+    const isMuxTag = /could not find tag for codec|automatic encoder selection failed/i.test(line)
+    if (!isDecoderErr && !isCodecParams && !isMuxTag) continue
+
+    // Tipo del stream referido: correlación por índice/inline; si no hay, por codec.
+    let type = refTypeOf(line)
+    if (type == null) {
+      const c = codecInLine(line)
+      if (isVideoCodec(c)) type = 'video'
+      else if (c && c !== 'none' && c !== 'unknown') type = 'audio' // codec no-video ⇒ audio
+      else if (/\b(none|unknown)\b/i.test(line)) type = 'audio'     // "for: none"/"unknown"
+    }
+    if (type !== 'audio') continue // video o indeterminado no-audio ⇒ no evidencia de audio
+
+    if (isDecoderErr) audioDecoderUnavailable = true
+    if (isCodecParams) audioParametersIncomplete = true
+    if (isMuxTag) audioMuxIncompatible = true
   }
 
   const audioTrackDisabled = /audio[^\n]*\b(disabled|deshabilitad)/i.test(t)
@@ -327,4 +373,30 @@ export function decideReactiveAudioRestart(opts: {
   const stableAudioEvidence = decision.videoOnly && AUDIO_EVIDENCE_REASONS.has(decision.reason)
 
   return { restart: decision.videoOnly, decision, stableAudioEvidence }
+}
+
+/**
+ * Buffer de reensamblado de líneas de stderr. Node NO garantiza que los chunks
+ * coincidan con líneas: se acumula y sólo se emiten líneas COMPLETAS; la última
+ * (sin '\n') queda pendiente hasta el próximo chunk o el flush final. No inserta
+ * saltos artificiales entre fragmentos: reconstruye la línea original tal cual.
+ * La MISMA línea reconstruida alimenta a todos los consumidores.
+ */
+export function makeStderrLineBuffer() {
+  let carry = ''
+  return {
+    /** Acumula un chunk y devuelve las líneas COMPLETAS disponibles. */
+    push(chunk: string): string[] {
+      carry += chunk
+      const parts = carry.split(/\r?\n/)
+      carry = parts.pop() ?? ''
+      return parts
+    },
+    /** Devuelve el residual final (línea sin '\n') y lo vacía. */
+    flush(): string | null {
+      const r = carry
+      carry = ''
+      return r || null
+    },
+  }
 }

@@ -324,3 +324,131 @@ describe('máquina de stderr simulada (HEVC + Audio: none) — un único fallbac
     expect(r.restart).toBe(false)
   })
 })
+
+// ─── P2 Codex: correlación por índice de stream + reensamblado de chunks ──────
+
+import { makeStderrLineBuffer } from './preview-audio-policy'
+
+// Simula el consumo por chunks del handler real usando el MISMO buffer que la ruta.
+function runStderrChunks(chunks: string[], configuredMode: 'auto' | 'enabled' | 'disabled' = 'auto') {
+  const buf = makeStderrLineBuffer()
+  let tail: string[] = []
+  let audioSeen = false
+  let detectedAudioCodec: string | null = null
+  let attemptVideoOnly = false
+  let audioFallbackTried = false
+  let restarts = 0
+  const feed = (line: string) => {
+    const l = line.trim()
+    if (!l) return
+    tail.push(l); if (tail.length > 30) tail.shift()
+    const info = detectAudioStderrEvidence(l)
+    if (info.audioStreamSeen) audioSeen = true
+    if (info.audioCodec) detectedAudioCodec = info.audioCodec
+    const r = decideReactiveAudioRestart({
+      configuredMode, detectedAudioCodec, audioStreamSeen: audioSeen,
+      stderrText: tail.join('\n'), attemptVideoOnly, firstByteSent: false, audioFallbackTried,
+    })
+    if (r.restart) { restarts++; audioFallbackTried = true; attemptVideoOnly = true }
+  }
+  for (const c of chunks) for (const l of buf.push(c)) feed(l)
+  const resid = buf.flush(); if (resid) feed(resid)
+  return { restarts, detectedAudioCodec }
+}
+
+describe('makeStderrLineBuffer — reensamblado', () => {
+  it('línea partida en dos chunks se reconstruye', () => {
+    const buf = makeStderrLineBuffer()
+    expect(buf.push('Stream #0:1: Aud')).toEqual([])
+    expect(buf.push('io: none\n')).toEqual(['Stream #0:1: Audio: none'])
+  })
+  it('no inserta saltos artificiales entre fragmentos', () => {
+    const buf = makeStderrLineBuffer()
+    buf.push('abc'); buf.push('def\n')
+    // reconstruye "abcdef", no "abc\ndef"
+    expect(buf.push('')).toEqual([])
+  })
+  it('flush devuelve el residual sin salto final', () => {
+    const buf = makeStderrLineBuffer()
+    buf.push('line1\npartial')
+    expect(buf.flush()).toBe('partial')
+  })
+})
+
+describe('P2 test 1/2 — "Audio: none" partida en chunks ⇒ un único fallback', () => {
+  it('dos chunks', () => {
+    const r = runStderrChunks(['Stream #0:0: Video: hevc\nStream #0:1: Aud', 'io: none\n'])
+    expect(r.restarts).toBe(1)
+    expect(r.detectedAudioCodec).toBe('none')
+  })
+  it('tres chunks', () => {
+    const r = runStderrChunks(['Stream #0:1: Au', 'dio: no', 'ne\n'])
+    expect(r.restarts).toBe(1)
+  })
+})
+
+describe('P2 test 3/4/5 — correlación por índice, codec arbitrario', () => {
+  it('codec arbitrario adpcm_g726le en #0:1 (audio) ⇒ fallback', () => {
+    const r = runStderrChunks([
+      'Stream #0:0: Video: hevc, 1920x1080\n',
+      'Stream #0:1: Audio: adpcm_g726le\n',
+      'Decoder (codec adpcm_g726le) not found for input stream #0:1\n',
+    ])
+    expect(r.restarts).toBe(1)
+  })
+  it('mismo mensaje para #0:0 (video) ⇒ NO fallback de audio', () => {
+    const ev = detectAudioStderrEvidence(
+      'Stream #0:0: Video: hevc\nDecoder (codec hevc) not found for input stream #0:0'
+    )
+    expect(ev.audioDecoderUnavailable).toBe(false)
+    const r = runStderrChunks([
+      'Stream #0:0: Video: hevc\n',
+      'Decoder (codec hevc) not found for input stream #0:0\n',
+    ])
+    expect(r.restarts).toBe(0)
+  })
+  it('orden invertido: error de decoder ANTES de la definición del stream', () => {
+    const r = runStderrChunks([
+      'Decoder (codec adpcm_g726le) not found for input stream #0:1\n',
+      'Stream #0:1: Audio: adpcm_g726le\n',
+    ])
+    expect(r.restarts).toBe(1)
+  })
+})
+
+describe('P2 test 6/8/9 — un solo fallback / AAC / Box 4', () => {
+  it('varios chunks no generan múltiples fallback', () => {
+    const r = runStderrChunks([
+      'Stream #0:0: Video: hevc\n', 'Stream #0:1: Audio: none\n',
+      'more stderr line a\n', 'more stderr line b\n', 'Output #0, mp4\n',
+    ])
+    expect(r.restarts).toBe(1)
+  })
+  it('AAC válido no dispara fallback', () => {
+    const r = runStderrChunks(['Stream #0:0: Video: h264\nStream #0:1: Audio: aac (LC)\n'])
+    expect(r.restarts).toBe(0)
+  })
+  it('Box 4: HEVC + Audio: none ⇒ un fallback', () => {
+    const r = runStderrChunks(['Stream #0:0: Video: hevc\nStream #0:1: Audio: none\n'])
+    expect(r.restarts).toBe(1)
+  })
+})
+
+describe('detectAudioStderrEvidence — correlación (codec-agnóstica)', () => {
+  it('reconoce cualquier codec de audio por índice, sin allow-list', () => {
+    for (const codec of ['adpcm_g726le', 'g722', 'speex', 'nellymoser', 'wmav2']) {
+      const ev = detectAudioStderrEvidence(
+        `Stream #0:1: Audio: ${codec}\nDecoder (codec ${codec}) not found for input stream #0:1`
+      )
+      expect(ev.audioDecoderUnavailable, codec).toBe(true)
+    }
+  })
+  it('decoder faltante de VIDEO nunca marca evidencia de audio', () => {
+    for (const codec of ['hevc', 'h264', 'mpeg4', 'av1']) {
+      const ev = detectAudioStderrEvidence(
+        `Stream #0:0: Video: ${codec}\nDecoder (codec ${codec}) not found for input stream #0:0`
+      )
+      expect(ev.audioDecoderUnavailable, codec).toBe(false)
+    }
+  })
+})
