@@ -533,3 +533,57 @@ describe('aislamiento con leases en cierre', () => {
     expect(c.activeCount('nvr-A')).toBe(2)
   })
 })
+
+// ─── Codex #144 (2ª ronda): TODA ruta de cierre espera la salida ─────────────
+
+describe('P1 — el cupo no se suelta mientras el proceso siga vivo, venga de donde venga', () => {
+  // Simula el helper releasePlaybackLeaseAfterExit del route: marca TERMINATING
+  // y sólo libera cuando el registry confirma la salida. Se ejercita el
+  // invariante para las rutas que ANTES liberaban de inmediato:
+  // desconexión del cliente y presupuesto de arranque agotado.
+  const teardownWithLiveProcess = (
+    c: NvrPlaybackAdmissionController, sessionId: string, reason: string,
+  ) => {
+    c.markTerminating({ nvrId: 'nvr-A', sessionId })
+    return {
+      confirmExit: () => c.release({ nvrId: 'nvr-A', sessionId, reason }),
+    }
+  }
+
+  for (const reason of ['client_disconnect', 'request_error', 'startup_budget_exhausted', 'watchdog']) {
+    it(`cierre por ${reason}: la cola NO se promueve hasta la salida real`, () => {
+      const { c } = ctl({ globalDefault: 1 })
+      c.acquire(req({ sessionId: 'sA' }))
+      c.markConsumed({ nvrId: 'nvr-A', sessionId: 'sA' })
+      c.acquire(req({ sessionId: 'sB', slotIndex: 1 }))
+
+      const t = teardownWithLiveProcess(c, 'sA', reason)
+      // Mientras el FFmpeg vive, el cupo sigue tomado y B espera.
+      expect(c.leaseState('nvr-A', 'sA')).toBe('terminating')
+      expect(c.activeCount('nvr-A')).toBe(1)
+      expect(c.hasLease('nvr-A', 'sB')).toBe(false)
+      expect(c.reconcile('nvr-A')).toHaveLength(0)
+
+      // Confirmada la salida, se libera y se promueve exactamente una vez.
+      const r = t.confirmExit()
+      expect(r.released).toBe(true)
+      expect(r.promoted.map(p => p.sessionId)).toEqual(['sB'])
+      expect(c.hasLease('nvr-A', 'sB')).toBe(true)
+    })
+  }
+
+  it('cierres concurrentes por varias rutas liberan y promueven una sola vez', () => {
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.acquire(req({ sessionId: 'sB', slotIndex: 1 }))
+    // DELETE + client_disconnect + watchdog compiten por cerrar la misma sesión.
+    c.markTerminating({ nvrId: 'nvr-A', sessionId: 'sA' })
+    c.markTerminating({ nvrId: 'nvr-A', sessionId: 'sA' })
+    const r1 = c.release({ nvrId: 'nvr-A', sessionId: 'sA', reason: 'delete_endpoint' })
+    const r2 = c.release({ nvrId: 'nvr-A', sessionId: 'sA', reason: 'client_disconnect' })
+    const r3 = c.release({ nvrId: 'nvr-A', sessionId: 'sA', reason: 'watchdog' })
+    expect([r1, r2, r3].filter(r => r.released)).toHaveLength(1)
+    expect([r1, r2, r3].flatMap(r => r.promoted)).toHaveLength(1)
+    expect(c.activeCount('nvr-A')).toBe(1)   // sólo sB
+  })
+})

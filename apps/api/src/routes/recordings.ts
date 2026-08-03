@@ -673,46 +673,17 @@ function terminatePreviewSessionInner(sessionId: string, session: PreviewSession
     return
   }
 
-  // CON procesos: el lease pasa a TERMINATING y SIGUE ocupando capacidad. Un cupo
-  // representa una sesión RTSP real: durante SIGTERM / kill grace / drenaje el
-  // proceso anterior todavía la tiene tomada contra el NVR. Promover ahora abriría
-  // una segunda sesión y volvería a producir 453 (review Codex #143).
-  admission.markTerminating({ nvrId: session.nvrId, sessionId })
-  log(
-    `[recordings-preview] nvr_playback_lease_terminating nvrId=${session.nvrId} sessionId=${sessionId}` +
-    ` leaseType=${admission.leaseTypeOf(session.nvrId, sessionId) ?? 'preview'} cameraId=${session.cameraId}` +
-    ` reason=${reason} aliveCount=${reg!.aliveCount()} activeCount=${admission.activeCount(session.nvrId)}` +
-    ` queuedCount=${admission.queuedCount(session.nvrId)}`
-  )
+  // CON procesos: el cierre pasa por la ÚNICA vía que espera la salida real.
+  // El lease queda TERMINATING y sigue ocupando capacidad hasta que el registry
+  // confirme aliveCount()===0; recién ahí se libera y se promueve la cola.
   const pending = terminateAllPreviewChildren(session, reason, log)  // (12c)
   if (pending > 0) {                           // (12e) confirmar, o marcar pendiente
     log(`[recordings-preview] cleanup_pending sessionId=${sessionId} reason=${reason} pendingChildren=${pending}`)
   }
-
-  // Esperar la salida REAL antes de liberar y promover. Orden observable:
-  //   lease_terminating → ffmpeg exit/close → aliveCount=0 → lease_released → queue_promoted
-  void reg!.waitAllExited(PREVIEW_TERMINATION_WAIT_MS).then((allExited) => {
-    if (allExited) {
-      log(
-        `[recordings-preview] nvr_playback_processes_exit_confirmed nvrId=${session.nvrId}` +
-        ` sessionId=${sessionId} aliveCount=0 reason=${reason}`
-      )
-      releasePlaybackLease(session.nvrId, sessionId, reason)
-      if (!already) {
-        log(`[recordings-preview] session_deleted sessionId=${sessionId} slotIndex=${session.slotIndex} reason=${reason}`)
-      }
-      return
-    }
-    // El hard kill venció y el registry AÚN reporta vivos: NO liberar, NO
-    // promover. Queda para que el barrido lo reintente cuando salgan de verdad.
-    admission.markTerminating({ nvrId: session.nvrId, sessionId, stuck: true })
-    stuckTerminations.set(sessionId, { nvrId: session.nvrId, cameraId: session.cameraId, registry: reg!, reason, since: Date.now() })
-    log(
-      `[recordings-preview] nvr_playback_termination_stuck nvrId=${session.nvrId} sessionId=${sessionId}` +
-      ` cameraId=${session.cameraId} reason=${reason} aliveCount=${reg!.aliveCount()}` +
-      ` activeCount=${admission.activeCount(session.nvrId)}`
-    )
-  })
+  releasePlaybackLeaseAfterExit(session, sessionId, reason, log)
+  if (!already) {
+    log(`[recordings-preview] session_deleted sessionId=${sessionId} slotIndex=${session.slotIndex} reason=${reason}`)
+  }
 }
 
 // Métricas para /metrics (Prometheus) — solo conteos, sin datos sensibles.
@@ -824,6 +795,57 @@ const PREVIEW_UNCONSUMED_LEASE_MS = Math.max(
   10_000,
   parseInt(process.env.RECORDINGS_UNCONSUMED_LEASE_MS || '', 10) || 45_000,
 )
+
+/**
+ * ÚNICA vía para soltar el cupo de un stream. Espera la salida REAL de los
+ * procesos antes de liberar y promover: un cupo representa una sesión RTSP real
+ * y, durante SIGTERM / kill grace / drenaje del pipe, el FFmpeg anterior todavía
+ * la tiene tomada contra el NVR.
+ *
+ * TODAS las rutas de cierre deben pasar por acá — teardown ordenado,
+ * desconexión del cliente, error de request, presupuesto total agotado,
+ * watchdog — o el solapamiento (y el 453) vuelve por la puerta que quede
+ * abierta (review Codex #144).
+ *
+ * Idempotente: varias llamadas concurrentes esperan en paralelo, pero sólo la
+ * primera liberación efectiva promueve la cola.
+ */
+function releasePlaybackLeaseAfterExit(
+  session: PreviewSession, sessionId: string, reason: string, log: (m: string) => void,
+): void {
+  const reg = session.procRegistry
+  // Sin procesos vivos el cupo no corresponde a ninguna sesión RTSP: liberar ya.
+  if (!reg || reg.aliveCount() === 0) {
+    releasePlaybackLease(session.nvrId, sessionId, reason)
+    return
+  }
+  admission.markTerminating({ nvrId: session.nvrId, sessionId })
+  log(
+    `[recordings-preview] nvr_playback_lease_terminating nvrId=${session.nvrId} sessionId=${sessionId}` +
+    ` leaseType=${admission.leaseTypeOf(session.nvrId, sessionId) ?? 'preview'} cameraId=${session.cameraId}` +
+    ` reason=${reason} aliveCount=${reg.aliveCount()} activeCount=${admission.activeCount(session.nvrId)}` +
+    ` queuedCount=${admission.queuedCount(session.nvrId)}`
+  )
+  void reg.waitAllExited(PREVIEW_TERMINATION_WAIT_MS).then((allExited) => {
+    if (allExited) {
+      log(
+        `[recordings-preview] nvr_playback_processes_exit_confirmed nvrId=${session.nvrId}` +
+        ` sessionId=${sessionId} aliveCount=0 reason=${reason}`
+      )
+      releasePlaybackLease(session.nvrId, sessionId, reason)
+      return
+    }
+    admission.markTerminating({ nvrId: session.nvrId, sessionId, stuck: true })
+    stuckTerminations.set(sessionId, {
+      nvrId: session.nvrId, cameraId: session.cameraId, registry: reg, reason, since: Date.now(),
+    })
+    log(
+      `[recordings-preview] nvr_playback_termination_stuck nvrId=${session.nvrId} sessionId=${sessionId}` +
+      ` cameraId=${session.cameraId} reason=${reason} aliveCount=${reg.aliveCount()}` +
+      ` activeCount=${admission.activeCount(session.nvrId)}`
+    )
+  })
+}
 
 /** Logger inyectado por las rutas para los eventos de capacidad. */
 let releaseLeaseLogger: ((msg: string) => void) | null = null
@@ -2339,8 +2361,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // La reserva quedó CONSUMIDA: ya no puede expirar por "concedida y nunca
     // usada". A partir de aquí el lease vive hasta que el proceso se recolecte.
     admission.markConsumed({ nvrId: session.nvrId, sessionId })
-    // Liberador del lease: idempotente y ligado a la recolección del proceso.
-    const releaseNvrSlot = (reason: string) => releasePlaybackLease(session.nvrId, sessionId, reason)
+    // Liberador del lease: SIEMPRE a través de la espera de salida real, para que
+    // la desconexión del cliente y el presupuesto agotado no promuevan la cola
+    // con el FFmpeg anterior todavía vivo (review Codex #144).
+    const releaseNvrSlot = (reason: string) =>
+      releasePlaybackLeaseAfterExit(session, sessionId, reason, (m) => server.log.info(m))
 
     // Session may have been deleted while waiting in the queue
     if (!previewSessions.has(sessionId)) {
