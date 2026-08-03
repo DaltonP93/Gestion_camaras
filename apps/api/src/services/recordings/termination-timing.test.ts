@@ -145,3 +145,44 @@ describe('getTerminationTiming — fuente única, memoizada y con clamping obser
     expect(lines).toHaveLength(0)
   })
 })
+
+describe('normalización estricta de cadenas (Codex #145)', () => {
+  // parseInt acepta prefijos parciales: "1e5"->1, "2000ms"->2000. Una config mal
+  // formada debe caer al DEFAULT determinista, no colarse ni elevarse al mínimo.
+  it('cadenas no decimales completas caen al default, no a un valor parcial', () => {
+    for (const bad of ['1e5', '2000ms', '12abc', '1.5', ' 20 00', '0x10', '+5000', '-5000', '', '   ']) {
+      const t = resolveTerminationTiming({
+        previewKillGraceMs: '2000', configuredTerminationWaitMs: bad,
+      })
+      expect(t.requestedTerminationWaitMs, `configured=${JSON.stringify(bad)}`).toBeNull()
+      expect(t.effectiveTerminationWaitMs, `configured=${JSON.stringify(bad)}`).toBe(DEFAULT_TERMINATION_WAIT_MS)
+      expect(t.wasClamped).toBe(false)
+    }
+  })
+
+  it('"1e5" ya NO produce una espera efectiva de 5 s', () => {
+    const t = resolveTerminationTiming({ previewKillGraceMs: 2_000, configuredTerminationWaitMs: '1e5' })
+    expect(t.effectiveTerminationWaitMs).not.toBe(5_000)
+    expect(t.effectiveTerminationWaitMs).toBe(DEFAULT_TERMINATION_WAIT_MS)
+  })
+
+  it('un kill grace mal formado cae al default (no al mínimo)', () => {
+    const t = resolveTerminationTiming({ previewKillGraceMs: '2e3', configuredTerminationWaitMs: '15000' })
+    expect(t.previewKillGraceMs).toBe(DEFAULT_KILL_GRACE_MS)
+    expect(t.effectiveTerminationWaitMs).toBe(15_000)
+  })
+
+  it('cadenas decimales válidas siguen aceptándose (con espacios alrededor)', () => {
+    const t = resolveTerminationTiming({ previewKillGraceMs: ' 20000 ', configuredTerminationWaitMs: '30000' })
+    expect(t.previewKillGraceMs).toBe(20_000)
+    expect(t.requestedTerminationWaitMs).toBe(30_000)
+    expect(t.effectiveTerminationWaitMs).toBe(30_000)
+  })
+
+  it('tipos no numéricos ni cadena se rechazan', () => {
+    for (const bad of [{}, [], true, () => 1]) {
+      const t = resolveTerminationTiming({ configuredTerminationWaitMs: bad as any })
+      expect(t.requestedTerminationWaitMs).toBeNull()
+    }
+  })
+})

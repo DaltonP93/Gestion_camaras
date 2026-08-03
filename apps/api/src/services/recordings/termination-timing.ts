@@ -40,9 +40,26 @@ export interface TerminationTiming {
   exitConfirmationMarginMs: number
 }
 
-/** Normaliza un entero dentro de [min,max]; null si no es utilizable. */
+/**
+ * Normaliza un entero de milisegundos dentro de [min,max]; null si el valor no
+ * es utilizable, en cuyo caso el llamador aplica su default determinista.
+ *
+ * Una cadena debe ser un entero DECIMAL COMPLETO. No se usa parseInt suelto
+ * porque acepta prefijos parciales: "1e5" daría 1 y "2000ms" daría 2000, de modo
+ * que una configuración mal formada se aceptaría en silencio (o peor, se
+ * elevaría al mínimo) en vez de caer al default (review Codex #145).
+ */
 function normalizeMs(value: unknown, min: number, max: number): number | null {
-  const n = typeof value === 'string' ? parseInt(value, 10) : Number(value)
+  let n: number
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!/^\d+$/.test(trimmed)) return null   // rechaza "", "1e5", "2000ms", "-5", "1.5"
+    n = Number(trimmed)
+  } else if (typeof value === 'number') {
+    n = value
+  } else {
+    return null
+  }
   if (!Number.isFinite(n)) return null
   const floored = Math.floor(n)
   if (floored <= 0) return null

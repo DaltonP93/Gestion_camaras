@@ -174,13 +174,33 @@ ALTER TABLE "recordings_settings" DROP COLUMN IF EXISTS "recordingsDefaultMaxCon
 
 ### 2.1 Configurar o confirmar el límite efectivo
 
-Por NVR (recomendado para la prueba):
+> **Antes de modificar nada, ANOTÁ el valor actual.** Si el NVR ya tenía un
+> límite explícito distinto de 1, sobrescribirlo sin registrarlo dejaría todas
+> sus reproducciones serializadas de forma permanente después de la prueba.
+> La restauración es obligatoria en §2.4, tanto si el resultado es GO como
+> NO-GO.
+
+**Paso 0 — registrar el estado previo** (copiá la salida a la evidencia):
+
+```bash
+docker exec visioncore_postgres psql -U visioncore -d visioncore_db -c \
+  "SELECT id, name, \"maxConcurrentPlaybackSessions\" AS valor_previo
+     FROM nvrs WHERE id = '<nvrId-de-prueba>';"
+
+docker exec visioncore_postgres psql -U visioncore -d visioncore_db -c \
+  'SELECT "recordingsDefaultMaxConcurrentPerNvr" AS global_previo FROM recordings_settings;'
+```
+
+Anotá: `valor_previo = ____` (puede ser `NULL` = auto) y `global_previo = ____`.
+
+**Opción A — por NVR (recomendada)**: sólo afecta al NVR de prueba.
 
 ```sql
 UPDATE nvrs SET "maxConcurrentPlaybackSessions" = 1 WHERE id = '<nvrId-de-prueba>';
 ```
 
-o dejarlo en `NULL` (auto) y fijar el global:
+**Opción B — global**: úsala sólo si necesitás dejar el NVR en `auto`. Afecta a
+**todos** los NVR sin límite propio, así que restaurala sí o sí al terminar.
 
 ```sql
 UPDATE recordings_settings SET "recordingsDefaultMaxConcurrentPerNvr" = 1 WHERE id = 'singleton';
@@ -226,6 +246,33 @@ docker logs --since 10m visioncore_api 2>&1 \
 
 Confirmá además que el `sessionId` de B en `nvr_playback_queue_promoted` es el
 **mismo** que el de su `preview_queued` inicial (no se creó otra sesión).
+
+### 2.4 Restaurar el límite (OBLIGATORIO, con GO o con NO-GO)
+
+Al terminar la validación devolvé la configuración a su valor previo. Omitir
+este paso deja las reproducciones de ese NVR —o de todos, si usaste la opción
+B— innecesariamente serializadas.
+
+```sql
+-- Si usaste la opción A y el valor previo era un número:
+UPDATE nvrs SET "maxConcurrentPlaybackSessions" = <valor_previo> WHERE id = '<nvrId-de-prueba>';
+
+-- Si el valor previo era NULL (auto):
+UPDATE nvrs SET "maxConcurrentPlaybackSessions" = NULL WHERE id = '<nvrId-de-prueba>';
+
+-- Si usaste la opción B (global):
+UPDATE recordings_settings SET "recordingsDefaultMaxConcurrentPerNvr" = <global_previo> WHERE id = 'singleton';
+```
+
+Verificá que el endpoint vuelva a mostrar el `effectiveLimit` esperado:
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "$BASE_URL/api/admin/diagnostics/recording-playback-capacity" \
+  | jq '.nvrs[] | {nvrName, configuredLimit, effectiveLimit}'
+```
+
+Dejá constancia en la evidencia: `límite restaurado a ____ (hora ____)`.
 
 ---
 
@@ -298,6 +345,10 @@ Valores efectivos: kill_grace=____ wait=____ margin=____ unconsumed=____ cooldow
 ¿Hubo recordings_termination_wait_clamped al arrancar?  sí / no
 
 NVR de prueba:      nvrId=____________  nombre=____________  effectiveLimit=____
+Límite PREVIO del NVR (valor_previo):  ____________   (NULL = auto)
+Límite global PREVIO (global_previo):  ____________
+Opción usada para fijar el límite:     A (por NVR) / B (global)
+Límite RESTAURADO a: ____________  hora: ____________
 Cámara A:           cameraId=__________  nombre=____________
 Cámara B:           cameraId=__________  nombre=____________
 Cámara C (otro NVR):cameraId=__________  nombre=____________  nvrId=__________
@@ -324,6 +375,8 @@ nvr_playback_processes_exit_confirmed …
 nvr_playback_lease_released           …
 nvr_playback_queue_promoted           …
 ```
+
+**¿Se restauró el límite de capacidad?** sí / no  — obligatorio antes de cerrar.
 
 **Conclusión:** GO / NO-GO
 **Motivo (si NO-GO):**
