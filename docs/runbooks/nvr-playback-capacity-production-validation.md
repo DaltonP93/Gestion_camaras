@@ -75,6 +75,11 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   "$BASE_URL/api/admin/diagnostics/recording-playback-capacity" | jq .
 ```
 
+> El endpoint refleja el estado **en memoria** del controlador: un NVR sin
+> reproducciones ni cola **no aparece** en la lista, y los límites que muestra son
+> los que se cargaron en la última reproducción/diagnóstico de ese NVR. Para ver
+> la configuración persistida usá las consultas SQL de §1.6.
+
 Salida relevante por NVR: `configuredLimit`, `effectiveLimit`,
 `temporaryCapacityReduction`, `activeCount`, `queuedCount`, `last453At`,
 `cooldownUntil`, más `active[]` (con `sessionId`, `cameraId`, `cameraName`,
@@ -206,8 +211,24 @@ UPDATE nvrs SET "maxConcurrentPlaybackSessions" = 1 WHERE id = '<nvrId-de-prueba
 UPDATE recordings_settings SET "recordingsDefaultMaxConcurrentPerNvr" = 1 WHERE id = 'singleton';
 ```
 
-Confirmá en el endpoint que `effectiveLimit` sea `1` (la configuración se relee
-con un TTL corto; si no se refleja, esperá ~30 s).
+**Cómo verificar el cambio (importante):** el endpoint de diagnóstico expone el
+estado **en memoria** del controlador (`admission.snapshot()`) y **no consulta la
+base**. El límite por NVR y el global se cargan al controlador únicamente cuando
+arranca un preview o un diagnóstico de ese NVR; además, un NVR sin actividad ni
+siquiera aparece en el snapshot. Por lo tanto:
+
+1. **Verificá la configuración en la BASE**, que es la fuente de verdad:
+
+```bash
+docker exec visioncore_postgres psql -U visioncore -d visioncore_db -c \
+  "SELECT id, name, \"maxConcurrentPlaybackSessions\" FROM nvrs WHERE id = '<nvrId-de-prueba>';"
+docker exec visioncore_postgres psql -U visioncore -d visioncore_db -c \
+  'SELECT "recordingsDefaultMaxConcurrentPerNvr" FROM recordings_settings;'
+```
+
+2. El `effectiveLimit` del endpoint reflejará el valor nuevo **recién a partir de
+   la primera reproducción posterior al cambio** (paso 2 de §2.2). Confirmalo
+   ahí, no antes: esperar sin reproducir nada no lo actualiza.
 
 ### 2.2 Secuencia
 
@@ -264,7 +285,18 @@ UPDATE nvrs SET "maxConcurrentPlaybackSessions" = NULL WHERE id = '<nvrId-de-pru
 UPDATE recordings_settings SET "recordingsDefaultMaxConcurrentPerNvr" = <global_previo> WHERE id = 'singleton';
 ```
 
-Verificá que el endpoint vuelva a mostrar el `effectiveLimit` esperado:
+Verificá la restauración **en la base** (el endpoint no la relee):
+
+```bash
+docker exec visioncore_postgres psql -U visioncore -d visioncore_db -c \
+  "SELECT id, name, \"maxConcurrentPlaybackSessions\" FROM nvrs WHERE id = '<nvrId-de-prueba>';"
+docker exec visioncore_postgres psql -U visioncore -d visioncore_db -c \
+  'SELECT "recordingsDefaultMaxConcurrentPerNvr" FROM recordings_settings;'
+```
+
+Si querés confirmarlo también en el endpoint, reproducí una vez cualquier cámara
+de ese NVR y volvé a consultarlo: el controlador recarga el límite al arrancar
+esa reproducción.
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
