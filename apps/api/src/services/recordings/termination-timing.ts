@@ -12,6 +12,10 @@
 // gracia, el lease sólo se liberaría en el barrido periódico y toda la cola de
 // ese NVR quedaría bloqueada innecesariamente.
 //
+// También resuelve los otros dos plazos de capacidad (reserva no consumida y
+// cooldown tras un 453), porque comparten el mismo problema: el valor CRUDO del
+// entorno no es necesariamente el efectivo.
+//
 // Estas variables de entorno se leen ACÁ y en ningún otro archivo.
 
 /** Margen para recibir exit/close, drenar stdio, correr markExited y actualizar aliveCount. */
@@ -20,6 +24,14 @@ export const EXIT_CONFIRMATION_MARGIN_MS = 3_000
 export const DEFAULT_TERMINATION_WAIT_MS = 12_000
 /** Gracia SIGTERM→SIGKILL por defecto. */
 export const DEFAULT_KILL_GRACE_MS = 2_000
+/** Plazo por defecto para que una reserva concedida abra su GET /stream. */
+export const DEFAULT_UNCONSUMED_LEASE_MS = 45_000
+const MIN_UNCONSUMED_LEASE_MS = 10_000
+const MAX_UNCONSUMED_LEASE_MS = 600_000
+/** Cooldown por defecto de la reducción temporal de capacidad tras un 453. */
+export const DEFAULT_CAPACITY_COOLDOWN_MS = 120_000
+const MIN_CAPACITY_COOLDOWN_MS = 1_000
+const MAX_CAPACITY_COOLDOWN_MS = 3_600_000
 
 // Límites razonables: descartan NaN, negativos, cero no intencional y overflow.
 const MIN_KILL_GRACE_MS = 500
@@ -40,6 +52,10 @@ export interface TerminationTiming {
   /** true si el kill grace configurado fue normalizado a los límites válidos. */
   killGraceWasNormalized: boolean
   exitConfirmationMarginMs: number
+  /** Plazo EFECTIVO para reservas concedidas que no abren /stream. */
+  unconsumedLeaseMs: number
+  /** Cooldown EFECTIVO de la reducción temporal tras un 453. */
+  capacityCooldownMs: number
 }
 
 /**
@@ -80,6 +96,8 @@ export function resolveTerminationTiming(input: {
   previewKillGraceMs?: unknown
   configuredTerminationWaitMs?: unknown
   exitConfirmationMarginMs?: unknown
+  unconsumedLeaseMs?: unknown
+  capacityCooldownMs?: unknown
 }): TerminationTiming {
   // Intención cruda del operador (ya validada, todavía sin acotar).
   const parsedGrace = parseStrictMs(input.previewKillGraceMs)
@@ -103,6 +121,15 @@ export function resolveTerminationTiming(input: {
   const requestedOrDefault = requestedTerminationWaitMs ?? DEFAULT_TERMINATION_WAIT_MS
   const effectiveTerminationWaitMs = Math.max(requestedOrDefault, minimumTerminationWaitMs)
 
+  const parsedLease = parseStrictMs(input.unconsumedLeaseMs)
+  const unconsumedLeaseMs = parsedLease != null
+    ? clampMs(parsedLease, MIN_UNCONSUMED_LEASE_MS, MAX_UNCONSUMED_LEASE_MS)
+    : DEFAULT_UNCONSUMED_LEASE_MS
+  const parsedCooldown = parseStrictMs(input.capacityCooldownMs)
+  const capacityCooldownMs = parsedCooldown != null
+    ? clampMs(parsedCooldown, MIN_CAPACITY_COOLDOWN_MS, MAX_CAPACITY_COOLDOWN_MS)
+    : DEFAULT_CAPACITY_COOLDOWN_MS
+
   return {
     previewKillGraceMs,
     requestedTerminationWaitMs,
@@ -115,6 +142,8 @@ export function resolveTerminationTiming(input: {
     // El kill grace también puede haberse normalizado (p.ej. 100 corre como 500).
     killGraceWasNormalized: parsedGrace != null && previewKillGraceMs !== parsedGrace,
     exitConfirmationMarginMs,
+    unconsumedLeaseMs,
+    capacityCooldownMs,
   }
 }
 
@@ -134,6 +163,8 @@ export function getTerminationTiming(log?: (msg: string) => void): TerminationTi
     previewKillGraceMs: process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS,
     configuredTerminationWaitMs: process.env.RECORDINGS_TERMINATION_WAIT_MS,
     exitConfirmationMarginMs: process.env.RECORDINGS_EXIT_CONFIRMATION_MARGIN_MS,
+    unconsumedLeaseMs: process.env.RECORDINGS_UNCONSUMED_LEASE_MS,
+    capacityCooldownMs: process.env.RECORDINGS_NVR_CAPACITY_COOLDOWN_MS,
   })
   if (!resolvedLogged) {
     resolvedLogged = true
@@ -149,7 +180,9 @@ export function getTerminationTiming(log?: (msg: string) => void): TerminationTi
       ` requestedTerminationWaitMs=${cached.requestedTerminationWaitMs ?? 'none'}` +
       ` effectiveTerminationWaitMs=${cached.effectiveTerminationWaitMs}` +
       ` wasClamped=${cached.wasClamped}` +
-      ` killGraceWasNormalized=${cached.killGraceWasNormalized}`
+      ` killGraceWasNormalized=${cached.killGraceWasNormalized}` +
+      ` unconsumedLeaseMs=${cached.unconsumedLeaseMs}` +
+      ` capacityCooldownMs=${cached.capacityCooldownMs}`
     )
   }
   if (cached.wasClamped && !clampLogged) {

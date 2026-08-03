@@ -787,7 +787,7 @@ export function logPreviewStartupConfig(log: (msg: string) => void, gitCommit: s
 // y la sesión sin cupo queda EN COLA, con posición y cancelación explícitas.
 export const admission = new NvrPlaybackAdmissionController({
   safeDefaultLimit: MAX_PREVIEW_PER_NVR,
-  cooldownMs: Math.max(0, parseInt(process.env.RECORDINGS_NVR_CAPACITY_COOLDOWN_MS || '', 10) || 120_000),
+  cooldownMs: TERMINATION_TIMING.capacityCooldownMs,
 })
 
 /**
@@ -795,10 +795,7 @@ export const admission = new NvrPlaybackAdmissionController({
  * se libera y se promueve la cola: cubre respuestas perdidas y pestañas
  * cerradas antes del DELETE. Debe superar el arranque normal (probe + spawn).
  */
-const PREVIEW_UNCONSUMED_LEASE_MS = Math.max(
-  10_000,
-  parseInt(process.env.RECORDINGS_UNCONSUMED_LEASE_MS || '', 10) || 45_000,
-)
+const PREVIEW_UNCONSUMED_LEASE_MS = TERMINATION_TIMING.unconsumedLeaseMs
 
 /**
  * ÚNICA vía para soltar el cupo de un stream. Espera la salida REAL de los

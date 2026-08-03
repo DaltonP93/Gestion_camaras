@@ -241,3 +241,40 @@ describe('honestidad de wasClamped (Codex #145, 4ª ronda)', () => {
     expect(resolveTerminationTiming({}).killGraceWasNormalized).toBe(false)
   })
 })
+
+describe('lease y cooldown también se resuelven (Codex #145, 5ª ronda)', () => {
+  it('el valor CRUDO no es el efectivo cuando está fuera de rango', () => {
+    // Afirmación corregida: 5000 corre como 10000 y 0 corre como 120000.
+    const t = resolveTerminationTiming({ unconsumedLeaseMs: '5000', capacityCooldownMs: '0' })
+    expect(t.unconsumedLeaseMs).toBe(10_000)
+    expect(t.capacityCooldownMs).toBe(120_000)
+  })
+  it('valores válidos se respetan', () => {
+    const t = resolveTerminationTiming({ unconsumedLeaseMs: '60000', capacityCooldownMs: '300000' })
+    expect(t.unconsumedLeaseMs).toBe(60_000)
+    expect(t.capacityCooldownMs).toBe(300_000)
+  })
+  it('valores ausentes o mal formados caen a los defaults', () => {
+    for (const bad of [undefined, null, '', '1e5', '45s', -1]) {
+      const t = resolveTerminationTiming({ unconsumedLeaseMs: bad as any, capacityCooldownMs: bad as any })
+      expect(t.unconsumedLeaseMs).toBe(45_000)
+      expect(t.capacityCooldownMs).toBe(120_000)
+    }
+  })
+  it('se acotan a máximos razonables', () => {
+    const t = resolveTerminationTiming({ unconsumedLeaseMs: 10 ** 9, capacityCooldownMs: 10 ** 9 })
+    expect(t.unconsumedLeaseMs).toBe(600_000)
+    expect(t.capacityCooldownMs).toBe(3_600_000)
+  })
+  it('la línea resuelta los incluye', () => {
+    resetTerminationTimingCache()
+    process.env.RECORDINGS_UNCONSUMED_LEASE_MS = '5000'
+    const lines: string[] = []
+    getTerminationTiming((m) => lines.push(m))
+    const resolved = lines.find(l => l.includes('recordings_termination_timing_resolved'))!
+    expect(resolved).toContain('unconsumedLeaseMs=10000')
+    expect(resolved).toContain('capacityCooldownMs=')
+    delete process.env.RECORDINGS_UNCONSUMED_LEASE_MS
+    resetTerminationTimingCache()
+  })
+})

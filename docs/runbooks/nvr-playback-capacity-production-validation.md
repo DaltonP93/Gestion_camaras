@@ -62,7 +62,7 @@ docker logs visioncore_api 2>&1 | grep -m1 recordings_termination_timing_resolve
 Salida (ejemplo con los defaults):
 
 ```
-recordings_termination_timing_resolved previewKillGraceMs=2000 exitConfirmationMarginMs=3000 minimumTerminationWaitMs=5000 requestedTerminationWaitMs=none effectiveTerminationWaitMs=12000 wasClamped=false killGraceWasNormalized=false
+recordings_termination_timing_resolved previewKillGraceMs=2000 exitConfirmationMarginMs=3000 minimumTerminationWaitMs=5000 requestedTerminationWaitMs=none effectiveTerminationWaitMs=12000 wasClamped=false killGraceWasNormalized=false unconsumedLeaseMs=45000 capacityCooldownMs=120000
 ```
 
 - `effectiveTerminationWaitMs` es **el valor que realmente rige**: anotá ése en
@@ -81,9 +81,11 @@ docker exec visioncore_api sh -lc 'echo "kill_grace=$RECORDINGS_PREVIEW_KILL_GRA
 docker logs visioncore_api 2>&1 | grep -m1 recordings_termination_wait_clamped || echo "la espera configurada no se modificó"
 ```
 
-> `RECORDINGS_UNCONSUMED_LEASE_MS` y `RECORDINGS_NVR_CAPACITY_COOLDOWN_MS` no
-> forman parte de esa línea: para ellas el valor crudo del entorno sí es el
-> efectivo (sólo se les aplica un mínimo).
+`unconsumedLeaseMs` y `capacityCooldownMs` también salen en esa línea, y por el
+mismo motivo: su valor crudo **tampoco** es necesariamente el efectivo
+(`RECORDINGS_UNCONSUMED_LEASE_MS=5000` corre como `10000`;
+`RECORDINGS_NVR_CAPACITY_COOLDOWN_MS=0` corre como `120000`). Anotá siempre los
+de la línea resuelta.
 
 ### 1.4 Endpoint administrativo de diagnóstico
 
@@ -249,7 +251,23 @@ docker exec visioncore_postgres psql -U visioncore -d visioncore_db -c \
   'SELECT "recordingsDefaultMaxConcurrentPerNvr" FROM recordings_settings;'
 ```
 
-2. El `effectiveLimit` del endpoint reflejará el valor nuevo **recién a partir de
+2. **Invalidá la caché antes de arrancar la prueba.** El valor global se
+   memoiza 30 s en el API (`getSystemDefaultMaxConcurrentPerNvr`) y un `UPDATE`
+   por SQL **no** la invalida: si hubo una reproducción o un diagnóstico en los
+   30 s previos al cambio, la primera reproducción posterior podría seguir
+   usando el límite viejo y permitir más de una sesión durante la prueba.
+   Elegí una de estas dos vías:
+
+```bash
+# Vía determinista (recomendada): reinicia el API y vuelve a emitir la línea resuelta.
+docker compose restart api
+docker logs visioncore_api 2>&1 | grep -m1 recordings_termination_timing_resolved
+
+# Alternativa sin reinicio: esperar a que venza el TTL.
+sleep 35
+```
+
+3. El `effectiveLimit` del endpoint reflejará el valor nuevo **recién a partir de
    la primera reproducción posterior al cambio** (paso 2 de §2.2). Confirmalo
    ahí, no antes: esperar sin reproducir nada no lo actualiza.
 
@@ -317,9 +335,10 @@ docker exec visioncore_postgres psql -U visioncore -d visioncore_db -c \
   'SELECT "recordingsDefaultMaxConcurrentPerNvr" FROM recordings_settings;'
 ```
 
-Si querés confirmarlo también en el endpoint, reproducí una vez cualquier cámara
-de ese NVR y volvé a consultarlo: el controlador recarga el límite al arrancar
-esa reproducción.
+Si querés confirmarlo también en el endpoint, invalidá primero la caché
+(`docker compose restart api` o esperar 35 s) y reproducí una vez cualquier
+cámara de ese NVR: el controlador recarga el límite al arrancar esa
+reproducción.
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -400,7 +419,7 @@ Valores EFECTIVOS (de recordings_termination_timing_resolved):
   previewKillGraceMs=____  exitConfirmationMarginMs=____  minimumTerminationWaitMs=____
   requestedTerminationWaitMs=____  effectiveTerminationWaitMs=____
   wasClamped= sí / no      killGraceWasNormalized= sí / no
-Otros (crudo=efectivo): unconsumed=____  cooldown=____
+  unconsumedLeaseMs=____  capacityCooldownMs=____
 
 NVR de prueba:      nvrId=____________  nombre=____________  effectiveLimit=____
 Límite PREVIO del NVR (valor_previo):  ____________   (NULL = auto)
