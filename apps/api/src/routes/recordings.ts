@@ -2658,6 +2658,32 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         // clasificar / decidir el fallback post-close, para no perder una
         // evidencia de audio que llegó en el último fragmento sin salto.
         flushStderrCarry()
+        // Liberar la estructura pendiente del tracker (acotada y deduplicada).
+        // Las evidencias sin resolver quedan NEUTRALES: nunca pasan a audio. Se
+        // registra un resumen acotado y saneado (sin URI, credenciales ni stderr).
+        // Sólo se registra cuando QUEDA evidencia sin resolver (caso neutral que
+        // interesa diagnosticar) o cuando algún límite suprimió entradas. En el
+        // camino normal (error indexado seguido de su declaración) la evidencia
+        // ya se resolvió y no se emite un log vacío con streamKey=none. Los
+        // contadores de por vida y los pendientes se reportan por separado para
+        // no aparear la muestra de un pendiente con totales ya resueltos.
+        const pStats = audioEvidence.pendingStats()
+        if (pStats.pendingUniqueCount > 0 || pStats.suppressedCount > 0) {
+          const sample = audioEvidence.pendingEvidence()[0]
+          server.log.info(
+            `[recordings-preview] audio_evidence_pending_deduplicated sessionId=${sessionId}` +
+            ` cameraId=${session.cameraId}` +
+            ` pendingUniqueCount=${pStats.pendingUniqueCount}` +
+            ` pendingOccurrences=${pStats.pendingOccurrences}` +
+            ` suppressedCount=${pStats.suppressedCount}` +
+            ` lifetimeOccurrences=${pStats.totalOccurrences}` +
+            (sample
+              ? ` sampleStreamKey=${sample.streamKey} sampleErrorKind=${sample.errorKind}` +
+                ` sampleOccurrences=${sample.occurrences}`
+              : ' sample=none')
+          )
+        }
+        audioEvidence.clearPending()
         const code = exitCode
         const elapsedMs = Date.now() - streamStartMs
         server.log.info(
