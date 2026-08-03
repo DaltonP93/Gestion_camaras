@@ -50,17 +50,40 @@ recordings_termination_wait_clamped configuredTerminationWaitMs=... previewKillG
 
 ### 1.3 Valores efectivos de kill grace y termination wait
 
-Antes de empezar, dejá registrado qué valores están activos:
+**Registrá los valores EFECTIVOS, no el entorno crudo.** El proceso normaliza lo
+que lee: un `kill_grace=100` corre como `500` (mínimo) y una espera de `900000`
+se recorta a `600000` (máximo). Por eso el API emite al arrancar una línea con
+los valores ya resueltos:
+
+```bash
+docker logs visioncore_api 2>&1 | grep -m1 recordings_termination_timing_resolved
+```
+
+Salida (ejemplo con los defaults):
+
+```
+recordings_termination_timing_resolved previewKillGraceMs=2000 exitConfirmationMarginMs=3000 minimumTerminationWaitMs=5000 requestedTerminationWaitMs=none effectiveTerminationWaitMs=12000 wasClamped=false killGraceWasNormalized=false
+```
+
+- `effectiveTerminationWaitMs` es **el valor que realmente rige**: anotá ése en
+  la evidencia.
+- `wasClamped=true` ⇒ lo que configuraste no es lo que corre (se elevó al piso o
+  se recortó al máximo).
+- `killGraceWasNormalized=true` ⇒ el kill grace configurado quedó fuera de rango
+  y se ajustó.
+
+Si además querés ver qué se configuró (**crudo, sin normalizar**):
 
 ```bash
 docker exec visioncore_api sh -lc 'echo "kill_grace=$RECORDINGS_PREVIEW_KILL_GRACE_MS wait=$RECORDINGS_TERMINATION_WAIT_MS margin=$RECORDINGS_EXIT_CONFIRMATION_MARGIN_MS unconsumed=$RECORDINGS_UNCONSUMED_LEASE_MS cooldown=$RECORDINGS_NVR_CAPACITY_COOLDOWN_MS"'
 
-# ¿El API tuvo que elevar la espera al arrancar?
-docker logs visioncore_api 2>&1 | grep -m1 recordings_termination_wait_clamped || echo "sin clamping (configuración coherente)"
+# Detalle del ajuste, si lo hubo
+docker logs visioncore_api 2>&1 | grep -m1 recordings_termination_wait_clamped || echo "la espera configurada no se modificó"
 ```
 
-Con los defaults: `kill_grace=2000`, `margin=3000` ⇒ mínimo `5000`; como el wait
-por defecto es `12000`, el efectivo es **12000** y no hay clamping.
+> `RECORDINGS_UNCONSUMED_LEASE_MS` y `RECORDINGS_NVR_CAPACITY_COOLDOWN_MS` no
+> forman parte de esa línea: para ellas el valor crudo del entorno sí es el
+> efectivo (sólo se les aplica un mínimo).
 
 ### 1.4 Endpoint administrativo de diagnóstico
 
@@ -373,8 +396,11 @@ Detené la validación y aplicá el rollback de §1.7 si ocurre **cualquiera**:
 Fecha/hora inicio (local):
 Fecha/hora fin (local):
 Versión desplegada (COMMIT_SHA / imagen):
-Valores efectivos: kill_grace=____ wait=____ margin=____ unconsumed=____ cooldown=____
-¿Hubo recordings_termination_wait_clamped al arrancar?  sí / no
+Valores EFECTIVOS (de recordings_termination_timing_resolved):
+  previewKillGraceMs=____  exitConfirmationMarginMs=____  minimumTerminationWaitMs=____
+  requestedTerminationWaitMs=____  effectiveTerminationWaitMs=____
+  wasClamped= sí / no      killGraceWasNormalized= sí / no
+Otros (crudo=efectivo): unconsumed=____  cooldown=____
 
 NVR de prueba:      nvrId=____________  nombre=____________  effectiveLimit=____
 Límite PREVIO del NVR (valor_previo):  ____________   (NULL = auto)

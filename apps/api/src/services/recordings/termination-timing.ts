@@ -35,21 +35,22 @@ export interface TerminationTiming {
   minimumTerminationWaitMs: number
   /** El valor que se usa realmente. */
   effectiveTerminationWaitMs: number
-  /** true si hubo que elevar lo configurado hasta el piso. */
+  /** true si lo que pidió el operador NO es lo que corre (elevado o recortado). */
   wasClamped: boolean
+  /** true si el kill grace configurado fue normalizado a los límites válidos. */
+  killGraceWasNormalized: boolean
   exitConfirmationMarginMs: number
 }
 
 /**
- * Normaliza un entero de milisegundos dentro de [min,max]; null si el valor no
- * es utilizable, en cuyo caso el llamador aplica su default determinista.
+ * Parsea un entero de milisegundos SIN acotar. Devuelve null si el valor no es
+ * utilizable, en cuyo caso el llamador aplica su default determinista.
  *
  * Una cadena debe ser un entero DECIMAL COMPLETO. No se usa parseInt suelto
  * porque acepta prefijos parciales: "1e5" daría 1 y "2000ms" daría 2000, de modo
- * que una configuración mal formada se aceptaría en silencio (o peor, se
- * elevaría al mínimo) en vez de caer al default (review Codex #145).
+ * que una configuración mal formada se aceptaría en silencio (review Codex #145).
  */
-function normalizeMs(value: unknown, min: number, max: number): number | null {
+function parseStrictMs(value: unknown): number | null {
   let n: number
   if (typeof value === 'string') {
     const trimmed = value.trim()
@@ -62,9 +63,10 @@ function normalizeMs(value: unknown, min: number, max: number): number | null {
   }
   if (!Number.isFinite(n)) return null
   const floored = Math.floor(n)
-  if (floored <= 0) return null
-  return Math.min(max, Math.max(min, floored))
+  return floored > 0 ? floored : null
 }
+
+const clampMs = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
 /**
  * PURA. Resuelve los plazos garantizando el orden entre ambos.
@@ -79,12 +81,20 @@ export function resolveTerminationTiming(input: {
   configuredTerminationWaitMs?: unknown
   exitConfirmationMarginMs?: unknown
 }): TerminationTiming {
-  const previewKillGraceMs =
-    normalizeMs(input.previewKillGraceMs, MIN_KILL_GRACE_MS, MAX_KILL_GRACE_MS) ?? DEFAULT_KILL_GRACE_MS
-  const exitConfirmationMarginMs =
-    normalizeMs(input.exitConfirmationMarginMs, 500, 60_000) ?? EXIT_CONFIRMATION_MARGIN_MS
-  const requestedTerminationWaitMs =
-    normalizeMs(input.configuredTerminationWaitMs, MIN_TERMINATION_WAIT_MS, MAX_TERMINATION_WAIT_MS)
+  // Intención cruda del operador (ya validada, todavía sin acotar).
+  const parsedGrace = parseStrictMs(input.previewKillGraceMs)
+  const parsedWait = parseStrictMs(input.configuredTerminationWaitMs)
+  const parsedMargin = parseStrictMs(input.exitConfirmationMarginMs)
+
+  const previewKillGraceMs = parsedGrace != null
+    ? clampMs(parsedGrace, MIN_KILL_GRACE_MS, MAX_KILL_GRACE_MS)
+    : DEFAULT_KILL_GRACE_MS
+  const exitConfirmationMarginMs = parsedMargin != null
+    ? clampMs(parsedMargin, 500, 60_000)
+    : EXIT_CONFIRMATION_MARGIN_MS
+  const requestedTerminationWaitMs = parsedWait != null
+    ? clampMs(parsedWait, MIN_TERMINATION_WAIT_MS, MAX_TERMINATION_WAIT_MS)
+    : null
 
   const minimumTerminationWaitMs = Math.max(
     MIN_TERMINATION_WAIT_MS,
@@ -98,15 +108,19 @@ export function resolveTerminationTiming(input: {
     requestedTerminationWaitMs,
     minimumTerminationWaitMs,
     effectiveTerminationWaitMs,
-    // Sólo se considera "recortado" si el operador pidió explícitamente un valor
-    // insuficiente; subir el default interno no es una decisión suya.
-    wasClamped: requestedTerminationWaitMs != null && effectiveTerminationWaitMs > requestedTerminationWaitMs,
+    // HONESTO: true siempre que lo que pidió el operador NO sea lo que corre —
+    // ya sea porque se elevó al piso o porque se recortó al máximo. Antes un
+    // valor por encima del tope se acotaba en silencio, sin log (Codex #145).
+    wasClamped: parsedWait != null && effectiveTerminationWaitMs !== parsedWait,
+    // El kill grace también puede haberse normalizado (p.ej. 100 corre como 500).
+    killGraceWasNormalized: parsedGrace != null && previewKillGraceMs !== parsedGrace,
     exitConfirmationMarginMs,
   }
 }
 
 let cached: TerminationTiming | null = null
 let clampLogged = false
+let resolvedLogged = false
 
 /**
  * Timing efectivo del proceso, resuelto UNA vez desde el entorno. Si el
@@ -121,6 +135,23 @@ export function getTerminationTiming(log?: (msg: string) => void): TerminationTi
     configuredTerminationWaitMs: process.env.RECORDINGS_TERMINATION_WAIT_MS,
     exitConfirmationMarginMs: process.env.RECORDINGS_EXIT_CONFIRMATION_MARGIN_MS,
   })
+  if (!resolvedLogged) {
+    resolvedLogged = true
+    // SIEMPRE se registran los valores EFECTIVOS. El entorno crudo puede diferir
+    // de lo que corre (un kill grace de 100 corre como 500; una espera de 900000
+    // se recorta a 600000), así que leer las variables no alcanza para saber con
+    // qué tiempos opera el proceso (review Codex #145).
+    log?.(
+      `[recordings-preview] recordings_termination_timing_resolved` +
+      ` previewKillGraceMs=${cached.previewKillGraceMs}` +
+      ` exitConfirmationMarginMs=${cached.exitConfirmationMarginMs}` +
+      ` minimumTerminationWaitMs=${cached.minimumTerminationWaitMs}` +
+      ` requestedTerminationWaitMs=${cached.requestedTerminationWaitMs ?? 'none'}` +
+      ` effectiveTerminationWaitMs=${cached.effectiveTerminationWaitMs}` +
+      ` wasClamped=${cached.wasClamped}` +
+      ` killGraceWasNormalized=${cached.killGraceWasNormalized}`
+    )
+  }
   if (cached.wasClamped && !clampLogged) {
     clampLogged = true
     log?.(
@@ -138,4 +169,5 @@ export function getTerminationTiming(log?: (msg: string) => void): TerminationTi
 export function resetTerminationTimingCache(): void {
   cached = null
   clampLogged = false
+  resolvedLogged = false
 }

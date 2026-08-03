@@ -126,23 +126,55 @@ describe('getTerminationTiming — fuente única, memoizada y con clamping obser
 
     expect(t.effectiveTerminationWaitMs).toBe(23_000)
     expect(t.wasClamped).toBe(true)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain('recordings_termination_wait_clamped')
-    expect(lines[0]).toContain('configuredTerminationWaitMs=12000')
-    expect(lines[0]).toContain('previewKillGraceMs=20000')
-    expect(lines[0]).toContain('exitConfirmationMarginMs=3000')
-    expect(lines[0]).toContain('effectiveTerminationWaitMs=23000')
-    expect(lines[0]).not.toMatch(/rtsp:|password|token/i)
+    const clamped = lines.filter(l => l.includes('recordings_termination_wait_clamped'))
+    expect(clamped).toHaveLength(1)
+    expect(clamped[0]).toContain('configuredTerminationWaitMs=12000')
+    expect(clamped[0]).toContain('previewKillGraceMs=20000')
+    expect(clamped[0]).toContain('exitConfirmationMarginMs=3000')
+    expect(clamped[0]).toContain('effectiveTerminationWaitMs=23000')
+    expect(lines.join('\n')).not.toMatch(/rtsp:|password|token/i)
   })
 
-  it('no registra nada cuando la configuración ya es suficiente', () => {
+  it('SIEMPRE registra los valores resueltos, una sola vez', () => {
+    process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS = '2000'
+    process.env.RECORDINGS_TERMINATION_WAIT_MS = '30000'
+    const lines: string[] = []
+    getTerminationTiming((m) => lines.push(m))
+    getTerminationTiming((m) => lines.push(m))
+    const resolved = lines.filter(l => l.includes('recordings_termination_timing_resolved'))
+    expect(resolved).toHaveLength(1)
+    expect(resolved[0]).toContain('effectiveTerminationWaitMs=30000')
+    expect(resolved[0]).toContain('wasClamped=false')
+    expect(resolved[0]).toContain('killGraceWasNormalized=false')
+  })
+
+  it('no registra el clamp cuando la configuración ya es suficiente', () => {
     process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS = '2000'
     process.env.RECORDINGS_TERMINATION_WAIT_MS = '30000'
     const lines: string[] = []
     const t = getTerminationTiming((m) => lines.push(m))
     expect(t.effectiveTerminationWaitMs).toBe(30_000)
     expect(t.wasClamped).toBe(false)
-    expect(lines).toHaveLength(0)
+    expect(lines.filter(l => l.includes('recordings_termination_wait_clamped'))).toHaveLength(0)
+  })
+
+  it('un recorte al MÁXIMO ya no pasa en silencio: wasClamped y log', () => {
+    process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS = '2000'
+    process.env.RECORDINGS_TERMINATION_WAIT_MS = '900000'   // > tope de 600000
+    const lines: string[] = []
+    const t = getTerminationTiming((m) => lines.push(m))
+    expect(t.effectiveTerminationWaitMs).toBe(600_000)
+    expect(t.wasClamped).toBe(true)      // antes era false y no había log
+    expect(lines.filter(l => l.includes('recordings_termination_wait_clamped'))).toHaveLength(1)
+  })
+
+  it('un kill grace fuera de rango se marca como normalizado', () => {
+    process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS = '100'     // < mínimo de 500
+    const lines: string[] = []
+    const t = getTerminationTiming((m) => lines.push(m))
+    expect(t.previewKillGraceMs).toBe(500)
+    expect(t.killGraceWasNormalized).toBe(true)
+    expect(lines.filter(l => l.includes('killGraceWasNormalized=true'))).toHaveLength(1)
   })
 })
 
@@ -184,5 +216,28 @@ describe('normalización estricta de cadenas (Codex #145)', () => {
       const t = resolveTerminationTiming({ configuredTerminationWaitMs: bad as any })
       expect(t.requestedTerminationWaitMs).toBeNull()
     }
+  })
+})
+
+describe('honestidad de wasClamped (Codex #145, 4ª ronda)', () => {
+  it('recorte al máximo cuenta como clamped', () => {
+    const t = resolveTerminationTiming({ previewKillGraceMs: 2_000, configuredTerminationWaitMs: 900_000 })
+    expect(t.effectiveTerminationWaitMs).toBe(600_000)
+    expect(t.wasClamped).toBe(true)
+  })
+  it('elevación al piso cuenta como clamped', () => {
+    const t = resolveTerminationTiming({ previewKillGraceMs: 20_000, configuredTerminationWaitMs: 12_000 })
+    expect(t.wasClamped).toBe(true)
+  })
+  it('un valor exacto y dentro de rango NO cuenta como clamped', () => {
+    const t = resolveTerminationTiming({ previewKillGraceMs: 2_000, configuredTerminationWaitMs: 30_000 })
+    expect(t.wasClamped).toBe(false)
+  })
+  it('killGraceWasNormalized distingue ajuste de valor válido', () => {
+    expect(resolveTerminationTiming({ previewKillGraceMs: 100 }).killGraceWasNormalized).toBe(true)
+    expect(resolveTerminationTiming({ previewKillGraceMs: 999_999 }).killGraceWasNormalized).toBe(true)
+    expect(resolveTerminationTiming({ previewKillGraceMs: 2_000 }).killGraceWasNormalized).toBe(false)
+    // Sin configurar no hay "normalización": se aplica el default.
+    expect(resolveTerminationTiming({}).killGraceWasNormalized).toBe(false)
   })
 })
