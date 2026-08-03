@@ -205,6 +205,19 @@ export function RecordingsPage() {
    * La cola NO puede lograr simultaneidad cuando el NVR sólo concede una sesión:
    * simplemente evita el error y arranca sola en cuanto hay cupo.
    */
+  /**
+   * Saca al slot del estado "En espera" con un mensaje accionable. Sin esto, un
+   * corte del polling dejaría la cámara mostrando la cola indefinidamente.
+   * Sólo actúa si el slot sigue siendo el nuestro (generación vigente).
+   */
+  const failQueuedSlot = (slotIndex: number, myKey: string, sessionId: string, message: string) => {
+    deleteSessionOnce('preview', sessionId)
+    if (slotKeysRef.current[slotIndex] !== myKey) return
+    setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+      ...s, status: 'error', queue: null, errorMsg: message,
+    } : s))
+  }
+
   const waitForPlaybackCapacity = async (
     slotIndex: number, sessionId: string, myKey: string,
   ): Promise<string | null> => {
@@ -260,25 +273,41 @@ export function RecordingsPage() {
           } : s))
           continue
         }
-        // 'active' sin streamUrl: el backend ya la considera en curso — seguir
-        // consultando hasta que devuelva ready o venza el total.
-        continue
+        // Estados TERMINALES: la sesión ya no puede llegar a 'ready'.
+        //  · 'error'  → el backend registró un fallo.
+        //  · 'active' → ni en cola ni con lease sin adjuntar: la reserva se
+        //    perdió (p.ej. el barrido la expiró tras una caída larga del
+        //    polling). Nada volverá a promoverla.
+        // Seguir sondeando hasta los 10 min dejaría el slot bloqueado en "En
+        // espera" sin salida. Se corta ya para que el usuario pueda reintentar.
+        console.info(
+          `[recordings-ui] preview_queue_terminal slot=${slotIndex} sessionId=${sessionId}` +
+          ` status=${st.status ?? 'unknown'}`
+        )
+        failQueuedSlot(
+          slotIndex, myKey, sessionId,
+          st.status === 'error'
+            ? 'No se pudo iniciar la reproducción.'
+            : 'La reserva de reproducción expiró. Volvé a intentarlo.',
+        )
+        return null
       } catch (err: any) {
         const status: number | undefined = err?.response?.status
         // NO recuperables: sesión inexistente → limpiar sin seguir esperando.
         if (status === 404 || status === 410) {
           console.info(`[recordings-ui] preview_queue_session_gone slot=${slotIndex} sessionId=${sessionId} status=${status}`)
+          failQueuedSlot(slotIndex, myKey, sessionId, 'La sesión de reproducción ya no existe. Volvé a intentarlo.')
           return null
         }
         // NO recuperables: autenticación/permisos → cortar y cancelar backend.
         if (status === 401 || status === 403) {
           console.warn(`[recordings-ui] preview_queue_auth_stop slot=${slotIndex} sessionId=${sessionId} status=${status}`)
-          deleteSessionOnce('preview', sessionId)
+          failQueuedSlot(slotIndex, myKey, sessionId, 'Sesión expirada o sin permisos para reproducir.')
           return null
         }
         if (!isRecoverable(status)) {
           console.warn(`[recordings-ui] preview_queue_fatal slot=${slotIndex} sessionId=${sessionId} status=${status}`)
-          deleteSessionOnce('preview', sessionId)
+          failQueuedSlot(slotIndex, myKey, sessionId, 'No se pudo consultar el estado de la reproducción.')
           return null
         }
         // Recuperable: mantener el slot en 'queued' y reintentar la MISMA sesión.
@@ -295,13 +324,7 @@ export function RecordingsPage() {
 
     // Timeout TOTAL: cancelar en el backend exactamente una vez y avisar.
     console.info(`[recordings-ui] nvr_playback_status_retry_exhausted slot=${slotIndex} sessionId=${sessionId}`)
-    deleteSessionOnce('preview', sessionId)
-    if (slotKeysRef.current[slotIndex] === myKey) {
-      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
-        ...s, status: 'error', queue: null,
-        errorMsg: 'La espera de reproducción venció. Volvé a intentarlo.',
-      } : s))
-    }
+    failQueuedSlot(slotIndex, myKey, sessionId, 'La espera de reproducción venció. Volvé a intentarlo.')
     return null
   }
 
