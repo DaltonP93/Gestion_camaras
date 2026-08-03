@@ -3,6 +3,7 @@ import {
   NvrPlaybackAdmissionController,
   isNvrCapacityCategory,
   stderrIndicates453,
+  resolveTerminationWaitMs,
 } from './nvr-playback-admission'
 
 // Reloj inyectable para tests deterministas.
@@ -585,5 +586,44 @@ describe('P1 — el cupo no se suelta mientras el proceso siga vivo, venga de do
     expect([r1, r2, r3].filter(r => r.released)).toHaveLength(1)
     expect([r1, r2, r3].flatMap(r => r.promoted)).toHaveLength(1)
     expect(c.activeCount('nvr-A')).toBe(1)   // sólo sB
+  })
+})
+
+// ─── Codex #144 (3ª ronda): la espera de salida debe superar el kill grace ───
+
+describe('resolveTerminationWaitMs — piso sobre el kill grace', () => {
+  it('con la gracia por defecto (2 s) usa el default de 12 s', () => {
+    expect(resolveTerminationWaitMs(2_000)).toBe(12_000)
+  })
+
+  it('DEFECTO CORREGIDO: una gracia mayor que el default eleva la espera', () => {
+    // Antes: espera fija 12 s < gracia 20 s ⇒ waitAllExited vencía ANTES del
+    // SIGKILL y la terminación se marcaba atascada sin motivo.
+    expect(resolveTerminationWaitMs(20_000)).toBe(25_000)   // 20 s + margen
+    expect(resolveTerminationWaitMs(20_000)).toBeGreaterThan(20_000)
+  })
+
+  it('la espera SIEMPRE supera la gracia, sea cual sea la configuración', () => {
+    for (const grace of [500, 2_000, 12_000, 20_000, 60_000, 120_000]) {
+      for (const configured of [undefined, null, 0, -5, 1_000, 12_000, 90_000]) {
+        const wait = resolveTerminationWaitMs(grace, configured as any)
+        expect(wait, `grace=${grace} configured=${configured}`).toBeGreaterThan(grace)
+      }
+    }
+  })
+
+  it('un valor configurado por encima del piso se respeta', () => {
+    expect(resolveTerminationWaitMs(2_000, 30_000)).toBe(30_000)
+  })
+
+  it('un valor configurado por DEBAJO del piso se eleva al piso', () => {
+    expect(resolveTerminationWaitMs(20_000, 3_000)).toBe(25_000)
+  })
+
+  it('valores inválidos caen al default sin romper el invariante', () => {
+    for (const bad of [undefined, null, 0, -1, NaN, 'x' as any]) {
+      expect(resolveTerminationWaitMs(2_000, bad)).toBe(12_000)
+    }
+    expect(resolveTerminationWaitMs(NaN as any)).toBeGreaterThanOrEqual(12_000)
   })
 })

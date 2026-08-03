@@ -127,6 +127,34 @@ export interface AdmissionControllerOptions {
   averageLeaseMs?: number
 }
 
+/**
+ * Margen sobre el kill grace: tiempo para que el proceso muera tras el SIGKILL
+ * y para que el registry observe su exit/close real.
+ */
+export const TERMINATION_WAIT_MARGIN_MS = 5_000
+/** Espera por defecto de la salida de procesos, si no hay nada configurado. */
+export const DEFAULT_TERMINATION_WAIT_MS = 12_000
+
+/**
+ * Resuelve cuánto esperar la salida REAL de los procesos antes de dar la
+ * terminación por atascada.
+ *
+ * DEBE superar siempre el kill grace: si venciera antes de que el registry
+ * llegue a enviar su SIGKILL programado, el lease se marcaría "atascado" sin
+ * motivo y — aunque el proceso muriese al vencer la gracia — sólo se liberaría
+ * en el barrido periódico, bloqueando la cola de ese NVR hasta un minuto extra.
+ * Por eso el kill grace + margen actúa como PISO, por encima de lo configurado.
+ */
+export function resolveTerminationWaitMs(
+  killGraceMs: number, configuredMs?: number | null,
+): number {
+  const grace = Number.isFinite(killGraceMs) && killGraceMs > 0 ? killGraceMs : 0
+  const floor = Math.max(2_000, grace + TERMINATION_WAIT_MARGIN_MS)
+  const configured = Number(configuredMs)
+  if (Number.isFinite(configured) && configured > 0) return Math.max(floor, Math.floor(configured))
+  return Math.max(floor, DEFAULT_TERMINATION_WAIT_MS)
+}
+
 /** Valor seguro cuando no hay nada configurado: 1 sesión por NVR. */
 export const SAFE_DEFAULT_LIMIT = 1
 /** Cooldown por defecto de la reducción temporal tras un 453. */

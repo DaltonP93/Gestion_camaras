@@ -30,7 +30,7 @@ import {
   decideReactiveAudioRestart, createAudioEvidenceTracker, makeStderrLineBuffer,
 } from '../services/recordings/preview-audio-policy'
 import {
-  NvrPlaybackAdmissionController, isNvrCapacityCategory,
+  NvrPlaybackAdmissionController, isNvrCapacityCategory, resolveTerminationWaitMs,
 } from '../services/recordings/nvr-playback-admission'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
@@ -607,9 +607,16 @@ function terminateAllPreviewChildren(session: PreviewSession, reason: string, lo
  * Cuánto se espera la salida REAL de los hijos antes de considerar la
  * terminación atascada. Debe superar el kill grace (SIGTERM → SIGKILL).
  */
-const PREVIEW_TERMINATION_WAIT_MS = Math.max(
-  2_000,
-  parseInt(process.env.RECORDINGS_TERMINATION_WAIT_MS || '', 10) || 12_000,
+// Gracia entre SIGTERM y SIGKILL para los hijos del preview.
+const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS || '2000', 10) || 2000)
+
+// La espera SIEMPRE debe superar el kill grace (piso = gracia + margen): si
+// venciera antes del SIGKILL programado, la terminación se marcaría atascada sin
+// motivo y el cupo sólo se liberaría en el barrido, bloqueando la cola de ese NVR
+// hasta un minuto extra (review Codex #144).
+const PREVIEW_TERMINATION_WAIT_MS = resolveTerminationWaitMs(
+  PREVIEW_KILL_GRACE_MS,
+  parseInt(process.env.RECORDINGS_TERMINATION_WAIT_MS || '', 10),
 )
 
 /**
@@ -711,7 +718,6 @@ const PREVIEW_START_STAGGER_MS = Math.max(0, parseInt(process.env.RECORDINGS_PRE
 // de arrancar. FFmpeg mismo espera ~60s a nivel RTSP; Node no debe cortar antes.
 const PREVIEW_FIRST_BYTE_TIMEOUT_MS = Math.max(3_000, parseInt(process.env.RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS || '25000', 10) || 25_000)
 // Gracia tras SIGTERM antes de SIGKILL a un FFmpeg que ignora la señal.
-const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS || '2000', 10) || 2000)
 // Edad a partir de la cual el sweep mata un FFmpeg huérfano (vivo pero superado
 // por un takeover, ya no es el proceso activo de la sesión). Red de seguridad
 // independiente del JWT y del ciclo de la request (req 15).
