@@ -39,6 +39,8 @@ export interface PlaybackLease {
   firstByteAt: number | null
   pid: number | null
   processAlive: boolean
+  /** El cliente ya pidió GET /stream: la reserva fue consumida. */
+  consumed: boolean
 }
 
 export interface QueuedRequest {
@@ -185,7 +187,10 @@ export class NvrPlaybackAdmissionController {
   acquire(req: AdmissionRequest): AdmissionDecision {
     const st = this.stateOf(req.nvrId)
     const now = req.requestedAt ?? this.now()
-    this.restoreCapacityIfElapsed(req.nvrId, st)
+    // Reconciliar ANTES de decidir: si el cooldown ya venció y hay cupo nuevo,
+    // la cola se promueve primero. Sin esto una solicitud recién llegada podría
+    // quedarse con el hueco recuperado y saltarse el FIFO.
+    this.reconcile(req.nvrId)
 
     // Idempotencia: ya tiene lease.
     if (st.leases.has(req.sessionId)) return this.decision(req.nvrId, true, null)
@@ -207,6 +212,7 @@ export class NvrPlaybackAdmissionController {
         firstByteAt: null,
         pid: null,
         processAlive: false,
+        consumed: false,
       })
       return this.decision(req.nvrId, true, null)
     }
@@ -279,6 +285,65 @@ export class NvrPlaybackAdmissionController {
       reduced: this.effectiveLimitFor(args.nvrId) < before,
       cooldownUntil: st.cooldownUntil,
     }
+  }
+
+  /**
+   * Reconcilia el estado de un NVR: restaura la capacidad si venció el cooldown
+   * y promueve de la cola todo lo que quepa. Devuelve las solicitudes
+   * promovidas. Debe invocarse periódicamente (barrido) y antes de decidir una
+   * nueva admisión, para que la recuperación de capacidad no deje una cola
+   * esperando ni permita que una solicitud nueva se salte el FIFO.
+   */
+  reconcile(nvrId: string): QueuedRequest[] {
+    const st = this.stateOf(nvrId)
+    this.restoreCapacityIfElapsed(nvrId, st)
+    if (st.queue.length === 0) return []
+    return this.promote(nvrId, st)
+  }
+
+  /** Reconcilia TODOS los NVR conocidos (barrido periódico). */
+  reconcileAll(): Array<{ nvrId: string; promoted: QueuedRequest[] }> {
+    const out: Array<{ nvrId: string; promoted: QueuedRequest[] }> = []
+    for (const nvrId of [...this.states.keys()]) {
+      const promoted = this.reconcile(nvrId)
+      if (promoted.length) out.push({ nvrId, promoted })
+    }
+    return out
+  }
+
+  /**
+   * Marca que la sesión CONSUMIÓ su lease: ya abrió (o está abriendo) el stream.
+   * Una reserva concedida que nunca se consume debe expirar, o bloquearía el
+   * NVR hasta el TTL de la sesión.
+   */
+  markConsumed(args: { nvrId: string; sessionId: string }): void {
+    const lease = this.stateOf(args.nvrId).leases.get(args.sessionId)
+    if (lease) lease.consumed = true
+  }
+
+  /**
+   * Libera los leases CONCEDIDOS pero nunca consumidos que superaron el plazo
+   * (respuesta perdida, pestaña cerrada antes del DELETE, cliente que nunca
+   * pidió /stream). Devuelve lo liberado y lo promovido.
+   */
+  expireUnconsumedLeases(maxAgeMs: number, at?: number): Array<{
+    nvrId: string; sessionId: string; cameraId: string; ageMs: number; promoted: QueuedRequest[]
+  }> {
+    const now = at ?? this.now()
+    const expired: Array<{ nvrId: string; sessionId: string; cameraId: string; ageMs: number; promoted: QueuedRequest[] }> = []
+    for (const [nvrId, st] of this.states) {
+      for (const lease of [...st.leases.values()]) {
+        if (lease.consumed || lease.firstByteAt != null) continue
+        const ageMs = now - lease.acquiredAt
+        if (ageMs < maxAgeMs) continue
+        st.leases.delete(lease.sessionId)
+        expired.push({
+          nvrId, sessionId: lease.sessionId, cameraId: lease.cameraId, ageMs,
+          promoted: this.promote(nvrId, st),
+        })
+      }
+    }
+    return expired
   }
 
   /** Marca que esta sesión ya produjo su primer byte (reproduce de verdad). */
@@ -387,6 +452,7 @@ export class NvrPlaybackAdmissionController {
         firstByteAt: null,
         pid: null,
         processAlive: false,
+        consumed: false,
       })
       promoted.push(next)
     }

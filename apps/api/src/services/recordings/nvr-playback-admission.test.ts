@@ -303,3 +303,99 @@ describe('snapshot de diagnóstico', () => {
     expect(c.snapshot()).toHaveLength(0)
   })
 })
+
+// ─── Codex #143: reservas no consumidas, FIFO tras cooldown, readiness ───────
+
+describe('Codex #143 P1 — expiración de reservas concedidas y nunca consumidas', () => {
+  it('libera el lease que nunca abrió stream y promueve la cola', () => {
+    const { c, clock } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sFantasma' }))       // /preview/start OK…
+    c.acquire(req({ sessionId: 'sB', slotIndex: 1 })) // …pero nunca pide /stream
+    expect(c.queuedCount('nvr-A')).toBe(1)
+
+    clock.advance(10_000)
+    expect(c.expireUnconsumedLeases(45_000)).toHaveLength(0)   // aún dentro del plazo
+
+    clock.advance(40_000)
+    const expired = c.expireUnconsumedLeases(45_000)
+    expect(expired).toHaveLength(1)
+    expect(expired[0].sessionId).toBe('sFantasma')
+    expect(expired[0].promoted.map(p => p.sessionId)).toEqual(['sB'])
+    expect(c.hasLease('nvr-A', 'sB')).toBe(true)
+    expect(c.hasLease('nvr-A', 'sFantasma')).toBe(false)
+  })
+
+  it('NO expira una reserva ya consumida (el stream se abrió)', () => {
+    const { c, clock } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.markConsumed({ nvrId: 'nvr-A', sessionId: 'sA' })
+    clock.advance(10 * 60_000)
+    expect(c.expireUnconsumedLeases(45_000)).toHaveLength(0)
+    expect(c.hasLease('nvr-A', 'sA')).toBe(true)
+  })
+
+  it('NO expira una sesión que ya emitió primer byte aunque no se marcara consumida', () => {
+    const { c, clock } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.markFirstByte({ nvrId: 'nvr-A', sessionId: 'sA' })
+    clock.advance(10 * 60_000)
+    expect(c.expireUnconsumedLeases(45_000)).toHaveLength(0)
+  })
+})
+
+describe('Codex #143 P2 — la recuperación de capacidad promueve la cola (FIFO)', () => {
+  it('tras el cooldown se promueve la cola existente, sin que una nueva se cuele', () => {
+    const { c, clock } = ctl({ globalDefault: 2, cooldownMs: 60_000 })
+    // sA reproduce bien; sB recibe 453 ⇒ límite temporal 1.
+    c.acquire(req({ sessionId: 'sA' }))
+    c.markFirstByte({ nvrId: 'nvr-A', sessionId: 'sA' })
+    c.acquire(req({ sessionId: 'sB', slotIndex: 1 }))
+    c.report453({ nvrId: 'nvr-A', sessionId: 'sB' })
+    expect(c.effectiveLimitFor('nvr-A')).toBe(1)
+
+    // Liberar el lease fallido deja a sC esperando detrás del sano.
+    c.release({ nvrId: 'nvr-A', sessionId: 'sB', reason: 'close' })
+    c.acquire(req({ sessionId: 'sC', slotIndex: 2 }))
+    expect(c.queuedCount('nvr-A')).toBe(1)
+
+    // Vencido el cooldown, la reconciliación promueve a sC de inmediato.
+    clock.advance(61_000)
+    const promoted = c.reconcile('nvr-A')
+    expect(promoted.map(p => p.sessionId)).toEqual(['sC'])
+    expect(c.hasLease('nvr-A', 'sC')).toBe(true)
+    expect(c.queuedCount('nvr-A')).toBe(0)
+  })
+
+  it('una solicitud NUEVA no se salta el FIFO cuando el cooldown ya venció', () => {
+    const { c, clock } = ctl({ globalDefault: 2, cooldownMs: 60_000 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.markFirstByte({ nvrId: 'nvr-A', sessionId: 'sA' })
+    c.acquire(req({ sessionId: 'sB', slotIndex: 1 }))
+    c.report453({ nvrId: 'nvr-A', sessionId: 'sB' })
+    c.release({ nvrId: 'nvr-A', sessionId: 'sB', reason: 'close' })
+    c.acquire(req({ sessionId: 'sViejo', slotIndex: 2 }))   // espera desde antes
+    expect(c.queuedCount('nvr-A')).toBe(1)
+
+    clock.advance(61_000)
+    // La recién llegada NO debe quedarse con el cupo recuperado.
+    const nueva = c.acquire(req({ sessionId: 'sNueva', slotIndex: 3 }))
+    expect(c.hasLease('nvr-A', 'sViejo')).toBe(true)   // el que esperaba, primero
+    expect(nueva.granted).toBe(false)
+    expect(nueva.queued).toBe(true)
+  })
+
+  it('reconcileAll cubre todos los NVR conocidos', () => {
+    const { c, clock } = ctl({ globalDefault: 2, cooldownMs: 60_000 })
+    for (const nvrId of ['nvr-A', 'nvr-B']) {
+      c.acquire(req({ nvrId, sessionId: `${nvrId}-1` }))
+      c.markFirstByte({ nvrId, sessionId: `${nvrId}-1` })
+      c.report453({ nvrId })
+      c.acquire(req({ nvrId, sessionId: `${nvrId}-2` }))
+    }
+    clock.advance(61_000)
+    const all = c.reconcileAll()
+    expect(all).toHaveLength(2)
+    expect(c.hasLease('nvr-A', 'nvr-A-2')).toBe(true)
+    expect(c.hasLease('nvr-B', 'nvr-B-2')).toBe(true)
+  })
+})

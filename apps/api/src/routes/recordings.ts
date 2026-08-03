@@ -620,7 +620,6 @@ function terminatePreviewSession(sessionId: string, session: PreviewSession, rea
       ` cameraId=${session.cameraId} reason=${reason} queuedCount=${admission.queuedCount(session.nvrId)}`
     )
   }
-  promotedSessions.delete(sessionId)
   releasePlaybackLease(session.nvrId, sessionId, reason)
   const pending = terminateAllPreviewChildren(session, reason, log)  // (12c)
   if (pending > 0) {                           // (12e) confirmar, o marcar pendiente
@@ -730,8 +729,15 @@ export const admission = new NvrPlaybackAdmissionController({
   cooldownMs: Math.max(0, parseInt(process.env.RECORDINGS_NVR_CAPACITY_COOLDOWN_MS || '', 10) || 120_000),
 })
 
-/** Sesiones promovidas desde la cola y aún no consumidas por su GET /stream. */
-const promotedSessions = new Set<string>()
+/**
+ * Plazo máximo para que una reserva concedida abra su GET /stream. Pasado esto
+ * se libera y se promueve la cola: cubre respuestas perdidas y pestañas
+ * cerradas antes del DELETE. Debe superar el arranque normal (probe + spawn).
+ */
+const PREVIEW_UNCONSUMED_LEASE_MS = Math.max(
+  10_000,
+  parseInt(process.env.RECORDINGS_UNCONSUMED_LEASE_MS || '', 10) || 45_000,
+)
 
 /** Logger inyectado por las rutas para los eventos de capacidad. */
 let releaseLeaseLogger: ((msg: string) => void) | null = null
@@ -752,7 +758,6 @@ export function releasePlaybackLease(nvrId: string, sessionId: string, reason: s
     ` effectiveLimit=${admission.effectiveLimitFor(nvrId)}`
   )
   for (const p of r.promoted) {
-    promotedSessions.add(p.sessionId)
     releaseLeaseLogger?.(
       `[recordings-preview] nvr_playback_queue_promoted nvrId=${nvrId} sessionId=${p.sessionId}` +
       ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${Date.now() - p.queuedAt}` +
@@ -820,6 +825,40 @@ setInterval(() => {
   }
   for (const [sid, info] of failedPreviewSessions.entries()) {
     if (now > info.expiresAt) failedPreviewSessions.delete(sid)
+  }
+
+  // ── Capacidad por NVR ────────────────────────────────────────────────────
+  // 1) Reservas CONCEDIDAS que nunca abrieron stream (respuesta perdida, pestaña
+  //    cerrada antes del DELETE, cliente que jamás pidió /stream). El barrido de
+  //    arriba las ignora porque no tienen procRegistry, así que sin esto el lease
+  //    bloquearía el NVR hasta el TTL de 30 min (review Codex #143).
+  for (const exp of admission.expireUnconsumedLeases(PREVIEW_UNCONSUMED_LEASE_MS, now)) {
+    console.warn(
+      `[recordings-preview] nvr_playback_lease_released nvrId=${exp.nvrId} sessionId=${exp.sessionId}` +
+      ` cameraId=${exp.cameraId} reason=reservation_expired durationMs=${exp.ageMs}` +
+      ` activeCount=${admission.activeCount(exp.nvrId)} queuedCount=${admission.queuedCount(exp.nvrId)}`
+    )
+    for (const p of exp.promoted) {
+      console.info(
+        `[recordings-preview] nvr_playback_queue_promoted nvrId=${exp.nvrId} sessionId=${p.sessionId}` +
+        ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${now - p.queuedAt} reason=reservation_expired`
+      )
+    }
+  }
+  // 2) Capacidad restaurada tras el cooldown: promover la cola YA, para que una
+  //    solicitud nueva no se quede con el hueco recuperado saltándose el FIFO.
+  for (const r of admission.reconcileAll()) {
+    console.info(
+      `[recordings-preview] nvr_playback_capacity_restored nvrId=${r.nvrId}` +
+      ` effectiveLimit=${admission.effectiveLimitFor(r.nvrId)} promoted=${r.promoted.length}` +
+      ` queuedCount=${admission.queuedCount(r.nvrId)}`
+    )
+    for (const p of r.promoted) {
+      console.info(
+        `[recordings-preview] nvr_playback_queue_promoted nvrId=${r.nvrId} sessionId=${p.sessionId}` +
+        ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${now - p.queuedAt} reason=capacity_restored`
+      )
+    }
   }
   // Prune expired cache entries and cap per-camera preference maps so the
   // process doesn't accumulate memory across months of navigation
@@ -2198,6 +2237,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         queuePosition: pos,
       })
     }
+    // La reserva quedó CONSUMIDA: ya no puede expirar por "concedida y nunca
+    // usada". A partir de aquí el lease vive hasta que el proceso se recolecte.
+    admission.markConsumed({ nvrId: session.nvrId, sessionId })
     // Liberador del lease: idempotente y ligado a la recolección del proceso.
     const releaseNvrSlot = (reason: string) => releasePlaybackLease(session.nvrId, sessionId, reason)
 
@@ -3059,8 +3101,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           },
         })
       }
-      if (promotedSessions.has(sessionId) && !session.hadFirstByte) {
-        promotedSessions.delete(sessionId)
+      // Readiness DURABLE e idempotente: cualquier sesión que TENGA lease y aún
+      // no haya adjuntado su stream devuelve 'ready' con el streamUrl, tantas
+      // veces como haga falta. Antes esto dependía de un marcador de un solo
+      // uso: si esa respuesta se perdía, el cliente nunca abría el stream y el
+      // lease quedaba ocupando capacidad hasta el TTL (review Codex #143).
+      if (admission.hasLease(session.nvrId, sessionId) && !session.streamAttached && !session.hadFirstByte) {
         return reply.send({
           ok: true,
           status: 'ready',
