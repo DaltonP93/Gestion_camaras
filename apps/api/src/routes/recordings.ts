@@ -30,8 +30,9 @@ import {
   decideReactiveAudioRestart, createAudioEvidenceTracker, makeStderrLineBuffer,
 } from '../services/recordings/preview-audio-policy'
 import {
-  NvrPlaybackAdmissionController, isNvrCapacityCategory, resolveTerminationWaitMs,
+  NvrPlaybackAdmissionController, isNvrCapacityCategory,
 } from '../services/recordings/nvr-playback-admission'
+import { getTerminationTiming } from '../services/recordings/termination-timing'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
 import { PreviewProcessRegistry, type AttemptRecord } from '../services/recordings/preview-process-registry'
@@ -607,17 +608,14 @@ function terminateAllPreviewChildren(session: PreviewSession, reason: string, lo
  * Cuánto se espera la salida REAL de los hijos antes de considerar la
  * terminación atascada. Debe superar el kill grace (SIGTERM → SIGKILL).
  */
-// Gracia entre SIGTERM y SIGKILL para los hijos del preview.
-const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS || '2000', 10) || 2000)
-
-// La espera SIEMPRE debe superar el kill grace (piso = gracia + margen): si
-// venciera antes del SIGKILL programado, la terminación se marcaría atascada sin
-// motivo y el cupo sólo se liberaría en el barrido, bloqueando la cola de ese NVR
-// hasta un minuto extra (review Codex #144).
-const PREVIEW_TERMINATION_WAIT_MS = resolveTerminationWaitMs(
-  PREVIEW_KILL_GRACE_MS,
-  parseInt(process.env.RECORDINGS_TERMINATION_WAIT_MS || '', 10),
-)
+// Timing del cierre resuelto en su FUENTE ÚNICA (services/recordings/
+// termination-timing). La espera de salida nunca puede ser menor que el kill
+// grace + margen de confirmación: si venciera antes del SIGKILL programado, la
+// terminación se marcaría atascada sin motivo y el cupo sólo se liberaría en el
+// barrido, bloqueando la cola de ese NVR (review Codex #144).
+const TERMINATION_TIMING = getTerminationTiming((m) => console.warn(m))
+const PREVIEW_KILL_GRACE_MS = TERMINATION_TIMING.previewKillGraceMs
+const PREVIEW_TERMINATION_WAIT_MS = TERMINATION_TIMING.effectiveTerminationWaitMs
 
 /**
  * Terminaciones que superaron el hard kill con procesos aún vivos. Su lease NO
