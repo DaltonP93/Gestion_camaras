@@ -202,10 +202,26 @@ describe('detectAudioStderrEvidence — distingue audio de video', () => {
     const ev = detectAudioStderrEvidence('Stream #0:1: Audio: ')
     expect(ev.audioStreamSeen).toBe(true)
   })
-  it('reconoce decoder de audio ausente para none/unknown', () => {
+  it('reconoce decoder de audio ausente para none/unknown SIN índice', () => {
     expect(detectAudioStderrEvidence('No decoder found for codec none').audioDecoderUnavailable).toBe(true)
     expect(detectAudioStderrEvidence('no decoder found for: none').audioDecoderUnavailable).toBe(true)
-    expect(detectAudioStderrEvidence('Decoder (codec pcm_alaw) not found for input stream #0:1').audioDecoderUnavailable).toBe(true)
+  })
+  // INVARIANTE (Codex sobre #140): si la línea trae un ÍNDICE de stream, manda
+  // el registro y NADA más. Sin declaración previa la evidencia queda pendiente
+  // aunque el mensaje incluya "(codec pcm_alaw)" — antes se inferí­a audio, lo
+  // que permitía que un codec de video futuro (vvc) disparara fallback de audio.
+  it('línea INDEXADA sin declaración: pendiente, nunca inferida por codec', () => {
+    const ev = detectAudioStderrEvidence('Decoder (codec pcm_alaw) not found for input stream #0:1')
+    expect(ev.audioDecoderUnavailable).toBe(false)
+    expect(ev.videoDecoderUnavailable).toBe(false)
+    expect(ev.unresolvedDecoderErrors).toBe(1)
+  })
+  it('la misma línea, ya declarado #0:1 como audio, sí resuelve a audio', () => {
+    const ev = detectAudioStderrEvidence(
+      'Stream #0:1: Audio: pcm_alaw\nDecoder (codec pcm_alaw) not found for input stream #0:1'
+    )
+    expect(ev.audioDecoderUnavailable).toBe(true)
+    expect(ev.unresolvedDecoderErrors).toBe(0)
   })
   it('NO marca decoder de audio cuando el problema es de VIDEO', () => {
     const ev = detectAudioStderrEvidence('Decoder (codec hevc) not found for input stream #0:0, Video: hevc')
@@ -666,6 +682,194 @@ describe('P2-3 test 12 — el intento previo se termina y recolecta antes del re
     await term
     expect(killed[0]).toBe('SIGTERM')
     // Sólo AHORA puede relanzarse: no quedan hijos vivos (cero huérfanos).
+    expect(reg.aliveCount()).toBe(0)
+  })
+})
+
+// ─── P2 Codex (4ª ronda): el ÍNDICE de stream es la única fuente de verdad ────
+
+import { isAudioCodecName, isVideoCodecName } from './preview-audio-policy'
+
+describe('P2-4 test 1 — codec de video FUTURO indexado antes de la declaración', () => {
+  const ERR = 'Decoder (codec vvc) not found for input stream #0:0'
+
+  it('inmediato: pendiente, type=null, sin fallback, sin aprender la cámara', () => {
+    const r = runAttempt([ERR + '\n'])
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.evidence.videoDecoderUnavailable).toBe(false)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(1)
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+  })
+
+  it('tras "Stream #0:0: Video: vvc": videoDecoderUnavailable y CODEC_UNSUPPORTED', () => {
+    const r = runAttempt([ERR + '\n', 'Stream #0:0: Video: vvc\n'])
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(0)
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+    expect(classifyRtspError(`${ERR}\nStream #0:0: Video: vvc`)).toBe('CODEC_UNSUPPORTED')
+  })
+})
+
+describe('P2-4 test 2 — caso simétrico de audio', () => {
+  const ERR = 'Decoder (codec adpcm_g726le) not found for input stream #0:1'
+  it('antes de la declaración: pendiente, sin fallback', () => {
+    const r = runAttempt([ERR + '\n'])
+    expect(r.evidence.unresolvedDecoderErrors).toBe(1)
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+  })
+  it('tras "Stream #0:1: Audio: adpcm_g726le": un solo fallback video-only', () => {
+    const r = runAttempt([ERR + '\n', 'Stream #0:1: Audio: adpcm_g726le\n'])
+    expect(r.evidence.audioDecoderUnavailable).toBe(true)
+    expect(r.restarts).toBe(1)
+    expect(r.learnedCamera).toBe(true)
+  })
+})
+
+describe('P2-4 tests 3/4 — el registro tiene precedencia absoluta sobre el codec', () => {
+  it('3. codec con pinta de audio pero índice declarado VIDEO ⇒ video, sin fallback', () => {
+    const r = runAttempt([
+      'Decoder (codec adpcm_g726le) not found for input stream #0:0\n',
+      'Stream #0:0: Video: vvc\n',
+    ])
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+  })
+  it('4. codec de video futuro con índice NUNCA se infiere como audio', () => {
+    for (const codec of ['vvc', 'h266', 'avs3', 'codec_del_futuro']) {
+      const r = runAttempt([`Decoder (codec ${codec}) not found for input stream #0:0\n`])
+      expect(r.evidence.audioDecoderUnavailable, codec).toBe(false)
+      expect(r.restarts, codec).toBe(0)
+      expect(r.learnedCamera, codec).toBe(false)
+    }
+  })
+})
+
+describe('P2-4 tests 5/6 — inferencia por codec SÓLO sin índice, con evidencia positiva', () => {
+  it('5. sin índice + codec de familia de audio ⇒ audio', () => {
+    const r = runAttempt(['Decoder (codec adpcm_g726le) not found\n'])
+    expect(r.evidence.audioDecoderUnavailable).toBe(true)
+    expect(r.restarts).toBe(1)
+  })
+  it('6. sin índice + codec vvc ⇒ nunca audio (queda video, jamás por exclusión)', () => {
+    const r = runAttempt(['Decoder (codec vvc) not found\n'])
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.restarts).toBe(0)
+  })
+  it('sin índice + codec desconocido (ni audio ni video) ⇒ NEUTRAL', () => {
+    const r = runAttempt(['Decoder (codec zzz_futuro) not found\n'])
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.evidence.videoDecoderUnavailable).toBe(false)
+    expect(r.restarts).toBe(0)
+  })
+  it('reconocedores: positivo de audio y positivo de video, sin exclusión', () => {
+    for (const c of ['pcm_mulaw', 'adpcm_g726le', 'aac', 'opus', 'g722', 'speex']) {
+      expect(isAudioCodecName(c), c).toBe(true)
+    }
+    for (const c of ['vvc', 'h266', 'avs3', 'hevc', 'h264']) {
+      expect(isAudioCodecName(c), c).toBe(false)
+    }
+    expect(isVideoCodecName('vvc')).toBe(true)
+    expect(isVideoCodecName('adpcm_g726le')).toBe(false)
+  })
+})
+
+describe('P2-4 tests 7/8 — pendientes sin resolver y múltiples por índice', () => {
+  it('7. pending que nunca recibe declaración: sin fallback ni aprendizaje', () => {
+    const r = runAttempt([
+      'Decoder (codec vvc) not found for input stream #0:0\n',
+      'frame= 1 fps=0.0\n', 'Output #0, mp4\n',
+    ])
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(1)
+  })
+  it('8. varias evidencias pendientes del MISMO índice ⇒ un único reinicio', () => {
+    const r = runAttempt([
+      'Decoder (codec adpcm_g726le) not found for input stream #0:1\n',
+      'Error while opening decoder for input stream #0:1\n',
+      'Could not find codec parameters for stream #0:1\n',
+      'Stream #0:1: Audio: adpcm_g726le\n',
+      'more stderr\n',
+    ])
+    expect(r.restarts).toBe(1)
+    expect(r.evidence.audioDecoderUnavailable).toBe(true)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(0)
+  })
+})
+
+describe('P2-4 tests 9/10 — chunks y tail', () => {
+  it('9. declaración en un chunk posterior se reensambla y resuelve', () => {
+    const r = runAttempt([
+      'Decoder (codec adpcm_g726le) not found for input stream #0:1\nStr',
+      'eam #0:1: Aud', 'io: adpcm_g726le\n',
+    ])
+    expect(r.evidence.audioDecoderUnavailable).toBe(true)
+    expect(r.restarts).toBe(1)
+  })
+  it('10. declaración evictada del tail: el registro conserva el tipo', () => {
+    const filler = Array.from({ length: 8 }, (_, i) => `log ${i}\n`)
+    const r = runAttempt(
+      ['Stream #0:0: Video: vvc\n', ...filler, 'Decoder (codec vvc) not found for input stream #0:0\n'],
+      { tailCap: 3 },
+    )
+    expect(r.tail.join('\n')).not.toContain('Stream #0:0: Video: vvc')
+    expect(r.streams.get('0:0')?.type).toBe('video')
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(r.restarts).toBe(0)
+  })
+})
+
+describe('P2-4 tests 11/12/13 — no regresión', () => {
+  it('11. Box 4 "Audio: none" mantiene el fallback correcto', () => {
+    const r = runAttempt(['Stream #0:0: Video: hevc\nStream #0:1: Audio: none\n'])
+    expect(r.restarts).toBe(1)
+    expect(r.learnedCamera).toBe(true)
+  })
+  it('12. AAC válido mantiene audio (sin fallback)', () => {
+    const r = runAttempt(['Stream #0:0: Video: h264\nStream #0:1: Audio: aac (LC), 16000 Hz\n'])
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+  })
+  it('13. decoder HEVC real sigue siendo CODEC_UNSUPPORTED', () => {
+    const r = runAttempt([
+      'Stream #0:0: Video: hevc\n',
+      'Decoder (codec hevc) not found for input stream #0:0\n',
+    ])
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(r.restarts).toBe(0)
+    expect(classifyRtspError('Stream #0:0: Video: hevc\nDecoder (codec hevc) not found for input stream #0:0'))
+      .toBe('CODEC_UNSUPPORTED')
+  })
+  it('9-bis. "Could not find codec parameters for stream 1 (Audio: pcm_mulaw)" declara el tipo inline', () => {
+    const r = runAttempt(['Could not find codec parameters for stream 1 (Audio: pcm_mulaw, 8000 Hz)\n'])
+    expect(r.streams.get('num:1')?.type).toBe('audio')
+    expect(r.evidence.audioParametersIncomplete).toBe(true)
+  })
+})
+
+describe('P2-4 test 14 — recolección del intento previo antes del relanzamiento', () => {
+  it('el A/V anterior sale y se recolecta (aliveCount()==0) antes del video-only', async () => {
+    const reg = new PreviewProcessRegistry()
+    const signals: string[] = []
+    const proc: any = { pid: 777, kill: (s: string) => { signals.push(s); return true } }
+    const rec = reg.register(proc, Date.now())
+
+    const r = runAttempt([
+      'Decoder (codec adpcm_g726le) not found for input stream #0:1\n',
+      'Stream #0:1: Audio: adpcm_g726le\n',
+    ])
+    expect(r.restarts).toBe(1)
+
+    const term = reg.terminate(rec.attemptId, 'audio_fallback', { onSigterm: () => {}, onSigkill: () => {} })
+    reg.markExited(rec.attemptId)
+    await term
+    expect(signals[0]).toBe('SIGTERM')
     expect(reg.aliveCount()).toBe(0)
   })
 })
