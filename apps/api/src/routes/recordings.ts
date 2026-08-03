@@ -2661,15 +2661,26 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         // Liberar la estructura pendiente del tracker (acotada y deduplicada).
         // Las evidencias sin resolver quedan NEUTRALES: nunca pasan a audio. Se
         // registra un resumen acotado y saneado (sin URI, credenciales ni stderr).
+        // Sólo se registra cuando QUEDA evidencia sin resolver (caso neutral que
+        // interesa diagnosticar) o cuando algún límite suprimió entradas. En el
+        // camino normal (error indexado seguido de su declaración) la evidencia
+        // ya se resolvió y no se emite un log vacío con streamKey=none. Los
+        // contadores de por vida y los pendientes se reportan por separado para
+        // no aparear la muestra de un pendiente con totales ya resueltos.
         const pStats = audioEvidence.pendingStats()
-        if (pStats.totalOccurrences > 0) {
+        if (pStats.pendingUniqueCount > 0 || pStats.suppressedCount > 0) {
           const sample = audioEvidence.pendingEvidence()[0]
           server.log.info(
             `[recordings-preview] audio_evidence_pending_deduplicated sessionId=${sessionId}` +
-            ` cameraId=${session.cameraId} streamKey=${sample?.streamKey ?? 'none'}` +
-            ` errorKind=${sample?.errorKind ?? 'none'} occurrences=${sample?.occurrences ?? 0}` +
-            ` suppressedCount=${pStats.suppressedCount} pendingUniqueCount=${pStats.pendingUniqueCount}` +
-            ` totalOccurrences=${pStats.totalOccurrences}`
+            ` cameraId=${session.cameraId}` +
+            ` pendingUniqueCount=${pStats.pendingUniqueCount}` +
+            ` pendingOccurrences=${pStats.pendingOccurrences}` +
+            ` suppressedCount=${pStats.suppressedCount}` +
+            ` lifetimeOccurrences=${pStats.totalOccurrences}` +
+            (sample
+              ? ` sampleStreamKey=${sample.streamKey} sampleErrorKind=${sample.errorKind}` +
+                ` sampleOccurrences=${sample.occurrences}`
+              : ' sample=none')
           )
         }
         audioEvidence.clearPending()

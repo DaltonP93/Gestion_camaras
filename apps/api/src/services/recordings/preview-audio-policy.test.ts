@@ -1060,3 +1060,48 @@ describe('P2-5 test 13 — recolección del intento previo antes del video-only'
     expect(reg.aliveCount()).toBe(0)
   })
 })
+
+// ─── Codex #142: contadores de por vida vs pendientes ────────────────────────
+
+describe('pendingStats — distingue lifetime de pendiente (Codex #142)', () => {
+  it('tras resolver, no queda nada pendiente aunque el lifetime siga >0', () => {
+    const t = createAudioEvidenceTracker()
+    for (let i = 0; i < 500; i++) t.push('Decoder (codec vvc) not found for input stream #0:0')
+    expect(t.pendingStats().pendingUniqueCount).toBe(1)
+    expect(t.pendingStats().pendingOccurrences).toBe(500)
+
+    t.push('Stream #0:0: Video: vvc')   // llega la declaración → se resuelve
+
+    const s = t.pendingStats()
+    // Nada pendiente ⇒ el log de close NO debe emitirse (gate por pendingUniqueCount).
+    expect(s.pendingUniqueCount).toBe(0)
+    expect(s.pendingOccurrences).toBe(0)
+    expect(t.pendingEvidence()).toHaveLength(0)
+    // El contador de por vida se conserva, claramente separado.
+    expect(s.totalOccurrences).toBe(500)
+  })
+
+  it('con un hecho resuelto y otro pendiente, pendingOccurrences sólo cuenta el pendiente', () => {
+    const t = createAudioEvidenceTracker()
+    for (let i = 0; i < 300; i++) t.push('Decoder (codec vvc) not found for input stream #0:0')
+    for (let i = 0; i < 20; i++) t.push('Error while opening decoder for input stream #0:5')
+    t.push('Stream #0:0: Video: vvc')   // resuelve sólo el de #0:0
+
+    const s = t.pendingStats()
+    expect(s.pendingUniqueCount).toBe(1)
+    expect(s.pendingOccurrences).toBe(20)      // NO 320: excluye lo ya resuelto
+    expect(s.totalOccurrences).toBe(320)       // lifetime completo
+    const sample = t.pendingEvidence()[0]
+    expect(sample.streamKey).toContain('5')    // la muestra es del pendiente real
+    expect(sample.occurrences).toBe(20)
+  })
+
+  it('sin evidencia alguna, todos los contadores en cero (no se emite log)', () => {
+    const t = createAudioEvidenceTracker()
+    t.push('Stream #0:0: Video: hevc')
+    const s = t.pendingStats()
+    expect(s.pendingUniqueCount).toBe(0)
+    expect(s.suppressedCount).toBe(0)
+    expect(s.totalOccurrences).toBe(0)
+  })
+})

@@ -342,7 +342,16 @@ export const MAX_PENDING_EVIDENCE_TOTAL_PER_ATTEMPT = 32
 export interface PendingEvidenceStats {
   /** Hechos lógicos distintos retenidos ahora mismo. */
   pendingUniqueCount: number
-  /** Ocurrencias totales observadas (incluye las deduplicadas). */
+  /**
+   * Ocurrencias sumadas de los hechos que siguen PENDIENTES ahora mismo.
+   * Se distingue de totalOccurrences (de por vida) para que un diagnóstico no
+   * mezcle la muestra de un pendiente con totales de hechos ya resueltos.
+   */
+  pendingOccurrences: number
+  /**
+   * Ocurrencias observadas DE POR VIDA en el intento, incluidas las de hechos
+   * ya resueltos. No se decrementa al resolver: es un contador acumulado.
+   */
   totalOccurrences: number
   /** Ocurrencias descartadas por alcanzar un límite (nunca se crean entradas). */
   suppressedCount: number
@@ -579,8 +588,13 @@ export function createAudioEvidenceTracker() {
 
     /** Contadores acotados para logs sanitizados. */
     pendingStats(): PendingEvidenceStats {
+      let pendingOccurrences = 0
+      for (const facts of pending.values()) {
+        for (const e of facts.values()) pendingOccurrences += e.occurrences
+      }
       return {
         pendingUniqueCount,
+        pendingOccurrences,
         totalOccurrences,
         suppressedCount,
         pendingStreamCount: pending.size,
