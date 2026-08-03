@@ -208,23 +208,43 @@ export function RecordingsPage() {
   const waitForPlaybackCapacity = async (
     slotIndex: number, sessionId: string, myKey: string,
   ): Promise<string | null> => {
-    const POLL_MS = 2_500
     const MAX_WAIT_MS = 10 * 60 * 1000
+    // Backoff acotado con jitter. Un fallo transitorio del status NO puede
+    // abandonar la cola: el lease seguiría tomado en el backend y el usuario
+    // vería el slot colgado. El backend devuelve 'ready' idempotentemente, así
+    // que reintentar es seguro y nunca crea otra sesión.
+    const BACKOFF_MS = [2_500, 3_000, 5_000, 8_000, 10_000]
     const started = Date.now()
+    let failures = 0
+    let retryAfterMs: number | null = null
+
+    const isRecoverable = (status: number | undefined): boolean =>
+      status === undefined ||            // error de red / timeout (sin respuesta)
+      status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+
     while (Date.now() - started < MAX_WAIT_MS) {
-      await new Promise(r => setTimeout(r, POLL_MS))
-      // El slot cambió (cancelar, cerrar, otro playhead, otro layout) → abandonar.
+      const base = retryAfterMs ?? BACKOFF_MS[Math.min(failures, BACKOFF_MS.length - 1)]
+      retryAfterMs = null
+      const jitter = Math.floor(Math.random() * 400)
+      await new Promise(r => setTimeout(r, base + jitter))
+
+      // GENERACIÓN: si el usuario cambió cámara, playhead, búsqueda o layout, se
+      // aborta. Una respuesta tardía nunca debe reproducir en el slot nuevo.
       if (slotKeysRef.current[slotIndex] !== myKey) {
         console.info(`[recordings-ui] preview_queue_abandoned slot=${slotIndex} sessionId=${sessionId}`)
         deleteSessionOnce('preview', sessionId)
         return null
       }
+
       try {
         const st = await apiGet<{
           status?: string; streamUrl?: string; queuePosition?: number | null
           capacity?: { activeCount: number; effectiveLimit: number }
         }>(`/recordings/preview/${sessionId}/status`, {})
+        failures = 0
+
         if (st.status === 'ready' && st.streamUrl) {
+          if (slotKeysRef.current[slotIndex] !== myKey) { deleteSessionOnce('preview', sessionId); return null }
           console.info(`[recordings-ui] preview_queue_promoted slot=${slotIndex} sessionId=${sessionId}`)
           return st.streamUrl
         }
@@ -240,14 +260,48 @@ export function RecordingsPage() {
           } : s))
           continue
         }
-        // Cualquier otro estado (error/activa) corta la espera.
-        return null
-      } catch {
-        return null   // la sesión desapareció
+        // 'active' sin streamUrl: el backend ya la considera en curso — seguir
+        // consultando hasta que devuelva ready o venza el total.
+        continue
+      } catch (err: any) {
+        const status: number | undefined = err?.response?.status
+        // NO recuperables: sesión inexistente → limpiar sin seguir esperando.
+        if (status === 404 || status === 410) {
+          console.info(`[recordings-ui] preview_queue_session_gone slot=${slotIndex} sessionId=${sessionId} status=${status}`)
+          return null
+        }
+        // NO recuperables: autenticación/permisos → cortar y cancelar backend.
+        if (status === 401 || status === 403) {
+          console.warn(`[recordings-ui] preview_queue_auth_stop slot=${slotIndex} sessionId=${sessionId} status=${status}`)
+          deleteSessionOnce('preview', sessionId)
+          return null
+        }
+        if (!isRecoverable(status)) {
+          console.warn(`[recordings-ui] preview_queue_fatal slot=${slotIndex} sessionId=${sessionId} status=${status}`)
+          deleteSessionOnce('preview', sessionId)
+          return null
+        }
+        // Recuperable: mantener el slot en 'queued' y reintentar la MISMA sesión.
+        failures++
+        const retryAfter = Number(err?.response?.headers?.['retry-after'])
+        if (Number.isFinite(retryAfter) && retryAfter > 0) retryAfterMs = Math.min(retryAfter * 1000, 30_000)
+        console.info(
+          `[recordings-ui] nvr_playback_status_retry slot=${slotIndex} sessionId=${sessionId}` +
+          ` status=${status ?? 'network'} attempt=${failures}`
+        )
+        continue
       }
     }
-    console.info(`[recordings-ui] preview_queue_timeout slot=${slotIndex} sessionId=${sessionId}`)
+
+    // Timeout TOTAL: cancelar en el backend exactamente una vez y avisar.
+    console.info(`[recordings-ui] nvr_playback_status_retry_exhausted slot=${slotIndex} sessionId=${sessionId}`)
     deleteSessionOnce('preview', sessionId)
+    if (slotKeysRef.current[slotIndex] === myKey) {
+      setSlots(prev => prev.map((s, i) => i === slotIndex ? {
+        ...s, status: 'error', queue: null,
+        errorMsg: 'La espera de reproducción venció. Volvé a intentarlo.',
+      } : s))
+    }
     return null
   }
 

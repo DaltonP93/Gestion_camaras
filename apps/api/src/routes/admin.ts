@@ -125,6 +125,10 @@ export const adminRoutes: FastifyPluginAsync = async (server) => {
           processAlive: a.processAlive,
           acquiredAt: new Date(a.acquiredAt).toISOString(),
           firstByteAt: a.firstByteAt ? new Date(a.firstByteAt).toISOString() : null,
+          leaseType: a.leaseType,
+          consumed: a.consumed,
+          state: a.state,
+          terminating: a.terminating,
         })),
         queue: n.queue.map(q => ({
           sessionId: q.sessionId,

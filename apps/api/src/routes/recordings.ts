@@ -603,7 +603,45 @@ function terminateAllPreviewChildren(session: PreviewSession, reason: string, lo
 
 // Teardown ORDENADO de una sesión (req 12): closing → bloquear GET → disposers →
 // terminar attempts → confirmar sin vivos (o cleanup_pending).
+/**
+ * Cuánto se espera la salida REAL de los hijos antes de considerar la
+ * terminación atascada. Debe superar el kill grace (SIGTERM → SIGKILL).
+ */
+const PREVIEW_TERMINATION_WAIT_MS = Math.max(
+  2_000,
+  parseInt(process.env.RECORDINGS_TERMINATION_WAIT_MS || '', 10) || 12_000,
+)
+
+/**
+ * Terminaciones que superaron el hard kill con procesos aún vivos. Su lease NO
+ * se libera: el barrido reintenta hasta que aliveCount() llegue a cero.
+ */
+const stuckTerminations = new Map<string, {
+  nvrId: string; cameraId: string; registry: PreviewProcessRegistry; reason: string; since: number
+}>()
+
+/**
+ * Terminaciones en curso por sessionId. DELETE, client_disconnect, error,
+ * ended, watchdog, unmount, close y exit concurrentes comparten UNA sola
+ * secuencia: no se ejecutan dos kills ni se libera/promueve dos veces.
+ */
+const terminationsInFlight = new Set<string>()
+
 function terminatePreviewSession(sessionId: string, session: PreviewSession, reason: string, log: (m: string) => void) {
+  // Idempotencia entre disparadores concurrentes.
+  if (terminationsInFlight.has(sessionId)) return
+  terminationsInFlight.add(sessionId)
+  try {
+    terminatePreviewSessionInner(sessionId, session, reason, log)
+  } finally {
+    // La espera de salida es asíncrona; el guard se libera al terminar la
+    // secuencia síncrona porque la sesión ya salió de previewSessions y el
+    // lease quedó en TERMINATING (no re-entrable por capacidad).
+    terminationsInFlight.delete(sessionId)
+  }
+}
+
+function terminatePreviewSessionInner(sessionId: string, session: PreviewSession, reason: string, log: (m: string) => void) {
   const already = session.closing
   session.closing = true                       // (12a) marcar closing (bloquea GET)
   previewSessions.delete(sessionId)            // (12b) impedir nuevos GET (lookup falla)
@@ -611,7 +649,7 @@ function terminatePreviewSession(sessionId: string, session: PreviewSession, rea
     for (const d of [...session.disposers]) { try { d() } catch { /* noop */ } }
     session.disposers.clear()
   }
-  // Capacidad del NVR: soltar el lease Y la solicitud en cola. Cubre cancelar,
+  // Capacidad del NVR: soltar la solicitud en cola de inmediato. Cubre cancelar,
   // cerrar el slot, cambiar de playhead/búsqueda/layout, salir de Grabaciones y
   // el shutdown. Una solicitud cancelada NUNCA debe iniciarse después.
   if (admission.cancelQueued({ nvrId: session.nvrId, sessionId, reason })) {
@@ -620,13 +658,61 @@ function terminatePreviewSession(sessionId: string, session: PreviewSession, rea
       ` cameraId=${session.cameraId} reason=${reason} queuedCount=${admission.queuedCount(session.nvrId)}`
     )
   }
-  releasePlaybackLease(session.nvrId, sessionId, reason)
+
+  const reg = session.procRegistry
+  const hasChildren = !!reg && reg.aliveCount() > 0
+
+  // SIN procesos (aún en cola, reserva no consumida, /stream nunca abierto):
+  // el cupo no corresponde a ninguna sesión RTSP real ⇒ liberar ya.
+  if (!hasChildren) {
+    releasePlaybackLease(session.nvrId, sessionId, reason)
+    terminateAllPreviewChildren(session, reason, log)
+    if (!already) {
+      log(`[recordings-preview] session_deleted sessionId=${sessionId} slotIndex=${session.slotIndex} reason=${reason}`)
+    }
+    return
+  }
+
+  // CON procesos: el lease pasa a TERMINATING y SIGUE ocupando capacidad. Un cupo
+  // representa una sesión RTSP real: durante SIGTERM / kill grace / drenaje el
+  // proceso anterior todavía la tiene tomada contra el NVR. Promover ahora abriría
+  // una segunda sesión y volvería a producir 453 (review Codex #143).
+  admission.markTerminating({ nvrId: session.nvrId, sessionId })
+  log(
+    `[recordings-preview] nvr_playback_lease_terminating nvrId=${session.nvrId} sessionId=${sessionId}` +
+    ` leaseType=${admission.leaseTypeOf(session.nvrId, sessionId) ?? 'preview'} cameraId=${session.cameraId}` +
+    ` reason=${reason} aliveCount=${reg!.aliveCount()} activeCount=${admission.activeCount(session.nvrId)}` +
+    ` queuedCount=${admission.queuedCount(session.nvrId)}`
+  )
   const pending = terminateAllPreviewChildren(session, reason, log)  // (12c)
   if (pending > 0) {                           // (12e) confirmar, o marcar pendiente
     log(`[recordings-preview] cleanup_pending sessionId=${sessionId} reason=${reason} pendingChildren=${pending}`)
-  } else if (!already) {
-    log(`[recordings-preview] session_deleted sessionId=${sessionId} slotIndex=${session.slotIndex} reason=${reason}`)
   }
+
+  // Esperar la salida REAL antes de liberar y promover. Orden observable:
+  //   lease_terminating → ffmpeg exit/close → aliveCount=0 → lease_released → queue_promoted
+  void reg!.waitAllExited(PREVIEW_TERMINATION_WAIT_MS).then((allExited) => {
+    if (allExited) {
+      log(
+        `[recordings-preview] nvr_playback_processes_exit_confirmed nvrId=${session.nvrId}` +
+        ` sessionId=${sessionId} aliveCount=0 reason=${reason}`
+      )
+      releasePlaybackLease(session.nvrId, sessionId, reason)
+      if (!already) {
+        log(`[recordings-preview] session_deleted sessionId=${sessionId} slotIndex=${session.slotIndex} reason=${reason}`)
+      }
+      return
+    }
+    // El hard kill venció y el registry AÚN reporta vivos: NO liberar, NO
+    // promover. Queda para que el barrido lo reintente cuando salgan de verdad.
+    admission.markTerminating({ nvrId: session.nvrId, sessionId, stuck: true })
+    stuckTerminations.set(sessionId, { nvrId: session.nvrId, cameraId: session.cameraId, registry: reg!, reason, since: Date.now() })
+    log(
+      `[recordings-preview] nvr_playback_termination_stuck nvrId=${session.nvrId} sessionId=${sessionId}` +
+      ` cameraId=${session.cameraId} reason=${reason} aliveCount=${reg!.aliveCount()}` +
+      ` activeCount=${admission.activeCount(session.nvrId)}`
+    )
+  })
 }
 
 // Métricas para /metrics (Prometheus) — solo conteos, sin datos sensibles.
@@ -828,6 +914,19 @@ setInterval(() => {
   }
 
   // ── Capacidad por NVR ────────────────────────────────────────────────────
+  // 0) Terminaciones ATASCADAS: el hard kill venció con procesos aún vivos y el
+  //    lease sigue ocupando capacidad a propósito. Liberar SÓLO cuando el
+  //    registry confirme finalmente aliveCount()===0, y una sola vez.
+  for (const [sid, st] of [...stuckTerminations.entries()]) {
+    if (st.registry.aliveCount() > 0) continue
+    stuckTerminations.delete(sid)
+    console.info(
+      `[recordings-preview] nvr_playback_processes_exit_confirmed nvrId=${st.nvrId} sessionId=${sid}` +
+      ` cameraId=${st.cameraId} aliveCount=0 reason=${st.reason} stuckMs=${now - st.since}`
+    )
+    releasePlaybackLease(st.nvrId, sid, `${st.reason}_after_stuck`)
+  }
+
   // 1) Reservas CONCEDIDAS que nunca abrieron stream (respuesta perdida, pestaña
   //    cerrada antes del DELETE, cliente que jamás pidió /stream). El barrido de
   //    arriba las ignora porque no tienen procRegistry, así que sin esto el lease
@@ -3288,6 +3387,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const diagDecision = admission.acquire({
       nvrId: camera.nvr.id, sessionId: diagSessionId, userId: request.user.sub,
       cameraId: camera.id, cameraName: camera.name, slotIndex: -1,
+      leaseType: 'diagnostic',
     })
     if (!diagDecision.granted) {
       admission.cancelQueued({ nvrId: camera.nvr.id, sessionId: diagSessionId, reason: 'diagnostics_no_capacity' })
@@ -3301,6 +3401,16 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         },
       })
     }
+    // El diagnóstico NO entra por GET /preview/:id/stream, así que debe marcarse
+    // consumido de inmediato: sin esto el barrido de reservas no consumidas
+    // expiraría su lease a los 45 s mientras sus FFmpeg siguen vivos, y otra
+    // reproducción entraría en paralelo contra el mismo NVR (review Codex #143).
+    admission.markConsumed({ nvrId: camera.nvr.id, sessionId: diagSessionId, leaseType: 'diagnostic' })
+    server.log.info(
+      `[recordings-preview] nvr_diagnostic_lease_consumed nvrId=${camera.nvr.id} sessionId=${diagSessionId}` +
+      ` leaseType=diagnostic cameraId=${camera.id} activeCount=${admission.activeCount(camera.nvr.id)}` +
+      ` queuedCount=${admission.queuedCount(camera.nvr.id)}`
+    )
     const releaseNvrSlot = () => releasePlaybackLease(camera.nvr.id, diagSessionId, 'diagnostics_done')
 
     const timeoutMs   = body.perStrategyTimeoutMs ?? 25000

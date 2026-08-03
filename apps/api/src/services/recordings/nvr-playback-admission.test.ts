@@ -399,3 +399,137 @@ describe('Codex #143 P2 — la recuperación de capacidad promueve la cola (FIFO
     expect(c.hasLease('nvr-B', 'nvr-B-2')).toBe(true)
   })
 })
+
+// ─── Codex sobre 50f2bd3: ciclo de vida del lease ────────────────────────────
+
+describe('P1 — TERMINATING sigue ocupando capacidad', () => {
+  it('un lease en cierre NO libera el cupo ni promueve la cola', () => {
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.markConsumed({ nvrId: 'nvr-A', sessionId: 'sA' })
+    c.acquire(req({ sessionId: 'sB', slotIndex: 1 }))
+
+    // Empieza el cierre de A: el proceso sigue vivo (SIGTERM / kill grace).
+    expect(c.markTerminating({ nvrId: 'nvr-A', sessionId: 'sA' })).toBe(true)
+    expect(c.leaseState('nvr-A', 'sA')).toBe('terminating')
+    expect(c.terminatingCount('nvr-A')).toBe(1)
+    // B DEBE seguir en cola mientras A esté vivo.
+    expect(c.activeCount('nvr-A')).toBe(1)
+    expect(c.hasLease('nvr-A', 'sB')).toBe(false)
+    expect(c.queuedCount('nvr-A')).toBe(1)
+    // Reconciliar no puede colar a B mientras A ocupa el cupo.
+    expect(c.reconcile('nvr-A')).toHaveLength(0)
+    expect(c.hasLease('nvr-A', 'sB')).toBe(false)
+
+    // Recién tras la salida REAL se libera y se promueve.
+    const r = c.release({ nvrId: 'nvr-A', sessionId: 'sA', reason: 'exit_confirmed' })
+    expect(r.released).toBe(true)
+    expect(r.promoted.map(p => p.sessionId)).toEqual(['sB'])
+  })
+
+  it('un lease TERMINATING nunca es expirado por el barrido de reservas', () => {
+    const { c, clock } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.markTerminating({ nvrId: 'nvr-A', sessionId: 'sA' })
+    clock.advance(10 * 60_000)
+    expect(c.expireUnconsumedLeases(45_000)).toHaveLength(0)
+    expect(c.hasLease('nvr-A', 'sA')).toBe(true)
+  })
+
+  it('TERMINATING_STUCK conserva el cupo hasta la liberación posterior', () => {
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.acquire(req({ sessionId: 'sB', slotIndex: 1 }))
+    c.markTerminating({ nvrId: 'nvr-A', sessionId: 'sA', stuck: true })
+    expect(c.leaseState('nvr-A', 'sA')).toBe('terminating_stuck')
+    expect(c.reconcile('nvr-A')).toHaveLength(0)
+    expect(c.queuedCount('nvr-A')).toBe(1)
+    // El barrido detecta la salida y libera UNA sola vez.
+    const r1 = c.release({ nvrId: 'nvr-A', sessionId: 'sA', reason: 'after_stuck' })
+    const r2 = c.release({ nvrId: 'nvr-A', sessionId: 'sA', reason: 'after_stuck' })
+    expect(r1.promoted).toHaveLength(1)
+    expect(r2.released).toBe(false)
+    expect(r2.promoted).toHaveLength(0)
+  })
+
+  it('el fallback A/V → video-only no abre ventana para robar el cupo', () => {
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.markConsumed({ nvrId: 'nvr-A', sessionId: 'sA' })
+    c.acquire(req({ sessionId: 'sOtro', slotIndex: 1 }))
+    // El relanzamiento video-only reutiliza la MISMA sesión: sigue con su lease.
+    expect(c.acquire(req({ sessionId: 'sA' })).granted).toBe(true)
+    expect(c.hasLease('nvr-A', 'sOtro')).toBe(false)
+    expect(c.activeCount('nvr-A')).toBe(1)
+  })
+})
+
+describe('P2 — leases de diagnóstico', () => {
+  it('el diagnóstico se marca consumido y NO expira a los 45 s', () => {
+    const { c, clock } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'diag_1', slotIndex: -1, leaseType: 'diagnostic' }))
+    c.markConsumed({ nvrId: 'nvr-A', sessionId: 'diag_1', leaseType: 'diagnostic' })
+    expect(c.leaseTypeOf('nvr-A', 'diag_1')).toBe('diagnostic')
+
+    clock.advance(120_000)                       // dura más de 45 s
+    expect(c.expireUnconsumedLeases(45_000)).toHaveLength(0)
+    expect(c.hasLease('nvr-A', 'diag_1')).toBe(true)
+  })
+
+  it('una preview del mismo NVR permanece en cola mientras corre el diagnóstico', () => {
+    const { c, clock } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'diag_1', slotIndex: -1, leaseType: 'diagnostic' }))
+    c.markConsumed({ nvrId: 'nvr-A', sessionId: 'diag_1', leaseType: 'diagnostic' })
+    const prev = c.acquire(req({ sessionId: 'sPrev' }))
+    expect(prev.queued).toBe(true)
+
+    clock.advance(120_000)
+    c.expireUnconsumedLeases(45_000)
+    expect(c.hasLease('nvr-A', 'sPrev')).toBe(false)   // sigue esperando
+
+    // Al terminar el diagnóstico se libera y promueve.
+    const r = c.release({ nvrId: 'nvr-A', sessionId: 'diag_1', reason: 'diagnostics_done' })
+    expect(r.promoted.map(p => p.sessionId)).toEqual(['sPrev'])
+  })
+
+  it('un diagnóstico aún EN COLA puede cancelarse normalmente', () => {
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sA' }))
+    const d = c.acquire(req({ sessionId: 'diag_2', slotIndex: -1, leaseType: 'diagnostic' }))
+    expect(d.queued).toBe(true)
+    expect(c.cancelQueued({ nvrId: 'nvr-A', sessionId: 'diag_2', reason: 'diagnostics_no_capacity' })).toBe(true)
+    expect(c.release({ nvrId: 'nvr-A', sessionId: 'sA', reason: 'close' }).promoted).toHaveLength(0)
+  })
+
+  it('el snapshot expone leaseType, consumed, state y terminating', () => {
+    const { c } = ctl({ globalDefault: 2 })
+    c.acquire(req({ sessionId: 'sA' }))
+    c.markFirstByte({ nvrId: 'nvr-A', sessionId: 'sA' })
+    c.acquire(req({ sessionId: 'diag_1', slotIndex: -1, leaseType: 'diagnostic' }))
+    c.markConsumed({ nvrId: 'nvr-A', sessionId: 'diag_1', leaseType: 'diagnostic' })
+    c.markTerminating({ nvrId: 'nvr-A', sessionId: 'diag_1' })
+
+    const active = c.snapshot()[0].active
+    const a = active.find(x => x.sessionId === 'sA')!
+    const d = active.find(x => x.sessionId === 'diag_1')!
+    expect(a).toMatchObject({ leaseType: 'preview', consumed: true, state: 'active', terminating: false })
+    expect(d).toMatchObject({ leaseType: 'diagnostic', consumed: true, state: 'terminating', terminating: true })
+  })
+})
+
+describe('aislamiento con leases en cierre', () => {
+  it('un TERMINATING en un NVR no bloquea a otro NVR', () => {
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ nvrId: 'nvr-A', sessionId: 'a1' }))
+    c.markTerminating({ nvrId: 'nvr-A', sessionId: 'a1' })
+    expect(c.acquire(req({ nvrId: 'nvr-B', sessionId: 'b1' })).granted).toBe(true)
+  })
+  it('nunca se supera el límite efectivo contando los TERMINATING', () => {
+    const { c } = ctl({ globalDefault: 2 })
+    c.acquire(req({ sessionId: 's1' }))
+    c.acquire(req({ sessionId: 's2' }))
+    c.markTerminating({ nvrId: 'nvr-A', sessionId: 's1' })
+    expect(c.acquire(req({ sessionId: 's3' })).queued).toBe(true)
+    expect(c.activeCount('nvr-A')).toBe(2)
+  })
+})
