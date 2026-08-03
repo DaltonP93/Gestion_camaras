@@ -2658,6 +2658,21 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         // clasificar / decidir el fallback post-close, para no perder una
         // evidencia de audio que llegó en el último fragmento sin salto.
         flushStderrCarry()
+        // Liberar la estructura pendiente del tracker (acotada y deduplicada).
+        // Las evidencias sin resolver quedan NEUTRALES: nunca pasan a audio. Se
+        // registra un resumen acotado y saneado (sin URI, credenciales ni stderr).
+        const pStats = audioEvidence.pendingStats()
+        if (pStats.totalOccurrences > 0) {
+          const sample = audioEvidence.pendingEvidence()[0]
+          server.log.info(
+            `[recordings-preview] audio_evidence_pending_deduplicated sessionId=${sessionId}` +
+            ` cameraId=${session.cameraId} streamKey=${sample?.streamKey ?? 'none'}` +
+            ` errorKind=${sample?.errorKind ?? 'none'} occurrences=${sample?.occurrences ?? 0}` +
+            ` suppressedCount=${pStats.suppressedCount} pendingUniqueCount=${pStats.pendingUniqueCount}` +
+            ` totalOccurrences=${pStats.totalOccurrences}`
+          )
+        }
+        audioEvidence.clearPending()
         const code = exitCode
         const elapsedMs = Date.now() - streamStartMs
         server.log.info(

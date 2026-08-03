@@ -873,3 +873,190 @@ describe('P2-4 test 14 — recolección del intento previo antes del relanzamien
     expect(reg.aliveCount()).toBe(0)
   })
 })
+
+// ─── P2 Codex (5ª ronda): pendiente deduplicado y ACOTADO ────────────────────
+
+import {
+  MAX_PENDING_EVIDENCE_PER_STREAM,
+  MAX_PENDING_STREAMS_PER_ATTEMPT,
+  MAX_PENDING_EVIDENCE_TOTAL_PER_ATTEMPT,
+} from './preview-audio-policy'
+
+describe('P2-5 tests 1/2 — deduplicación por hecho lógico', () => {
+  it('1. 10.000 repeticiones exactas ⇒ una sola evidencia lógica, memoria constante', () => {
+    const t = createAudioEvidenceTracker()
+    for (let i = 0; i < 10_000; i++) t.push('Decoder (codec vvc) not found for input stream #0:0')
+    const pend = t.pendingEvidence()
+    expect(pend).toHaveLength(1)
+    expect(pend[0].occurrences).toBe(10_000)
+    expect(t.evidence().unresolvedDecoderErrors).toBe(1)
+    expect(t.pendingStats().pendingUniqueCount).toBe(1)
+    expect(t.pendingStats().totalOccurrences).toBe(10_000)
+    // Neutral: sin evidencia de audio ni de video, sin fallback posible.
+    expect(t.evidence().audioDecoderUnavailable).toBe(false)
+    expect(t.evidence().videoDecoderUnavailable).toBe(false)
+  })
+
+  it('2. fingerprints variables NO evaden la deduplicación', () => {
+    const t = createAudioEvidenceTracker()
+    for (let i = 0; i < 10_000; i++) {
+      t.push(`Decoder (codec vvc) not found for input stream #0:0 (retry ${i}, ts=${i * 7})`)
+    }
+    const pend = t.pendingEvidence()
+    expect(pend).toHaveLength(1)
+    expect(pend[0].occurrences).toBe(10_000)
+    // Se conserva la primera muestra y la última, no las 10.000.
+    expect(pend[0].rawFingerprint).toContain('retry 0')
+    expect(pend[0].lastRawFingerprint).toContain('retry 9999')
+    expect(pend[0].createdSequence).toBe(1)      // firstSequence
+    expect(pend[0].lastSequence).toBe(10_000)
+  })
+})
+
+describe('P2-5 tests 3/4/5 — límites defensivos y overflow determinista', () => {
+  it('3. varios errorKind/codec del mismo stream respetan MAX_PENDING_EVIDENCE_PER_STREAM', () => {
+    const t = createAudioEvidenceTracker()
+    // 6 hechos lógicos distintos (codec variable) para el MISMO stream.
+    for (let i = 0; i < 6; i++) t.push(`Decoder (codec futuro_${i}) not found for input stream #0:0`)
+    const pend = t.pendingEvidence()
+    expect(pend.length).toBe(MAX_PENDING_EVIDENCE_PER_STREAM)
+    expect(t.pendingStats().suppressedCount).toBe(6 - MAX_PENDING_EVIDENCE_PER_STREAM)
+    // Se conservan los PRIMEROS (política determinista).
+    expect(pend[0].explicitCodec).toBe('futuro_0')
+  })
+
+  it('4. muchos streams distintos respetan MAX_PENDING_STREAMS_PER_ATTEMPT', () => {
+    const t = createAudioEvidenceTracker()
+    for (let i = 0; i < MAX_PENDING_STREAMS_PER_ATTEMPT + 10; i++) {
+      t.push(`Error while opening decoder for input stream #0:${i}`)
+    }
+    const stats = t.pendingStats()
+    expect(stats.pendingStreamCount).toBe(MAX_PENDING_STREAMS_PER_ATTEMPT)
+    expect(stats.suppressedCount).toBe(10)
+    expect(stats.pendingUniqueCount).toBeLessThanOrEqual(MAX_PENDING_EVIDENCE_TOTAL_PER_ATTEMPT)
+  })
+
+  it('5. overflow determinista, suppressedCount correcto y sin excepciones', () => {
+    const t = createAudioEvidenceTracker()
+    expect(() => {
+      for (let s = 0; s < 40; s++) {
+        for (let c = 0; c < 6; c++) {
+          t.push(`Decoder (codec c_${c}) not found for input stream #0:${s}`)
+        }
+      }
+    }).not.toThrow()
+    const stats = t.pendingStats()
+    expect(stats.pendingUniqueCount).toBeLessThanOrEqual(MAX_PENDING_EVIDENCE_TOTAL_PER_ATTEMPT)
+    expect(stats.pendingStreamCount).toBeLessThanOrEqual(MAX_PENDING_STREAMS_PER_ATTEMPT)
+    expect(stats.totalOccurrences).toBe(40 * 6)
+    expect(stats.suppressedCount).toBe(40 * 6 - stats.pendingUniqueCount)
+    // Determinismo: dos ejecuciones idénticas dan el mismo resultado.
+    const t2 = createAudioEvidenceTracker()
+    for (let s = 0; s < 40; s++) for (let c = 0; c < 6; c++) t2.push(`Decoder (codec c_${c}) not found for input stream #0:${s}`)
+    expect(t2.pendingStats()).toEqual(stats)
+  })
+})
+
+describe('P2-5 tests 6/7 — resolución única tras miles de repeticiones', () => {
+  it('6. declaración de VIDEO ⇒ resuelve una vez, CODEC_UNSUPPORTED, pending vacío', () => {
+    const r = runAttempt([
+      ...Array.from({ length: 5000 }, () => 'Decoder (codec vvc) not found for input stream #0:0\n'),
+      'Stream #0:0: Video: vvc\n',
+    ])
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(r.evidence.audioDecoderUnavailable).toBe(false)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(0)
+    expect(r.restarts).toBe(0)
+    expect(r.learnedCamera).toBe(false)
+    expect(classifyRtspError('Decoder (codec vvc) not found for input stream #0:0\nStream #0:0: Video: vvc'))
+      .toBe('CODEC_UNSUPPORTED')
+  })
+
+  it('7. declaración de AUDIO ⇒ exactamente un fallback, pending vacío', () => {
+    const r = runAttempt([
+      ...Array.from({ length: 5000 }, () => 'Decoder (codec adpcm_g726le) not found for input stream #0:1\n'),
+      'Stream #0:1: Audio: adpcm_g726le\n',
+      ...Array.from({ length: 100 }, () => 'Decoder (codec adpcm_g726le) not found for input stream #0:1\n'),
+    ])
+    expect(r.evidence.audioDecoderUnavailable).toBe(true)
+    expect(r.evidence.unresolvedDecoderErrors).toBe(0)
+    expect(r.restarts).toBe(1)
+  })
+})
+
+describe('P2-5 tests 8/9 — aislamiento entre streams y limpieza final', () => {
+  it('8. resolver un stream no altera el otro', () => {
+    const t = createAudioEvidenceTracker()
+    t.push('Decoder (codec vvc) not found for input stream #0:0')
+    t.push('Decoder (codec adpcm_g726le) not found for input stream #0:1')
+    expect(t.evidence().unresolvedDecoderErrors).toBe(2)
+    t.push('Stream #0:0: Video: vvc')
+    expect(t.evidence().videoDecoderUnavailable).toBe(true)
+    expect(t.evidence().audioDecoderUnavailable).toBe(false)
+    // El pendiente de #0:1 sigue intacto y neutral.
+    const pend = t.pendingEvidence()
+    expect(pend).toHaveLength(1)
+    expect(pend[0].streamKey).toContain('1')
+    t.push('Stream #0:1: Audio: adpcm_g726le')
+    expect(t.evidence().audioDecoderUnavailable).toBe(true)
+    expect(t.evidence().unresolvedDecoderErrors).toBe(0)
+  })
+
+  it('9. pendiente sin declaración: neutral y estructura limpiada en close', () => {
+    const t = createAudioEvidenceTracker()
+    for (let i = 0; i < 1000; i++) t.push('Decoder (codec vvc) not found for input stream #0:0')
+    expect(t.evidence().audioDecoderUnavailable).toBe(false)
+    expect(t.evidence().videoDecoderUnavailable).toBe(false)
+    t.clearPending()   // close/exit
+    expect(t.evidence().unresolvedDecoderErrors).toBe(0)
+    expect(t.pendingEvidence()).toHaveLength(0)
+    // Nunca se convierte en audio tras la limpieza.
+    expect(t.evidence().audioDecoderUnavailable).toBe(false)
+  })
+})
+
+describe('P2-5 tests 10/11/12/14 — no regresión con stderr repetido', () => {
+  it('10. Box 4 "Audio: none" conserva el fallback', () => {
+    const r = runAttempt(['Stream #0:0: Video: hevc\nStream #0:1: Audio: none\n'])
+    expect(r.restarts).toBe(1)
+    expect(r.learnedCamera).toBe(true)
+  })
+  it('11. AAC válido no dispara fallback', () => {
+    const r = runAttempt(['Stream #0:0: Video: h264\nStream #0:1: Audio: aac (LC)\n'])
+    expect(r.restarts).toBe(0)
+  })
+  it('12. decoder HEVC real conserva CODEC_UNSUPPORTED', () => {
+    const r = runAttempt([
+      'Stream #0:0: Video: hevc\n',
+      ...Array.from({ length: 500 }, () => 'Decoder (codec hevc) not found for input stream #0:0\n'),
+    ])
+    expect(r.evidence.videoDecoderUnavailable).toBe(true)
+    expect(r.restarts).toBe(0)
+  })
+  it('14. stderr repetido NO genera múltiples reinicios', () => {
+    const r = runAttempt([
+      'Stream #0:0: Video: hevc\nStream #0:1: Audio: none\n',
+      ...Array.from({ length: 2000 }, () => 'Decoder (codec none) not found for input stream #0:1\n'),
+    ])
+    expect(r.restarts).toBe(1)
+  })
+})
+
+describe('P2-5 test 13 — recolección del intento previo antes del video-only', () => {
+  it('el A/V anterior sale y se recolecta antes del relanzamiento', async () => {
+    const reg = new PreviewProcessRegistry()
+    const signals: string[] = []
+    const proc: any = { pid: 909, kill: (s: string) => { signals.push(s); return true } }
+    const rec = reg.register(proc, Date.now())
+    const r = runAttempt([
+      ...Array.from({ length: 3000 }, () => 'Decoder (codec adpcm_g726le) not found for input stream #0:1\n'),
+      'Stream #0:1: Audio: adpcm_g726le\n',
+    ])
+    expect(r.restarts).toBe(1)
+    const term = reg.terminate(rec.attemptId, 'audio_fallback', { onSigterm: () => {}, onSigkill: () => {} })
+    reg.markExited(rec.attemptId)
+    await term
+    expect(signals[0]).toBe('SIGTERM')
+    expect(reg.aliveCount()).toBe(0)
+  })
+})

@@ -312,10 +312,42 @@ export interface PendingDecoderEvidence {
   streamKey: string
   errorKind: DecoderErrorKind
   explicitCodec: string | null
-  /** Línea saneada y truncada, sólo para diagnóstico. */
+  /** Primera línea saneada y truncada de este hecho lógico (diagnóstico). */
   rawFingerprint: string
-  /** Orden de llegada dentro del intento. */
+  /** Última línea saneada observada (sólo si difiere de la primera). */
+  lastRawFingerprint: string | null
+  /** Orden de llegada de la PRIMERA ocurrencia dentro del intento. */
   createdSequence: number
+  /** Orden de llegada de la ÚLTIMA ocurrencia. */
+  lastSequence: number
+  /** Cuántas veces se observó este MISMO hecho lógico. */
+  occurrences: number
+}
+
+// ─── Límites defensivos del almacenamiento pendiente ─────────────────────────
+// Un FFmpeg ruidoso o bloqueado puede repetir el mismo error de decoder miles de
+// veces mientras el stream sigue sin declararse. La evidencia pendiente se
+// deduplica por hecho LÓGICO (streamKey + errorKind + codec normalizado) y se
+// acota con estos topes explícitos, para que la memoria no crezca con el volumen
+// de stderr ni se multiplique con previews concurrentes.
+
+/** Máximo de hechos lógicos distintos retenidos por stream. */
+export const MAX_PENDING_EVIDENCE_PER_STREAM = 4
+/** Máximo de streams distintos con evidencia pendiente por intento. */
+export const MAX_PENDING_STREAMS_PER_ATTEMPT = 16
+/** Máximo global de hechos lógicos pendientes por intento. */
+export const MAX_PENDING_EVIDENCE_TOTAL_PER_ATTEMPT = 32
+
+/** Contadores del almacenamiento pendiente (diagnóstico y logs acotados). */
+export interface PendingEvidenceStats {
+  /** Hechos lógicos distintos retenidos ahora mismo. */
+  pendingUniqueCount: number
+  /** Ocurrencias totales observadas (incluye las deduplicadas). */
+  totalOccurrences: number
+  /** Ocurrencias descartadas por alcanzar un límite (nunca se crean entradas). */
+  suppressedCount: number
+  /** Streams distintos con evidencia pendiente. */
+  pendingStreamCount: number
 }
 
 /**
@@ -337,7 +369,12 @@ export interface PendingDecoderEvidence {
  */
 export function createAudioEvidenceTracker() {
   const streamRegistry = new Map<string, { type: StreamKind; codec: string | null }>()
-  const pending = new Map<string, PendingDecoderEvidence[]>()
+  // streamKey → (claveLógica → agregado). La clave lógica NO depende del
+  // fingerprint: un texto de error variable no puede evadir la deduplicación.
+  const pending = new Map<string, Map<string, PendingDecoderEvidence>>()
+  let pendingUniqueCount = 0
+  let totalOccurrences = 0
+  let suppressedCount = 0
 
   let sequence = 0
   let audioStreamSeen = false
@@ -358,14 +395,61 @@ export function createAudioEvidenceTracker() {
     }
   }
 
-  /** Resuelve TODAS las evidencias pendientes de un stream recién declarado. */
+  /**
+   * Resuelve las evidencias pendientes de un stream recién declarado: cada
+   * hecho LÓGICO se aplica UNA sola vez, aunque se haya observado miles de
+   * veces. Luego se liberan sus referencias (fingerprints incluidos).
+   */
   const resolvePendingFor = (keys: string[], kind: StreamKind) => {
     for (const k of keys) {
-      const list = pending.get(k)
-      if (!list) continue
+      const facts = pending.get(k)
+      if (!facts) continue
       pending.delete(k)
-      for (const e of list) applyKind(kind, e.errorKind)
+      pendingUniqueCount -= facts.size
+      for (const e of facts.values()) applyKind(kind, e.errorKind)
+      facts.clear()
     }
+  }
+
+  /**
+   * Registra una ocurrencia de evidencia pendiente, deduplicada por hecho
+   * lógico. Política de overflow DETERMINISTA: se conservan los primeros hechos
+   * únicos; al alcanzar cualquier límite no se crean entradas nuevas y sólo se
+   * incrementa suppressedCount. Las repeticiones de un hecho ya retenido nunca
+   * se suprimen: sólo actualizan occurrences/lastSequence/lastRawFingerprint.
+   */
+  const recordPending = (
+    streamKey: string, errorKind: DecoderErrorKind,
+    explicitCodec: string | null, fingerprint: string,
+  ) => {
+    totalOccurrences++
+    const factKey = `${errorKind}|${explicitCodec ?? ''}`
+    const facts = pending.get(streamKey)
+
+    const existing = facts?.get(factKey)
+    if (existing) {
+      existing.occurrences++
+      existing.lastSequence = sequence
+      existing.lastRawFingerprint = fingerprint === existing.rawFingerprint ? existing.lastRawFingerprint : fingerprint
+      return
+    }
+
+    // Nuevo hecho lógico: validar los tres topes antes de crear la entrada.
+    if (!facts && pending.size >= MAX_PENDING_STREAMS_PER_ATTEMPT) { suppressedCount++; return }
+    if (facts && facts.size >= MAX_PENDING_EVIDENCE_PER_STREAM) { suppressedCount++; return }
+    if (pendingUniqueCount >= MAX_PENDING_EVIDENCE_TOTAL_PER_ATTEMPT) { suppressedCount++; return }
+
+    const target = facts ?? new Map<string, PendingDecoderEvidence>()
+    if (!facts) pending.set(streamKey, target)
+    target.set(factKey, {
+      streamKey, errorKind, explicitCodec,
+      rawFingerprint: fingerprint,
+      lastRawFingerprint: null,
+      createdSequence: sequence,
+      lastSequence: sequence,
+      occurrences: 1,
+    })
+    pendingUniqueCount++
   }
 
   const registerStream = (prog: string | null, idx: string, kind: StreamKind, codec: string | null) => {
@@ -446,18 +530,11 @@ export function createAudioEvidenceTracker() {
           if (reg) { for (const ek of errorKinds) applyKind(reg.type, ek); return }
         }
         // Índice aún NO registrado ⇒ PENDIENTE y NEUTRAL. Sin inferencia por codec.
+        // El almacenamiento está deduplicado por hecho lógico y acotado: repetir
+        // el mismo error miles de veces no hace crecer la estructura.
         const key = keys[0]
-        const list = pending.get(key) ?? []
-        for (const ek of errorKinds) {
-          list.push({
-            streamKey: key,
-            errorKind: ek,
-            explicitCodec,
-            rawFingerprint: sanitize(line),
-            createdSequence: sequence,
-          })
-        }
-        pending.set(key, list)
+        const fingerprint = sanitize(line)
+        for (const ek of errorKinds) recordPending(key, ek, explicitCodec, fingerprint)
         return
       }
 
@@ -479,13 +556,12 @@ export function createAudioEvidenceTracker() {
 
     /** Instantánea de la evidencia acumulada. */
     evidence(): AudioEvidenceSnapshot {
-      let unresolved = 0
-      for (const list of pending.values()) unresolved += list.length
       return {
         audioStreamSeen, audioCodec,
         audioDecoderUnavailable, audioMuxIncompatible, audioParametersIncomplete,
         audioTrackDisabled, videoDecoderUnavailable,
-        unresolvedDecoderErrors: unresolved,
+        // Hechos LÓGICOS pendientes (no ocurrencias): acotado por diseño.
+        unresolvedDecoderErrors: pendingUniqueCount,
       }
     },
 
@@ -494,11 +570,31 @@ export function createAudioEvidenceTracker() {
       return new Map(streamRegistry)
     },
 
-    /** Evidencias pendientes sin resolver (diagnóstico/tests). */
+    /** Evidencias pendientes sin resolver, deduplicadas (diagnóstico/tests). */
     pendingEvidence(): PendingDecoderEvidence[] {
       const out: PendingDecoderEvidence[] = []
-      for (const list of pending.values()) out.push(...list)
+      for (const facts of pending.values()) out.push(...facts.values())
       return out.sort((a, b) => a.createdSequence - b.createdSequence)
+    },
+
+    /** Contadores acotados para logs sanitizados. */
+    pendingStats(): PendingEvidenceStats {
+      return {
+        pendingUniqueCount,
+        totalOccurrences,
+        suppressedCount,
+        pendingStreamCount: pending.size,
+      }
+    },
+
+    /**
+     * Libera TODA la estructura pendiente (close/exit). Las evidencias sin
+     * resolver quedan neutrales para siempre: nunca se convierten en audio.
+     */
+    clearPending(): void {
+      for (const facts of pending.values()) facts.clear()
+      pending.clear()
+      pendingUniqueCount = 0
     },
   }
 }
