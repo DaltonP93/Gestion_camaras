@@ -26,7 +26,21 @@ export interface AdmissionRequest {
   cameraName?: string | null
   slotIndex: number
   requestedAt?: number
+  leaseType?: LeaseType
 }
+
+/**
+ * Estado del ciclo de vida de un lease.
+ *  reserved   → concedido, el cliente aún no pidió /stream
+ *  attached   → /stream en curso (reserva consumida)
+ *  active     → ya emitió primer byte
+ *  terminating→ cerrando: SIGUE ocupando capacidad hasta que salgan los procesos
+ *  terminating_stuck → venció el hard kill y el registry aún reporta vivos
+ */
+export type LeaseState = 'reserved' | 'attached' | 'active' | 'terminating' | 'terminating_stuck'
+
+/** Origen del lease: reproducción normal o diagnóstico ADMIN. */
+export type LeaseType = 'preview' | 'diagnostic'
 
 export interface PlaybackLease {
   nvrId: string
@@ -41,6 +55,8 @@ export interface PlaybackLease {
   processAlive: boolean
   /** El cliente ya pidió GET /stream: la reserva fue consumida. */
   consumed: boolean
+  state: LeaseState
+  leaseType: LeaseType
 }
 
 export interface QueuedRequest {
@@ -85,6 +101,10 @@ export interface NvrCapacitySnapshot {
     processAlive: boolean
     acquiredAt: number
     firstByteAt: number | null
+    leaseType: LeaseType
+    consumed: boolean
+    state: LeaseState
+    terminating: boolean
   }>
   queue: Array<{
     sessionId: string
@@ -213,6 +233,8 @@ export class NvrPlaybackAdmissionController {
         pid: null,
         processAlive: false,
         consumed: false,
+        state: 'reserved',
+        leaseType: req.leaseType ?? 'preview',
       })
       return this.decision(req.nvrId, true, null)
     }
@@ -316,9 +338,12 @@ export class NvrPlaybackAdmissionController {
    * Una reserva concedida que nunca se consume debe expirar, o bloquearía el
    * NVR hasta el TTL de la sesión.
    */
-  markConsumed(args: { nvrId: string; sessionId: string }): void {
+  markConsumed(args: { nvrId: string; sessionId: string; leaseType?: LeaseType }): void {
     const lease = this.stateOf(args.nvrId).leases.get(args.sessionId)
-    if (lease) lease.consumed = true
+    if (!lease) return
+    lease.consumed = true
+    if (args.leaseType) lease.leaseType = args.leaseType
+    if (lease.state === 'reserved') lease.state = 'attached'
   }
 
   /**
@@ -333,7 +358,10 @@ export class NvrPlaybackAdmissionController {
     const expired: Array<{ nvrId: string; sessionId: string; cameraId: string; ageMs: number; promoted: QueuedRequest[] }> = []
     for (const [nvrId, st] of this.states) {
       for (const lease of [...st.leases.values()]) {
+        // Nunca expirar una reserva consumida, una que ya reproduce, ni una en
+        // cierre: esas ocupan una sesión RTSP real hasta que el proceso salga.
         if (lease.consumed || lease.firstByteAt != null) continue
+        if (lease.state === 'terminating' || lease.state === 'terminating_stuck') continue
         const ageMs = now - lease.acquiredAt
         if (ageMs < maxAgeMs) continue
         st.leases.delete(lease.sessionId)
@@ -349,7 +377,40 @@ export class NvrPlaybackAdmissionController {
   /** Marca que esta sesión ya produjo su primer byte (reproduce de verdad). */
   markFirstByte(args: { nvrId: string; sessionId: string; at?: number }): void {
     const lease = this.stateOf(args.nvrId).leases.get(args.sessionId)
-    if (lease && lease.firstByteAt == null) lease.firstByteAt = args.at ?? this.now()
+    if (!lease) return
+    if (lease.firstByteAt == null) lease.firstByteAt = args.at ?? this.now()
+    lease.consumed = true
+    if (lease.state === 'reserved' || lease.state === 'attached') lease.state = 'active'
+  }
+
+  /**
+   * Marca el lease como EN CIERRE. Sigue ocupando capacidad: un cupo representa
+   * una sesión RTSP real, y durante SIGTERM / kill grace / drenaje del pipe el
+   * proceso anterior todavía la tiene tomada. No se promueve la cola hasta que
+   * el registry confirme la salida real.
+   */
+  markTerminating(args: { nvrId: string; sessionId: string; stuck?: boolean }): boolean {
+    const lease = this.stateOf(args.nvrId).leases.get(args.sessionId)
+    if (!lease) return false
+    lease.state = args.stuck ? 'terminating_stuck' : 'terminating'
+    return true
+  }
+
+  /** ¿Hay leases en cierre para este NVR? (siguen consumiendo capacidad). */
+  terminatingCount(nvrId: string): number {
+    let n = 0
+    for (const l of this.stateOf(nvrId).leases.values()) {
+      if (l.state === 'terminating' || l.state === 'terminating_stuck') n++
+    }
+    return n
+  }
+
+  leaseState(nvrId: string, sessionId: string): LeaseState | null {
+    return this.stateOf(nvrId).leases.get(sessionId)?.state ?? null
+  }
+
+  leaseTypeOf(nvrId: string, sessionId: string): LeaseType | null {
+    return this.stateOf(nvrId).leases.get(sessionId)?.leaseType ?? null
   }
 
   /** Asocia el proceso FFmpeg al lease (diagnóstico). */
@@ -399,6 +460,10 @@ export class NvrPlaybackAdmissionController {
           processAlive: l.processAlive,
           acquiredAt: l.acquiredAt,
           firstByteAt: l.firstByteAt,
+          leaseType: l.leaseType,
+          consumed: l.consumed,
+          state: l.state,
+          terminating: l.state === 'terminating' || l.state === 'terminating_stuck',
         })),
         queue: st.queue.map((q, i) => ({
           sessionId: q.sessionId,
@@ -453,6 +518,8 @@ export class NvrPlaybackAdmissionController {
         pid: null,
         processAlive: false,
         consumed: false,
+        state: 'reserved',
+        leaseType: 'preview',
       })
       promoted.push(next)
     }
