@@ -32,6 +32,7 @@ import {
 import {
   NvrPlaybackAdmissionController, isNvrCapacityCategory,
 } from '../services/recordings/nvr-playback-admission'
+import { getTerminationTiming } from '../services/recordings/termination-timing'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
 import { PreviewProcessRegistry, type AttemptRecord } from '../services/recordings/preview-process-registry'
@@ -607,10 +608,14 @@ function terminateAllPreviewChildren(session: PreviewSession, reason: string, lo
  * Cuánto se espera la salida REAL de los hijos antes de considerar la
  * terminación atascada. Debe superar el kill grace (SIGTERM → SIGKILL).
  */
-const PREVIEW_TERMINATION_WAIT_MS = Math.max(
-  2_000,
-  parseInt(process.env.RECORDINGS_TERMINATION_WAIT_MS || '', 10) || 12_000,
-)
+// Timing del cierre resuelto en su FUENTE ÚNICA (services/recordings/
+// termination-timing). La espera de salida nunca puede ser menor que el kill
+// grace + margen de confirmación: si venciera antes del SIGKILL programado, la
+// terminación se marcaría atascada sin motivo y el cupo sólo se liberaría en el
+// barrido, bloqueando la cola de ese NVR (review Codex #144).
+const TERMINATION_TIMING = getTerminationTiming((m) => console.warn(m))
+const PREVIEW_KILL_GRACE_MS = TERMINATION_TIMING.previewKillGraceMs
+const PREVIEW_TERMINATION_WAIT_MS = TERMINATION_TIMING.effectiveTerminationWaitMs
 
 /**
  * Terminaciones que superaron el hard kill con procesos aún vivos. Su lease NO
@@ -711,7 +716,6 @@ const PREVIEW_START_STAGGER_MS = Math.max(0, parseInt(process.env.RECORDINGS_PRE
 // de arrancar. FFmpeg mismo espera ~60s a nivel RTSP; Node no debe cortar antes.
 const PREVIEW_FIRST_BYTE_TIMEOUT_MS = Math.max(3_000, parseInt(process.env.RECORDINGS_PREVIEW_FIRST_BYTE_TIMEOUT_MS || '25000', 10) || 25_000)
 // Gracia tras SIGTERM antes de SIGKILL a un FFmpeg que ignora la señal.
-const PREVIEW_KILL_GRACE_MS = Math.max(500, parseInt(process.env.RECORDINGS_PREVIEW_KILL_GRACE_MS || '2000', 10) || 2000)
 // Edad a partir de la cual el sweep mata un FFmpeg huérfano (vivo pero superado
 // por un takeover, ya no es el proceso activo de la sesión). Red de seguridad
 // independiente del JWT y del ciclo de la request (req 15).
@@ -783,7 +787,7 @@ export function logPreviewStartupConfig(log: (msg: string) => void, gitCommit: s
 // y la sesión sin cupo queda EN COLA, con posición y cancelación explícitas.
 export const admission = new NvrPlaybackAdmissionController({
   safeDefaultLimit: MAX_PREVIEW_PER_NVR,
-  cooldownMs: Math.max(0, parseInt(process.env.RECORDINGS_NVR_CAPACITY_COOLDOWN_MS || '', 10) || 120_000),
+  cooldownMs: TERMINATION_TIMING.capacityCooldownMs,
 })
 
 /**
@@ -791,10 +795,7 @@ export const admission = new NvrPlaybackAdmissionController({
  * se libera y se promueve la cola: cubre respuestas perdidas y pestañas
  * cerradas antes del DELETE. Debe superar el arranque normal (probe + spawn).
  */
-const PREVIEW_UNCONSUMED_LEASE_MS = Math.max(
-  10_000,
-  parseInt(process.env.RECORDINGS_UNCONSUMED_LEASE_MS || '', 10) || 45_000,
-)
+const PREVIEW_UNCONSUMED_LEASE_MS = TERMINATION_TIMING.unconsumedLeaseMs
 
 /**
  * ÚNICA vía para soltar el cupo de un stream. Espera la salida REAL de los
