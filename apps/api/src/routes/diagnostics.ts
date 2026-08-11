@@ -62,7 +62,12 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
     // observación de salud evalúa ESTOS paths, no sólo el _sub calculado.
     const camSessions = getActiveSessions()
       .filter((s) => s.cameraId === cameraId)
-      .map((s) => ({ userId: s.userId, viewId: s.viewId, streamType: s.streamType, streamPath: s.streamPath, heartbeatAgeMs: Date.now() - s.lastHeartbeat.getTime() }))
+      .map((s) => ({
+        userId: s.userId, viewId: s.viewId, streamType: s.streamType, streamPath: s.streamPath,
+        // Heartbeat de CLIENTE. Se nombra explícitamente para que no vuelva a
+        // confundirse con actividad de medio o con el proceso vivo.
+        clientHeartbeatAgeMs: Date.now() - s.lastClientHeartbeat.getTime(),
+      }))
     const activeSessions = camSessions.length
 
     // ── Alerta activa (una no resuelta por tipo) ──
@@ -184,7 +189,7 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (server) => {
       }>> = {}
       let orphanSessions = 0
       for (const s of userSessions) {
-        const heartbeatAgeMs = now - s.lastHeartbeat.getTime()
+        const heartbeatAgeMs = now - s.lastClientHeartbeat.getTime()
         if (heartbeatAgeMs > ORPHAN_HEARTBEAT_MS) orphanSessions++
         if (!sessionsByView[s.viewId]) sessionsByView[s.viewId] = []
         sessionsByView[s.viewId].push({

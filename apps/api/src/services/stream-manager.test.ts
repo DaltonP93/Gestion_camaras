@@ -24,7 +24,7 @@ function seedSub(userId: string, cameraId: string, viewId: string, ageSec: numbe
   __seedSessionForTest({
     cameraId, userId, viewId, streamType: 'sub',
     streamPath: `nvr_x_${cameraId}_sub`,
-    startedAt: secondsAgo(ageSec), lastHeartbeat: secondsAgo(ageSec),
+    startedAt: secondsAgo(ageSec), lastClientHeartbeat: secondsAgo(ageSec),
   })
   __setViewHeartbeatForTest(userId, viewId, secondsAgo(ageSec))
 }

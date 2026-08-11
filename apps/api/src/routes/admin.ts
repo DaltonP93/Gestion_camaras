@@ -22,7 +22,9 @@ export const adminRoutes: FastifyPluginAsync = async (server) => {
 
     const sessionRows = allSessions.map(s => {
       const ageSeconds = Math.round((now - s.startedAt.getTime()) / 1000)
-      const lastHeartbeatSeconds = Math.round((now - s.lastHeartbeat.getTime()) / 1000)
+      // Edad del heartbeat de CLIENTE: la única evidencia de espectador. El
+      // estado del proceso se informa aparte (`state`) y no la sustituye.
+      const lastHeartbeatSeconds = Math.round((now - s.lastClientHeartbeat.getTime()) / 1000)
 
       const viewers = allSessions.filter(
         other => other.cameraId === s.cameraId && other.streamType === s.streamType,

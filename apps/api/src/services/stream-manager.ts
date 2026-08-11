@@ -7,10 +7,17 @@ import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, ge
 import type { NVR, Camera } from '@prisma/client'
 import { decryptNvrPassword as decryptPass } from './credentials'
 import { resolveGridProfile } from './transcode-profile'
+import {
+  getSessionTtl, decideSessionExpiry, decideProcessTermination, orphanViewKeys,
+  type SessionTruth, type SessionTtl,
+} from './session-lifecycle'
 
 // Límites configurables
 const MAX_STREAMS_PER_USER   = Number(process.env.MAX_STREAMS_PER_USER   || 32)
 const MAX_STREAMS_GLOBAL     = Number(process.env.MAX_STREAMS_GLOBAL     || 50)
+// TTL de sesiones: lo resuelve session-lifecycle (fuente única, con normalización
+// y log de los valores EFECTIVOS). STREAM_IDLE_TIMEOUT se conserva sólo como
+// compatibilidad para los llamadores que reportan el umbral en segundos.
 const STREAM_IDLE_TIMEOUT    = Number(process.env.STREAM_IDLE_TIMEOUT    || 90)  // segundos
 export const MAX_TRANSCODE_SESSIONS = Number(process.env.MAX_TRANSCODE_SESSIONS || 2)
 // How long to wait for HLS manifest after FFmpeg starts (default 60s to allow first segment)
@@ -54,7 +61,12 @@ interface TranscodeSourceRef {
 
 const transcodeRestarts   = new Map<string, TranscodeRestartInfo>()
 const transcodeSourceInfo = new Map<string, TranscodeSourceRef>()
-const transcodeLastActivity  = new Map<string, number>()  // ms — last viewer heartbeat for this path
+// DIAGNÓSTICO ÚNICAMENTE. Última actividad de MEDIO observada sobre este path.
+// NO es un heartbeat y NO puede mantener viva una sesión de usuario: que el medio
+// se mueva sólo prueba que FFmpeg tira del RTSP, no que alguien esté mirando.
+// Antes se llamaba lastMediaActivity y sí participaba en la decisión de
+// vigencia; ese uso fue eliminado (ver session-lifecycle.ts).
+const lastMediaActivity      = new Map<string, number>()  // ms
 const SUPERVISOR_GRACE_MS    = 60_000  // restart if viewer was active within this window
 
 const SUPERVISOR_MAX_RESTARTS = 3
@@ -91,7 +103,27 @@ interface StreamSession {
   streamType: 'sub' | 'main' | 'main_h264'  // sub=grid H264, main=HD (puede HEVC), main_h264=transcodificado
   streamPath: string
   startedAt: Date
-  lastHeartbeat: Date             // actualizado por touchSession o touchView
+  /**
+   * ÚNICA evidencia de que hay un espectador. Hora del SERVIDOR al recibir
+   * actividad explícita de un cliente autenticado (touchSession/touchView/
+   * reconcileView). Jamás se deriva de un timestamp enviado por el navegador,
+   * ni del proceso FFmpeg, ni de la actividad de medio.
+   */
+  lastClientHeartbeat: Date
+  /**
+   * Generación de la sesión. Se incrementa en cada apertura, de modo que un
+   * heartbeat en vuelo emitido antes de un cierre no pueda resucitar la sesión
+   * ya cerrada (ni volver a levantar su FFmpeg sin espectador).
+   */
+  generation: number
+}
+
+// Contador monótono de generaciones. Una sesión reabierta sobre la misma clave
+// recibe una generación mayor; todo lo emitido contra la anterior es tardío.
+let sessionGenerationCounter = 0
+function nextGeneration(): number {
+  sessionGenerationCounter += 1
+  return sessionGenerationCounter
 }
 
 // En memoria — se pierde al reiniciar (intencional: el frontend reconecta)
@@ -124,9 +156,11 @@ export function getSessionsForUser(userId: string): StreamSession[] {
 export function __seedSessionForTest(s: {
   cameraId: string; userId: string; viewId: string
   streamType: 'sub' | 'main' | 'main_h264'; streamPath: string
-  startedAt: Date; lastHeartbeat: Date
+  startedAt: Date; lastClientHeartbeat: Date; generation?: number
 }): void {
-  sessions.set(sessionKey(s.userId, s.cameraId, s.streamType), { ...s })
+  sessions.set(sessionKey(s.userId, s.cameraId, s.streamType), {
+    ...s, generation: s.generation ?? nextGeneration(),
+  })
   if (s.streamType === 'sub') {
     const vk = vKey(s.userId, s.viewId)
     if (!viewCameras.has(vk)) viewCameras.set(vk, new Set())
@@ -136,8 +170,13 @@ export function __seedSessionForTest(s: {
 export function __setViewHeartbeatForTest(userId: string, viewId: string, at: Date): void {
   viewHeartbeat.set(vKey(userId, viewId), at)
 }
+/** Sólo tests: marca actividad de MEDIO (que NO debe mantener viva una sesión). */
+export function __setMediaActivityForTest(streamPath: string, atMs: number): void {
+  lastMediaActivity.set(streamPath, atMs)
+}
 export function __resetSessionsForTest(): void {
   sessions.clear()
+  lastMediaActivity.clear()
   viewCameras.clear()
   viewHeartbeat.clear()
 }
@@ -149,49 +188,120 @@ export function __resetSessionsForTest(): void {
 // llegara al tope sin que hubiera esa cantidad de cámaras realmente visibles.
 //
 // Esta función elimina de forma síncrona (sin tocar MediaMTX — de eso se encarga el
-// cron cleanupIdleSessions) las sesiones cuyo view o cuyo lastHeartbeat expiró, y se
-// llama ANTES de evaluar el límite global. Conserva sesiones main_h264 cuyo FFmpeg
-// siga vivo o con actividad reciente para no cortar transcodificaciones en curso.
+// cron cleanupIdleSessions) las sesiones cuyo heartbeat de CLIENTE venció, y se
+// llama ANTES de evaluar el límite global.
+//
+// CAMBIO A1: antes conservaba sesiones main_h264 cuyo FFmpeg siguiera vivo o con
+// actividad de medio reciente. Esa excepción convertía al proceso en su propio
+// justificante y hacía inmortal la sesión. Ahora la vigencia la decide sólo el
+// heartbeat de cliente; el proceso se termina cuando ya no queda ningún
+// espectador válido sobre su path.
 export function pruneStaleSessions(): number {
-  const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
-  let pruned = 0
+  const nowMs = Date.now()
+  const ttl = getSessionTtl(msg => console.info(msg))
+  const { expired, surviving } = decideSessionExpiry({
+    sessions: toSessionTruths(),
+    viewHeartbeats: viewHeartbeatsAsMs(),
+    nowMs,
+    ttl,
+  })
+  if (expired.length === 0) return 0
 
-  for (const [key, session] of sessions.entries()) {
+  const termination = decideProcessTermination(expired.map(e => e.session), surviving)
+
+  for (const { session, reason, clientHeartbeatAgeMs } of expired) {
     const vk = vKey(session.userId, session.viewId)
-    const hb = viewHeartbeat.get(vk)
-    const viewExpired    = !hb || hb < cutoff
-    const sessionExpired = session.lastHeartbeat < cutoff
-    if (!viewExpired && !sessionExpired) continue
-
-    if (session.streamType === 'main_h264') {
-      const ffmpegAlive    = isTranscodeProcessAlive(session.streamPath)
-      const lastActivity   = transcodeLastActivity.get(session.streamPath) ?? 0
-      const recentActivity = (Date.now() - lastActivity) < SUPERVISOR_GRACE_MS
-      // No cortar transcodificaciones vivas / recién usadas por heartbeats atrasados
-      if (ffmpegAlive || recentActivity) continue
-      stopTranscodeProcess(session.streamPath)
-      transcodeInFlight.delete(session.streamPath)
-      transcodeRestarts.delete(session.streamPath)
-      transcodeSourceInfo.delete(session.streamPath)
-      transcodeLastActivity.delete(session.streamPath)
-    }
-    if (session.streamType === 'sub') {
-      viewCameras.get(vk)?.delete(session.cameraId)
-    }
-    sessions.delete(key)
-    pruned++
+    if (session.streamType === 'sub') viewCameras.get(vk)?.delete(session.cameraId)
+    sessions.delete(session.key)
+    console.info(
+      `[stream-manager] view_session_expired cameraId=${session.cameraId}` +
+      ` streamType=${session.streamType} viewId=${session.viewId}` +
+      ` reason=${reason} clientHeartbeatAgeMs=${clientHeartbeatAgeMs}` +
+      ` generation=${session.generation}`
+    )
   }
 
-  // Limpiar mapas de views vencidos
-  for (const [vk, hb] of viewHeartbeat.entries()) {
-    if (hb < cutoff) {
-      viewCameras.delete(vk)
-      viewHeartbeat.delete(vk)
-    }
-  }
+  terminateProcesses(termination, 'prune_stale')
+  pruneOrphanViewIndexes(surviving, nowMs, ttl)
 
-  if (pruned > 0) console.info(`[stream-manager] pruned_stale_sessions count=${pruned}`)
-  return pruned
+  console.info(`[stream-manager] pruned_stale_sessions count=${expired.length}`)
+  return expired.length
+}
+
+// ─── Puentes entre el estado en memoria y el módulo PURO ─────────────────────
+
+/** Proyección del mapa de sesiones a la forma que consume session-lifecycle. */
+function toSessionTruths(): SessionTruth[] {
+  return Array.from(sessions.entries()).map(([key, s]) => ({
+    key,
+    userId: s.userId,
+    viewId: s.viewId,
+    cameraId: s.cameraId,
+    streamType: s.streamType,
+    streamPath: s.streamPath,
+    lastClientHeartbeatMs: s.lastClientHeartbeat.getTime(),
+    generation: s.generation,
+  }))
+}
+
+/** Proyección de UNA sesión (ya sacada del mapa) a la forma pura. */
+function sessionTruthOf(key: string, s: StreamSession): SessionTruth {
+  return {
+    key,
+    userId: s.userId,
+    viewId: s.viewId,
+    cameraId: s.cameraId,
+    streamType: s.streamType,
+    streamPath: s.streamPath,
+    lastClientHeartbeatMs: s.lastClientHeartbeat.getTime(),
+    generation: s.generation,
+  }
+}
+
+function viewHeartbeatsAsMs(): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const [vk, at] of viewHeartbeat.entries()) out.set(vk, at.getTime())
+  return out
+}
+
+/**
+ * Aplica la decisión de terminación. Idempotente: `stopTranscodeProcess` tolera
+ * un path ya detenido, y los índices se borran con `delete` (no-op si no están).
+ */
+function terminateProcesses(
+  decision: { terminate: string[]; keepAlive: Array<{ streamPath: string; remainingViewers: number }> },
+  reason: string,
+): void {
+  for (const { streamPath, remainingViewers } of decision.keepAlive) {
+    console.info(
+      `[stream-manager] transcode_keepalive path=${streamPath}` +
+      ` remainingViewers=${remainingViewers} reason=${reason}`
+    )
+  }
+  for (const streamPath of decision.terminate) {
+    stopTranscodeProcess(streamPath)
+    transcodeInFlight.delete(streamPath)
+    transcodeRestarts.delete(streamPath)
+    transcodeSourceInfo.delete(streamPath)
+    lastMediaActivity.delete(streamPath)
+    console.info(`[stream-manager] transcode_killed path=${streamPath} reason=${reason}_refcount_zero`)
+  }
+}
+
+/** Poda de índices auxiliares sin dueño (si no, reaparecen como demanda). */
+function pruneOrphanViewIndexes(surviving: SessionTruth[], nowMs: number, ttl: SessionTtl): void {
+  const knownViewKeys = new Set<string>([...viewCameras.keys(), ...viewHeartbeat.keys()])
+  const orphans = orphanViewKeys({
+    knownViewKeys: [...knownViewKeys],
+    surviving,
+    viewHeartbeats: viewHeartbeatsAsMs(),
+    nowMs,
+    ttl,
+  })
+  for (const vk of orphans) {
+    viewCameras.delete(vk)
+    viewHeartbeat.delete(vk)
+  }
 }
 
 // ─── Contadores rodantes de resultados de start-stream (últimos 15 min) ─────
@@ -286,7 +396,44 @@ export function __resetOutcomesForTest(): void {
 // pruneStaleSessions/cleanupIdleSessions) — en ms, para que el diagnóstico
 // marque como "huérfana" exactamente lo que la limpieza real consideraría vencido.
 export function getStreamIdleTimeoutMs(): number {
-  return STREAM_IDLE_TIMEOUT * 1000
+  return getSessionTtl().standardTtlMs
+}
+
+/** Timeout efectivo de sesiones HD/transcodificadas (ms). */
+export function getStreamHdIdleTimeoutMs(): number {
+  return getSessionTtl().hdTtlMs
+}
+
+// ─── Guarda contra respuestas tardías ────────────────────────────────────────
+// Un heartbeat puede estar EN VUELO cuando el usuario cierra la pestaña o cambia
+// de cámara. Si el servidor lo procesa después del cierre, recrearía la sesión y
+// volvería a levantar FFmpeg sin espectador. Se registra el instante del cierre
+// explícito de cada view y se descarta toda actividad recibida ANTES de él.
+const viewClosedAt = new Map<string, number>()
+const CLOSED_VIEW_MEMORY_MS = 5 * 60_000
+
+function markViewClosed(userId: string, viewId: string): void {
+  const nowMs = Date.now()
+  viewClosedAt.set(vKey(userId, viewId), nowMs)
+  // Poda perezosa: no conservar cierres viejos para siempre.
+  for (const [vk, at] of viewClosedAt.entries()) {
+    if (nowMs - at > CLOSED_VIEW_MEMORY_MS) viewClosedAt.delete(vk)
+  }
+}
+
+/**
+ * ¿Esta petición quedó obsoleta por un cierre explícito posterior a su llegada?
+ * `receivedAtMs` es la hora del SERVIDOR al recibir la petición, no un dato del
+ * cliente.
+ */
+export function isViewClosedAfter(userId: string, viewId: string, receivedAtMs: number): boolean {
+  const closedAt = viewClosedAt.get(vKey(userId, viewId))
+  return closedAt !== undefined && closedAt >= receivedAtMs
+}
+
+/** Sólo tests: limpia la memoria de cierres. */
+export function __resetClosedViewsForTest(): void {
+  viewClosedAt.clear()
 }
 
 // Límites efectivos resueltos (env → número) — para el endpoint de diagnóstico.
@@ -317,19 +464,38 @@ export function getStreamCounts(userId: string): StreamCounts {
   }
 }
 
-// Tocar una sola sesión (backward compat para touch-stream endpoint individual)
-export function touchSession(userId: string, cameraId: string, streamType: 'sub' | 'main' | 'main_h264' = 'sub') {
+// Tocar una sola sesión (backward compat para touch-stream endpoint individual).
+//
+// `receivedAtMs` es la hora del SERVIDOR al recibir la petición. Se usa para
+// descartar heartbeats en vuelo que llegan después de un cierre explícito: sin
+// esa guarda, una respuesta tardía resucitaría una sesión ya cerrada.
+export function touchSession(
+  userId: string,
+  cameraId: string,
+  streamType: 'sub' | 'main' | 'main_h264' = 'sub',
+  receivedAtMs: number = Date.now(),
+) {
   const key = sessionKey(userId, cameraId, streamType)
   const s = sessions.get(key)
-  if (s) {
-    s.lastHeartbeat = new Date()
-    if (streamType === 'main_h264') transcodeLastActivity.set(s.streamPath, Date.now())
+  if (!s) return                                    // sesión inexistente: nada que resucitar
+  if (isViewClosedAfter(userId, s.viewId, receivedAtMs)) {
+    console.info(
+      `[stream-manager] heartbeat_ignored_stale cameraId=${cameraId}` +
+      ` streamType=${streamType} viewId=${s.viewId} reason=view_closed_after_request`
+    )
+    return
   }
+  // Hora del SERVIDOR, nunca un timestamp enviado por el navegador.
+  s.lastClientHeartbeat = new Date()
 }
 
 // Tocar todas las sesiones de un view de una vez — toca sub, main y main_h264
-// para evitar que el idle cleanup mate streams HD/transcodificados durante heartbeat
-export function touchView(userId: string, viewId: string) {
+// para que el idle cleanup no mate streams HD durante un heartbeat legítimo.
+export function touchView(userId: string, viewId: string, receivedAtMs: number = Date.now()) {
+  if (isViewClosedAfter(userId, viewId, receivedAtMs)) {
+    console.info(`[stream-manager] heartbeat_ignored_stale viewId=${viewId} reason=view_closed_after_request`)
+    return
+  }
   const vk = vKey(userId, viewId)
   viewHeartbeat.set(vk, new Date())
   const vCams = viewCameras.get(vk)
@@ -338,12 +504,18 @@ export function touchView(userId: string, viewId: string) {
   for (const cameraId of vCams) {
     for (const st of ['sub', 'main', 'main_h264'] as const) {
       const s = sessions.get(sessionKey(userId, cameraId, st))
-      if (s) {
-        s.lastHeartbeat = now
-        if (st === 'main_h264') transcodeLastActivity.set(s.streamPath, Date.now())
-      }
+      if (s) s.lastClientHeartbeat = now
     }
   }
+}
+
+/**
+ * Registra actividad de MEDIO sobre un path. Es DIAGNÓSTICO: no prolonga la
+ * vigencia de ninguna sesión. Se conserva porque el supervisor de reinicio lo
+ * usa para decidir si vale la pena re-spawnear FFmpeg tras una caída.
+ */
+export function recordMediaActivity(streamPath: string): void {
+  lastMediaActivity.set(streamPath, Date.now())
 }
 
 // ─── Transcode supervisor ────────────────────────────────────────────────────
@@ -378,7 +550,7 @@ async function runTranscodeSupervisor(
 
   const hasSession    = !!sessions.get(transcodeKey)
   const inFlightState = transcodeInFlight.get(streamPath)?.state
-  const lastActivity  = transcodeLastActivity.get(streamPath) ?? 0
+  const lastActivity  = lastMediaActivity.get(streamPath) ?? 0
   const recentViewer  = (Date.now() - lastActivity) < SUPERVISOR_GRACE_MS
   if (!hasSession && inFlightState !== 'starting' && !recentViewer) {
     console.info(
@@ -424,7 +596,7 @@ async function runTranscodeSupervisor(
 
   const hasSessionAfter    = !!sessions.get(transcodeKey)
   const inFlightStateAfter = transcodeInFlight.get(streamPath)?.state
-  const lastActivityAfter  = transcodeLastActivity.get(streamPath) ?? 0
+  const lastActivityAfter  = lastMediaActivity.get(streamPath) ?? 0
   const recentViewerAfter  = (Date.now() - lastActivityAfter) < SUPERVISOR_GRACE_MS
   if (!hasSessionAfter && inFlightStateAfter !== 'starting' && !recentViewerAfter) {
     console.info(
@@ -448,7 +620,7 @@ async function runTranscodeSupervisor(
   }
 
   console.info(`[supervisor] restarted path=${streamPath} pid=${proc.pid ?? 'pending'} attempt=${info.count}`)
-  transcodeLastActivity.set(streamPath, Date.now())
+  lastMediaActivity.set(streamPath, Date.now())
 
   const existing = transcodeInFlight.get(streamPath)
   if (existing && existing.state !== 'ready') {
@@ -595,9 +767,9 @@ async function startStreamCore(
     // ── 1. Reuse already-registered session ──────────────────
     const existingSession = sessions.get(transcodeKey)
     if (existingSession) {
-      existingSession.lastHeartbeat = new Date()
+      existingSession.lastClientHeartbeat = new Date()
       if (viewId) existingSession.viewId = viewId
-      transcodeLastActivity.set(existingSession.streamPath, Date.now())
+      lastMediaActivity.set(existingSession.streamPath, Date.now())
       console.info(`[userLimit] reuse existing cameraId=${cameraId} streamType=main_h264`)
       return { hlsUrl: getHlsUrl(existingSession.streamPath), webrtcUrl: getWebRtcUrl(existingSession.streamPath), streamPath: existingSession.streamPath, transcoded: true }
     }
@@ -612,7 +784,7 @@ async function startStreamCore(
       if (ready) {
         const s = sessions.get(transcodeKey)
         if (s) {
-          s.lastHeartbeat = new Date()
+          s.lastClientHeartbeat = new Date()
           return { hlsUrl: getHlsUrl(s.streamPath), webrtcUrl: getWebRtcUrl(s.streamPath), streamPath: s.streamPath, transcoded: true }
         }
       }
@@ -632,9 +804,9 @@ async function startStreamCore(
       const effectiveViewId0 = viewId || 'default'
       sessions.set(transcodeKey, {
         cameraId, userId, viewId: effectiveViewId0, streamType: 'main_h264',
-        streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+        streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
       })
-      transcodeLastActivity.set(streamPath, Date.now())
+      lastMediaActivity.set(streamPath, Date.now())
       // Supervisor is still attached from the original spawn — no need to re-attach.
       transcodeInFlight.set(streamPath, { state: 'ready', promise: Promise.resolve(true), resolve: () => {} })
       return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
@@ -722,9 +894,9 @@ async function startStreamCore(
           const effectiveViewId2 = viewId || 'default'
           sessions.set(transcodeKey, {
             cameraId, userId, viewId: effectiveViewId2, streamType: 'main_h264',
-            streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+            streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
           })
-          transcodeLastActivity.set(streamPath, Date.now())
+          lastMediaActivity.set(streamPath, Date.now())
           transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
           resolveInFlight(true)
           return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
@@ -744,9 +916,9 @@ async function startStreamCore(
           const effectiveViewId3 = viewId || 'default'
           sessions.set(transcodeKey, {
             cameraId, userId, viewId: effectiveViewId3, streamType: 'main_h264',
-            streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+            streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
           })
-          transcodeLastActivity.set(streamPath, Date.now())
+          lastMediaActivity.set(streamPath, Date.now())
           transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
           resolveInFlight(true)
           return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
@@ -764,9 +936,9 @@ async function startStreamCore(
       const effectiveViewId = viewId || 'default'
       sessions.set(transcodeKey, {
         cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
-        streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+        streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
       })
-      transcodeLastActivity.set(streamPath, Date.now())
+      lastMediaActivity.set(streamPath, Date.now())
       transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
       resolveInFlight(true)
       console.info(`[transcode] ready cameraId=${cameraId} ch=${ch} path=${streamPath}`)
@@ -796,7 +968,7 @@ async function startStreamCore(
   const key = sessionKey(userId, cameraId, effectiveType as 'sub' | 'main')
   const existingSession = sessions.get(key)
   if (existingSession) {
-    existingSession.lastHeartbeat = new Date()
+    existingSession.lastClientHeartbeat = new Date()
     if (viewId) existingSession.viewId = viewId
     console.info(`[userLimit] reuse existing cameraId=${cameraId} streamType=${effectiveType}`)
     return { hlsUrl: getHlsUrl(existingSession.streamPath), webrtcUrl: getWebRtcUrl(existingSession.streamPath), streamPath: existingSession.streamPath }
@@ -839,7 +1011,7 @@ async function startStreamCore(
   const effectiveViewId = viewId || 'default'
   sessions.set(key, {
     cameraId, userId, viewId: effectiveViewId, streamType: effectiveType as 'sub' | 'main',
-    streamPath, startedAt: new Date(), lastHeartbeat: new Date(),
+    streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
   })
   if (effectiveType === 'sub') {
     const vk = vKey(userId, effectiveViewId)
@@ -864,29 +1036,35 @@ export async function stopStream(
   let clearedInFlight = false
 
   if (session) {
+    const generation = session.generation
     if (streamType === 'sub') {
       const vk = vKey(userId, session.viewId)
       viewCameras.get(vk)?.delete(cameraId)
     }
     sessions.delete(key)
+    // Cierre EXPLÍCITO de esta cámara dentro del view: todo heartbeat en vuelo
+    // emitido antes de este instante queda invalidado y no podrá recrearla.
+    markViewClosed(userId, session.viewId)
+    console.info(
+      `[stream-manager] view_session_closed cameraId=${cameraId} streamType=${streamType}` +
+      ` viewId=${session.viewId} generation=${generation} reason=${reason || 'unspecified'}`
+    )
     if (streamType === 'main_h264') {
       // Only kill FFmpeg when the reason explicitly permits it.
       // Non-kill reasons (retry, hls_error, etc.) keep FFmpeg alive so the next
       // startStream call can detect the live process and reuse it without re-spawning.
       const shouldKill = !reason || TRANSCODE_KILL_REASONS.has(reason)
-      // Even if shouldKill, don't kill FFmpeg when other sessions are still watching
-      const otherWatchers = Array.from(sessions.values()).filter(
-        s => s.streamPath === session.streamPath && s.streamType === 'main_h264'
-      ).length
-      if (shouldKill && otherWatchers > 0) {
-        console.info(`[live] stop_deferred_active_viewers path=${session.streamPath} watchers=${otherWatchers} reason=${reason || 'unspecified'}`)
-      } else if (shouldKill) {
-        stopTranscodeProcess(session.streamPath)
-        transcodeRestarts.delete(session.streamPath)
-        transcodeSourceInfo.delete(session.streamPath)
-        transcodeLastActivity.delete(session.streamPath)
+      // Refcount compartido: aunque toque matar, no se mata mientras otro
+      // espectador siga usando EXACTAMENTE el mismo proceso/perfil.
+      const decision = decideProcessTermination(
+        [sessionTruthOf(key, session)],
+        toSessionTruths(),
+      )
+      if (shouldKill && decision.terminate.length > 0) {
+        terminateProcesses(decision, reason || 'stop_stream')
         killedFfmpeg = true
-        console.info(`[live] transcode_killed path=${session.streamPath} reason=refcount_zero`)
+      } else if (shouldKill) {
+        terminateProcesses({ terminate: [], keepAlive: decision.keepAlive }, reason || 'stop_stream')
       } else {
         console.info(`[live] stop_stream_keep_ffmpeg path=${session.streamPath} reason=${reason}`)
       }
@@ -895,6 +1073,8 @@ export async function stopStream(
       clearedInFlight = true
     }
   } else {
+    // Idempotencia: cerrar dos veces (pagehide + desmontaje + cambio de layout
+    // concurrentes) no es un error y no debe producir efectos adicionales.
     console.info(`[live] stop_ignored_stale cameraId=${cameraId} streamType=${streamType} reason=${reason || 'unspecified'}`)
   }
 
@@ -934,10 +1114,19 @@ export async function reconcileView(
   const visibleSet = new Set(visibleCameraIds)
   const suppressSet = new Set(suppressStartCameraIds)
   const vk = vKey(userId, viewId)
+  const receivedAtMs = Date.now()
 
   console.info(`[live] heartbeat userId=${userId} viewId=${viewId} cameraIds=[${visibleCameraIds.join(',')}]`)
 
-  // Actualizar heartbeat del view
+  // GUARDA DE RESPUESTA TARDÍA: si el view se cerró explícitamente después de
+  // que llegó esta petición, reconciliar volvería a crear sesiones y a levantar
+  // FFmpeg sin espectador. Se descarta el heartbeat entero.
+  if (isViewClosedAfter(userId, viewId, receivedAtMs)) {
+    console.info(`[live] heartbeat_ignored_stale viewId=${viewId} reason=view_closed_after_request`)
+    return { streams: {}, errors: {}, startedIds: [], stoppedIds: [] }
+  }
+
+  // Actualizar heartbeat del view (hora del SERVIDOR)
   viewHeartbeat.set(vk, new Date())
 
   const streams: ReconcileResult['streams'] = {}
@@ -963,14 +1152,14 @@ export async function reconcileView(
     if (existing) {
       // Ya está corriendo — tocar y devolver URL
       const now2 = new Date()
-      existing.lastHeartbeat = now2
+      existing.lastClientHeartbeat = now2
       existing.viewId = viewId
       // Touch co-located main/main_h264 sessions so idle cleanup doesn't kill active focus streams
       for (const st of ['main', 'main_h264'] as const) {
         const sOther = sessions.get(sessionKey(userId, cameraId, st))
         if (sOther) {
-          sOther.lastHeartbeat = now2
-          if (st === 'main_h264') transcodeLastActivity.set(sOther.streamPath, Date.now())
+          sOther.lastClientHeartbeat = now2
+          if (st === 'main_h264') lastMediaActivity.set(sOther.streamPath, Date.now())
           console.info(`[reconcileView] touch ${st} cameraId=${cameraId} path=${sOther.streamPath}`)
         }
       }
@@ -1043,26 +1232,26 @@ export async function cleanupUserSessions(
 
   let removed = 0
 
+  // Snapshot ANTES de borrar: la decisión de qué procesos terminar se toma
+  // sobre el conjunto completo, no sesión por sesión. Si no, la primera sesión
+  // cerrada de un proceso compartido lo mataría para las demás.
+  const closingTruths = targetSessions.map(s =>
+    sessionTruthOf(sessionKey(userId, s.cameraId, s.streamType), s))
+  const closingKeys = new Set(closingTruths.map(t => t.key))
+  const survivingTruths = toSessionTruths().filter(t => !closingKeys.has(t.key))
+  const termination = decideProcessTermination(closingTruths, survivingTruths)
+
   for (const session of targetSessions) {
     const key = sessionKey(userId, session.cameraId, session.streamType)
+    if (!sessions.has(key)) continue     // idempotente: ya cerrada por otra vía
     sessions.delete(key)
     removed++
-
-    if (session.streamType === 'main_h264') {
-      const otherWatchers = Array.from(sessions.values()).filter(
-        s => s.streamPath === session.streamPath && s.streamType === 'main_h264'
-      ).length
-      if (otherWatchers > 0) {
-        console.info(`[live] transcode_keepalive path=${session.streamPath} reason=other_active_session viewers=${otherWatchers}`)
-      } else {
-        stopTranscodeProcess(session.streamPath)
-        transcodeInFlight.delete(session.streamPath)
-        transcodeRestarts.delete(session.streamPath)
-        transcodeSourceInfo.delete(session.streamPath)
-        transcodeLastActivity.delete(session.streamPath)
-        console.info(`[live] transcode_killed path=${session.streamPath} reason=refcount_zero`)
-      }
-    }
+    markViewClosed(userId, session.viewId)
+    console.info(
+      `[stream-manager] view_session_closed cameraId=${session.cameraId}` +
+      ` streamType=${session.streamType} viewId=${session.viewId}` +
+      ` generation=${session.generation} reason=${viewId ? 'cleanup_view' : 'cleanup_stale'}`
+    )
 
     const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === session.cameraId)
     if (!othersWatching) {
@@ -1075,6 +1264,9 @@ export async function cleanupUserSessions(
       }
     }
   }
+
+  // Terminar los FFmpeg que quedaron sin ningún espectador válido.
+  terminateProcesses(termination, viewId ? 'cleanup_view' : 'cleanup_stale')
 
   // Clean view maps
   if (viewId) {
@@ -1094,73 +1286,68 @@ export async function cleanupUserSessions(
   return removed
 }
 
-// Limpiar sesiones inactivas (llamar desde un cron)
-// Una sesión es idle si su view no ha hecho heartbeat en STREAM_IDLE_TIMEOUT segundos
+// Limpiar sesiones inactivas (llamar desde un cron).
+//
+// UNA SESIÓN ES IDLE CUANDO SU CLIENTE DEJÓ DE LATIR. Punto.
+//
+// Antes esta función tenía dos escapes que la volvían inofensiva justo en el
+// caso que debía resolver:
+//
+//   if (ffmpegAlive)    { session.lastHeartbeat = new Date(); continue }
+//   if (recentActivity) { session.lastHeartbeat = new Date(); continue }
+//
+// El primero es el bug de las 26 horas: el limpiador renovaba el heartbeat con
+// evidencia del PROCESO, no del espectador, y así el proceso se mantenía vivo a
+// sí mismo. El segundo hacía lo mismo con actividad de MEDIO. Ambos eliminados:
+// `processAlive` y `lastMediaActivity` quedan como diagnóstico y no participan
+// de ninguna decisión de vigencia.
+//
+// El efecto que aquellos escapes buscaban —que una pestaña con el heartbeat
+// ralentizado no pierda el HD— se resuelve donde corresponde: el TTL de HD es
+// configurable (STREAM_HD_IDLE_TIMEOUT, 90 s por defecto) y el frontend reanuda
+// el heartbeat al volver a ser visible.
 export async function cleanupIdleSessions(server: FastifyInstance): Promise<number> {
-  const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
-  let removed = 0
+  const nowMs = Date.now()
+  const ttl = getSessionTtl(msg => server.log.info(msg))
+  const { expired, surviving } = decideSessionExpiry({
+    sessions: toSessionTruths(),
+    viewHeartbeats: viewHeartbeatsAsMs(),
+    nowMs,
+    ttl,
+  })
+  if (expired.length === 0) return 0
 
-  // Detectar views con heartbeat expirado
-  const staleViews = new Set<string>()
-  for (const [vk, lastBeat] of viewHeartbeat.entries()) {
-    if (lastBeat < cutoff) {
-      staleViews.add(vk)
-    }
-  }
+  // Decidir la terminación ANTES de borrar: qué procesos quedan sin espectador
+  // se calcula sobre el conjunto completo, no sesión por sesión (si no, la
+  // primera sesión vencida de un proceso compartido lo mataría).
+  const termination = decideProcessTermination(expired.map(e => e.session), surviving)
 
-  // Eliminar sesiones de views expirados o con lastHeartbeat expirado
-  for (const [key, session] of sessions.entries()) {
+  for (const { session, reason, clientHeartbeatAgeMs } of expired) {
     const vk = vKey(session.userId, session.viewId)
-    const isStale = staleViews.has(vk) || session.lastHeartbeat < cutoff
-    if (!isStale) continue
-
-    if (session.streamType === 'main_h264') {
-      const ffmpegAlive     = isTranscodeProcessAlive(session.streamPath)
-      const lastActivity    = transcodeLastActivity.get(session.streamPath) ?? 0
-      const activityAgeMs   = Date.now() - lastActivity
-      const recentActivity  = activityAgeMs < SUPERVISOR_GRACE_MS
-      const heartbeatAgeMs  = Date.now() - session.lastHeartbeat.getTime()
-
-      console.info(
-        `[cleanupIdle] main_h264 check key=${key} view=${session.viewId}` +
-        ` heartbeatAgeMs=${heartbeatAgeMs} activityAgeMs=${activityAgeMs}` +
-        ` ffmpegAlive=${ffmpegAlive} recentActivity=${recentActivity}`
-      )
-
-      // Keep alive if FFmpeg is running — prevents tab-throttled heartbeats from killing active transcodes.
-      if (ffmpegAlive) {
-        session.lastHeartbeat = new Date()
-        console.info(`[cleanupIdle] skip path=${session.streamPath} reason=ffmpeg_alive — bumped lastHeartbeat`)
-        continue
-      }
-
-      // Keep alive if viewer was recently active (transcodeLastActivity updated by touch-stream / heartbeat).
-      if (recentActivity) {
-        session.lastHeartbeat = new Date()
-        console.info(`[cleanupIdle] skip path=${session.streamPath} reason=recent_activity activityAgeMs=${activityAgeMs}`)
-        continue
-      }
-    }
-
-    sessions.delete(key)
-    removed++
-    if (session.streamType === 'main_h264') {
-      stopTranscodeProcess(session.streamPath)
-      transcodeInFlight.delete(session.streamPath)
-      transcodeRestarts.delete(session.streamPath)
-      transcodeSourceInfo.delete(session.streamPath)
-      transcodeLastActivity.delete(session.streamPath)
-    }
-    server.log.info(`[stream-manager] idle_removed key=${key} streamType=${session.streamType} view=${session.viewId}`)
+    if (session.streamType === 'sub') viewCameras.get(vk)?.delete(session.cameraId)
+    sessions.delete(session.key)
+    // Diagnóstico: se registra el estado del proceso y del medio, pero como
+    // OBSERVACIÓN — no intervinieron en la decisión.
+    const processAlive = session.streamType === 'main_h264'
+      ? isTranscodeProcessAlive(session.streamPath)
+      : null
+    const mediaAgeMs = lastMediaActivity.has(session.streamPath)
+      ? nowMs - (lastMediaActivity.get(session.streamPath) as number)
+      : null
+    server.log.info(
+      `[stream-manager] view_session_expired cameraId=${session.cameraId}` +
+      ` streamType=${session.streamType} viewId=${session.viewId}` +
+      ` reason=${reason} clientHeartbeatAgeMs=${clientHeartbeatAgeMs}` +
+      ` generation=${session.generation}` +
+      ` observed_processAlive=${processAlive ?? 'n/a'}` +
+      ` observed_mediaActivityAgeMs=${mediaAgeMs ?? 'n/a'}`
+    )
   }
 
-  // Limpiar view maps para views expirados
-  for (const vk of staleViews) {
-    viewCameras.delete(vk)
-    viewHeartbeat.delete(vk)
-  }
+  terminateProcesses(termination, 'idle_cleanup')
+  pruneOrphanViewIndexes(surviving, nowMs, ttl)
 
-  return removed
+  return expired.length
 }
 
 // Resumen de todas las sesiones activas (para panel admin)
@@ -1178,7 +1365,7 @@ export function getAdminSessionsSummary(): Array<{
     viewId:        s.viewId,
     streamPath:    s.streamPath,
     startedAt:     s.startedAt,
-    lastHeartbeat: s.lastHeartbeat,
+    lastHeartbeat: s.lastClientHeartbeat,
   }))
 }
 
@@ -1209,9 +1396,9 @@ export function getSessionsDiagnostic(): {
       viewId:        s.viewId,
       streamType:    s.streamType,
       startedAt:     s.startedAt,
-      lastHeartbeat: s.lastHeartbeat,
+      lastHeartbeat: s.lastClientHeartbeat,
       ageSec:        Math.round((now - s.startedAt.getTime()) / 1000),
-      idleSec:       Math.round((now - s.lastHeartbeat.getTime()) / 1000),
+      idleSec:       Math.round((now - s.lastClientHeartbeat.getTime()) / 1000),
     })),
   }
 }
@@ -1293,7 +1480,7 @@ export function getTranscodeSlots(): {
         pid:           proc?.pid,
         processAlive:  alive,
         startedAt:     s.startedAt,
-        lastHeartbeat: s.lastHeartbeat,
+        lastHeartbeat: s.lastClientHeartbeat,
         profile,
         reason,
       }
@@ -1333,7 +1520,7 @@ export async function getStreamManagerStatus(server: FastifyInstance) {
       viewId:       s.viewId,
       streamPath:   s.streamPath,
       startedAt:    s.startedAt,
-      lastHeartbeat: s.lastHeartbeat,
+      lastHeartbeat: s.lastClientHeartbeat,
       mediaStatus:  cameraStatuses[s.cameraId],
     })),
   }
