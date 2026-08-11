@@ -116,6 +116,12 @@ services:
       RECORDINGS_UNCONSUMED_LEASE_MS: ${RECORDINGS_UNCONSUMED_LEASE_MS:-45000}
       RECORDINGS_NVR_CAPACITY_COOLDOWN_MS: ${RECORDINGS_NVR_CAPACITY_COOLDOWN_MS:-120000}
       RECORDINGS_PREVIEW_TOTAL_STARTUP_MS: ${RECORDINGS_PREVIEW_TOTAL_STARTUP_MS:-60000}
+      # ── Vigencia de sesiones de LiveView ─────────────────────
+      # Único criterio: heartbeat de CLIENTE. Ni el proceso vivo ni la actividad
+      # de medio prolongan una sesión. STREAM_HD_IDLE_TIMEOUT aplica a las
+      # sesiones transcodificadas con la pestaña en segundo plano.
+      STREAM_IDLE_TIMEOUT: ${STREAM_IDLE_TIMEOUT:-90}
+      STREAM_HD_IDLE_TIMEOUT: ${STREAM_HD_IDLE_TIMEOUT:-90}
       # ── Analítica de video ───────────────────────────────────
       # Secreto compartido con el servicio analytics (openssl rand -hex 32).
       # Vacío = endpoints de analítica deshabilitados.

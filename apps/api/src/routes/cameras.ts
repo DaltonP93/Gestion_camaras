@@ -513,6 +513,45 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     return reply.send({ ok: true })
   })
 
+  // ─── Cierre de sesiones con `fetch(..., { keepalive: true })` ──────────────
+  //
+  // El navegador aborta las peticiones pendientes al descargar la página, así
+  // que un cierre disparado en `pagehide`/desmontaje puede no llegar nunca y la
+  // sesión queda viva hasta el TTL. `keepalive: true` permite que la petición
+  // sobreviva a la descarga.
+  //
+  // Se usan verbos DELETE (semántica de eliminación, idempotente) en lugar de
+  // `navigator.sendBeacon`: sendBeacon NO permite fijar el encabezado
+  // `Authorization`, y no vamos a mover el token a la URL ni a una cookie
+  // ad-hoc sólo para poder usarlo. El TTL del servidor sigue siendo la garantía
+  // final si el cierre no llega.
+  //
+  // Ambas rutas son IDEMPOTENTES: cerrar algo ya cerrado responde 200 sin
+  // efectos adicionales (pagehide, desmontaje y cambio de layout pueden
+  // dispararse a la vez).
+
+  // DELETE /api/cameras/:id/stream?streamType=&reason=
+  server.delete('/:id/stream', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const q = request.query as any
+    const user = request.user
+    const streamType: 'sub' | 'main' | 'main_h264' =
+      q?.streamType === 'main'      ? 'main'      :
+      q?.streamType === 'main_h264' ? 'main_h264' : 'sub'
+    const reason = typeof q?.reason === 'string' ? q.reason : undefined
+    await stopStream(server, user.sub, id, streamType, reason)
+    return reply.send({ ok: true })
+  })
+
+  // DELETE /api/cameras/my-sessions?viewId=
+  server.delete('/my-sessions', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const q = request.query as any
+    const user = request.user
+    const viewId = typeof q?.viewId === 'string' && q.viewId.length > 0 ? q.viewId : undefined
+    const cleaned = await cleanupUserSessions(server, user.sub, viewId)
+    return reply.send({ cleaned })
+  })
+
   // POST /api/cameras/:id/touch-stream — Heartbeat para evitar timeout
   server.post('/:id/touch-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }

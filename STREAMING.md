@@ -75,9 +75,62 @@ Configurables en el contenedor `api` via variables de entorno:
 |---|---|---|
 | `MAX_STREAMS_PER_USER` | 16 | Streams simultáneos por usuario |
 | `MAX_STREAMS_GLOBAL` | 50 | Streams simultáneos en total |
-| `STREAM_IDLE_TIMEOUT` | 90s | Tiempo sin actividad antes de liberar sesión |
+| `STREAM_IDLE_TIMEOUT` | 90 s | TTL de una sesión sin heartbeat de **cliente** |
+| `STREAM_HD_IDLE_TIMEOUT` | 90 s | TTL de sesiones HD/transcodificadas (hereda el anterior si no se define) |
+
+Ambos se acotan al rango 15–3600 s. El API registra al arrancar una línea con
+los valores **efectivos**, porque el valor crudo del entorno no es
+necesariamente el que rige:
+
+```
+stream_session_ttl_resolved standardTtlMs=90000 hdTtlMs=90000 requestedStandardSec=none requestedHdSec=none wasClamped=false
+```
 
 Las sesiones se almacenan en memoria; se pierden al reiniciar el API (intencional: el frontend reconecta).
+
+### Vigencia de una sesión: tres conceptos distintos
+
+Una sesión vive **sólo** mientras su cliente late. Estos tres datos existen por
+separado y no pueden sustituirse entre sí:
+
+| Concepto | Qué es | ¿Mantiene viva la sesión? |
+|---|---|---|
+| `lastClientHeartbeat` | Hora del **servidor** al recibir actividad explícita de un cliente autenticado | **Sí — es la única evidencia de espectador** |
+| `lastMediaActivity` | Última actividad de medio observada sobre el path | No (diagnóstico) |
+| `processAlive` | Si el proceso FFmpeg sigue corriendo | No (estado observado) |
+
+El timestamp lo pone siempre el servidor: un valor enviado por el navegador no
+es confiable.
+
+> **Regresión histórica que esto corrige.** El limpiador renovaba el heartbeat
+> cuando veía FFmpeg vivo, con lo que el proceso se justificaba a sí mismo: una
+> sesión iniciada el 2026-08-10T12:38Z seguía "latiendo" el 2026-08-11T14:22Z
+> (26 h) sin ningún espectador. Además contaba como demanda real en el monitor
+> de pipeline y contribuía a generar `CAMERA_STREAM_ERROR` falsos.
+
+### Ciclo de cierre
+
+1. **Pestaña visible y player montado** → heartbeat periódico (30 s).
+2. **`document.hidden`** → el heartbeat se **suspende**.
+3. **Vuelve a ser visible antes del TTL** → heartbeat inmediato; la sesión se conserva.
+4. **Oculta más que el TTL** → el servidor expira la sesión y libera su FFmpeg.
+   Al volver se pide alta calidad **una sola vez**, respetando la capacidad, y
+   mientras tanto sigue reproduciéndose la baja calidad (nunca pantalla negra).
+5. **Desmontaje, cambio de cámara/layout, cierre explícito y `pagehide`** →
+   cierre inmediato e idempotente con `fetch(..., { keepalive: true })` sobre
+   `DELETE /api/cameras/:id/stream` o `DELETE /api/cameras/my-sessions`.
+6. **TTL del servidor** → garantía final si nada de lo anterior llegó.
+
+No se usa `navigator.sendBeacon`: no permite fijar `Authorization`, y poner el
+token en la URL o en una cookie ad-hoc empeoraría la seguridad para resolver
+algo que `keepalive` ya resuelve.
+
+### Procesos compartidos
+
+Varias sesiones pueden compartir un mismo FFmpeg (mismo `streamPath`/perfil).
+Al vencer o cerrarse una sesión sólo se termina el proceso si **no queda ningún
+otro espectador válido** sobre ese path. La decisión se toma sobre el conjunto
+completo de sesiones, no una por una.
 
 ---
 
