@@ -54,7 +54,7 @@ vi.mock('./stream', () => ({
 }))
 
 const {
-  startStream, getActiveSessions, getTranscodeCounts, beginRequest,
+  startStream, getActiveSessions, getTranscodeCounts, beginRequest, markViewClosed,
   __seedSessionForTest, __setViewHeartbeatForTest, __setMediaActivityForTest,
   __resetSessionsForTest, __resetClosedViewsForTest, __isPathPublishedForTest,
   __getTranscodeInFlightPathsForTest, __hasTranscodeSourceInfoForTest,
@@ -350,5 +350,65 @@ describe('el single-flight local distingue "tiene dueño" de "está listo"', () 
 
     expect(__isPathPublishedForTest(PATH_A)).toBe(true)
     expect(getActiveSessions().some(s => s.streamPath === PATH_A)).toBe(true)
+  })
+})
+
+// ─── El mismo criterio en el aborto del registro (revisión de #153) ──────────
+
+describe('el aborto por cierre de pestaña aplica la misma comprobación de vida', () => {
+  /**
+   * El iniciador se cancela por `pagehide` mientras otra pestaña espera su
+   * single-flight. `abortRegistration` decide qué anunciarle al que espera.
+   */
+  async function abortoConWaiter(procesoVivoAlAbortar: boolean) {
+    let abrir!: () => void
+    hlsReadyGate = new Promise<void>(r => { abrir = r })
+    const server = makeServerCanal(() => 1)
+
+    const iniciador = startStream(server, 'u1', 'camH', 'v1', 'main_h264', ticket())
+    await esperarSpawn(1)
+
+    // Segunda pestaña: MISMO path, así que espera el arranque en curso.
+    const waiter = startStream(server, 'u2', 'camH', 'v2', 'main_h264', ticket())
+    for (let i = 0; i < 20; i++) await tick()
+    expect(spawned).toEqual([PATH_A])            // no spawneó otro: está esperando
+
+    markViewClosed('u1', 'v1', ticket())         // pagehide del iniciador
+    if (!procesoVivoAlAbortar) aliveProcesses.delete(PATH_A)
+
+    abrir()
+    const [rIniciador, rWaiter] = await Promise.all([iniciador, waiter])
+    return { rIniciador, rWaiter }
+  }
+
+  it('(17) con FFmpeg ya muerto, el que espera no adopta el proceso inexistente', async () => {
+    const { rIniciador, rWaiter } = await abortoConWaiter(false)
+
+    expect(rIniciador.error?.code).toBe('VIEW_CLOSED')
+    expect(rWaiter.error?.code).toBe('TRANSCODE_NOT_READY')
+    expect(rWaiter.streamPath).toBe('')
+    expect(getActiveSessions()).toHaveLength(0)
+  })
+
+  it('(18) y el path muerto queda liberado, no publicado y sin con qué reiniciarlo', async () => {
+    __setMediaActivityForTest(PATH_A, Date.now())
+
+    await abortoConWaiter(false)
+
+    expect(__isPathPublishedForTest(PATH_A)).toBe(false)
+    expect(__hasTranscodeSourceInfoForTest(PATH_A)).toBe(false)
+    expect(__hasTranscodeRestartsForTest(PATH_A)).toBe(false)
+    expect(__hasMediaActivityForTest(PATH_A)).toBe(false)
+    expect(getTranscodeCounts().total).toBe(0)
+  })
+
+  it('(19) con FFmpeg vivo el que espera sigue adoptándolo: no hay regresión', async () => {
+    const { rIniciador, rWaiter } = await abortoConWaiter(true)
+
+    expect(rIniciador.error?.code).toBe('VIEW_CLOSED')
+    expect(rWaiter.error).toBeUndefined()
+    expect(rWaiter.streamPath).toBe(PATH_A)
+    expect(stopped).not.toContain(PATH_A)
+    expect(getActiveSessions().map(s => s.userId)).toEqual(['u2'])
   })
 })

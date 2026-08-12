@@ -1421,15 +1421,24 @@ async function startStreamCore(
      * que los que esperaban recibían TRANSCODE_NOT_READY sobre un FFmpeg que
      * `releaseUnownedStream` sí había preservado — proceso vivo y sin dueño
      * (revisión de #147, segunda vuelta).
+     *
+     * SIEMPRE se pasa por la liberación. Consultar `hasWaiters` por separado
+     * para saltársela dejaba fuera la comprobación de vida: si FFmpeg ya había
+     * muerto, el waiter recibía `true`, adoptaba un proceso inexistente y la
+     * publicación y el estado por path quedaban sin limpiar, porque nadie
+     * volvía a ejecutar la liberación (revisión de #153). Ahora decide un solo
+     * punto —`releaseUnownedStream`— y su respuesta se combina con la vida del
+     * proceso, igual que en la finalización.
      */
     const abortRegistration = async () => {
-      const adopters = hasWaiters(streamPath)
-      if (!adopters) {
-        await releaseUnownedStream(
-          server, cameraId, streamPath, 'view_closed_during_start', startAttemptId,
-        )
-      }
-      resolveInFlightSafe(adopters)
+      const kept = await releaseUnownedStream(
+        server, cameraId, streamPath, 'view_closed_during_start', startAttemptId,
+      )
+      // Conservado por otro dueño Y con proceso detrás: recién ahí un waiter
+      // puede adoptarlo. Si el dueño es otro arranque que todavía no spawneó,
+      // este single-flight no puede prometer nada: falla y el que espera
+      // reintenta.
+      resolveInFlightSafe(kept && isTranscodeProcessAlive(streamPath))
       return abortResult('before_register_transcode')
     }
 
