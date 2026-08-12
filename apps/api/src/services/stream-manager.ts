@@ -1537,12 +1537,21 @@ async function startStreamCore(
       const localKept = await releaseUnownedStream(
         server, cameraId, opts.localPath, 'superseded_after_register', opts.attemptId,
       )
-      // El single-flight del path LOCAL describe la disponibilidad de ESE path,
-      // no la de la sesión: se resuelve `true` sólo si la liberación lo
-      // conservó por tener otro dueño (un waiter que lo va a adoptar). Si quedó
-      // sin dueño se resuelve `false`, o los que esperan recibirían una URL de
-      // un proceso ya terminado.
-      opts.resolveLocalReady?.(localKept)
+      // El single-flight del path LOCAL describe la DISPONIBILIDAD de ese path,
+      // y "tener dueño" no es lo mismo que "estar listo": `releaseUnownedStream`
+      // devuelve `true` en cuanto alguien lo reclama, sin mirar el proceso. Si
+      // FFmpeg murió después de `waitForHlsReady` pero antes de esta
+      // finalización, resolver con ese valor sacaría al waiter por la rama de
+      // éxito sobre un proceso ya terminado (revisión de #153). Se exigen las
+      // dos condiciones: conservado Y vivo.
+      const localUsable = localKept && isTranscodeProcessAlive(opts.localPath)
+      if (localKept && !localUsable) {
+        console.warn(
+          `[transcode] local_path_kept_but_dead path=${opts.localPath}` +
+          ` cameraId=${cameraId} attempt=${opts.attemptId}`
+        )
+      }
+      opts.resolveLocalReady?.(localUsable)
 
       // 2ª relectura, DESPUÉS del await de la liberación.
       current = sessions.get(transcodeKey)

@@ -116,7 +116,11 @@ async function esperarSpawn(n: number): Promise<void> {
  * la reemplaza antes de que el viejo llegue a finalizar. Ese es exactamente el
  * hueco que el P1 dejaba sin limpiar.
  */
-async function repunteTrasRegistro(extras?: { antesDelSegundo?: () => Promise<void> | void }) {
+async function repunteTrasRegistro(extras?: {
+  antesDelSegundo?: () => Promise<void> | void
+  /** Se ejecuta con los dos arranques ya detenidos, antes de abrir la compuerta. */
+  antesDeAbrir?: () => Promise<void> | void
+}) {
   let abrir!: () => void
   hlsReadyGate = new Promise<void>(r => { abrir = r })
 
@@ -133,6 +137,8 @@ async function repunteTrasRegistro(extras?: { antesDelSegundo?: () => Promise<vo
   const tNuevo = ticket()
   const nuevo = startStream(server, 'u1', 'camH', 'v1', 'main_h264', tNuevo)
   await esperarSpawn(2)                    // el nuevo espera en la MISMA compuerta
+
+  await extras?.antesDeAbrir?.()
 
   abrir()
   const [rViejo, rNuevo] = await Promise.all([viejo, nuevo])
@@ -274,5 +280,46 @@ describe('la liberación respeta a los dueños válidos del path local', () => {
     expect(rWaiter.error).toBeUndefined()
     expect(rWaiter.streamPath).toBe(PATH_A)
     expect(getActiveSessions().find(s => s.userId === 'u2')!.streamPath).toBe(PATH_A)
+  })
+})
+
+// ─── Conservado no es lo mismo que listo (revisión de #153) ──────────────────
+
+describe('el single-flight local distingue "tiene dueño" de "está listo"', () => {
+  /** Igual que el caso 12, pero FFmpeg muere tras superar `waitForHlsReady`. */
+  async function waiterConProcesoMuerto() {
+    let esperando!: Promise<any>
+
+    const { rViejo } = await repunteTrasRegistro({
+      antesDelSegundo: async () => {
+        esperando = startStream(
+          makeServerCanal(() => 1), 'u2', 'camH', 'v2', 'main_h264', ticket(),
+        )
+        await tick()
+      },
+      // El proceso local cae DESPUÉS de que la compuerta ya lo dio por listo y
+      // ANTES de que la finalización resuelva el single-flight.
+      antesDeAbrir: () => { aliveProcesses.delete(PATH_A) },
+    })
+
+    return { rViejo, rWaiter: await esperando }
+  }
+
+  it('(13) un waiter no recibe éxito sobre un path conservado pero con FFmpeg muerto', async () => {
+    const { rViejo, rWaiter } = await waiterConProcesoMuerto()
+
+    expect(rViejo.streamPath).toBe(PATH_B)              // el iniciador, repuntado
+    expect(rWaiter.error?.code).toBe('TRANSCODE_NOT_READY')
+    expect(rWaiter.streamPath).toBe('')
+    expect(rWaiter.hlsUrl).toBe('')
+  })
+
+  it('(14) y no se registra ninguna sesión sobre ese path muerto', async () => {
+    await waiterConProcesoMuerto()
+
+    const filas = getActiveSessions()
+    expect(filas).toHaveLength(1)
+    expect(filas[0].streamPath).toBe(PATH_B)
+    expect(filas.some(s => s.streamPath === PATH_A)).toBe(false)
   })
 })
