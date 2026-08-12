@@ -19,6 +19,8 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 
 const stopped: string[] = []
 const removed: string[] = []
+/** Paths retirados de MediaMTX por su nombre exacto (el receptor `main_h264`). */
+const removedPaths: string[] = []
 const spawned: string[] = []
 const aliveProcesses = new Set<string>()
 let hlsReadyGate: Promise<void> | null = null
@@ -29,6 +31,7 @@ vi.mock('./stream', () => ({
   getWebRtcUrl: (p: string) => `https://w/${p}/whep`,
   publishStream: async () => true,
   removeStream: async (_n: any, cam: any) => { removed.push(cam.id); return true },
+  removeTranscodedPath: async (p: string) => { removedPaths.push(p); return true },
   getStreamStatus: async () => ({ ready: true }),
   publishTranscodedStream: async () => true,
   // El path depende del CANAL: cambiarlo entre dos lecturas de la base es lo
@@ -148,7 +151,7 @@ async function repunteTrasRegistro(extras?: {
 beforeEach(() => {
   __resetSessionsForTest()
   __resetClosedViewsForTest()
-  stopped.length = 0; removed.length = 0; spawned.length = 0
+  stopped.length = 0; removed.length = 0; spawned.length = 0; removedPaths.length = 0
   aliveProcesses.clear()
   hlsReadyGate = null
 })
@@ -410,5 +413,40 @@ describe('el aborto por cierre de pestaña aplica la misma comprobación de vida
     expect(rWaiter.streamPath).toBe(PATH_A)
     expect(stopped).not.toContain(PATH_A)
     expect(getActiveSessions().map(s => s.userId)).toEqual(['u2'])
+  })
+})
+
+// ─── El receptor pasivo se retira de MediaMTX (revisión de #153) ─────────────
+
+describe('el path transcodificado descartado se retira de MediaMTX', () => {
+  it('(20) el repunte borra la configuración del path local exacto', async () => {
+    await repunteTrasRegistro()
+
+    // `removeStream` sólo recorre `sub`/`main`: el receptor pasivo necesita su
+    // propio retiro por nombre exacto, o la configuración se acumula.
+    expect(removedPaths).toContain(PATH_A)
+  })
+
+  it('(21) y no toca el path retenido', async () => {
+    await repunteTrasRegistro()
+    expect(removedPaths).not.toContain(PATH_B)
+  })
+
+  it('(22) el aborto por cierre con FFmpeg muerto también lo retira', async () => {
+    let abrir!: () => void
+    hlsReadyGate = new Promise<void>(r => { abrir = r })
+    const server = makeServerCanal(() => 1)
+
+    const iniciador = startStream(server, 'u1', 'camH', 'v1', 'main_h264', ticket())
+    await esperarSpawn(1)
+    const waiter = startStream(server, 'u2', 'camH', 'v2', 'main_h264', ticket())
+    for (let i = 0; i < 20; i++) await tick()
+
+    markViewClosed('u1', 'v1', ticket())
+    aliveProcesses.delete(PATH_A)
+    abrir()
+    await Promise.all([iniciador, waiter])
+
+    expect(removedPaths).toContain(PATH_A)
   })
 })

@@ -3,7 +3,7 @@
 // Este manager trackea quién está mirando para informar al frontend y aplicar límites.
 import type { FastifyInstance } from 'fastify'
 import type { ChildProcess } from 'child_process'
-import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr, getStreamDetails, getActiveTranscodesList, getTranscodeRawStderr, getTranscodeRtspMasked } from './stream'
+import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, removeTranscodedPath, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr, getStreamDetails, getActiveTranscodesList, getTranscodeRawStderr, getTranscodeRtspMasked } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import { decryptNvrPassword as decryptPass } from './credentials'
 import { resolveGridProfile } from './transcode-profile'
@@ -780,6 +780,13 @@ async function releaseUnownedStream(
   /** Intento que se está descartando: no debe contarse como propietario. */
   excludeAttemptId?: string,
 ): Promise<boolean> {
+  // ¿Es un path de transcodificación? Se decide ANTES de borrar el estado que
+  // lo delata, porque más abajo se limpia todo.
+  const isTranscodePath =
+    transcodeInFlight.has(streamPath) ||
+    transcodeSourceInfo.has(streamPath) ||
+    isTranscodeProcessAlive(streamPath)
+
   transcodeInFlight.delete(streamPath)
 
   // Dueños válidos: sesiones ya registradas, pestañas esperando el arranque
@@ -838,6 +845,15 @@ async function releaseUnownedStream(
     return false
   }
   publishedPaths.delete(streamPath)
+
+  // El receptor pasivo de transcodificación se retira POR PATH EXACTO.
+  // `removeStream` sólo recorre los `sub`/`main` de la cámara, así que el
+  // `main_h264` quedaba configurado en MediaMTX para siempre y cada repunte de
+  // canal acumulaba una ruta huérfana más (revisión de #153). No sustituye a la
+  // limpieza por cámara de abajo: son paths distintos.
+  if (isTranscodePath) {
+    await removeTranscodedPath(streamPath).catch(() => false)
+  }
 
   // `removeStream` retira los paths `sub`/`main` DE LA CÁMARA, no este path en
   // concreto, así que sólo corresponde cuando ninguna sesión mira esa cámara.

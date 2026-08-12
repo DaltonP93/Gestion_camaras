@@ -23,6 +23,7 @@ vi.mock('./stream', () => ({
     return true
   },
   removeStream: async (_n: any, cam: any) => { removed.push(cam.id); return true },
+  removeTranscodedPath: async () => true,
   getStreamStatus: async () => ({ ready: true }),
   publishTranscodedStream: async () => { if (publishGate) await publishGate; return true },
   getTranscodedStreamPath: (_n: any, cam: any) => `nvr_x_${cam.id}_main_h264`,
