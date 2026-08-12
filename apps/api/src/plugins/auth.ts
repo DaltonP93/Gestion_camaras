@@ -4,7 +4,7 @@ import fastifyJwt from '@fastify/jwt'
 import { redactUrlSecrets } from '../lib/log-redact'
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
 import type { Role } from '@prisma/client'
-import { beginRequest, type RequestTicket } from '../services/stream-manager'
+import type { RequestTicket } from '../services/stream-manager'
 
 export interface JWTPayload {
   sub: string
@@ -25,8 +25,8 @@ declare module 'fastify' {
   interface FastifyRequest {
     /**
      * Ticket de llegada de ESTA petición: hora del servidor + secuencia
-     * monótona. Lo estampa un hook `onRequest`, que corre ANTES de la
-     * autenticación.
+     * monótona. Lo estampa el PRIMER hook `onRequest` registrado en
+     * `server.ts`, antes de rate-limit y de la autenticación.
      *
      * Por qué no basta con tomarlo en la primera línea del handler: la
      * autenticación es un `preHandler` que ya hizo `await request.jwtVerify()`.
@@ -46,13 +46,6 @@ declare module 'fastify' {
 }
 
 const authPlugin: FastifyPluginAsync = fp(async (server) => {
-  // PRIMER punto asíncrono de la petición. `onRequest` corre antes de
-  // preParsing, preValidation y preHandler — es decir, antes de jwtVerify.
-  server.decorateRequest('requestTicket', null as unknown as RequestTicket)
-  server.addHook('onRequest', async (request) => {
-    request.requestTicket = beginRequest()
-  })
-
   const jwtSecret = process.env.JWT_SECRET
   if (!jwtSecret || jwtSecret.length < 32) {
     throw new Error(
