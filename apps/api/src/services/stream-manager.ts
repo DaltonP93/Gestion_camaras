@@ -9,6 +9,7 @@ import { decryptNvrPassword as decryptPass } from './credentials'
 import { resolveGridProfile } from './transcode-profile'
 import {
   getSessionTtl, decideSessionExpiry, decideProcessTermination, orphanViewKeys,
+  hasFreshClientViewer,
   type SessionTruth, type SessionTtl,
 } from './session-lifecycle'
 
@@ -134,8 +135,45 @@ const sessions = new Map<string, StreamSession>()
 const viewCameras   = new Map<string, Set<string>>() // key: `${userId}:${viewId}`
 const viewHeartbeat = new Map<string, Date>()         // key: `${userId}:${viewId}` → last heartbeat
 
-function sessionKey(userId: string, cameraId: string, streamType: 'sub' | 'main' | 'main_h264' = 'sub') {
-  return `${userId}:${cameraId}:${streamType}`
+// La PERTENENCIA de una sesión es (usuario, pestaña). Antes la clave era
+// `userId:cameraId:streamType`, con lo que dos pestañas del mismo usuario
+// viendo la misma cámara con el mismo tipo colapsaban en UNA fila: la segunda
+// se apropiaba de la primera reescribiendo su viewId, y cerrar en una cerraba
+// la de la otra. El proceso FFmpeg se sigue compartiendo por `streamPath`
+// (eso lo resuelve decideProcessTermination), pero la fila es de cada pestaña.
+// Parámetros NOMBRADOS a propósito: la firma anterior era (userId, cameraId,
+// streamType), todos string, así que agregar viewId posicionalmente habría
+// compilado sin error en cada llamador mientras construía claves equivocadas.
+function sessionKey(k: {
+  userId: string
+  viewId: string
+  cameraId: string
+  streamType: 'sub' | 'main' | 'main_h264'
+}) {
+  return `${k.userId}::${k.viewId}::${k.cameraId}::${k.streamType}`
+}
+
+/** viewId por defecto cuando un llamador antiguo no lo envía. */
+const DEFAULT_VIEW_ID = 'default'
+
+/**
+ * Resuelve a qué sesión se refiere una petición que NO trae viewId.
+ *
+ * Una pestaña no puede tocar ni cerrar la sesión de otra pestaña del mismo
+ * usuario. Si hay ambigüedad (varias pestañas con esa cámara y tipo), la
+ * petición se rechaza en vez de elegir una al azar.
+ */
+function resolveOwnedSessionKey(
+  userId: string,
+  viewId: string | undefined,
+  cameraId: string,
+  streamType: 'sub' | 'main' | 'main_h264',
+): { key: string | null; ambiguous: boolean } {
+  if (viewId) return { key: sessionKey({ userId, viewId, cameraId, streamType }), ambiguous: false }
+  const matches = Array.from(sessions.entries()).filter(([, s]) =>
+    s.userId === userId && s.cameraId === cameraId && s.streamType === streamType)
+  if (matches.length === 1) return { key: matches[0][0], ambiguous: false }
+  return { key: null, ambiguous: matches.length > 1 }
 }
 
 function vKey(userId: string, viewId: string) {
@@ -158,7 +196,7 @@ export function __seedSessionForTest(s: {
   streamType: 'sub' | 'main' | 'main_h264'; streamPath: string
   startedAt: Date; lastClientHeartbeat: Date; generation?: number
 }): void {
-  sessions.set(sessionKey(s.userId, s.cameraId, s.streamType), {
+  sessions.set(sessionKey({ userId: s.userId, viewId: s.viewId, cameraId: s.cameraId, streamType: s.streamType }), {
     ...s, generation: s.generation ?? nextGeneration(),
   })
   if (s.streamType === 'sub') {
@@ -412,7 +450,85 @@ export function getStreamHdIdleTimeoutMs(): number {
 const viewClosedAt = new Map<string, number>()
 const CLOSED_VIEW_MEMORY_MS = 5 * 60_000
 
-function markViewClosed(userId: string, viewId: string): void {
+/**
+ * Arranques EN VUELO por `streamPath`, con su dueño y el instante en que llegó
+ * la petición. Permite saber si un arranque quedó huérfano porque su pestaña se
+ * cerró mientras corrían las operaciones asíncronas (DB, publishStream,
+ * waitForHlsReady…), que es la ventana por la que todavía podía nacer una
+ * sesión fantasma (revisión de #146).
+ */
+interface InFlightStart {
+  userId: string
+  viewId: string
+  receivedAtMs: number
+}
+const inFlightStarts = new Map<string, InFlightStart>()
+
+/**
+ * Elimina TODAS las sesiones que apuntan a un `streamPath` cuyo proceso ya no
+ * puede sostenerse. Con la clave por pestaña, un mismo path puede tener varias
+ * filas (una por viewer): borrar sólo la del `sourceRef` dejaría las demás
+ * apuntando a un proceso muerto.
+ */
+function dropSessionsByStreamPath(streamPath: string, reason: string): void {
+  for (const [key, s] of Array.from(sessions.entries())) {
+    if (s.streamPath !== streamPath) continue
+    sessions.delete(key)
+    console.info(
+      `[stream-manager] view_session_closed cameraId=${s.cameraId} streamType=${s.streamType}` +
+      ` viewId=${s.viewId} generation=${s.generation} reason=${reason}`
+    )
+  }
+}
+
+/**
+ * Deshace lo que un arranque abortado alcanzó a crear, SIN tocar lo que otro
+ * espectador válido siga usando.
+ *
+ * Reglas: no matar un proceso compartido con otro viewer fresco, no dejar
+ * `transcodeInFlight` colgado, y sólo retirar el path de MediaMTX si ninguna
+ * sesión de nadie apunta a esa cámara.
+ */
+async function releaseUnownedStream(
+  server: FastifyInstance,
+  cameraId: string,
+  streamPath: string,
+  reason: string,
+): Promise<void> {
+  inFlightStarts.delete(streamPath)
+  transcodeInFlight.delete(streamPath)
+
+  const survivors = toSessionTruths()
+  const stillOwned = survivors.some(s => s.streamPath === streamPath)
+  if (stillOwned) {
+    console.info(`[live] start_aborted_keepalive path=${streamPath} reason=${reason} — otro viewer lo usa`)
+    return
+  }
+
+  if (isTranscodeProcessAlive(streamPath)) {
+    stopTranscodeProcess(streamPath)
+    transcodeRestarts.delete(streamPath)
+    transcodeSourceInfo.delete(streamPath)
+    lastMediaActivity.delete(streamPath)
+    console.info(`[stream-manager] transcode_killed path=${streamPath} reason=${reason}`)
+  }
+
+  // El path de MediaMTX sólo se retira si NINGUNA sesión mira esa cámara.
+  if (survivors.some(s => s.cameraId === cameraId)) return
+  const camera = await server.prisma.camera.findUnique({
+    where: { id: cameraId }, include: { nvr: true },
+  }).catch(() => null)
+  if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
+}
+
+/** ¿El arranque en vuelo de este path perdió a su dueño? */
+function isStartCancelled(streamPath: string): boolean {
+  const st = inFlightStarts.get(streamPath)
+  if (!st) return false
+  return isViewClosedAfter(st.userId, st.viewId, st.receivedAtMs)
+}
+
+export function markViewClosed(userId: string, viewId: string): void {
   const nowMs = Date.now()
   viewClosedAt.set(vKey(userId, viewId), nowMs)
   // Poda perezosa: no conservar cierres viejos para siempre.
@@ -474,8 +590,20 @@ export function touchSession(
   cameraId: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
   receivedAtMs: number = Date.now(),
+  viewId?: string,
 ) {
-  const key = sessionKey(userId, cameraId, streamType)
+  // Sin viewId la pertenencia es ambigua. Se resuelve sólo si el usuario tiene
+  // EXACTAMENTE una sesión para esa cámara y tipo; con dos pestañas abiertas se
+  // rechaza, porque una pestaña no puede tocar la sesión de la otra.
+  const { key, ambiguous } = resolveOwnedSessionKey(userId, viewId, cameraId, streamType)
+  if (ambiguous) {
+    console.info(
+      `[stream-manager] touch_ignored_ambiguous cameraId=${cameraId} streamType=${streamType}` +
+      ` reason=multiple_views_without_viewId`
+    )
+    return
+  }
+  if (!key) return
   const s = sessions.get(key)
   if (!s) return                                    // sesión inexistente: nada que resucitar
   if (isViewClosedAfter(userId, s.viewId, receivedAtMs)) {
@@ -503,7 +631,7 @@ export function touchView(userId: string, viewId: string, receivedAtMs: number =
   const now = new Date()
   for (const cameraId of vCams) {
     for (const st of ['sub', 'main', 'main_h264'] as const) {
-      const s = sessions.get(sessionKey(userId, cameraId, st))
+      const s = sessions.get(sessionKey({ userId, viewId, cameraId, streamType: st }))
       if (s) s.lastClientHeartbeat = now
     }
   }
@@ -546,16 +674,35 @@ async function runTranscodeSupervisor(
   _exitSignal: NodeJS.Signals | null,
   exitReason: string,
 ): Promise<void> {
-  const transcodeKey = sessionKey(sourceRef.userId, sourceRef.cameraId, 'main_h264')
-
-  const hasSession    = !!sessions.get(transcodeKey)
+  // AUTORIZACIÓN DEL REINICIO (corrección de la revisión de #146).
+  //
+  // Antes bastaba `recentViewer = now - lastMediaActivity < SUPERVISOR_GRACE_MS`
+  // para re-spawnear. Eso contradice la regla del módulo: la actividad de medio
+  // es DIAGNÓSTICO y no prueba que haya un espectador, así que el supervisor
+  // podía resucitar un FFmpeg sin propietario — la misma sesión fantasma que A1
+  // eliminó, entrando por otra puerta.
+  //
+  // Sólo autorizan un reinicio:
+  //   · una sesión con heartbeat de CLIENTE fresco sobre este streamPath, o
+  //   · un arranque en vuelo todavía válido (no cancelado).
+  //
+  // La búsqueda es por `streamPath`, no por clave de sesión: el proceso es
+  // compartido y su dueño puede ser cualquier pestaña, no la del sourceRef.
+  const nowMs = Date.now()
+  const ttl = getSessionTtl()
+  const freshViewer = hasFreshClientViewer({
+    sessions: toSessionTruths(), streamPath, nowMs, ttl,
+  })
   const inFlightState = transcodeInFlight.get(streamPath)?.state
-  const lastActivity  = lastMediaActivity.get(streamPath) ?? 0
-  const recentViewer  = (Date.now() - lastActivity) < SUPERVISOR_GRACE_MS
-  if (!hasSession && inFlightState !== 'starting' && !recentViewer) {
+  const inFlightValid = inFlightState === 'starting' && !isStartCancelled(streamPath)
+
+  if (!freshViewer && !inFlightValid) {
+    const lastActivity = lastMediaActivity.get(streamPath) ?? 0
     console.info(
-      `[supervisor] skip path=${streamPath} reason=no_active_session` +
-      ` inFlight=${inFlightState ?? 'none'} lastActivityMsAgo=${Date.now() - lastActivity}`
+      `[supervisor] skip path=${streamPath} reason=no_valid_viewer` +
+      ` inFlight=${inFlightState ?? 'none'}` +
+      // Se registra como OBSERVACIÓN: no participó de la decisión.
+      ` observed_mediaActivityMsAgo=${lastActivity ? nowMs - lastActivity : 'n/a'}`
     )
     transcodeRestarts.delete(streamPath)
     return
@@ -578,7 +725,7 @@ async function runTranscodeSupervisor(
       `[supervisor] exhausted path=${streamPath} count=${info.count}/${SUPERVISOR_MAX_RESTARTS}` +
       ` reason=${exitReason} — dropping session`
     )
-    sessions.delete(transcodeKey)
+    dropSessionsByStreamPath(streamPath, 'supervisor_exhausted')
     transcodeInFlight.set(streamPath, { state: 'failed', promise: Promise.resolve(false), resolve: () => {} })
     return
   }
@@ -594,14 +741,18 @@ async function runTranscodeSupervisor(
 
   await new Promise(r => setTimeout(r, backoffMs))
 
-  const hasSessionAfter    = !!sessions.get(transcodeKey)
+  // Mismo criterio que antes del backoff: durante la espera el espectador pudo
+  // irse. La actividad de medio sigue sin autorizar nada.
+  const nowAfter = Date.now()
+  const freshViewerAfter = hasFreshClientViewer({
+    sessions: toSessionTruths(), streamPath, nowMs: nowAfter, ttl: getSessionTtl(),
+  })
   const inFlightStateAfter = transcodeInFlight.get(streamPath)?.state
-  const lastActivityAfter  = lastMediaActivity.get(streamPath) ?? 0
-  const recentViewerAfter  = (Date.now() - lastActivityAfter) < SUPERVISOR_GRACE_MS
-  if (!hasSessionAfter && inFlightStateAfter !== 'starting' && !recentViewerAfter) {
+  const inFlightValidAfter = inFlightStateAfter === 'starting' && !isStartCancelled(streamPath)
+  if (!freshViewerAfter && !inFlightValidAfter) {
     console.info(
-      `[supervisor] restart_cancelled path=${streamPath} reason=session_gone_after_backoff` +
-      ` inFlight=${inFlightStateAfter ?? 'none'} lastActivityMsAgo=${Date.now() - lastActivityAfter}`
+      `[supervisor] restart_cancelled path=${streamPath} reason=no_valid_viewer_after_backoff` +
+      ` inFlight=${inFlightStateAfter ?? 'none'}`
     )
     return
   }
@@ -614,7 +765,7 @@ async function runTranscodeSupervisor(
   const proc = spawnTranscodeProcess(sourceRef.nvr, sourceRef.camera, streamPath)
   if (!proc) {
     console.error(`[supervisor] restart_spawn_failed path=${streamPath} attempt=${info.count}`)
-    sessions.delete(transcodeKey)
+    dropSessionsByStreamPath(streamPath, 'supervisor_spawn_failed')
     transcodeInFlight.set(streamPath, { state: 'failed', promise: Promise.resolve(false), resolve: () => {} })
     return
   }
@@ -675,8 +826,28 @@ async function startStreamCore(
   cameraId: string,
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
+  receivedAtMs: number = Date.now(),
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
-  const existingKey = sessionKey(userId, cameraId, streamType)
+  const effectiveViewId = viewId || DEFAULT_VIEW_ID
+
+  // GUARDA REPETIDA. Cada operación asíncrona de este arranque (consulta a la
+  // base, publishStream, spawn de FFmpeg, waitForHlsReady, espera de
+  // transcodeInFlight) es una ventana en la que puede llegar el `pagehide` de
+  // la pestaña. Comprobar sólo al entrar no alcanza: había que volver a
+  // comprobar antes de registrar, reutilizar o devolver una sesión.
+  const cancelled = () => isViewClosedAfter(userId, effectiveViewId, receivedAtMs)
+  const abortResult = (stage: string) => {
+    console.info(
+      `[live] start_aborted cameraId=${cameraId} streamType=${streamType}` +
+      ` viewId=${effectiveViewId} stage=${stage} reason=view_closed_during_start`
+    )
+    return {
+      hlsUrl: '', webrtcUrl: '', streamPath: '',
+      error: { code: 'VIEW_CLOSED', message: 'La vista se cerró durante el arranque' } as StreamError,
+    }
+  }
+  if (cancelled()) return abortResult('entry')
+  const existingKey = sessionKey({ userId, viewId: effectiveViewId, cameraId, streamType })
   const hasExisting = sessions.has(existingKey)
   console.info(`[live] start_stream cameraId=${cameraId} streamType=${streamType} existingSession=${hasExisting} userId=${userId}`)
 
@@ -685,6 +856,7 @@ async function startStreamCore(
     where: { id: cameraId },
     include: { nvr: true },
   })
+  if (cancelled()) return abortResult('after_db_lookup')
 
   if (!camera || !camera.nvr) {
     return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: { code: 'CAMERA_NOT_FOUND', message: 'Cámara no encontrada' } }
@@ -760,9 +932,38 @@ async function startStreamCore(
         error: { code: 'MEDIA_SERVER_ERROR', message: 'FFmpeg no disponible en el servidor.' } }
     }
 
-    const transcodeKey = sessionKey(userId, cameraId, 'main_h264')
+    const transcodeKey = sessionKey({ userId, viewId: effectiveViewId, cameraId, streamType: 'main_h264' })
     const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
     const streamPath = getTranscodedStreamPath(nvr as any, camera as any)
+
+
+    // Resolución del single-flight tolerante al orden: la primera ruta de
+    // registro ocurre ANTES de que exista el `resolveInFlight` del arranque
+    // nuevo. Un arranque abortado debe resolver la promesa igual, o cualquier
+    // otra petición que la esté esperando quedaría colgada para siempre.
+    let resolveInFlightRef: ((v: boolean) => void) | null = null
+    const resolveInFlightSafe = (v: boolean) => {
+      transcodeInFlight.set(streamPath, {
+        state: v ? 'ready' : 'failed',
+        promise: Promise.resolve(v),
+        resolve: () => {},
+      })
+      resolveInFlightRef?.(v)
+    }
+
+    // Registrador ÚNICO de la sesión transcodificada. Comprueba la cancelación
+    // inmediatamente antes de escribir: entre el inicio del arranque y este
+    // punto hubo publishTranscodedStream, spawn y waitForHlsReady, cualquiera
+    // de los cuales pudo solaparse con el `pagehide` de la pestaña.
+    const registerTranscodeSession = (): boolean => {
+      if (cancelled()) return false
+      sessions.set(transcodeKey, {
+        cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
+        streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(),
+        generation: nextGeneration(),
+      })
+      return true
+    }
 
     // ── 1. Reuse already-registered session ──────────────────
     const existingSession = sessions.get(transcodeKey)
@@ -801,11 +1002,11 @@ async function startStreamCore(
     // the existing URL immediately without spawning a new process.
     if (isTranscodeProcessAlive(streamPath)) {
       console.info(`[transcode] reuse_live_process path=${streamPath} cameraId=${cameraId} — session cleared but FFmpeg alive`)
-      const effectiveViewId0 = viewId || 'default'
-      sessions.set(transcodeKey, {
-        cameraId, userId, viewId: effectiveViewId0, streamType: 'main_h264',
-        streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
-      })
+      if (!registerTranscodeSession()) {
+        await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
+        resolveInFlightSafe(false)
+        return abortResult('before_register_transcode')
+      }
       lastMediaActivity.set(streamPath, Date.now())
       // Supervisor is still attached from the original spawn — no need to re-attach.
       transcodeInFlight.set(streamPath, { state: 'ready', promise: Promise.resolve(true), resolve: () => {} })
@@ -834,7 +1035,11 @@ async function startStreamCore(
     // ── 4. Start new transcode with in-flight guard ──────────
     let resolveInFlight!: (v: boolean) => void
     const readyPromise = new Promise<boolean>(r => { resolveInFlight = r })
+    resolveInFlightRef = resolveInFlight
     transcodeInFlight.set(streamPath, { state: 'starting', promise: readyPromise, resolve: resolveInFlight })
+    // El arranque queda registrado con su dueño: si la pestaña se cierra, el
+    // supervisor sabrá que este in-flight ya no autoriza ningún reinicio.
+    inFlightStarts.set(streamPath, { userId, viewId: effectiveViewId, receivedAtMs })
 
     try {
       // Register passive RTSP receiver path in MediaMTX (no runOnDemand)
@@ -891,11 +1096,11 @@ async function startStreamCore(
           // indicators were not detected — likely fMP4/LL-HLS format or master playlist.
           // FFmpeg IS alive and MediaMTX IS muxing; return the URL and let VideoPlayer retry.
           console.warn(`[transcode] hls_partial_ready path=${streamPath} manifestVisible=true elapsedMs=${elapsedMs} — returning url for VideoPlayer retry`)
-          const effectiveViewId2 = viewId || 'default'
-          sessions.set(transcodeKey, {
-            cameraId, userId, viewId: effectiveViewId2, streamType: 'main_h264',
-            streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
-          })
+          if (!registerTranscodeSession()) {
+            await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
+            resolveInFlightSafe(false)
+            return abortResult('before_register_transcode')
+          }
           lastMediaActivity.set(streamPath, Date.now())
           transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
           resolveInFlight(true)
@@ -913,11 +1118,11 @@ async function startStreamCore(
             ` sourceType=${liveDetails?.sourceType} active=${liveDetails?.active}` +
             ` — publisher active, HLS muxer slow; returning URL for VideoPlayer retry`
           )
-          const effectiveViewId3 = viewId || 'default'
-          sessions.set(transcodeKey, {
-            cameraId, userId, viewId: effectiveViewId3, streamType: 'main_h264',
-            streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
-          })
+          if (!registerTranscodeSession()) {
+            await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
+            resolveInFlightSafe(false)
+            return abortResult('before_register_transcode')
+          }
           lastMediaActivity.set(streamPath, Date.now())
           transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
           resolveInFlight(true)
@@ -933,11 +1138,11 @@ async function startStreamCore(
             details: `lastStatus=${lastStatus} elapsed=${elapsedMs}ms` } }
       }
 
-      const effectiveViewId = viewId || 'default'
-      sessions.set(transcodeKey, {
-        cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
-        streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
-      })
+      if (!registerTranscodeSession()) {
+        await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
+        resolveInFlightSafe(false)
+        return abortResult('before_register_transcode')
+      }
       lastMediaActivity.set(streamPath, Date.now())
       transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
       resolveInFlight(true)
@@ -948,6 +1153,10 @@ async function startStreamCore(
       transcodeInFlight.delete(streamPath)
       resolveInFlight(false)
       throw err
+    } finally {
+      // El arranque dejó de estar en vuelo por cualquier vía (éxito, error o
+      // aborto): sin esto el supervisor seguiría viéndolo como autorización.
+      inFlightStarts.delete(streamPath)
     }
   }
 
@@ -965,7 +1174,7 @@ async function startStreamCore(
   }
 
   // ── Session reuse: return existing session without counting toward limit ─
-  const key = sessionKey(userId, cameraId, effectiveType as 'sub' | 'main')
+  const key = sessionKey({ userId, viewId: effectiveViewId, cameraId, streamType: effectiveType as 'sub' | 'main' })
   const existingSession = sessions.get(key)
   if (existingSession) {
     existingSession.lastClientHeartbeat = new Date()
@@ -998,7 +1207,10 @@ async function startStreamCore(
     `[startStream] publish cameraId=${cameraId} nvrId=${camera.nvr.id} ch=${camera.channel}` +
     ` streamType=${effectiveType} path=${streamPath} rtsp=${rtspMasked}`
   )
+  if (cancelled()) return abortResult('before_publish')
+  inFlightStarts.set(streamPath, { userId, viewId: effectiveViewId, receivedAtMs })
   const published = await publishStream(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
+  inFlightStarts.delete(streamPath)
   if (!published) {
     console.error(
       `[startStream] publish_failed cameraId=${cameraId} nvrId=${camera.nvr.id} ch=${camera.channel} path=${streamPath}`
@@ -1007,8 +1219,14 @@ async function startStreamCore(
       error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar stream en el servidor de medios' } }
   }
 
+  // Última comprobación ANTES de registrar: si la pestaña se cerró durante el
+  // publish, se deshace lo recién creado en vez de dejar una sesión huérfana.
+  if (cancelled()) {
+    await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
+    return abortResult('before_register')
+  }
+
   // ── Register session ──────────────────────────────────────────────────
-  const effectiveViewId = viewId || 'default'
   sessions.set(key, {
     cameraId, userId, viewId: effectiveViewId, streamType: effectiveType as 'sub' | 'main',
     streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
@@ -1029,13 +1247,23 @@ export async function stopStream(
   cameraId: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
   reason?: string,
+  viewId?: string,
 ): Promise<void> {
-  const key = sessionKey(userId, cameraId, streamType)
-  const session = sessions.get(key)
+  // Una pestaña no puede cerrar la sesión de otra pestaña del mismo usuario:
+  // sin viewId sólo se resuelve si la pertenencia es inequívoca.
+  const { key, ambiguous } = resolveOwnedSessionKey(userId, viewId, cameraId, streamType)
+  if (ambiguous) {
+    console.info(
+      `[live] stop_ignored_ambiguous cameraId=${cameraId} streamType=${streamType}` +
+      ` reason=multiple_views_without_viewId`
+    )
+    return
+  }
+  const session = key ? sessions.get(key) : undefined
   let killedFfmpeg = false
   let clearedInFlight = false
 
-  if (session) {
+  if (session && key) {
     const generation = session.generation
     if (streamType === 'sub') {
       const vk = vKey(userId, session.viewId)
@@ -1146,7 +1374,7 @@ export async function reconcileView(
 
   // Para cada cámara visible: iniciar si no tiene sesión sub, o tocar si ya existe
   for (const cameraId of visibleCameraIds) {
-    const key = sessionKey(userId, cameraId, 'sub')
+    const key = sessionKey({ userId, viewId, cameraId, streamType: 'sub' })
     const existing = sessions.get(key)
 
     if (existing) {
@@ -1156,7 +1384,7 @@ export async function reconcileView(
       existing.viewId = viewId
       // Touch co-located main/main_h264 sessions so idle cleanup doesn't kill active focus streams
       for (const st of ['main', 'main_h264'] as const) {
-        const sOther = sessions.get(sessionKey(userId, cameraId, st))
+        const sOther = sessions.get(sessionKey({ userId, viewId, cameraId, streamType: st }))
         if (sOther) {
           sOther.lastClientHeartbeat = now2
           if (st === 'main_h264') lastMediaActivity.set(sOther.streamPath, Date.now())
@@ -1219,14 +1447,33 @@ export async function cleanupUserSessions(
   let targetSessions: StreamSession[]
 
   if (viewId) {
+    // MARCAR EL CIERRE PRIMERO Y SIEMPRE, aunque no haya ninguna sesión todavía.
+    //
+    // El caso crítico de la revisión de #146: un start-stream entra, y antes de
+    // que registre la sesión llega el `pagehide`. Si sólo marcáramos el cierre
+    // al encontrar sesiones, acá habría cero, no se marcaría nada, y el
+    // arranque terminaría después registrando una sesión y un FFmpeg sin
+    // espectador — exactamente la sesión fantasma que A1 debía eliminar.
+    markViewClosed(userId, viewId)
     targetSessions = getSessionsForUser(userId).filter(s => s.viewId === viewId)
     console.info(`[live] cleanup_view userId=${userId} viewId=${viewId} sessions=${targetSessions.length}`)
   } else {
-    const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
-    targetSessions = getSessionsForUser(userId).filter(s => {
-      const hb = viewHeartbeat.get(vKey(userId, s.viewId))
-      return !hb || hb < cutoff
+    // Misma decisión centralizada y mismo TTL EFECTIVO por tipo que usa el cron.
+    // Antes acá se leía STREAM_IDLE_TIMEOUT crudo y se aplicaba un único cutoff
+    // a sub, main y main_h264 por igual, ignorando STREAM_HD_IDLE_TIMEOUT y el
+    // clamping.
+    const nowMs = Date.now()
+    const ttl = getSessionTtl()
+    const { expired } = decideSessionExpiry({
+      sessions: toSessionTruths().filter(t => t.userId === userId),
+      viewHeartbeats: viewHeartbeatsAsMs(),
+      nowMs,
+      ttl,
     })
+    const expiredKeys = new Set(expired.map(e => e.session.key))
+    targetSessions = Array.from(sessions.entries())
+      .filter(([k]) => expiredKeys.has(k))
+      .map(([, s]) => s)
     console.info(`[live] cleanup_stale userId=${userId} orphaned=${targetSessions.length}`)
   }
 
@@ -1236,13 +1483,13 @@ export async function cleanupUserSessions(
   // sobre el conjunto completo, no sesión por sesión. Si no, la primera sesión
   // cerrada de un proceso compartido lo mataría para las demás.
   const closingTruths = targetSessions.map(s =>
-    sessionTruthOf(sessionKey(userId, s.cameraId, s.streamType), s))
+    sessionTruthOf(sessionKey({ userId, viewId: s.viewId, cameraId: s.cameraId, streamType: s.streamType }), s))
   const closingKeys = new Set(closingTruths.map(t => t.key))
   const survivingTruths = toSessionTruths().filter(t => !closingKeys.has(t.key))
   const termination = decideProcessTermination(closingTruths, survivingTruths)
 
   for (const session of targetSessions) {
-    const key = sessionKey(userId, session.cameraId, session.streamType)
+    const key = sessionKey({ userId, viewId: session.viewId, cameraId: session.cameraId, streamType: session.streamType })
     if (!sessions.has(key)) continue     // idempotente: ya cerrada por otra vía
     sessions.delete(key)
     removed++

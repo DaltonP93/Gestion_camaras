@@ -8,6 +8,7 @@ import {
   Loader2,
 } from 'lucide-react'
 import { apiGet, apiPost } from '@/lib/api'
+import { closeStreamSession, closeViewSessions } from '@/lib/sessionClose'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
 import type { CameraPlaybackError } from '@/components/cameras/VideoPlayer'
 import { clsx } from 'clsx'
@@ -169,6 +170,18 @@ export function ViewPlayerPage() {
   const [slideshowActive, setSlideshowActive] = useState(false)
   const slideshowRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // Identidad ESTABLE de esta pestaña. Se declara acá arriba, antes que
+  // cualquier arranque, porque todos los caminos que crean o reinician un
+  // stream deben mandar EXACTAMENTE este viewId.
+  //
+  // El defecto que corrige (revisión de #146): los start-stream de esta página
+  // no enviaban viewId, así que el backend registraba la sesión bajo
+  // viewId='default' mientras el heartbeat periódico usaba 'vp_…'. La sesión
+  // quedaba con heartbeat de cliente fresco pero sin heartbeat de view que le
+  // correspondiera, y expiraba por `view_heartbeat_missing` — matando el FFmpeg
+  // de una cámara que el usuario estaba mirando.
+  const viewIdRef = useRef<string>(`vp_${Math.random().toString(36).slice(2)}`)
+
   // ─── Fullscreen state machine ─────────────────────────────────────────────
   const [fsState, setFsState] = useState<FsState>(FS_IDLE)
   // Ref mirror for fsState.cameraId — readable inside event listeners without stale closures
@@ -178,8 +191,8 @@ export function ViewPlayerPage() {
 
   // ─── Stop active HD stream ────────────────────────────────────────────────
   const stopHdStream = useCallback((cameraId: string) => {
-    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'main',      reason: 'exit_fullscreen' }).catch(() => {})
-    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'main_h264', reason: 'exit_fullscreen' }).catch(() => {})
+    void closeStreamSession(cameraId, 'main',      'exit_fullscreen', viewIdRef.current)
+    void closeStreamSession(cameraId, 'main_h264', 'exit_fullscreen', viewIdRef.current)
   }, [])
 
   // ─── Enter fullscreen (must be called inside user gesture) ───────────────
@@ -216,7 +229,7 @@ export function ViewPlayerPage() {
     }
 
     // Start HD stream
-    apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType })
+    apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType, viewId: viewIdRef.current })
       .then((info) => {
         // Verify this camera is still the active fullscreen
         if (fsCamIdRef.current !== cameraId) return
@@ -266,11 +279,21 @@ export function ViewPlayerPage() {
     }
   }, [stopHdStream])
 
-  // ─── Cleanup on page navigation / unmount ────────────────────────────────
+  // ─── Cierre en navegación, desmontaje y descarga de la página ────────────
+  // Antes sólo se cerraba el HD en pantalla completa: los substreams de la
+  // grilla quedaban vivos hasta vencer el TTL. Ahora se cierra TODA la vista
+  // con `keepalive`, que sobrevive a la descarga de la página, y de forma
+  // idempotente (pagehide + desmontaje pueden dispararse a la vez).
   useEffect(() => {
-    return () => {
+    const closeThisView = () => {
       const cam = fsCamIdRef.current
       if (cam) stopHdStream(cam)
+      void closeViewSessions(viewIdRef.current)
+    }
+    window.addEventListener('pagehide', closeThisView)
+    return () => {
+      window.removeEventListener('pagehide', closeThisView)
+      closeThisView()
     }
   }, [stopHdStream])
 
@@ -278,7 +301,7 @@ export function ViewPlayerPage() {
   const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
     if (err.code !== 'HLS_SESSION_EXPIRED') return
     setTimeout(() => {
-      apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, {})
+      apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { viewId: viewIdRef.current })
         .then((info) => setSlots((prev) => prev.map((s) => s.cameraId === cameraId ? { ...s, stream: info } : s)))
         .catch(() => {})
     }, 2000)
@@ -289,7 +312,7 @@ export function ViewPlayerPage() {
     const cam = slots.find((s) => s.cameraId === cameraId)?.camera
     const hdStreamType = pickHdStreamType(cam)
     setTimeout(() => {
-      apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType })
+      apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType, viewId: viewIdRef.current })
         .then((info) => {
           setFsState(prev =>
             prev.cameraId === cameraId ? { ...prev, hdStream: info } : prev
@@ -341,7 +364,7 @@ export function ViewPlayerPage() {
       .filter((cid) => !slots.find((s) => s.cameraId === cid)?.stream)
     if (pageIds.length === 0) return
 
-    Promise.allSettled(pageIds.map((cid) => apiPost<StreamInfo>(`/cameras/${cid}/start-stream`, {})))
+    Promise.allSettled(pageIds.map((cid) => apiPost<StreamInfo>(`/cameras/${cid}/start-stream`, { viewId: viewIdRef.current })))
       .then((results) => {
         const loaded = new Map<string, StreamInfo>()
         results.forEach((r, i) => { if (r.status === 'fulfilled') loaded.set(pageIds[i], r.value) })
@@ -371,7 +394,6 @@ export function ViewPlayerPage() {
   const nextPage = useCallback(() => setCurrentPage((p) => (p + 1) % totalPages), [totalPages])
 
   // ─── Heartbeat — keeps stream sessions alive (prevents 90s idle expiry) ──
-  const viewIdRef = useRef<string>(`vp_${Math.random().toString(36).slice(2)}`)
   useEffect(() => {
     if (!view || filledSlots.length === 0) return
     const perPage     = getSlotsPerPage(view.layout)

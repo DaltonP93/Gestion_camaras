@@ -2,7 +2,7 @@
 // Endpoint de viewport heartbeat: reconcilia cámaras visibles sin N llamadas individuales
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTranscodesDiagnostic, getStreamCounts, getSessionsDiagnostic } from '../services/stream-manager'
+import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTranscodesDiagnostic, getStreamCounts, getSessionsDiagnostic, getStreamIdleTimeoutMs, getStreamHdIdleTimeoutMs } from '../services/stream-manager'
 import { getFfmpegCapabilities, isTranscodingEnabled } from '../services/stream'
 
 const heartbeatSchema = z.object({
@@ -80,6 +80,12 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
       transcodingEnabled:  isTranscodingEnabled(),
       encoders:            caps.encoders,
       maxTranscodeSessions: MAX_TRANSCODE_SESSIONS,
+      // TTL EFECTIVO de sesiones, ya normalizado y acotado por getSessionTtl().
+      // El frontend NO debe suponer 90 s: si el operador configura otro valor
+      // (o configura uno inválido que se acota), la lógica de reanudación tras
+      // una pestaña oculta tiene que usar el plazo que realmente rige.
+      streamIdleTimeoutMs:   getStreamIdleTimeoutMs(),
+      streamHdIdleTimeoutMs: getStreamHdIdleTimeoutMs(),
     })
   })
 

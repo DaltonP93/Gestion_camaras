@@ -509,7 +509,10 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const reason = typeof body?.reason === 'string' ? body.reason : undefined
-    await stopStream(server, user.sub, id, streamType, reason)
+    // viewId identifica la PESTAÑA dueña: una pestaña no puede cerrar la sesión
+    // de otra pestaña del mismo usuario.
+    const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+    await stopStream(server, user.sub, id, streamType, reason, viewId)
     return reply.send({ ok: true })
   })
 
@@ -539,7 +542,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       q?.streamType === 'main'      ? 'main'      :
       q?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const reason = typeof q?.reason === 'string' ? q.reason : undefined
-    await stopStream(server, user.sub, id, streamType, reason)
+    const viewId = typeof q?.viewId === 'string' && q.viewId.length > 0 ? q.viewId : undefined
+    await stopStream(server, user.sub, id, streamType, reason, viewId)
     return reply.send({ ok: true })
   })
 
@@ -556,7 +560,14 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
   server.post('/:id/touch-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const user = request.user
-    touchSession(user.sub, id)
+    const body = request.body as any
+    const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+    const streamType: 'sub' | 'main' | 'main_h264' =
+      body?.streamType === 'main'      ? 'main'      :
+      body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
+    // Hora del SERVIDOR al recibir: descarta heartbeats en vuelo posteriores a
+    // un cierre explícito.
+    touchSession(user.sub, id, streamType, Date.now(), viewId)
     return reply.send({ ok: true })
   })
 

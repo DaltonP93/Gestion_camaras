@@ -53,13 +53,22 @@ export async function closeWithKeepalive(path: string): Promise<boolean> {
 
 export type StreamKind = 'sub' | 'main' | 'main_h264'
 
-/** Cierra UNA sesión de cámara. Idempotente del lado del servidor. */
+/**
+ * Cierra UNA sesión de cámara. Idempotente del lado del servidor.
+ *
+ * `viewId` identifica la PESTAÑA dueña. Sin él, el backend sólo puede resolver
+ * la pertenencia cuando es inequívoca, y con dos pestañas del mismo usuario
+ * sobre la misma cámara rechaza el cierre en vez de adivinar: una pestaña no
+ * puede cerrar la sesión de otra.
+ */
 export function closeStreamSession(
   cameraId: string,
   streamType: StreamKind,
   reason: string,
+  viewId?: string,
 ): Promise<boolean> {
   const qs = new URLSearchParams({ streamType, reason })
+  if (viewId) qs.set('viewId', viewId)
   return closeWithKeepalive(`/cameras/${encodeURIComponent(cameraId)}/stream?${qs}`)
 }
 
