@@ -441,3 +441,86 @@ describe('#147 · una sesión HD retenida por su TTL conserva su índice de view
     expect(stopped).toEqual([])
   })
 })
+
+// ─── Revisión de #147, segunda vuelta ────────────────────────────────────────
+
+describe('#147b · el arranque "parcialmente listo" también se adopta', () => {
+  it('con manifestVisible y el iniciador cerrado, el que espera recibe URL', async () => {
+    // Las cuatro rutas de registro eran copias separadas y dos resolvían el
+    // single-flight en `false`: el proceso quedaba preservado por
+    // releaseUnownedStream pero SIN dueño, y los que esperaban recibían
+    // TRANSCODE_NOT_READY.
+    let release!: () => void
+    hlsReadyGate = new Promise<void>(r => { release = r })
+
+    const first  = startStream(fakeServer, 'u1', 'camHevc', 'tabA', 'main_h264')
+    await new Promise(r => setImmediate(r))
+    const second = startStream(fakeServer, 'u2', 'camHevc', 'tabB', 'main_h264')
+    markViewClosed('u1', 'tabA')
+    release()
+
+    const [r1, r2] = await Promise.all([first, second])
+    expect(r1.error?.code).toBe('VIEW_CLOSED')
+    expect(r2.error).toBeUndefined()
+    expect(r2.hlsUrl).toContain('nvr_x_camHevc_main_h264')
+    // El proceso preservado tiene dueño: no queda huérfano.
+    expect(stopped).toEqual([])
+    expect(getActiveSessions().map(s => s.viewId)).toEqual(['tabB'])
+  })
+})
+
+describe('#147b · arranques concurrentes del mismo path no transcodificado', () => {
+  it('el que se cancela NO retira el path que otro arranque en vuelo va a usar', async () => {
+    // Dos pestañas publican el MISMO `sub` a la vez. Si la primera se cancela y
+    // llama a removeStream, la segunda queda con una URL sobre un path ya
+    // retirado de MediaMTX.
+    let release!: () => void
+    publishGate = new Promise<void>(r => { release = r })
+
+    const a = startStream(fakeServer, 'u1', 'camA', 'tabA')
+    const b = startStream(fakeServer, 'u2', 'camA', 'tabB')
+    await new Promise(r => setImmediate(r))
+    markViewClosed('u1', 'tabA')
+    release()
+
+    const [ra, rb] = await Promise.all([a, b])
+    expect(ra.error?.code).toBe('VIEW_CLOSED')
+    expect(rb.error).toBeUndefined()
+    // El path NO se retiró: la pestaña B lo está usando.
+    expect(removed).toEqual([])
+    expect(getActiveSessions().map(s => s.viewId)).toEqual(['tabB'])
+  })
+
+  it('si se cancelan TODOS los arranques concurrentes, el path sí se retira', async () => {
+    let release!: () => void
+    publishGate = new Promise<void>(r => { release = r })
+
+    const a = startStream(fakeServer, 'u1', 'camA', 'tabA')
+    const b = startStream(fakeServer, 'u2', 'camA', 'tabB')
+    await new Promise(r => setImmediate(r))
+    markViewClosed('u1', 'tabA')
+    markViewClosed('u2', 'tabB')
+    release()
+
+    await Promise.all([a, b])
+    expect(getActiveSessions()).toHaveLength(0)
+    expect(removed).toContain('camA')
+  })
+})
+
+describe('#147b · reconcileView declara su pestaña al cerrar', () => {
+  it('quitar una cámara del viewport cierra SÓLO la sesión de esa pestaña', async () => {
+    // Con dos pestañas sobre la misma cámara, un cierre sin viewId resultaba
+    // ambiguo y se ignoraba, dejando la sesión contando cupo hasta el TTL.
+    await startStream(fakeServer, 'u1', 'camA', 'tabA')
+    await startStream(fakeServer, 'u1', 'camA', 'tabB')
+    expect(getActiveSessions()).toHaveLength(2)
+
+    // tabA deja de mostrar camA: el reconcile la cierra con su viewId.
+    await stopStream(fakeServer, 'u1', 'camA', 'sub', 'viewport_reconcile', 'tabA')
+
+    const rest = getActiveSessions()
+    expect(rest).toHaveLength(1)
+    expect(rest[0].viewId).toBe('tabB')
+  })
+})

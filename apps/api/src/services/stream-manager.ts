@@ -470,7 +470,33 @@ interface InFlightStart {
   streamType: 'sub' | 'main' | 'main_h264'
   receivedAtMs: number
 }
-const inFlightStarts = new Map<string, InFlightStart>()
+// path → (clave de sesión → arranque). Es un MAPA por path, no una entrada
+// única: dos pestañas pueden estar arrancando el MISMO path a la vez y la
+// segunda pisaba a la primera. Sin esto, la cancelada podía llamar a
+// removeStream después de que la otra registrara su sesión, dejando a un
+// espectador con URL sobre un path ya retirado de MediaMTX (revisión de #147).
+const inFlightStarts = new Map<string, Map<string, InFlightStart>>()
+
+function addInFlightStart(streamPath: string, key: string, info: InFlightStart): void {
+  const m = inFlightStarts.get(streamPath) ?? new Map<string, InFlightStart>()
+  m.set(key, info)
+  inFlightStarts.set(streamPath, m)
+}
+function removeInFlightStart(streamPath: string, key: string): void {
+  const m = inFlightStarts.get(streamPath)
+  if (!m) return
+  m.delete(key)
+  if (m.size === 0) inFlightStarts.delete(streamPath)
+}
+/** ¿Queda algún arranque en vuelo NO cancelado sobre este path? */
+function hasValidInFlightOwner(streamPath: string): boolean {
+  const m = inFlightStarts.get(streamPath)
+  if (!m) return false
+  for (const st of m.values()) {
+    if (!isTargetClosedAfter(st.userId, st.viewId, st.cameraId, st.streamType, st.receivedAtMs)) return true
+  }
+  return false
+}
 
 /**
  * Cuántas peticiones están ESPERANDO el arranque compartido de cada path.
@@ -526,11 +552,17 @@ async function releaseUnownedStream(
   streamPath: string,
   reason: string,
 ): Promise<void> {
-  inFlightStarts.delete(streamPath)
   transcodeInFlight.delete(streamPath)
 
+  // Dueños válidos: sesiones ya registradas, pestañas esperando el arranque
+  // compartido, y OTROS arranques en vuelo no cancelados sobre el mismo path
+  // (el caso de dos pestañas publicando el mismo `sub` a la vez, que
+  // `transcodeWaiters` no cubre porque sólo sigue transcodificaciones).
   const survivors = toSessionTruths()
-  const stillOwned = survivors.some(s => s.streamPath === streamPath) || hasWaiters(streamPath)
+  const stillOwned =
+    survivors.some(s => s.streamPath === streamPath) ||
+    hasWaiters(streamPath) ||
+    hasValidInFlightOwner(streamPath)
   if (stillOwned) {
     console.info(`[live] start_aborted_keepalive path=${streamPath} reason=${reason} — otro viewer lo usa`)
     return
@@ -552,11 +584,10 @@ async function releaseUnownedStream(
   if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
 }
 
-/** ¿El arranque en vuelo de este path perdió a su dueño? */
+/** ¿Todos los arranques en vuelo de este path perdieron a su dueño? */
 function isStartCancelled(streamPath: string): boolean {
-  const st = inFlightStarts.get(streamPath)
-  if (!st) return false
-  return isTargetClosedAfter(st.userId, st.viewId, st.cameraId, st.streamType, st.receivedAtMs)
+  if (!inFlightStarts.has(streamPath)) return false
+  return !hasValidInFlightOwner(streamPath)
 }
 
 /**
@@ -1018,6 +1049,23 @@ async function startStreamCore(
       resolveInFlightRef?.(v)
     }
 
+
+    /**
+     * Aborto del registro por cierre de la pestaña. ÚNICO punto: las cuatro
+     * rutas de registro (proceso vivo reutilizado, listo, y las dos de
+     * "parcialmente listo") deben comportarse igual. Antes eran copias
+     * separadas y dos de ellas resolvían el single-flight en `false`, con lo
+     * que los que esperaban recibían TRANSCODE_NOT_READY sobre un FFmpeg que
+     * `releaseUnownedStream` sí había preservado — proceso vivo y sin dueño
+     * (revisión de #147, segunda vuelta).
+     */
+    const abortRegistration = async () => {
+      const adopters = hasWaiters(streamPath)
+      if (!adopters) await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
+      resolveInFlightSafe(adopters)
+      return abortResult('before_register_transcode')
+    }
+
     // Registrador ÚNICO de la sesión transcodificada. Comprueba la cancelación
     // inmediatamente antes de escribir: entre el inicio del arranque y este
     // punto hubo publishTranscodedStream, spawn y waitForHlsReady, cualquiera
@@ -1092,16 +1140,7 @@ async function startStreamCore(
     // the existing URL immediately without spawning a new process.
     if (isTranscodeProcessAlive(streamPath)) {
       console.info(`[transcode] reuse_live_process path=${streamPath} cameraId=${cameraId} — session cleared but FFmpeg alive`)
-      if (!registerTranscodeSession()) {
-        // El medio SÍ arrancó; sólo se fue quien lo pidió. Si hay pestañas
-        // esperando este mismo path, el arranque se resuelve como EXITOSO para
-        // que lo adopten, y el proceso no se toca. Sin nadie esperando, se
-        // libera.
-        const adopters = hasWaiters(streamPath)
-        if (!adopters) await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
-        resolveInFlightSafe(adopters)
-        return abortResult('before_register_transcode')
-      }
+      if (!registerTranscodeSession()) return await abortRegistration()
       lastMediaActivity.set(streamPath, Date.now())
       // Supervisor is still attached from the original spawn — no need to re-attach.
       transcodeInFlight.set(streamPath, { state: 'ready', promise: Promise.resolve(true), resolve: () => {} })
@@ -1134,7 +1173,7 @@ async function startStreamCore(
     transcodeInFlight.set(streamPath, { state: 'starting', promise: readyPromise, resolve: resolveInFlight })
     // El arranque queda registrado con su dueño: si la pestaña se cierra, el
     // supervisor sabrá que este in-flight ya no autoriza ningún reinicio.
-    inFlightStarts.set(streamPath, { userId, viewId: effectiveViewId, cameraId, streamType, receivedAtMs })
+    addInFlightStart(streamPath, transcodeKey, { userId, viewId: effectiveViewId, cameraId, streamType, receivedAtMs })
 
     try {
       // Register passive RTSP receiver path in MediaMTX (no runOnDemand)
@@ -1191,11 +1230,7 @@ async function startStreamCore(
           // indicators were not detected — likely fMP4/LL-HLS format or master playlist.
           // FFmpeg IS alive and MediaMTX IS muxing; return the URL and let VideoPlayer retry.
           console.warn(`[transcode] hls_partial_ready path=${streamPath} manifestVisible=true elapsedMs=${elapsedMs} — returning url for VideoPlayer retry`)
-          if (!registerTranscodeSession()) {
-            await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
-            resolveInFlightSafe(false)
-            return abortResult('before_register_transcode')
-          }
+          if (!registerTranscodeSession()) return await abortRegistration()
           lastMediaActivity.set(streamPath, Date.now())
           transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
           resolveInFlight(true)
@@ -1213,11 +1248,7 @@ async function startStreamCore(
             ` sourceType=${liveDetails?.sourceType} active=${liveDetails?.active}` +
             ` — publisher active, HLS muxer slow; returning URL for VideoPlayer retry`
           )
-          if (!registerTranscodeSession()) {
-            await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
-            resolveInFlightSafe(false)
-            return abortResult('before_register_transcode')
-          }
+          if (!registerTranscodeSession()) return await abortRegistration()
           lastMediaActivity.set(streamPath, Date.now())
           transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
           resolveInFlight(true)
@@ -1233,16 +1264,7 @@ async function startStreamCore(
             details: `lastStatus=${lastStatus} elapsed=${elapsedMs}ms` } }
       }
 
-      if (!registerTranscodeSession()) {
-        // El medio SÍ arrancó; sólo se fue quien lo pidió. Si hay pestañas
-        // esperando este mismo path, el arranque se resuelve como EXITOSO para
-        // que lo adopten, y el proceso no se toca. Sin nadie esperando, se
-        // libera.
-        const adopters = hasWaiters(streamPath)
-        if (!adopters) await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
-        resolveInFlightSafe(adopters)
-        return abortResult('before_register_transcode')
-      }
+      if (!registerTranscodeSession()) return await abortRegistration()
       lastMediaActivity.set(streamPath, Date.now())
       transcodeInFlight.set(streamPath, { state: 'ready', promise: readyPromise, resolve: resolveInFlight })
       resolveInFlight(true)
@@ -1256,7 +1278,7 @@ async function startStreamCore(
     } finally {
       // El arranque dejó de estar en vuelo por cualquier vía (éxito, error o
       // aborto): sin esto el supervisor seguiría viéndolo como autorización.
-      inFlightStarts.delete(streamPath)
+      removeInFlightStart(streamPath, transcodeKey)
     }
   }
 
@@ -1308,9 +1330,13 @@ async function startStreamCore(
     ` streamType=${effectiveType} path=${streamPath} rtsp=${rtspMasked}`
   )
   if (cancelled()) return abortResult('before_publish')
-  inFlightStarts.set(streamPath, { userId, viewId: effectiveViewId, cameraId, streamType, receivedAtMs })
-  const published = await publishStream(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
-  inFlightStarts.delete(streamPath)
+  addInFlightStart(streamPath, key, { userId, viewId: effectiveViewId, cameraId, streamType, receivedAtMs })
+  let published: boolean
+  try {
+    published = await publishStream(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
+  } finally {
+    removeInFlightStart(streamPath, key)
+  }
   if (!published) {
     console.error(
       `[startStream] publish_failed cameraId=${cameraId} nvrId=${camera.nvr.id} ch=${camera.channel} path=${streamPath}`
@@ -1470,7 +1496,10 @@ export async function reconcileView(
   // Detener cámaras que ya no son visibles en este view (solo sub — main/main_h264 tienen lifecycle explícito)
   const toStop = Array.from(previousCams).filter(id => !visibleSet.has(id))
   for (const cameraId of toStop) {
-    await stopStream(server, userId, cameraId, 'sub', 'viewport_reconcile')
+    // Con viewId: sin él, si el usuario tiene otra pestaña sobre la misma
+    // cámara el resolutor lo considera ambiguo y IGNORA el cierre, dejando la
+    // sesión obsoleta contando cupo hasta el TTL.
+    await stopStream(server, userId, cameraId, 'sub', 'viewport_reconcile', viewId)
     stoppedIds.push(cameraId)
   }
 
