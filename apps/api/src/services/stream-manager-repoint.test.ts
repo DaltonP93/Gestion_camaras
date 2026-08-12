@@ -322,4 +322,33 @@ describe('el single-flight local distingue "tiene dueño" de "está listo"', () 
     expect(filas[0].streamPath).toBe(PATH_B)
     expect(filas.some(s => s.streamPath === PATH_A)).toBe(false)
   })
+
+  it('(15) el path muerto se libera del todo: un waiter que va a fallar no lo conserva', async () => {
+    // Un waiter sólo es dueño de algo que existe. Si el proceso murió, va a
+    // recibir un fallo y retirarse, y nadie volvería a ejecutar la liberación:
+    // conservarlo dejaría la publicación y el estado huérfanos para siempre.
+    __setMediaActivityForTest(PATH_A, Date.now())
+
+    await waiterConProcesoMuerto()
+
+    expect(__isPathPublishedForTest(PATH_A)).toBe(false)
+    expect(__hasTranscodeSourceInfoForTest(PATH_A)).toBe(false)
+    expect(__hasTranscodeRestartsForTest(PATH_A)).toBe(false)
+    expect(__hasMediaActivityForTest(PATH_A)).toBe(false)
+    expect(__getTranscodeInFlightPathsForTest()).not.toContain(PATH_A)
+    expect(getTranscodeCounts().total).toBe(1)
+  })
+
+  it('(16) una SESIÓN registrada sobre un path muerto sí lo conserva', async () => {
+    // El otro tipo de dueño no se limpia por debajo: la fila existe y es la
+    // purga por heartbeat la que decide su suerte, no una carrera de arranques.
+    seedSesionSinProceso({ userId: 'u9', viewId: 'v9', cameraId: 'camH', streamPath: PATH_A })
+
+    await repunteTrasRegistro({
+      antesDeAbrir: () => { aliveProcesses.delete(PATH_A) },
+    })
+
+    expect(__isPathPublishedForTest(PATH_A)).toBe(true)
+    expect(getActiveSessions().some(s => s.streamPath === PATH_A)).toBe(true)
+  })
 })

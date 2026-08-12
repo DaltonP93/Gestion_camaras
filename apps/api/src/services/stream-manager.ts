@@ -787,9 +787,16 @@ async function releaseUnownedStream(
   // (el caso de dos pestañas publicando el mismo `sub` a la vez, que
   // `transcodeWaiters` no cubre porque sólo sigue transcodificaciones).
   const survivors = toSessionTruths()
+  // Un WAITER sólo es dueño de algo que todavía existe. Si el proceso ya murió,
+  // los que esperan van a recibir un fallo y retirarse, y nadie volvería a
+  // ejecutar esta liberación: contarlos como dueños dejaba el path publicado y
+  // con su info de origen, sus reinicios y su actividad colgando sin nadie
+  // detrás (revisión de #153). El arranque en vuelo ajeno se comprueba aparte,
+  // que es el caso legítimo de "todavía no hay proceso pero sí dueño".
+  const waiterAdoptable = hasWaiters(streamPath) && isTranscodeProcessAlive(streamPath)
   const stillOwned =
     survivors.some(s => s.streamPath === streamPath) ||
-    hasWaiters(streamPath) ||
+    waiterAdoptable ||
     hasValidInFlightOwner(streamPath, excludeAttemptId)
   if (stillOwned) {
     console.info(`[live] start_aborted_keepalive path=${streamPath} reason=${reason} — otro viewer lo usa`)
@@ -798,11 +805,16 @@ async function releaseUnownedStream(
 
   if (isTranscodeProcessAlive(streamPath)) {
     stopTranscodeProcess(streamPath)
-    transcodeRestarts.delete(streamPath)
-    transcodeSourceInfo.delete(streamPath)
-    lastMediaActivity.delete(streamPath)
     console.info(`[stream-manager] transcode_killed path=${streamPath} reason=${reason}`)
   }
+  // El estado POR PATH se limpia siempre que el path quedó sin dueño, esté el
+  // proceso vivo o ya caído. Hacerlo sólo al matarlo dejaba a un FFmpeg que se
+  // murió solo con su info de origen intacta —es decir, con qué reiniciarlo—
+  // además de sus reinicios y su actividad. Para los paths `sub`/`main` estos
+  // mapas están vacíos y el borrado es un no-op.
+  transcodeRestarts.delete(streamPath)
+  transcodeSourceInfo.delete(streamPath)
+  lastMediaActivity.delete(streamPath)
 
   // El flag `publishedPaths` es POR PATH: se limpia siempre que ESTE path
   // quedó sin dueño, aunque la cámara conserve otra sesión sobre otro path
@@ -1546,6 +1558,10 @@ async function startStreamCore(
       // dos condiciones: conservado Y vivo.
       const localUsable = localKept && isTranscodeProcessAlive(opts.localPath)
       if (localKept && !localUsable) {
+        // Queda un caso así: una SESIÓN registrada sobre un path cuyo proceso
+        // murió. Ahí el path tiene dueño de verdad y no se limpia por debajo
+        // de él —de eso se encarga la purga por heartbeat—, pero tampoco se
+        // puede anunciar como listo.
         console.warn(
           `[transcode] local_path_kept_but_dead path=${opts.localPath}` +
           ` cameraId=${cameraId} attempt=${opts.attemptId}`
