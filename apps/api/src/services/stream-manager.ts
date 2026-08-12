@@ -87,10 +87,49 @@ const TRANSCODE_KILL_REASONS = new Set([
 // Desglose de cupos de transcodificación: activos (sesiones main_h264 registradas),
 // iniciando (paths en waitForHlsReady aún sin registrar) y total (lo que cuenta contra
 // el límite). Expuesto para el diagnóstico ADMIN y el contrato de TRANSCODE_LIMIT_REACHED.
-export function getTranscodeCounts(): { active: number; starting: number; total: number; max: number } {
-  const active   = Array.from(sessions.values()).filter(s => s.streamType === 'main_h264').length
-  const starting = Array.from(transcodeInFlight.values()).filter(f => f.state === 'starting').length
-  return { active, starting, total: active + starting, max: MAX_TRANSCODE_SESSIONS }
+/**
+ * Cupos de transcodificación: se cuentan PROCESOS, no espectadores.
+ *
+ * Un cupo es un FFmpeg, y un FFmpeg es un `streamPath`. Con la pertenencia por
+ * pestaña, dos viewers de la misma cámara producen DOS sesiones sobre UN solo
+ * proceso; contar filas hacía que la segunda pestaña consumiera un cupo
+ * inexistente y disparaba TRANSCODE_LIMIT_REACHED con capacidad libre
+ * (revisión de #147, tercera vuelta).
+ *
+ * `total` es la UNIÓN de paths activos e iniciando: un path que está activo y
+ * a la vez reiniciando no puede ocupar dos cupos.
+ */
+export function getTranscodeCounts(): {
+  active: number; starting: number; total: number; max: number
+  /** Paths que ya ocupan cupo — permite reutilizarlos con el máximo alcanzado. */
+  occupiedPaths: Set<string>
+} {
+  const activePaths = new Set(
+    Array.from(sessions.values())
+      .filter(s => s.streamType === 'main_h264')
+      .map(s => s.streamPath))
+  const startingPaths = new Set(
+    Array.from(transcodeInFlight.entries())
+      .filter(([, f]) => f.state === 'starting')
+      .map(([path]) => path))
+  const occupiedPaths = new Set([...activePaths, ...startingPaths])
+  return {
+    active: activePaths.size,
+    starting: startingPaths.size,
+    total: occupiedPaths.size,
+    max: MAX_TRANSCODE_SESSIONS,
+    occupiedPaths,
+  }
+}
+
+/** Cuántos propietarios (pestañas) usan cada proceso. Sólo diagnóstico. */
+export function getTranscodeViewerCounts(): Map<string, number> {
+  const byPath = new Map<string, number>()
+  for (const s of sessions.values()) {
+    if (s.streamType !== 'main_h264') continue
+    byPath.set(s.streamPath, (byPath.get(s.streamPath) ?? 0) + 1)
+  }
+  return byPath
 }
 
 function getActiveTranscodeCount(): number {
@@ -217,6 +256,12 @@ export function __resetSessionsForTest(): void {
   lastMediaActivity.clear()
   viewCameras.clear()
   viewHeartbeat.clear()
+  // Estado de arranques: sin limpiarlo, un test heredaba el `transcodeInFlight`
+  // del anterior y el arranque tomaba la rama de reutilización en vez de la de
+  // spawn, midiendo algo distinto de lo que el test creía medir.
+  transcodeInFlight.clear()
+  transcodeRestarts.clear()
+  transcodeSourceInfo.clear()
 }
 
 // ─── Purga liviana de sesiones vencidas ──────────────────────────────────────
@@ -451,9 +496,37 @@ export function getStreamHdIdleTimeoutMs(): number {
 // de cámara. Si el servidor lo procesa después del cierre, recrearía la sesión y
 // volvería a levantar FFmpeg sin espectador. Se registra el instante del cierre
 // explícito de cada view y se descarta toda actividad recibida ANTES de él.
-const viewClosedAt = new Map<string, number>()
+/**
+ * TICKET de petición: hora del servidor + número de SECUENCIA monótono.
+ *
+ * La hora sola no alcanza. `Date.now()` tiene granularidad de milisegundo, así
+ * que una petición legítima que llega en el MISMO milisegundo que un cierre no
+ * se puede distinguir de una anterior: comparando con `>=` se cancelaba una
+ * petición nueva válida, y con `>` se dejaba pasar una vieja. La secuencia
+ * ordena sin ambigüedad — quien sacó su ticket antes del cierre tiene un número
+ * menor, siempre.
+ *
+ * El ticket lo saca el handler HTTP en su primera línea síncrona.
+ */
+export interface RequestTicket {
+  /** Hora del SERVIDOR al recibir la petición (para logs y diagnóstico). */
+  receivedAtMs: number
+  /** Orden de llegada. Monótono dentro del proceso. */
+  seq: number
+}
+
+let requestSeq = 0
+
+/** Saca el ticket de una petición entrante. Llamar ANTES de cualquier `await`. */
+export function beginRequest(): RequestTicket {
+  requestSeq += 1
+  return { receivedAtMs: Date.now(), seq: requestSeq }
+}
+
+interface CloseMark { atMs: number; seq: number }
+const viewClosedAt = new Map<string, CloseMark>()
 // Cierres de UNA cámara concreta dentro de un view. Clave: la clave de sesión.
-const targetClosedAt = new Map<string, number>()
+const targetClosedAt = new Map<string, CloseMark>()
 const CLOSED_VIEW_MEMORY_MS = 5 * 60_000
 
 /**
@@ -468,7 +541,9 @@ interface InFlightStart {
   viewId: string
   cameraId: string
   streamType: 'sub' | 'main' | 'main_h264'
-  receivedAtMs: number
+  ticket: RequestTicket
+  /** Clave de sesión a la que aspira este intento (informativa). */
+  sessionKey: string
 }
 // path → (clave de sesión → arranque). Es un MAPA por path, no una entrada
 // única: dos pestañas pueden estar arrancando el MISMO path a la vez y la
@@ -477,15 +552,33 @@ interface InFlightStart {
 // espectador con URL sobre un path ya retirado de MediaMTX (revisión de #147).
 const inFlightStarts = new Map<string, Map<string, InFlightStart>>()
 
-function addInFlightStart(streamPath: string, key: string, info: InFlightStart): void {
+/**
+ * Identificador ÚNICO por invocación de arranque.
+ *
+ * La clave del mapa era la clave de SESIÓN, y dos peticiones simultáneas del
+ * mismo usuario, pestaña, cámara y tipo comparten esa clave: la segunda pisaba
+ * a la primera y luego el `finally` de la primera borraba la entrada de la
+ * segunda, dejándola sin protección (revisión de #147, tercera vuelta).
+ *
+ * Un contador monótono del proceso basta y no puede colisionar; `Date.now()`
+ * sí podría, porque dos invocaciones caben en el mismo milisegundo.
+ */
+let startAttemptCounter = 0
+function nextStartAttemptId(): string {
+  startAttemptCounter += 1
+  return `sa${startAttemptCounter}`
+}
+
+function addInFlightStart(streamPath: string, attemptId: string, info: InFlightStart): void {
   const m = inFlightStarts.get(streamPath) ?? new Map<string, InFlightStart>()
-  m.set(key, info)
+  m.set(attemptId, info)
   inFlightStarts.set(streamPath, m)
 }
-function removeInFlightStart(streamPath: string, key: string): void {
+/** Retira EXACTAMENTE ese intento. Idempotente: repetirlo no borra a otro. */
+function removeInFlightStart(streamPath: string, attemptId: string): void {
   const m = inFlightStarts.get(streamPath)
   if (!m) return
-  m.delete(key)
+  m.delete(attemptId)
   if (m.size === 0) inFlightStarts.delete(streamPath)
 }
 /** ¿Queda algún arranque en vuelo NO cancelado sobre este path? */
@@ -493,7 +586,7 @@ function hasValidInFlightOwner(streamPath: string): boolean {
   const m = inFlightStarts.get(streamPath)
   if (!m) return false
   for (const st of m.values()) {
-    if (!isTargetClosedAfter(st.userId, st.viewId, st.cameraId, st.streamType, st.receivedAtMs)) return true
+    if (!isTargetClosedAfter(st.userId, st.viewId, st.cameraId, st.streamType, st.ticket)) return true
   }
   return false
 }
@@ -578,11 +671,27 @@ async function releaseUnownedStream(
 
   // El path de MediaMTX sólo se retira si NINGUNA sesión mira esa cámara.
   if (survivors.some(s => s.cameraId === cameraId)) return
+  // …y UNA SOLA VEZ: si dos intentos concurrentes del mismo path se cancelan
+  // juntos, ambos llegan hasta acá y sin esta guarda cada uno emitiría su
+  // `removeStream`.
+  const lastRelease = pathReleasedAt.get(streamPath)
+  if (lastRelease !== undefined && Date.now() - lastRelease < PATH_RELEASE_DEDUP_MS) {
+    console.info(`[live] path_release_skipped path=${streamPath} reason=already_released`)
+    return
+  }
+  pathReleasedAt.set(streamPath, Date.now())
   const camera = await server.prisma.camera.findUnique({
     where: { id: cameraId }, include: { nvr: true },
   }).catch(() => null)
   if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
 }
+
+/**
+ * Último retiro de cada path, para no emitir `removeStream` dos veces cuando
+ * varios intentos concurrentes se cancelan a la vez.
+ */
+const pathReleasedAt = new Map<string, number>()
+const PATH_RELEASE_DEDUP_MS = 5_000
 
 /** ¿Todos los arranques en vuelo de este path perdieron a su dueño? */
 function isStartCancelled(streamPath: string): boolean {
@@ -601,13 +710,15 @@ function isStartCancelled(streamPath: string): boolean {
  */
 export function markViewClosed(userId: string, viewId: string): void {
   const nowMs = Date.now()
-  viewClosedAt.set(vKey(userId, viewId), nowMs)
+  // El cierre se sella con la secuencia VIGENTE: toda petición con ticket menor
+  // o igual llegó antes que él.
+  viewClosedAt.set(vKey(userId, viewId), { atMs: nowMs, seq: requestSeq })
   // Poda perezosa: no conservar cierres viejos para siempre.
-  for (const [vk, at] of viewClosedAt.entries()) {
-    if (nowMs - at > CLOSED_VIEW_MEMORY_MS) viewClosedAt.delete(vk)
+  for (const [vk, mark] of viewClosedAt.entries()) {
+    if (nowMs - mark.atMs > CLOSED_VIEW_MEMORY_MS) viewClosedAt.delete(vk)
   }
-  for (const [k, at] of targetClosedAt.entries()) {
-    if (nowMs - at > CLOSED_VIEW_MEMORY_MS) targetClosedAt.delete(k)
+  for (const [k, mark] of targetClosedAt.entries()) {
+    if (nowMs - mark.atMs > CLOSED_VIEW_MEMORY_MS) targetClosedAt.delete(k)
   }
 }
 
@@ -616,7 +727,7 @@ export function markViewClosed(userId: string, viewId: string): void {
  * arranques en vuelo de ESA cámara y tipo; el resto de la grilla sigue.
  */
 function markTargetClosed(key: string): void {
-  targetClosedAt.set(key, Date.now())
+  targetClosedAt.set(key, { atMs: Date.now(), seq: requestSeq })
 }
 
 /**
@@ -624,9 +735,10 @@ function markTargetClosed(key: string): void {
  * `receivedAtMs` es la hora del SERVIDOR al recibir la petición, no un dato del
  * cliente.
  */
-export function isViewClosedAfter(userId: string, viewId: string, receivedAtMs: number): boolean {
-  const closedAt = viewClosedAt.get(vKey(userId, viewId))
-  return closedAt !== undefined && closedAt >= receivedAtMs
+export function isViewClosedAfter(userId: string, viewId: string, ticket: RequestTicket): boolean {
+  const mark = viewClosedAt.get(vKey(userId, viewId))
+  // `<=`: un ticket con secuencia menor o igual a la del cierre salió ANTES.
+  return mark !== undefined && ticket.seq <= mark.seq
 }
 
 /**
@@ -636,17 +748,20 @@ export function isViewClosedAfter(userId: string, viewId: string, receivedAtMs: 
 export function isTargetClosedAfter(
   userId: string, viewId: string,
   cameraId: string, streamType: 'sub' | 'main' | 'main_h264',
-  receivedAtMs: number,
+  ticket: RequestTicket,
 ): boolean {
-  if (isViewClosedAfter(userId, viewId, receivedAtMs)) return true
-  const closedAt = targetClosedAt.get(sessionKey({ userId, viewId, cameraId, streamType }))
-  return closedAt !== undefined && closedAt >= receivedAtMs
+  if (isViewClosedAfter(userId, viewId, ticket)) return true
+  const mark = targetClosedAt.get(sessionKey({ userId, viewId, cameraId, streamType }))
+  return mark !== undefined && ticket.seq <= mark.seq
 }
 
 /** Sólo tests: limpia la memoria de cierres. */
 export function __resetClosedViewsForTest(): void {
   viewClosedAt.clear()
   targetClosedAt.clear()
+  pathReleasedAt.clear()
+  inFlightStarts.clear()
+  transcodeWaiters.clear()
 }
 
 // Límites efectivos resueltos (env → número) — para el endpoint de diagnóstico.
@@ -686,7 +801,7 @@ export function touchSession(
   userId: string,
   cameraId: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
-  receivedAtMs: number = Date.now(),
+  ticket: RequestTicket = beginRequest(),
   viewId?: string,
 ) {
   // Sin viewId la pertenencia es ambigua. Se resuelve sólo si el usuario tiene
@@ -703,7 +818,7 @@ export function touchSession(
   if (!key) return
   const s = sessions.get(key)
   if (!s) return                                    // sesión inexistente: nada que resucitar
-  if (isTargetClosedAfter(userId, s.viewId, cameraId, streamType, receivedAtMs)) {
+  if (isTargetClosedAfter(userId, s.viewId, cameraId, streamType, ticket)) {
     console.info(
       `[stream-manager] heartbeat_ignored_stale cameraId=${cameraId}` +
       ` streamType=${streamType} viewId=${s.viewId} reason=closed_after_request`
@@ -716,8 +831,8 @@ export function touchSession(
 
 // Tocar todas las sesiones de un view de una vez — toca sub, main y main_h264
 // para que el idle cleanup no mate streams HD durante un heartbeat legítimo.
-export function touchView(userId: string, viewId: string, receivedAtMs: number = Date.now()) {
-  if (isViewClosedAfter(userId, viewId, receivedAtMs)) {
+export function touchView(userId: string, viewId: string, ticket: RequestTicket = beginRequest()) {
+  if (isViewClosedAfter(userId, viewId, ticket)) {
     console.info(`[stream-manager] heartbeat_ignored_stale viewId=${viewId} reason=view_closed_after_request`)
     return
   }
@@ -900,15 +1015,29 @@ const HEALTH_STATUS_ERRORS: Record<string, StreamError> = {
 // contadores rodantes UNA sola vez, sin importar quién llame (handler HTTP o
 // reconcileView). El rechazo por permiso (403) se registra solo en el handler,
 // porque el chequeo de permisos ocurre antes de llegar aquí.
+/**
+ * `receivedAtMs` es la hora del SERVIDOR en que llegó la petición ORIGINAL, y
+ * debe capturarla el llamador en su primera parte SÍNCRONA.
+ *
+ * Por qué no vale el default de `startStreamCore`: el handler HTTP hace
+ * `await userCanAccessCamera(...)` antes de llamar acá. Si el `pagehide` cae
+ * durante esa espera, un `Date.now()` tomado después parecería POSTERIOR al
+ * cierre y la petición vieja se trataría como nueva, registrando una sesión
+ * huérfana (revisión de #147, tercera vuelta).
+ *
+ * Va en un objeto con nombre para que un llamador nuevo no pueda olvidarlo por
+ * descuido posicional.
+ */
 export async function startStream(
   server: FastifyInstance,
   userId: string,
   cameraId: string,
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
+  ticket?: RequestTicket,
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
   try {
-    const result = await startStreamCore(server, userId, cameraId, viewId, streamType)
+    const result = await startStreamCore(server, userId, cameraId, viewId, streamType, ticket)
     recordStartResult(userId, result.error)
     return result
   } catch (err) {
@@ -923,7 +1052,7 @@ async function startStreamCore(
   cameraId: string,
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
-  receivedAtMs: number = Date.now(),
+  ticket: RequestTicket = beginRequest(),
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
   const effectiveViewId = viewId || DEFAULT_VIEW_ID
 
@@ -932,8 +1061,12 @@ async function startStreamCore(
   // transcodeInFlight) es una ventana en la que puede llegar el `pagehide` de
   // la pestaña. Comprobar sólo al entrar no alcanza: había que volver a
   // comprobar antes de registrar, reutilizar o devolver una sesión.
+  // Identidad de ESTA invocación: dos peticiones simultáneas del mismo dueño
+  // comparten clave de sesión, así que la clave del registro en vuelo no puede
+  // ser esa; si lo fuera, el `finally` de la vieja borraría a la nueva.
+  const startAttemptId = nextStartAttemptId()
   const cancelled = () =>
-    isTargetClosedAfter(userId, effectiveViewId, cameraId, streamType, receivedAtMs)
+    isTargetClosedAfter(userId, effectiveViewId, cameraId, streamType, ticket)
   const abortResult = (stage: string) => {
     console.info(
       `[live] start_aborted cameraId=${cameraId} streamType=${streamType}` +
@@ -1149,7 +1282,9 @@ async function startStreamCore(
 
     // ── 3. Check limits (count starting + registered) ────────
     const counts = getTranscodeCounts()
-    if (counts.total >= MAX_TRANSCODE_SESSIONS) {
+    // Reutilizar un path que ya ocupa cupo no consume uno nuevo: otra pestaña
+    // mirando la MISMA cámara comparte el proceso.
+    if (!counts.occupiedPaths.has(streamPath) && counts.total >= MAX_TRANSCODE_SESSIONS) {
       console.warn(`[transcode] reject cameraId=${cameraId} reason=MAX_TRANSCODE_SESSIONS active=${counts.active} starting=${counts.starting} max=${counts.max}`)
       const startingTxt = counts.starting ? `, ${counts.starting} iniciando` : ''
       return { hlsUrl: '', webrtcUrl: '', streamPath: '',
@@ -1173,7 +1308,9 @@ async function startStreamCore(
     transcodeInFlight.set(streamPath, { state: 'starting', promise: readyPromise, resolve: resolveInFlight })
     // El arranque queda registrado con su dueño: si la pestaña se cierra, el
     // supervisor sabrá que este in-flight ya no autoriza ningún reinicio.
-    addInFlightStart(streamPath, transcodeKey, { userId, viewId: effectiveViewId, cameraId, streamType, receivedAtMs })
+    addInFlightStart(streamPath, startAttemptId, {
+      userId, viewId: effectiveViewId, cameraId, streamType, ticket, sessionKey: transcodeKey,
+    })
 
     try {
       // Register passive RTSP receiver path in MediaMTX (no runOnDemand)
@@ -1278,7 +1415,7 @@ async function startStreamCore(
     } finally {
       // El arranque dejó de estar en vuelo por cualquier vía (éxito, error o
       // aborto): sin esto el supervisor seguiría viéndolo como autorización.
-      removeInFlightStart(streamPath, transcodeKey)
+      removeInFlightStart(streamPath, startAttemptId)
     }
   }
 
@@ -1330,12 +1467,15 @@ async function startStreamCore(
     ` streamType=${effectiveType} path=${streamPath} rtsp=${rtspMasked}`
   )
   if (cancelled()) return abortResult('before_publish')
-  addInFlightStart(streamPath, key, { userId, viewId: effectiveViewId, cameraId, streamType, receivedAtMs })
+  addInFlightStart(streamPath, startAttemptId, {
+    userId, viewId: effectiveViewId, cameraId, streamType, ticket, sessionKey: key,
+  })
   let published: boolean
   try {
     published = await publishStream(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
   } finally {
-    removeInFlightStart(streamPath, key)
+    // Retira SÓLO este intento: un reemplazo del mismo dueño sigue registrado.
+    removeInFlightStart(streamPath, startAttemptId)
   }
   if (!published) {
     console.error(
@@ -1351,6 +1491,10 @@ async function startStreamCore(
     await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
     return abortResult('before_register')
   }
+
+  // El path vuelve a estar en uso: se olvida cualquier retiro previo para que
+  // un cierre posterior sí pueda volver a retirarlo.
+  pathReleasedAt.delete(streamPath)
 
   // ── Register session ──────────────────────────────────────────────────
   sessions.set(key, {
@@ -1470,14 +1614,14 @@ export async function reconcileView(
   const visibleSet = new Set(visibleCameraIds)
   const suppressSet = new Set(suppressStartCameraIds)
   const vk = vKey(userId, viewId)
-  const receivedAtMs = Date.now()
+  const ticket = beginRequest()
 
   console.info(`[live] heartbeat userId=${userId} viewId=${viewId} cameraIds=[${visibleCameraIds.join(',')}]`)
 
   // GUARDA DE RESPUESTA TARDÍA: si el view se cerró explícitamente después de
   // que llegó esta petición, reconciliar volvería a crear sesiones y a levantar
   // FFmpeg sin espectador. Se descarta el heartbeat entero.
-  if (isViewClosedAfter(userId, viewId, receivedAtMs)) {
+  if (isViewClosedAfter(userId, viewId, ticket)) {
     console.info(`[live] heartbeat_ignored_stale viewId=${viewId} reason=view_closed_after_request`)
     return { streams: {}, errors: {}, startedIds: [], stoppedIds: [] }
   }
@@ -1534,7 +1678,10 @@ export async function reconcileView(
       continue
     } else {
       // No tiene sesión — iniciar
-      const result = await startStream(server, userId, cameraId, viewId)
+      // El receivedAtMs del heartbeat: reconcileView también tiene awaits antes
+      // de llegar acá (stopStream de las cámaras salientes, consultas), así que
+      // el arranque debe medirse contra la llegada de ESTA petición.
+      const result = await startStream(server, userId, cameraId, viewId, 'sub', ticket)
       if (result.error) {
         errors[cameraId] = result.error
       } else {
@@ -1825,6 +1972,10 @@ export interface TranscodeSlot {
   lastHeartbeat: Date
   profile:       { width: string; fps: string; bitrate: string; encoder: string }
   reason:        string
+  /** Cuántas pestañas comparten ESTE proceso. Un slot = un proceso. */
+  viewerCount:   number
+  /** Propietarios del proceso. Sin tokens ni datos sensibles. */
+  viewers:       Array<{ userId: string; viewId: string }>
 }
 
 export function getTranscodeSlots(): {
@@ -1835,33 +1986,52 @@ export function getTranscodeSlots(): {
 } {
   const counts = getTranscodeCounts()
   const procByPath = new Map(getActiveTranscodesList().map(p => [p.streamPath, p]))
+  const viewersByPath = getTranscodeViewerCounts()
   const cfg = resolveGridProfile()
   const profile = { width: cfg.width, fps: cfg.fps, bitrate: cfg.bitrate, encoder: cfg.encoder }
 
-  const slots: TranscodeSlot[] = Array.from(sessions.values())
-    .filter(s => s.streamType === 'main_h264')
-    .map(s => {
-      const proc     = procByPath.get(s.streamPath)
-      const alive    = proc?.alive ?? false
-      const inFlight = transcodeInFlight.get(s.streamPath)
-      const reason = alive
-        ? 'proceso FFmpeg activo con sesión registrada'
-        : inFlight?.state === 'starting'
-          ? 'iniciando — esperando manifest HLS'
-          : 'sesión registrada sin proceso FFmpeg vivo (posible reinicio del supervisor)'
-      return {
-        cameraId:      s.cameraId,
-        userId:        s.userId,
-        viewId:        s.viewId,
-        streamPath:    s.streamPath,
-        pid:           proc?.pid,
-        processAlive:  alive,
-        startedAt:     s.startedAt,
-        lastHeartbeat: s.lastClientHeartbeat,
-        profile,
-        reason,
-      }
-    })
+  // UN SLOT POR PROCESO (streamPath), no por espectador. Antes se emitía una
+  // fila por sesión, así que dos pestañas de la misma cámara aparecían como dos
+  // slots mientras `activeProcessCount` decía 1: el diagnóstico se contradecía
+  // a sí mismo (revisión de #147, tercera vuelta). Los propietarios se informan
+  // aparte, en `viewerCount` y `viewers`.
+  const byPath = new Map<string, StreamSession[]>()
+  for (const sess of sessions.values()) {
+    if (sess.streamType !== 'main_h264') continue
+    const list = byPath.get(sess.streamPath) ?? []
+    list.push(sess)
+    byPath.set(sess.streamPath, list)
+  }
+
+  const slots: TranscodeSlot[] = Array.from(byPath.entries()).map(([streamPath, owners]) => {
+    const proc     = procByPath.get(streamPath)
+    const alive    = proc?.alive ?? false
+    const inFlight = transcodeInFlight.get(streamPath)
+    const reason = alive
+      ? 'proceso FFmpeg activo con sesión registrada'
+      : inFlight?.state === 'starting'
+        ? 'iniciando — esperando manifest HLS'
+        : 'sesión registrada sin proceso FFmpeg vivo (posible reinicio del supervisor)'
+    // El más antiguo representa el slot; el resto son co-propietarios.
+    const first = owners.reduce((a, b) => (a.startedAt <= b.startedAt ? a : b))
+    const freshest = owners.reduce((a, b) =>
+      (a.lastClientHeartbeat >= b.lastClientHeartbeat ? a : b))
+    return {
+      cameraId:      first.cameraId,
+      userId:        first.userId,
+      viewId:        first.viewId,
+      streamPath,
+      pid:           proc?.pid,
+      processAlive:  alive,
+      startedAt:     first.startedAt,
+      lastHeartbeat: freshest.lastClientHeartbeat,
+      profile,
+      reason,
+      viewerCount:   viewersByPath.get(streamPath) ?? owners.length,
+      // Sin tokens ni datos sensibles: sólo qué pestañas de qué usuarios lo usan.
+      viewers:       owners.map(o => ({ userId: o.userId, viewId: o.viewId })),
+    }
+  })
 
   return {
     maxTranscodes:      counts.max,

@@ -3,7 +3,7 @@ import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus, getStreamDetails } from '../services/stream'
 import { resolveGridProfile, deriveOutputResolution } from '../services/transcode-profile'
-import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary, recordStreamOutcome } from '../services/stream-manager'
+import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary, recordStreamOutcome, beginRequest } from '../services/stream-manager'
 import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -359,6 +359,15 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
   // POST /api/cameras/:id/start-stream — Iniciar stream (con session tracking)
   server.post('/:id/start-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
+    // PRIMERA LÍNEA, ANTES DE CUALQUIER `await`. El ticket lleva la hora del
+    // SERVIDOR y un número de secuencia monótono, y es contra él que se compara
+    // un cierre posterior.
+    //
+    // Si se tomara más tarde —por ejemplo después de `userCanAccessCamera`— un
+    // `pagehide` ocurrido durante esa espera quedaría ANTES del ticket, la
+    // petición vieja parecería nueva y registraría una sesión que el usuario ya
+    // cerró (revisión de #147, tercera vuelta).
+    const ticket = beginRequest()
     const { id } = request.params as { id: string }
     const user = request.user
 
@@ -378,7 +387,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     server.log.info(`[live] start_stream_requested cameraId=${id} streamType=${streamType} userId=${user.sub}`)
 
-    const result = await startStream(server, user.sub, id, viewId, streamType)
+    const result = await startStream(server, user.sub, id, viewId, streamType, ticket)
     if (result.error) {
       if (result.error.code === 'TRANSCODE_LIMIT_REACHED') {
         server.log.warn(`[live] start_stream_failed cameraId=${id} code=TRANSCODE_LIMIT_REACHED streamType=${streamType}`)
@@ -572,6 +581,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
   // POST /api/cameras/:id/touch-stream — Heartbeat para evitar timeout
   server.post('/:id/touch-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const ticket = beginRequest()      // antes de cualquier `await`
     const { id } = request.params as { id: string }
     const user = request.user
     const body = request.body as any
@@ -579,9 +589,9 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const streamType: 'sub' | 'main' | 'main_h264' =
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
-    // Hora del SERVIDOR al recibir: descarta heartbeats en vuelo posteriores a
-    // un cierre explícito.
-    touchSession(user.sub, id, streamType, Date.now(), viewId)
+    // El ticket se saca al entrar: descarta heartbeats en vuelo emitidos antes
+    // de un cierre explícito.
+    touchSession(user.sub, id, streamType, ticket, viewId)
     return reply.send({ ok: true })
   })
 
