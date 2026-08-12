@@ -520,13 +520,13 @@ export function LiveViewPage() {
     // keepalive: un cambio de layout/cámara puede coincidir con una navegación;
     // sin él la petición se aborta y la sesión queda viva hasta el TTL.
     await Promise.allSettled(
-      toStop.map(id => closeStreamSession(id, 'sub', reason || 'stop_sessions'))
+      toStop.map(id => closeStreamSession(id, 'sub', reason || 'stop_sessions', viewId))
     )
     toStop.forEach(id => {
       activeSessions.current.delete(id)
       pendingStarts.current.delete(id)
     })
-  }, [])
+  }, [viewId])
 
   // ─── Clear stagger timers ────────────────────────────────────
   const clearStaggerTimers = useCallback(() => {
@@ -853,7 +853,7 @@ export function LiveViewPage() {
 
   // ─── Retry a single grid camera (full stream restart) ───────
   const handleGridCameraRetry = useCallback((cameraId: string) => {
-    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'sub', reason: 'grid_retry' }).catch(() => {})
+    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'sub', reason: 'grid_retry', viewId }).catch(() => {})
     activeSessions.current.delete(cameraId)
     setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
     setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
@@ -908,7 +908,7 @@ export function LiveViewPage() {
       : (cameraId === focusCamera ? focusStreamType : 'sub')
     if (activeSessions.current.has(cameraId)) {
       console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${currentStreamType} reason=hls_fatal_error code=${err.code}`)
-      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: currentStreamType, reason: 'hls_fatal_error' }).catch(() => {})
+      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: currentStreamType, reason: 'hls_fatal_error', viewId }).catch(() => {})
       activeSessions.current.delete(cameraId)
     }
     // HLS manifest 404 on a grid (sub) camera = RTSP source returned 404 from NVR.
@@ -1109,8 +1109,8 @@ export function LiveViewPage() {
         // Explicitly switching back to sub — stop both main streams so FFmpeg is killed.
         console.info(`[LiveView] qualitySwitch cameraId=${cam} from=${focusStreamType} to=sub reason=switch_to_sub`)
         console.info(`[live-ui] fallback_to_substream cameraId=${cam} reason=user_selected_low_quality prevType=${focusStreamType}`)
-        void closeStreamSession(cam, 'main',      'switch_to_sub')
-        void closeStreamSession(cam, 'main_h264', 'switch_to_sub')
+        void closeStreamSession(cam, 'main',      'switch_to_sub', viewId)
+        void closeStreamSession(cam, 'main_h264', 'switch_to_sub', viewId)
         setFocusStreamInfo(null)
         setFocusStreamError(null)
         setFocusStreamType('sub')
@@ -1137,7 +1137,7 @@ export function LiveViewPage() {
       // b) Stopping main_h264 kills FFmpeg, then start-stream immediately re-spawns it
       //    causing the "closing existing publisher" duplicate in MediaMTX.
       if (prevType === 'main') {
-        apiPost(`/cameras/${cam}/stop-stream`, { streamType: 'main', reason: 'quality_switch' }).catch(() => {})
+        apiPost(`/cameras/${cam}/stop-stream`, { streamType: 'main', reason: 'quality_switch', viewId }).catch(() => {})
       }
 
       setFocusStreamInfo(null)
@@ -1197,8 +1197,8 @@ export function LiveViewPage() {
 
     // Stop main/main_h264 streams — sub stream stays alive for the grid
     if (prevFocusId) {
-      void closeStreamSession(prevFocusId, 'main',      'exit_focus')
-      void closeStreamSession(prevFocusId, 'main_h264', 'exit_focus')
+      void closeStreamSession(prevFocusId, 'main',      'exit_focus', viewId)
+      void closeStreamSession(prevFocusId, 'main_h264', 'exit_focus', viewId)
     }
 
     // Reconcile the grid cameras after returning from fullscreen.

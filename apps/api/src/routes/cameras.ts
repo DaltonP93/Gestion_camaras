@@ -383,6 +383,20 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       if (result.error.code === 'TRANSCODE_LIMIT_REACHED') {
         server.log.warn(`[live] start_stream_failed cameraId=${id} code=TRANSCODE_LIMIT_REACHED streamType=${streamType}`)
       }
+      // CANCELACIÓN, NO FALLO. Si la pestaña se cerró durante el arranque, el
+      // usuario simplemente se fue: no es un problema del pipeline. Sin este
+      // corte se escribiría streamHealthStatus=MEDIA_SERVER_ERROR y
+      // lastStreamFailureAt, y ese timestamp es justamente lo que el
+      // healthWorker toma como "alguien pidió video y no salió" — un cierre de
+      // pestaña normal acabaría fabricando CAMERA_STREAM_ERROR falsos, que es
+      // exactamente lo que este trabajo persigue eliminar (revisión de #147).
+      if (result.error.code === 'VIEW_CLOSED') {
+        server.log.info(
+          `[live] start_stream_cancelled userId=${user.sub} cameraId=${id}` +
+          ` streamType=${streamType} reason=view_closed_during_start`
+        )
+        return reply.status(409).send(result.error)
+      }
       // Si el error es del servidor de medios (no de límites ni de estado de salud),
       // marcar la cámara como MEDIA_SERVER_ERROR
       const isLimitError = result.error.code === 'STREAM_LIMIT_REACHED' || result.error.code === 'STREAM_LIMIT_GLOBAL'

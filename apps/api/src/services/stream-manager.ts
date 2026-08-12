@@ -377,6 +377,10 @@ const LIMIT_ERROR_CODES = new Set(['STREAM_LIMIT_REACHED', 'STREAM_LIMIT_GLOBAL'
 // (vía el wrapper startStream), así los heartbeats que recrean sesiones podadas
 // o chocan con límites también quedan contabilizados.
 function recordStartResult(userId: string, error?: { code: string } | null): void {
+  // Una cancelación por cierre de pestaña no es un resultado del arranque: no
+  // cuenta como aceptado ni como fallo. Contarla como `failed_other` ensuciaría
+  // el diagnóstico de "por qué a este usuario sólo le abren N cámaras".
+  if (error?.code === 'VIEW_CLOSED') return
   if (!error) {
     recordStreamOutcome(userId, 'accepted')
   } else {
@@ -448,6 +452,8 @@ export function getStreamHdIdleTimeoutMs(): number {
 // volvería a levantar FFmpeg sin espectador. Se registra el instante del cierre
 // explícito de cada view y se descarta toda actividad recibida ANTES de él.
 const viewClosedAt = new Map<string, number>()
+// Cierres de UNA cámara concreta dentro de un view. Clave: la clave de sesión.
+const targetClosedAt = new Map<string, number>()
 const CLOSED_VIEW_MEMORY_MS = 5 * 60_000
 
 /**
@@ -460,9 +466,34 @@ const CLOSED_VIEW_MEMORY_MS = 5 * 60_000
 interface InFlightStart {
   userId: string
   viewId: string
+  cameraId: string
+  streamType: 'sub' | 'main' | 'main_h264'
   receivedAtMs: number
 }
 const inFlightStarts = new Map<string, InFlightStart>()
+
+/**
+ * Cuántas peticiones están ESPERANDO el arranque compartido de cada path.
+ *
+ * Si el iniciador cierra su pestaña pero el medio ya arrancó bien, el proceso
+ * NO puede derribarse: hay espectadores válidos aguardando para adoptarlo. Sin
+ * este contador, la cancelación del iniciador resolvía el single-flight en
+ * `false` y los que esperaban recibían TRANSCODE_NOT_READY sobre un FFmpeg
+ * perfectamente sano (revisión de #147).
+ */
+const transcodeWaiters = new Map<string, number>()
+
+function addWaiter(streamPath: string): void {
+  transcodeWaiters.set(streamPath, (transcodeWaiters.get(streamPath) ?? 0) + 1)
+}
+function removeWaiter(streamPath: string): void {
+  const n = (transcodeWaiters.get(streamPath) ?? 1) - 1
+  if (n > 0) transcodeWaiters.set(streamPath, n)
+  else transcodeWaiters.delete(streamPath)
+}
+function hasWaiters(streamPath: string): boolean {
+  return (transcodeWaiters.get(streamPath) ?? 0) > 0
+}
 
 /**
  * Elimina TODAS las sesiones que apuntan a un `streamPath` cuyo proceso ya no
@@ -499,7 +530,7 @@ async function releaseUnownedStream(
   transcodeInFlight.delete(streamPath)
 
   const survivors = toSessionTruths()
-  const stillOwned = survivors.some(s => s.streamPath === streamPath)
+  const stillOwned = survivors.some(s => s.streamPath === streamPath) || hasWaiters(streamPath)
   if (stillOwned) {
     console.info(`[live] start_aborted_keepalive path=${streamPath} reason=${reason} — otro viewer lo usa`)
     return
@@ -525,9 +556,18 @@ async function releaseUnownedStream(
 function isStartCancelled(streamPath: string): boolean {
   const st = inFlightStarts.get(streamPath)
   if (!st) return false
-  return isViewClosedAfter(st.userId, st.viewId, st.receivedAtMs)
+  return isTargetClosedAfter(st.userId, st.viewId, st.cameraId, st.streamType, st.receivedAtMs)
 }
 
+/**
+ * Marca el cierre de TODO un view (pestaña). Reservado para
+ * `cleanupUserSessions`: desmontaje, `pagehide`, cierre de la vista entera.
+ *
+ * NO debe usarse al cerrar una sola cámara. `stopStream` lo hacía, y como la
+ * guarda de cancelación es por (usuario, view), cerrar la cámara A abortaba con
+ * VIEW_CLOSED un arranque en vuelo de la cámara B de la misma grilla: cambiar
+ * de cámara mataba el arranque de las demás (revisión de #147).
+ */
 export function markViewClosed(userId: string, viewId: string): void {
   const nowMs = Date.now()
   viewClosedAt.set(vKey(userId, viewId), nowMs)
@@ -535,6 +575,17 @@ export function markViewClosed(userId: string, viewId: string): void {
   for (const [vk, at] of viewClosedAt.entries()) {
     if (nowMs - at > CLOSED_VIEW_MEMORY_MS) viewClosedAt.delete(vk)
   }
+  for (const [k, at] of targetClosedAt.entries()) {
+    if (nowMs - at > CLOSED_VIEW_MEMORY_MS) targetClosedAt.delete(k)
+  }
+}
+
+/**
+ * Marca el cierre de UNA cámara concreta de un view. Sólo cancela heartbeats y
+ * arranques en vuelo de ESA cámara y tipo; el resto de la grilla sigue.
+ */
+function markTargetClosed(key: string): void {
+  targetClosedAt.set(key, Date.now())
 }
 
 /**
@@ -547,9 +598,24 @@ export function isViewClosedAfter(userId: string, viewId: string, receivedAtMs: 
   return closedAt !== undefined && closedAt >= receivedAtMs
 }
 
+/**
+ * ¿Quedó obsoleta una petición para UNA cámara concreta? Cubre los dos niveles:
+ * el cierre de la pestaña entera y el cierre puntual de esa cámara y tipo.
+ */
+export function isTargetClosedAfter(
+  userId: string, viewId: string,
+  cameraId: string, streamType: 'sub' | 'main' | 'main_h264',
+  receivedAtMs: number,
+): boolean {
+  if (isViewClosedAfter(userId, viewId, receivedAtMs)) return true
+  const closedAt = targetClosedAt.get(sessionKey({ userId, viewId, cameraId, streamType }))
+  return closedAt !== undefined && closedAt >= receivedAtMs
+}
+
 /** Sólo tests: limpia la memoria de cierres. */
 export function __resetClosedViewsForTest(): void {
   viewClosedAt.clear()
+  targetClosedAt.clear()
 }
 
 // Límites efectivos resueltos (env → número) — para el endpoint de diagnóstico.
@@ -606,10 +672,10 @@ export function touchSession(
   if (!key) return
   const s = sessions.get(key)
   if (!s) return                                    // sesión inexistente: nada que resucitar
-  if (isViewClosedAfter(userId, s.viewId, receivedAtMs)) {
+  if (isTargetClosedAfter(userId, s.viewId, cameraId, streamType, receivedAtMs)) {
     console.info(
       `[stream-manager] heartbeat_ignored_stale cameraId=${cameraId}` +
-      ` streamType=${streamType} viewId=${s.viewId} reason=view_closed_after_request`
+      ` streamType=${streamType} viewId=${s.viewId} reason=closed_after_request`
     )
     return
   }
@@ -835,7 +901,8 @@ async function startStreamCore(
   // transcodeInFlight) es una ventana en la que puede llegar el `pagehide` de
   // la pestaña. Comprobar sólo al entrar no alcanza: había que volver a
   // comprobar antes de registrar, reutilizar o devolver una sesión.
-  const cancelled = () => isViewClosedAfter(userId, effectiveViewId, receivedAtMs)
+  const cancelled = () =>
+    isTargetClosedAfter(userId, effectiveViewId, cameraId, streamType, receivedAtMs)
   const abortResult = (stage: string) => {
     console.info(
       `[live] start_aborted cameraId=${cameraId} streamType=${streamType}` +
@@ -981,13 +1048,36 @@ async function startStreamCore(
     const inFlight = transcodeInFlight.get(streamPath)
     if (inFlight?.state === 'starting') {
       console.info(`[transcode] awaiting in-progress cameraId=${cameraId} path=${streamPath}`)
-      const ready = await inFlight.promise
+      // Este arranque queda EN VUELO también para el que espera: si su pestaña
+      // se cierra mientras aguarda, el supervisor no debe tomar la espera ajena
+      // como autorización propia.
+      addWaiter(streamPath)
+      let ready: boolean
+      try {
+        ready = await inFlight.promise
+      } finally {
+        removeWaiter(streamPath)
+      }
       if (ready) {
-        const s = sessions.get(transcodeKey)
-        if (s) {
-          s.lastClientHeartbeat = new Date()
-          return { hlsUrl: getHlsUrl(s.streamPath), webrtcUrl: getWebRtcUrl(s.streamPath), streamPath: s.streamPath, transcoded: true }
+        // El proceso arrancó bien. CADA pestaña que esperaba necesita SU PROPIA
+        // fila: la clave es por view, así que buscar `transcodeKey` sin haberla
+        // creado devolvía siempre vacío y respondía TRANSCODE_NOT_READY aunque
+        // FFmpeg estuviera perfecto (revisión de #147). Además, sin fila propia
+        // la cancelación de la pestaña iniciadora se llevaba por delante un
+        // proceso que este espectador sí estaba usando.
+        const own = sessions.get(transcodeKey)
+        if (own) {
+          own.lastClientHeartbeat = new Date()
+          return { hlsUrl: getHlsUrl(own.streamPath), webrtcUrl: getWebRtcUrl(own.streamPath), streamPath: own.streamPath, transcoded: true }
         }
+        if (!registerTranscodeSession()) {
+          // El que esperaba también se fue: no se registra nada, y se libera el
+          // proceso sólo si no quedó ningún otro dueño.
+          await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_while_waiting')
+          return abortResult('waiting_shared_transcode')
+        }
+        console.info(`[transcode] waiter_registered cameraId=${cameraId} path=${streamPath} viewId=${effectiveViewId}`)
+        return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath, transcoded: true }
       }
       return { hlsUrl: '', webrtcUrl: '', streamPath: '',
         error: { code: 'TRANSCODE_NOT_READY', message: 'El stream transcodificado no pudo iniciar. Intenta de nuevo.' } }
@@ -1003,8 +1093,13 @@ async function startStreamCore(
     if (isTranscodeProcessAlive(streamPath)) {
       console.info(`[transcode] reuse_live_process path=${streamPath} cameraId=${cameraId} — session cleared but FFmpeg alive`)
       if (!registerTranscodeSession()) {
-        await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
-        resolveInFlightSafe(false)
+        // El medio SÍ arrancó; sólo se fue quien lo pidió. Si hay pestañas
+        // esperando este mismo path, el arranque se resuelve como EXITOSO para
+        // que lo adopten, y el proceso no se toca. Sin nadie esperando, se
+        // libera.
+        const adopters = hasWaiters(streamPath)
+        if (!adopters) await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
+        resolveInFlightSafe(adopters)
         return abortResult('before_register_transcode')
       }
       lastMediaActivity.set(streamPath, Date.now())
@@ -1039,7 +1134,7 @@ async function startStreamCore(
     transcodeInFlight.set(streamPath, { state: 'starting', promise: readyPromise, resolve: resolveInFlight })
     // El arranque queda registrado con su dueño: si la pestaña se cierra, el
     // supervisor sabrá que este in-flight ya no autoriza ningún reinicio.
-    inFlightStarts.set(streamPath, { userId, viewId: effectiveViewId, receivedAtMs })
+    inFlightStarts.set(streamPath, { userId, viewId: effectiveViewId, cameraId, streamType, receivedAtMs })
 
     try {
       // Register passive RTSP receiver path in MediaMTX (no runOnDemand)
@@ -1139,8 +1234,13 @@ async function startStreamCore(
       }
 
       if (!registerTranscodeSession()) {
-        await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
-        resolveInFlightSafe(false)
+        // El medio SÍ arrancó; sólo se fue quien lo pidió. Si hay pestañas
+        // esperando este mismo path, el arranque se resuelve como EXITOSO para
+        // que lo adopten, y el proceso no se toca. Sin nadie esperando, se
+        // libera.
+        const adopters = hasWaiters(streamPath)
+        if (!adopters) await releaseUnownedStream(server, cameraId, streamPath, 'view_closed_during_start')
+        resolveInFlightSafe(adopters)
         return abortResult('before_register_transcode')
       }
       lastMediaActivity.set(streamPath, Date.now())
@@ -1208,7 +1308,7 @@ async function startStreamCore(
     ` streamType=${effectiveType} path=${streamPath} rtsp=${rtspMasked}`
   )
   if (cancelled()) return abortResult('before_publish')
-  inFlightStarts.set(streamPath, { userId, viewId: effectiveViewId, receivedAtMs })
+  inFlightStarts.set(streamPath, { userId, viewId: effectiveViewId, cameraId, streamType, receivedAtMs })
   const published = await publishStream(nvr as NVR, camera as Camera, effectiveType as 'sub' | 'main')
   inFlightStarts.delete(streamPath)
   if (!published) {
@@ -1260,6 +1360,11 @@ export async function stopStream(
     return
   }
   const session = key ? sessions.get(key) : undefined
+  // Marcar el cierre ANTES de mirar si la sesión existe. Si el arranque de esta
+  // cámara sigue en vuelo todavía no hay fila que borrar, y sin esta marca el
+  // arranque terminaría después registrando una sesión que el usuario ya cerró
+  // — el mismo hueco que se tapó en `cleanupUserSessions`, aquí a nivel cámara.
+  if (key) markTargetClosed(key)
   let killedFfmpeg = false
   let clearedInFlight = false
 
@@ -1270,9 +1375,6 @@ export async function stopStream(
       viewCameras.get(vk)?.delete(cameraId)
     }
     sessions.delete(key)
-    // Cierre EXPLÍCITO de esta cámara dentro del view: todo heartbeat en vuelo
-    // emitido antes de este instante queda invalidado y no podrá recrearla.
-    markViewClosed(userId, session.viewId)
     console.info(
       `[stream-manager] view_session_closed cameraId=${cameraId} streamType=${streamType}` +
       ` viewId=${session.viewId} generation=${generation} reason=${reason || 'unspecified'}`
@@ -1521,13 +1623,12 @@ export async function cleanupUserSessions(
     viewCameras.delete(vk)
     viewHeartbeat.delete(vk)
   } else {
-    const cutoff = new Date(Date.now() - STREAM_IDLE_TIMEOUT * 1000)
-    for (const [vk, hb] of viewHeartbeat.entries()) {
-      if (vk.startsWith(`${userId}:`) && hb < cutoff) {
-        viewCameras.delete(vk)
-        viewHeartbeat.delete(vk)
-      }
-    }
+    // Con STREAM_HD_IDLE_TIMEOUT > STREAM_IDLE_TIMEOUT, una sesión HD cuya edad
+    // cae entre ambos TTL sobrevive arriba; si acá se borrara su viewHeartbeat
+    // con el cutoff estándar CRUDO, la siguiente limpieza la mataría por
+    // `view_heartbeat_missing` y el TTL de HD configurado no serviría de nada
+    // (revisión de #147). Se poda con la misma decisión de supervivencia.
+    pruneOrphanViewIndexes(toSessionTruths(), Date.now(), getSessionTtl())
   }
 
   return removed

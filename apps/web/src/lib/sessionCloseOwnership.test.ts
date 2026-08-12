@@ -36,10 +36,12 @@ describe('(1) el cierre declara la pestaña dueña', () => {
     expect(url).toContain('streamType=main_h264')
   })
 
-  it('sin viewId no lo inventa: el backend decidirá si la pertenencia es unívoca', async () => {
-    await closeStreamSession('cam1', 'sub', 'cleanup_unmount')
-    const [url] = fetchMock.mock.calls[0]
-    expect(url).not.toContain('viewId=')
+  it('el viewId es OBLIGATORIO en la firma: ningún llamador puede omitirlo', () => {
+    // Garantía de tipos, no de runtime: la revisión de #147 encontró cinco
+    // llamadores que lo omitían y el backend ignoraba esos cierres por
+    // ambigüedad, dejando sesiones consumiendo cupo hasta el TTL.
+    // @ts-expect-error — falta el argumento viewId
+    expect(() => closeStreamSession('cam1', 'sub', 'cleanup_unmount')).toBeTypeOf('function')
   })
 
   it('escapa el viewId', async () => {

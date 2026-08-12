@@ -336,3 +336,108 @@ describe('Inconsistencia adicional · autorización del supervisor', () => {
     expect(stopped).toEqual(['nvr_x_ch09_main_h264'])
   })
 })
+
+// ─── Revisión de #147 ────────────────────────────────────────────────────────
+
+describe('#147 · el que espera un arranque compartido registra su propia sesión', () => {
+  it('la segunda pestaña obtiene URL en vez de TRANSCODE_NOT_READY', async () => {
+    // Antes: la clave es por view, así que el que esperaba buscaba SU
+    // transcodeKey, no lo encontraba y devolvía TRANSCODE_NOT_READY aunque
+    // FFmpeg hubiera arrancado perfecto.
+    let release!: () => void
+    hlsReadyGate = new Promise<void>(r => { release = r })
+
+    const first  = startStream(fakeServer, 'u1', 'camHevc', 'tabA', 'main_h264')
+    await new Promise(r => setImmediate(r))
+    const second = startStream(fakeServer, 'u2', 'camHevc', 'tabB', 'main_h264')
+    release()
+
+    const [r1, r2] = await Promise.all([first, second])
+    expect(r1.error).toBeUndefined()
+    expect(r2.error).toBeUndefined()
+    expect(r2.hlsUrl).toContain('nvr_x_camHevc_main_h264')
+    // Cada pestaña tiene SU fila sobre el mismo proceso compartido.
+    expect(getActiveSessions().map(s => s.viewId).sort()).toEqual(['tabA', 'tabB'])
+  })
+
+  it('si la pestaña iniciadora se cierra, el que espera conserva el proceso', async () => {
+    let release!: () => void
+    hlsReadyGate = new Promise<void>(r => { release = r })
+
+    const first  = startStream(fakeServer, 'u1', 'camHevc', 'tabA', 'main_h264')
+    await new Promise(r => setImmediate(r))
+    const second = startStream(fakeServer, 'u2', 'camHevc', 'tabB', 'main_h264')
+    markViewClosed('u1', 'tabA')
+    release()
+
+    const [, r2] = await Promise.all([first, second])
+    expect(r2.error).toBeUndefined()
+    expect(stopped).toEqual([])                                  // no se mató el proceso
+    expect(getActiveSessions().map(s => s.viewId)).toEqual(['tabB'])
+  })
+})
+
+describe('#147 · la cancelación es POR CÁMARA, no por view entero', () => {
+  it('cerrar la cámara A no aborta el arranque en vuelo de la cámara B', async () => {
+    // Antes stopStream marcaba el view completo, así que cambiar de cámara
+    // abortaba con VIEW_CLOSED los arranques de las demás de la grilla.
+    seed('u1', 'tabA', 'camA', 'sub', 'nvr_x_camA_sub', 0)
+
+    let release!: () => void
+    publishGate = new Promise<void>(r => { release = r })
+    const startingB = startStream(fakeServer, 'u1', 'camB', 'tabA')
+    await new Promise(r => setImmediate(r))
+
+    await stopStream(fakeServer, 'u1', 'camA', 'sub', 'viewport_change', 'tabA')
+    release()
+
+    const rB = await startingB
+    expect(rB.error).toBeUndefined()
+    expect(getActiveSessions().map(s => s.cameraId)).toEqual(['camB'])
+  })
+
+  it('cerrar la MISMA cámara sí aborta su arranque en vuelo', async () => {
+    let release!: () => void
+    publishGate = new Promise<void>(r => { release = r })
+    const starting = startStream(fakeServer, 'u1', 'camA', 'tabA')
+    await new Promise(r => setImmediate(r))
+
+    await stopStream(fakeServer, 'u1', 'camA', 'sub', 'viewport_change', 'tabA')
+    release()
+
+    expect((await starting).error?.code).toBe('VIEW_CLOSED')
+    expect(getActiveSessions()).toHaveLength(0)
+  })
+
+  it('cerrar el view entero (pagehide) sí aborta todas las cámaras', async () => {
+    let release!: () => void
+    publishGate = new Promise<void>(r => { release = r })
+    const startingB = startStream(fakeServer, 'u1', 'camB', 'tabA')
+    await new Promise(r => setImmediate(r))
+
+    await cleanupUserSessions(fakeServer, 'u1', 'tabA')
+    release()
+
+    expect((await startingB).error?.code).toBe('VIEW_CLOSED')
+    expect(getActiveSessions()).toHaveLength(0)
+  })
+})
+
+describe('#147 · una sesión HD retenida por su TTL conserva su índice de view', () => {
+  it('con HD TTL > TTL estándar, la limpieza sin viewId no borra su viewHeartbeat', async () => {
+    // La sesión HD tiene 100 s (vence el estándar de 90 s pero no un HD mayor).
+    // Antes el tramo final de cleanupUserSessions borraba viewHeartbeat con el
+    // cutoff estándar CRUDO, y la siguiente pasada la mataba por
+    // `view_heartbeat_missing`, anulando el TTL de HD configurado.
+    seed('u1', 'tabA', 'camHd', 'main_h264', 'p_hd', 30)
+    __setViewHeartbeatForTest('u1', 'tabA', secondsAgo(30))
+
+    await cleanupUserSessions(fakeServer, 'u1')
+
+    // Sobrevive, y su índice sigue: una segunda pasada tampoco la mata.
+    expect(getActiveSessions()).toHaveLength(1)
+    await cleanupUserSessions(fakeServer, 'u1')
+    expect(getActiveSessions()).toHaveLength(1)
+    expect(stopped).toEqual([])
+  })
+})
