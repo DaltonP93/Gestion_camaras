@@ -400,3 +400,134 @@ describe('invariantes que deben seguir vigentes', () => {
     expect(stopped).toEqual(['p_camH_main_h264'])
   })
 })
+
+// ─── Revisión de #151 ────────────────────────────────────────────────────────
+
+describe('#151 · reutilización de sub/main reafirma propiedad', () => {
+  it('stop 1 retrasado NO borra una sesión sub REUTILIZADA por start 2', async () => {
+    // La rama de reutilización refrescaba el heartbeat pero no la propiedad, así
+    // que la sesión quedaba con una secuencia vieja y el stop anterior la borraba.
+    const start0 = ticket()
+    await startStream(makeServer(), 'u1', 'camA', 'v1', 'sub', start0)
+
+    const stop1  = ticket()               // el cierre entra…
+    const start2 = ticket()               // …y la REUTILIZACIÓN ocurre después
+    const reuse = await startStream(makeServer(), 'u1', 'camA', 'v1', 'sub', start2)
+    expect(reuse.error).toBeUndefined()
+
+    await stopStream(makeServer(), 'u1', 'camA', 'sub', 'viewport_change', 'v1', stop1)
+
+    expect(getActiveSessions()).toHaveLength(1)
+  })
+
+  it('lo mismo al reutilizar una sesión transcodificada', async () => {
+    seedSession({ userId: 'u1', viewId: 'v1', cameraId: 'camH', streamType: 'main_h264',
+                  streamPath: 'p_camH_main_h264', ownerSeq: 0 })
+
+    const stop1  = ticket()
+    const start2 = ticket()
+    await startStream(makeServer(hevc), 'u1', 'camH', 'v1', 'main_h264', start2)
+
+    await stopStream(makeServer(hevc), 'u1', 'camH', 'main_h264', 'exit_focus', 'v1', stop1)
+
+    expect(getActiveSessions()).toHaveLength(1)
+    expect(stopped).toEqual([])
+  })
+})
+
+describe('#151 · la limpieza sin viewId también marca el cierre', () => {
+  it('un arranque viejo de la vista purgada no puede registrar después', async () => {
+    // Sin la marca por vista, el arranque suspendido reanudaba y creaba una
+    // sesión fantasma: no había watermark que lo cancelara.
+    const startViejo = ticket()
+    seedSession({ userId: 'u1', viewId: 'v1', cameraId: 'camA', streamType: 'sub',
+                  streamPath: 'p_camA_sub', ageSec: 300, ownerSeq: 0 })
+
+    const limpieza = ticket()
+    await cleanupUserSessions(makeServer(), 'u1', undefined, limpieza)
+    expect(getActiveSessions()).toHaveLength(0)
+
+    // El arranque viejo reanuda ahora.
+    const r = await startStream(makeServer(), 'u1', 'camA', 'v1', 'sub', startViejo)
+
+    expect(r.error?.code).toBe('VIEW_CLOSED')
+    expect(getActiveSessions()).toHaveLength(0)
+  })
+
+  it('un arranque POSTERIOR a la limpieza sin viewId sí puede abrir', async () => {
+    seedSession({ userId: 'u1', viewId: 'v1', cameraId: 'camA', streamType: 'sub',
+                  streamPath: 'p_camA_sub', ageSec: 300, ownerSeq: 0 })
+    await cleanupUserSessions(makeServer(), 'u1', undefined, ticket())
+
+    const r = await startStream(makeServer(), 'u1', 'camA', 'v1', 'sub', ticket())
+    expect(r.error).toBeUndefined()
+  })
+})
+
+describe('#151 · un registro tardío no degrada una propiedad más nueva', () => {
+  it('start 1 que termina después de start 3 no baja lastOwnerRequestSeq', async () => {
+    let release!: () => void
+    publishGate = new Promise<void>(r => { release = r })
+
+    // Orden de LLEGADA: start 1, close 2, start 3.
+    // Orden de FINALIZACIÓN: start 3, start 1 (tardío), close 2 (tardío).
+    //
+    // Si el registro tardío de start 1 pisara la fila con ownerSeq=1, el cierre
+    // 2 la encontraría elegible y borraría lo que start 3 reclamó.
+    const start1 = ticket()
+    const pendiente = startStream(makeServer(), 'u1', 'camA', 'v1', 'sub', start1)
+    await tick()                          // start 1 espera en publishStream
+
+    const close2 = ticket()               // LLEGA acá; se procesa al final
+
+    publishGate = null
+    const start3 = ticket()
+    await startStream(makeServer(), 'u1', 'camA', 'v1', 'sub', start3)
+    expect(getActiveSessions()).toHaveLength(1)
+    expect(getActiveSessions()[0].lastOwnerRequestSeq).toBe(start3.seq)
+
+    release()                             // start 1 reanuda y quiere registrar
+    await pendiente
+
+    // La propiedad sigue siendo la de start 3, no la de start 1.
+    expect(getActiveSessions()[0].lastOwnerRequestSeq).toBe(start3.seq)
+
+    // Y por eso el cierre intermedio no puede llevársela.
+    await stopStream(makeServer(), 'u1', 'camA', 'sub', 'viewport_change', 'v1', close2)
+
+    expect(getActiveSessions()).toHaveLength(1)
+  })
+})
+
+describe('#151 · el path no se retira si aparece una sesión nueva durante la limpieza', () => {
+  it('se relee el mapa vivo antes de cada removeStream', async () => {
+    seedSession({ userId: 'u1', viewId: 'v1', cameraId: 'camA', streamType: 'sub',
+                  streamPath: 'p_camA_sub', ownerSeq: 0 })
+    seedSession({ userId: 'u1', viewId: 'v1', cameraId: 'camB', streamType: 'sub',
+                  streamPath: 'p_camB_sub', ownerSeq: 0 })
+
+    // Durante la consulta de camA se registra una sesión nueva para camB.
+    let inyectado = false
+    const server: any = {
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      prisma: {
+        camera: {
+          findUnique: async ({ where }: any) => {
+            if (!inyectado) {
+              inyectado = true
+              seedSession({ userId: 'u9', viewId: 'v9', cameraId: 'camB', streamType: 'sub',
+                            streamPath: 'p_camB_sub', ownerSeq: 999 })
+            }
+            return h264(where.id)
+          },
+        },
+      },
+    }
+
+    await cleanupUserSessions(server, 'u1', 'v1', ticket())
+
+    // camB sobrevive con su sesión nueva y su path NO se retira.
+    expect(removed).not.toContain('camB')
+    expect(getActiveSessions().map(s => s.userId)).toEqual(['u9'])
+  })
+})

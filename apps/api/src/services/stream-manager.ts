@@ -390,6 +390,44 @@ function toSessionTruths(): SessionTruth[] {
   }))
 }
 
+/**
+ * Registra una sesión SIN degradar una propiedad más nueva.
+ *
+ * Dos arranques concurrentes con la misma clave pueden terminar fuera de orden:
+ * si el viejo escribe después del nuevo, su `set` incondicional bajaba
+ * `lastOwnerRequestSeq` y dejaba la fila expuesta a un cierre intermedio
+ * (revisión de #151). Se relee la fila vigente y, si su propiedad ya es
+ * posterior, se conserva y sólo se reafirma.
+ *
+ * Devuelve la sesión que quedó en el mapa.
+ */
+function registerSessionMonotonic(
+  key: string,
+  candidate: StreamSession,
+  ticket: RequestTicket,
+): StreamSession {
+  const current = sessions.get(key)
+  if (current && current.lastOwnerRequestSeq > ticket.seq) {
+    // Un arranque POSTERIOR ya reclamó esta clave: no se la pisa.
+    reaffirmOwnership(current, ticket)   // no-op monotónico, deja constancia
+    current.lastClientHeartbeat = new Date()
+    console.info(
+      `[live] register_kept_newer cameraId=${candidate.cameraId}` +
+      ` streamType=${candidate.streamType} viewId=${candidate.viewId}` +
+      ` ownerSeq=${current.lastOwnerRequestSeq} incomingSeq=${ticket.seq}`
+    )
+    return current
+  }
+  sessions.set(key, candidate)
+  return candidate
+}
+
+/** ¿Queda alguna sesión VIVA (leída del mapa actual) sobre esta cámara? */
+function hasLiveSessionForCamera(cameraId: string): boolean {
+  for (const s of sessions.values()) if (s.cameraId === cameraId) return true
+  return false
+}
+
 /** Proyección de UNA sesión (ya sacada del mapa) a la forma pura. */
 function sessionTruthOf(key: string, s: StreamSession): SessionTruth {
   return {
@@ -1318,13 +1356,13 @@ async function startStreamCore(
     // de los cuales pudo solaparse con el `pagehide` de la pestaña.
     const registerTranscodeSession = (): boolean => {
       if (cancelled()) return false
-      sessions.set(transcodeKey, {
+      registerSessionMonotonic(transcodeKey, {
         cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
         streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(),
         generation: nextGeneration(),
         // La propiedad nace con el ticket de la petición que la creó.
         lastOwnerRequestSeq: ticket.seq,
-      })
+      }, ticket)
       return true
     }
 
@@ -1332,7 +1370,6 @@ async function startStreamCore(
     const existingSession = sessions.get(transcodeKey)
     if (existingSession) {
       existingSession.lastClientHeartbeat = new Date()
-    reaffirmOwnership(existingSession, ticket)
       reaffirmOwnership(existingSession, ticket)
       // Ya NO se reescribe `viewId`: la clave lo contiene, así que reasignarlo
       // desincronizaría la fila de su clave. Era el resto de cuando una segunda
@@ -1558,7 +1595,12 @@ async function startStreamCore(
   const existingSession = sessions.get(key)
   if (existingSession) {
     existingSession.lastClientHeartbeat = new Date()
-    if (viewId) existingSession.viewId = viewId
+    // Reutilizar una sesión REAFIRMA su propiedad. Sin esto, un `stop` anterior
+    // que resucita más tarde pasaba `resolveDeletable` y borraba la sesión que
+    // este arranque acababa de reclamar (revisión de #151).
+    reaffirmOwnership(existingSession, ticket)
+    // Ya NO se reescribe `viewId`: la clave lo contiene y reasignarlo
+    // desincronizaría la fila de su clave.
     console.info(`[userLimit] reuse existing cameraId=${cameraId} streamType=${effectiveType}`)
     return { hlsUrl: getHlsUrl(existingSession.streamPath), webrtcUrl: getWebRtcUrl(existingSession.streamPath), streamPath: existingSession.streamPath }
   }
@@ -1618,12 +1660,12 @@ async function startStreamCore(
 
 
   // ── Register session ──────────────────────────────────────────────────
-  sessions.set(key, {
+  registerSessionMonotonic(key, {
     cameraId, userId, viewId: effectiveViewId, streamType: effectiveType as 'sub' | 'main',
     streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(),
     generation: nextGeneration(),
     lastOwnerRequestSeq: ticket.seq,
-  })
+  }, ticket)
   if (effectiveType === 'sub') {
     const vk = vKey(userId, effectiveViewId)
     if (!viewCameras.has(vk)) viewCameras.set(vk, new Set())
@@ -1929,6 +1971,12 @@ export async function cleanupUserSessions(
       continue
     }
     const current = verdict.session
+    // Marca de cierre POR VISTA también en la limpieza sin viewId. Sin ella, un
+    // arranque viejo de esa vista suspendido en un await reanudaría y
+    // registraría una sesión fantasma: no habría watermark que lo cancelara.
+    // Con viewId ya se marcó una vez arriba; `advanceCloseWatermark` es
+    // monotónica e idempotente, así que repetirlo es inocuo.
+    if (!viewId) markViewClosed(userId, current.viewId, ticket)
     deleted.push(sessionTruthOf(key, current))
     if (current.streamType === 'sub') {
       viewCameras.get(vKey(userId, current.viewId))?.delete(current.cameraId)
@@ -1951,11 +1999,20 @@ export async function cleanupUserSessions(
   // nueva que sobrevivió— sigue mirando esa cámara.
   const camerasToCheck = new Set(deleted.map(d => d.cameraId))
   for (const cameraId of camerasToCheck) {
-    if (survivingTruths.some(t => t.cameraId === cameraId)) continue
+    // El snapshot `survivingTruths` se tomó antes del bucle, y cada consulta a
+    // la base es un await durante el cual puede registrarse una sesión NUEVA
+    // para otra cámara de la lista. Se relee el mapa vivo antes de consultar…
+    if (hasLiveSessionForCamera(cameraId)) continue
     const camera = await server.prisma.camera.findUnique({
       where: { id: cameraId },
       include: { nvr: true },
     }).catch(() => null)
+    // …y otra vez justo antes de retirar el path, que es lo que realmente
+    // destruye el recurso (revisión de #151).
+    if (hasLiveSessionForCamera(cameraId)) {
+      console.info(`[live] path_keep cameraId=${cameraId} reason=newer_session_registered`)
+      continue
+    }
     if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
   }
 
