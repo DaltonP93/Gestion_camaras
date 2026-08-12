@@ -3,6 +3,7 @@ import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
+import { beginRequest, type RequestTicket } from './services/stream-manager'
 import websocket from '@fastify/websocket'
 import staticFiles from '@fastify/static'
 import multipart from '@fastify/multipart'
@@ -77,6 +78,21 @@ async function main() {
   if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
     server.log.warn('[startup] JWT_SECRET parece muy corto (< 32 chars). Usa un secreto de al menos 32 caracteres aleatorios.')
   }
+
+  // ─── Ticket de llegada — PRIMER hook onRequest de todos ────
+  //
+  // Debe registrarse ANTES de cualquier otro plugin, porque Fastify ejecuta los
+  // hooks `onRequest` en orden de registro y varios de ellos son asíncronos:
+  // `@fastify/rate-limit` hace su comprobación en `onRequest`, y la
+  // autenticación espera en `preHandler`. Si el ticket se estampara después,
+  // una petición vieja podría quedar detenida en esos hooks mientras un cierre
+  // posterior la adelanta, y al reanudarse recibiría una secuencia MAYOR que la
+  // del cierre: pasaría por reapertura legítima y recrearía la sesión fantasma
+  // que esta barrera existe para impedir (revisión de #148).
+  server.decorateRequest('requestTicket', null as unknown as RequestTicket)
+  server.addHook('onRequest', async (request) => {
+    request.requestTicket = beginRequest()
+  })
 
   // ─── Plugins de seguridad ──────────────────────────────────
   await server.register(helmet, {

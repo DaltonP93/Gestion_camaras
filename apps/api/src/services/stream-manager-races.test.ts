@@ -495,3 +495,38 @@ describe('#148b · el cierre se sella con SU propio ticket', () => {
     expect(getActiveSessions()).toHaveLength(1)
   })
 })
+
+describe('#148c · el ticket se estampa antes que TODO otro hook onRequest', () => {
+  it('el hook está registrado antes de rate-limit y de la autenticación', async () => {
+    // Fastify ejecuta los `onRequest` en orden de REGISTRO, y varios son
+    // asíncronos: `@fastify/rate-limit` hace su comprobación ahí. Si el ticket
+    // se estampara después, una petición vieja podría esperar en rate-limit
+    // mientras un cierre posterior la adelanta, y al reanudarse recibiría una
+    // secuencia mayor — reapertura falsa.
+    //
+    // El orden de registro no es observable en runtime sin levantar el
+    // servidor, así que se fija sobre el archivo de arranque: es la única
+    // defensa determinista contra que alguien inserte un plugin por delante.
+    const server = (await import('node:fs')).readFileSync(
+      new URL('../server.ts', import.meta.url), 'utf8')
+
+    const hook       = server.indexOf("addHook('onRequest'")
+    const helmet     = server.indexOf('register(helmet')
+    const rateLimit  = server.indexOf('register(rateLimit')
+    const authPlugin = server.indexOf('register(authPlugin')
+
+    expect(hook).toBeGreaterThan(-1)
+    expect(rateLimit).toBeGreaterThan(-1)
+    expect(hook).toBeLessThan(helmet)
+    expect(hook).toBeLessThan(rateLimit)
+    expect(hook).toBeLessThan(authPlugin)
+  })
+
+  it('la secuencia de tickets es estrictamente creciente', () => {
+    const a = beginRequest()
+    const b = beginRequest()
+    const c = beginRequest()
+    expect(b.seq).toBeGreaterThan(a.seq)
+    expect(c.seq).toBeGreaterThan(b.seq)
+  })
+})
