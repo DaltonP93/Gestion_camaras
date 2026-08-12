@@ -156,6 +156,66 @@ interface StreamSession {
    * ya cerrada (ni volver a levantar su FFmpeg sin espectador).
    */
   generation: number
+  /**
+   * Secuencia de la ÚLTIMA petición autenticada que afirmó la propiedad de esta
+   * sesión: la que la creó, la reutilizó, la adoptó como waiter o la latió.
+   *
+   * No se reutiliza `generation`, que expresa creación/completado y no el orden
+   * de llegada HTTP. Acá hace falta lo segundo: un cierre sólo puede borrar una
+   * sesión cuya propiedad NO sea posterior a él.
+   *
+   *   stop 1 entra y queda esperando autenticación
+   *   start 2 entra y completa       → lastOwnerRequestSeq = 2
+   *   stop 1 continúa                → 2 > 1 ⇒ NO la borra
+   *
+   * Sólo la actualiza actividad real de cliente, y siempre con Math.max: ni el
+   * proceso vivo ni la actividad de medio la tocan (revisión de #149).
+   */
+  lastOwnerRequestSeq: number
+}
+
+/**
+ * Reafirma la propiedad de una sesión con el ticket de una petición
+ * autenticada. Monotónica: una petición vieja que llega tarde no puede bajar la
+ * marca y volver la sesión vulnerable a un cierre anterior.
+ */
+function reaffirmOwnership(session: StreamSession, ticket: RequestTicket): void {
+  session.lastOwnerRequestSeq = Math.max(session.lastOwnerRequestSeq, ticket.seq)
+}
+
+/**
+ * ¿Puede este cierre borrar esta sesión?
+ *
+ * Sólo si la propiedad de la sesión NO es posterior al cierre. Si lo es, la
+ * sesión fue creada o reafirmada por una petición que llegó después y debe
+ * preservarse.
+ */
+function closeMayDelete(session: StreamSession, closeTicket: RequestTicket): boolean {
+  return session.lastOwnerRequestSeq <= closeTicket.seq
+}
+
+/**
+ * Relee la sesión vigente y decide si este cierre puede borrarla.
+ *
+ * Se relee del mapa a propósito: entre el snapshot y el borrado hubo
+ * operaciones asíncronas, y la fila pudo ser reemplazada por otra petición
+ * (misma clave, generación distinta). Decidir con el objeto capturado borraría
+ * la sesión NUEVA.
+ */
+function resolveDeletable(
+  key: string,
+  expectedGeneration: number,
+  closeTicket: RequestTicket,
+): { deletable: false; reason: string } | { deletable: true; session: StreamSession } {
+  const current = sessions.get(key)
+  if (!current) return { deletable: false, reason: 'already_gone' }
+  if (current.generation !== expectedGeneration) {
+    return { deletable: false, reason: 'replaced_by_newer_generation' }
+  }
+  if (!closeMayDelete(current, closeTicket)) {
+    return { deletable: false, reason: 'reaffirmed_by_newer_request' }
+  }
+  return { deletable: true, session: current }
 }
 
 // Contador monótono de generaciones. Una sesión reabierta sobre la misma clave
@@ -233,10 +293,13 @@ export function getSessionsForUser(userId: string): StreamSession[] {
 export function __seedSessionForTest(s: {
   cameraId: string; userId: string; viewId: string
   streamType: 'sub' | 'main' | 'main_h264'; streamPath: string
-  startedAt: Date; lastClientHeartbeat: Date; generation?: number
+  startedAt: Date; lastClientHeartbeat: Date
+  generation?: number; lastOwnerRequestSeq?: number
 }): void {
   sessions.set(sessionKey({ userId: s.userId, viewId: s.viewId, cameraId: s.cameraId, streamType: s.streamType }), {
-    ...s, generation: s.generation ?? nextGeneration(),
+    ...s,
+    generation: s.generation ?? nextGeneration(),
+    lastOwnerRequestSeq: s.lastOwnerRequestSeq ?? 0,
   })
   if (s.streamType === 'sub') {
     const vk = vKey(s.userId, s.viewId)
@@ -716,22 +779,37 @@ function isStartCancelled(streamPath: string): boolean {
  * VIEW_CLOSED un arranque en vuelo de la cámara B de la misma grilla: cambiar
  * de cámara mataba el arranque de las demás (revisión de #147).
  */
-export function markViewClosed(
-  userId: string,
-  viewId: string,
-  ticket: RequestTicket = beginRequest(),
+/**
+ * Avanza una marca de cierre. NUNCA retrocede.
+ *
+ * Un `set` incondicional dejaba que un cierre viejo que terminaba tarde pisara
+ * una marca más nueva:
+ *
+ *   close 1 entra y queda esperando
+ *   start 2 entra
+ *   close 3 entra y termina  → watermark = 3
+ *   close 1 termina después  → watermark BAJA a 1
+ *   → start 2 deja de parecer obsoleto → sesión fantasma
+ *
+ * Es un watermark: sólo sube. Una secuencia menor no toca nada, y una igual
+ * tampoco reemplaza la información existente (revisión de #149 y #150).
+ */
+function advanceCloseWatermark(
+  map: Map<string, CloseMark>,
+  key: string,
+  ticket: RequestTicket,
 ): void {
-  const nowMs = Date.now()
-  // Se sella con la secuencia del TICKET DE ESTA PETICIÓN DE CIERRE, no con el
-  // contador global vigente.
-  //
-  // Usar el global era la carrera INVERSA: si el cierre se demoraba en
-  // autenticarse y mientras tanto llegaba una reapertura legítima, el contador
-  // global ya incluía esa reapertura; al sellar con él, la reapertura quedaba
-  // por debajo del sello y se rechazaba pese a haber llegado después
-  // (revisión de #148, segunda vuelta).
-  viewClosedAt.set(vKey(userId, viewId), { atMs: nowMs, seq: ticket.seq })
-  // Poda perezosa: no conservar cierres viejos para siempre.
+  const current = map.get(key)
+  if (current && ticket.seq <= current.seq) return
+  map.set(key, { atMs: Date.now(), seq: ticket.seq })
+}
+
+/**
+ * Poda de marcas viejas. Se hace por EDAD del propio registro y sólo sobre lo
+ * que realmente caducó: una petición antigua que se procesa tarde no puede
+ * arrastrarse por delante una marca más nueva.
+ */
+function pruneCloseMarks(nowMs: number): void {
   for (const [vk, mark] of viewClosedAt.entries()) {
     if (nowMs - mark.atMs > CLOSED_VIEW_MEMORY_MS) viewClosedAt.delete(vk)
   }
@@ -740,12 +818,21 @@ export function markViewClosed(
   }
 }
 
+export function markViewClosed(
+  userId: string,
+  viewId: string,
+  ticket: RequestTicket = beginRequest(),
+): void {
+  advanceCloseWatermark(viewClosedAt, vKey(userId, viewId), ticket)
+  pruneCloseMarks(Date.now())
+}
+
 /**
  * Marca el cierre de UNA cámara concreta de un view. Sólo cancela heartbeats y
  * arranques en vuelo de ESA cámara y tipo; el resto de la grilla sigue.
  */
 function markTargetClosed(key: string, ticket: RequestTicket): void {
-  targetClosedAt.set(key, { atMs: Date.now(), seq: ticket.seq })
+  advanceCloseWatermark(targetClosedAt, key, ticket)
 }
 
 /**
@@ -850,6 +937,9 @@ export function touchSession(
   }
   // Hora del SERVIDOR, nunca un timestamp enviado por el navegador.
   s.lastClientHeartbeat = new Date()
+  // Un heartbeat válido REAFIRMA la propiedad: protege la sesión de un cierre
+  // anterior que todavía esté en vuelo.
+  reaffirmOwnership(s, ticket)
 }
 
 // Tocar todas las sesiones de un view de una vez — toca sub, main y main_h264
@@ -867,7 +957,7 @@ export function touchView(userId: string, viewId: string, ticket: RequestTicket 
   for (const cameraId of vCams) {
     for (const st of ['sub', 'main', 'main_h264'] as const) {
       const s = sessions.get(sessionKey({ userId, viewId, cameraId, streamType: st }))
-      if (s) s.lastClientHeartbeat = now
+      if (s) { s.lastClientHeartbeat = now; reaffirmOwnership(s, ticket) }
     }
   }
 }
@@ -1232,6 +1322,8 @@ async function startStreamCore(
         cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
         streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(),
         generation: nextGeneration(),
+        // La propiedad nace con el ticket de la petición que la creó.
+        lastOwnerRequestSeq: ticket.seq,
       })
       return true
     }
@@ -1240,7 +1332,11 @@ async function startStreamCore(
     const existingSession = sessions.get(transcodeKey)
     if (existingSession) {
       existingSession.lastClientHeartbeat = new Date()
-      if (viewId) existingSession.viewId = viewId
+    reaffirmOwnership(existingSession, ticket)
+      reaffirmOwnership(existingSession, ticket)
+      // Ya NO se reescribe `viewId`: la clave lo contiene, así que reasignarlo
+      // desincronizaría la fila de su clave. Era el resto de cuando una segunda
+      // pestaña se apropiaba de la sesión de la primera.
       lastMediaActivity.set(existingSession.streamPath, Date.now())
       console.info(`[userLimit] reuse existing cameraId=${cameraId} streamType=main_h264`)
       return { hlsUrl: getHlsUrl(existingSession.streamPath), webrtcUrl: getWebRtcUrl(existingSession.streamPath), streamPath: existingSession.streamPath, transcoded: true }
@@ -1272,6 +1368,7 @@ async function startStreamCore(
         const own = sessions.get(transcodeKey)
         if (own) {
           own.lastClientHeartbeat = new Date()
+          reaffirmOwnership(own, ticket)
           return { hlsUrl: getHlsUrl(own.streamPath), webrtcUrl: getWebRtcUrl(own.streamPath), streamPath: own.streamPath, transcoded: true }
         }
         if (!registerTranscodeSession()) {
@@ -1523,7 +1620,9 @@ async function startStreamCore(
   // ── Register session ──────────────────────────────────────────────────
   sessions.set(key, {
     cameraId, userId, viewId: effectiveViewId, streamType: effectiveType as 'sub' | 'main',
-    streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(), generation: nextGeneration(),
+    streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(),
+    generation: nextGeneration(),
+    lastOwnerRequestSeq: ticket.seq,
   })
   if (effectiveType === 'sub') {
     const vk = vKey(userId, effectiveViewId)
@@ -1566,6 +1665,23 @@ export async function stopStream(
 
   if (session && key) {
     const generation = session.generation
+    // RELEER antes de borrar. Entre la captura de `session` y este punto hubo
+    // awaits, y la fila pudo ser reemplazada o reafirmada por una petición
+    // POSTERIOR a este cierre:
+    //
+    //   stop 1 entra y queda esperando autenticación
+    //   start 2 entra y completa      → lastOwnerRequestSeq = 2
+    //   stop 1 continúa               → 2 > 1 ⇒ preservar
+    //
+    // Decidir con el objeto capturado borraba la sesión nueva (revisión #149).
+    const verdict = resolveDeletable(key, generation, ticket)
+    if (!verdict.deletable) {
+      console.info(
+        `[live] stop_ignored_newer cameraId=${cameraId} streamType=${streamType}` +
+        ` viewId=${session.viewId} closeSeq=${ticket.seq} reason=${verdict.reason}`
+      )
+      return
+    }
     if (streamType === 'sub') {
       const vk = vKey(userId, session.viewId)
       viewCameras.get(vk)?.delete(cameraId)
@@ -1573,7 +1689,8 @@ export async function stopStream(
     sessions.delete(key)
     console.info(
       `[stream-manager] view_session_closed cameraId=${cameraId} streamType=${streamType}` +
-      ` viewId=${session.viewId} generation=${generation} reason=${reason || 'unspecified'}`
+      ` viewId=${session.viewId} generation=${generation} closeSeq=${ticket.seq}` +
+      ` reason=${reason || 'unspecified'}`
     )
     if (streamType === 'main_h264') {
       // Only kill FFmpeg when the reason explicitly permits it.
@@ -1688,12 +1805,14 @@ export async function reconcileView(
       // Ya está corriendo — tocar y devolver URL
       const now2 = new Date()
       existing.lastClientHeartbeat = now2
+      reaffirmOwnership(existing, ticket)
       existing.viewId = viewId
       // Touch co-located main/main_h264 sessions so idle cleanup doesn't kill active focus streams
       for (const st of ['main', 'main_h264'] as const) {
         const sOther = sessions.get(sessionKey({ userId, viewId, cameraId, streamType: st }))
         if (sOther) {
           sOther.lastClientHeartbeat = now2
+          reaffirmOwnership(sOther, ticket)
           if (st === 'main_h264') lastMediaActivity.set(sOther.streamPath, Date.now())
           console.info(`[reconcileView] touch ${st} cameraId=${cameraId} path=${sOther.streamPath}`)
         }
@@ -1791,37 +1910,53 @@ export async function cleanupUserSessions(
 
   let removed = 0
 
-  // Snapshot ANTES de borrar: la decisión de qué procesos terminar se toma
-  // sobre el conjunto completo, no sesión por sesión. Si no, la primera sesión
-  // cerrada de un proceso compartido lo mataría para las demás.
-  const closingTruths = targetSessions.map(s =>
-    sessionTruthOf(sessionKey({ userId, viewId: s.viewId, cameraId: s.cameraId, streamType: s.streamType }), s))
-  const closingKeys = new Set(closingTruths.map(t => t.key))
-  const survivingTruths = toSessionTruths().filter(t => !closingKeys.has(t.key))
-  const termination = decideProcessTermination(closingTruths, survivingTruths)
+  // FLUJO: el conjunto a terminar NO puede decidirse con un snapshot previo.
+  // Entre el snapshot y el borrado hay awaits, y una sesión pudo ser
+  // reemplazada o reafirmada por una petición POSTERIOR a este cierre. Por eso
+  // primero se borra lo realmente elegible, y recién con el mapa YA
+  // actualizado se decide qué procesos terminar (revisión de #149).
+  const deleted: SessionTruth[] = []
 
   for (const session of targetSessions) {
     const key = sessionKey({ userId, viewId: session.viewId, cameraId: session.cameraId, streamType: session.streamType })
-    if (!sessions.has(key)) continue     // idempotente: ya cerrada por otra vía
+    // Releer el estado ACTUAL de esta clave y comprobar propiedad.
+    const verdict = resolveDeletable(key, session.generation, ticket)
+    if (!verdict.deletable) {
+      console.info(
+        `[live] cleanup_skipped cameraId=${session.cameraId} streamType=${session.streamType}` +
+        ` viewId=${session.viewId} closeSeq=${ticket.seq} reason=${verdict.reason}`
+      )
+      continue
+    }
+    const current = verdict.session
+    deleted.push(sessionTruthOf(key, current))
+    if (current.streamType === 'sub') {
+      viewCameras.get(vKey(userId, current.viewId))?.delete(current.cameraId)
+    }
     sessions.delete(key)
     removed++
-    markViewClosed(userId, session.viewId, ticket)
     console.info(
-      `[stream-manager] view_session_closed cameraId=${session.cameraId}` +
-      ` streamType=${session.streamType} viewId=${session.viewId}` +
-      ` generation=${session.generation} reason=${viewId ? 'cleanup_view' : 'cleanup_stale'}`
+      `[stream-manager] view_session_closed cameraId=${current.cameraId}` +
+      ` streamType=${current.streamType} viewId=${current.viewId}` +
+      ` generation=${current.generation} closeSeq=${ticket.seq}` +
+      ` reason=${viewId ? 'cleanup_view' : 'cleanup_stale'}`
     )
+  }
 
-    const othersWatching = Array.from(sessions.values()).some(s => s.cameraId === session.cameraId)
-    if (!othersWatching) {
-      const camera = await server.prisma.camera.findUnique({
-        where: { id: session.cameraId },
-        include: { nvr: true },
-      })
-      if (camera?.nvr) {
-        removeStream(camera.nvr, camera).catch(() => {})
-      }
-    }
+  // Supervivientes leídos del mapa YA actualizado, no del snapshot.
+  const survivingTruths = toSessionTruths()
+  const termination = decideProcessTermination(deleted, survivingTruths)
+
+  // El path de MediaMTX sólo se retira si NINGUNA sesión —tampoco una más
+  // nueva que sobrevivió— sigue mirando esa cámara.
+  const camerasToCheck = new Set(deleted.map(d => d.cameraId))
+  for (const cameraId of camerasToCheck) {
+    if (survivingTruths.some(t => t.cameraId === cameraId)) continue
+    const camera = await server.prisma.camera.findUnique({
+      where: { id: cameraId },
+      include: { nvr: true },
+    }).catch(() => null)
+    if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
   }
 
   // Terminar los FFmpeg que quedaron sin ningún espectador válido.
@@ -1830,8 +1965,18 @@ export async function cleanupUserSessions(
   // Clean view maps
   if (viewId) {
     const vk = vKey(userId, viewId)
-    viewCameras.delete(vk)
-    viewHeartbeat.delete(vk)
+    // Sólo si el view quedó REALMENTE sin sesiones. Si una petición posterior
+    // creó o reafirmó una sesión en este mismo view, borrar sus índices la
+    // dejaría sin `viewHeartbeat` y la siguiente limpieza la mataría por
+    // `view_heartbeat_missing` (revisión de #149).
+    const stillHasSessions = Array.from(sessions.values())
+      .some(sess => sess.userId === userId && sess.viewId === viewId)
+    if (stillHasSessions) {
+      console.info(`[live] view_indexes_kept viewId=${viewId} reason=newer_sessions_present`)
+    } else {
+      viewCameras.delete(vk)
+      viewHeartbeat.delete(vk)
+    }
   } else {
     // Con STREAM_HD_IDLE_TIMEOUT > STREAM_IDLE_TIMEOUT, una sesión HD cuya edad
     // cae entre ambos TTL sobrevive arriba; si acá se borrara su viewHeartbeat
