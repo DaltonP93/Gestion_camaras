@@ -1456,7 +1456,29 @@ async function startStreamCore(
       session: StreamSession,
       opts: { inFlightPromise?: Promise<boolean>; resolveReady?: (v: boolean) => void },
     ) => {
-      const path = session.streamPath
+      // RELECTURA. `registerTranscodeSession` es `async`, así que su `await`
+      // cede el turno aunque no haya limpieza que esperar: otro arranque ya
+      // encolado puede reemplazar la fila antes de que lleguemos acá. Usar la
+      // sesión capturada respondería con el path viejo y marcaría READY el
+      // descartado — el mismo desajuste que este PR corrige (revisión de #152).
+      const current = sessions.get(transcodeKey)
+      if (!current) {
+        // La fila desapareció entre el registro y la finalización: un cierre se
+        // la llevó. No se devuelve una URL de algo que ya no tiene dueño.
+        console.info(
+          `[transcode] finalize_aborted cameraId=${cameraId}` +
+          ` reason=session_gone_after_register key=${transcodeKey}`
+        )
+        opts.resolveReady?.(false)
+        return abortResult('finalize_session_gone')
+      }
+      if (current.streamPath !== session.streamPath) {
+        console.info(
+          `[transcode] finalize_repointed cameraId=${cameraId}` +
+          ` from=${session.streamPath} to=${current.streamPath}`
+        )
+      }
+      const path = current.streamPath
       lastMediaActivity.set(path, Date.now())
       transcodeInFlight.set(path, {
         state: 'ready',

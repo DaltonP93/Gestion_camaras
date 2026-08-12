@@ -367,3 +367,48 @@ describe('invariantes que siguen vigentes', () => {
     expect(stopped).toEqual(['p_ch09_hd'])
   })
 })
+
+// ─── Revisión de #152 ────────────────────────────────────────────────────────
+
+describe('#152 · la finalización relee la sesión retenida', () => {
+  it('un reemplazo encolado durante el await del registro no deja responder con el path viejo', async () => {
+    // `registerTranscodeSession` es async: su await cede el turno aunque no
+    // haya limpieza. Otro arranque ya encolado puede reemplazar la fila entre
+    // el registro y la finalización.
+    hlsOutcome = 'ready'
+    let release!: () => void
+    hlsReadyGate = new Promise<void>(r => { release = r })
+
+    let canal = 1
+    const server: any = {
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      prisma: { camera: { findUnique: async ({ where }: any) => hevc(where.id, canal) } },
+    }
+
+    const viejo = startStream(server, 'u1', 'camH', 'v1', 'main_h264', ticket())
+    await tick()
+
+    // Encolado: se registra con otro path mientras el primero está por finalizar.
+    hlsReadyGate = null
+    canal = 2
+    await startStream(server, 'u1', 'camH', 'v1', 'main_h264', ticket())
+    const retenido = getActiveSessions()[0].streamPath
+
+    release()
+    const r = await viejo
+
+    // Responde con el path RELEÍDO del mapa, no con el que capturó al registrar.
+    expect(r.streamPath).toBe(retenido)
+    expect(r.hlsUrl).toContain(retenido)
+    // Y el descartado no quedó marcado como listo.
+    expect(__getTranscodeInFlightPathsForTest()).not.toContain('p_camH_ch1_main_h264')
+  })
+
+  // Lo que NO se prueba acá: la rama `finalize_aborted` —la fila desaparece
+  // entre el registro y la finalización— no es alcanzable de forma
+  // determinista desde afuera, porque entre esos dos puntos no hay ningún
+  // `await` propio: sólo puede colarse una microtarea YA encolada, que es
+  // justamente el caso del test de arriba. Prefiero dejarlo dicho antes que
+  // escribir un test que aparente cubrirla sin hacerlo.
+
+})
