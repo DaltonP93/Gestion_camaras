@@ -32,6 +32,11 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
       body.viewId,
       body.visibleCameraIds,
       body.suppressStartCameraIds ?? [],
+      // Ticket estampado por el hook `onRequest`, antes de la autenticación:
+      // tomarlo dentro de reconcileView sería posterior a `jwtVerify` y a la
+      // validación del cuerpo, con lo que una petición vieja reanudada tras un
+      // cierre parecería nueva (revisión de #148).
+      request.requestTicket,
     )
 
     // Log estructurado para diagnosticar producción

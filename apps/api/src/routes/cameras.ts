@@ -359,6 +359,12 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
   // POST /api/cameras/:id/start-stream — Iniciar stream (con session tracking)
   server.post('/:id/start-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
+    // El ticket lo estampa el hook `onRequest` (plugins/auth.ts), que corre
+    // ANTES de la autenticación. Tomarlo acá sería tarde: `server.authenticate`
+    // es un preHandler que ya hizo `await request.jwtVerify()`, y una petición
+    // vieja que se reanudara después de un cierre obtendría una secuencia mayor
+    // y pasaría por reapertura legítima (revisión de #148).
+    const ticket = request.requestTicket
     const { id } = request.params as { id: string }
     const user = request.user
 
@@ -378,7 +384,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     server.log.info(`[live] start_stream_requested cameraId=${id} streamType=${streamType} userId=${user.sub}`)
 
-    const result = await startStream(server, user.sub, id, viewId, streamType)
+    const result = await startStream(server, user.sub, id, viewId, streamType, ticket)
     if (result.error) {
       if (result.error.code === 'TRANSCODE_LIMIT_REACHED') {
         server.log.warn(`[live] start_stream_failed cameraId=${id} code=TRANSCODE_LIMIT_REACHED streamType=${streamType}`)
@@ -572,6 +578,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
   // POST /api/cameras/:id/touch-stream — Heartbeat para evitar timeout
   server.post('/:id/touch-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const ticket = request.requestTicket
     const { id } = request.params as { id: string }
     const user = request.user
     const body = request.body as any
@@ -579,9 +586,9 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const streamType: 'sub' | 'main' | 'main_h264' =
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
-    // Hora del SERVIDOR al recibir: descarta heartbeats en vuelo posteriores a
-    // un cierre explícito.
-    touchSession(user.sub, id, streamType, Date.now(), viewId)
+    // El ticket se saca al entrar: descarta heartbeats en vuelo emitidos antes
+    // de un cierre explícito.
+    touchSession(user.sub, id, streamType, ticket, viewId)
     return reply.send({ ok: true })
   })
 

@@ -35,7 +35,7 @@ vi.mock('./stream', () => ({
 
 const {
   pruneStaleSessions, cleanupIdleSessions, stopStream, cleanupUserSessions,
-  touchSession, touchView, getActiveSessions, getStreamCounts, isViewClosedAfter,
+  touchSession, touchView, getActiveSessions, getStreamCounts, isViewClosedAfter, beginRequest,
   __seedSessionForTest, __setViewHeartbeatForTest, __setMediaActivityForTest,
   __resetSessionsForTest, __resetClosedViewsForTest,
 } = await import('./stream-manager')
@@ -202,23 +202,23 @@ describe('A1 · procesos compartidos', () => {
 describe('A1 · respuestas tardías e índices auxiliares', () => {
   it('(11) un heartbeat tardío NO resucita una sesión ya cerrada', async () => {
     seedSub('u1', 'camA', 'v1', 0)
-    // El heartbeat sale del navegador ANTES del cierre…
-    const heartbeatReceivedAt = Date.now() - 1
+    // El heartbeat saca su ticket ANTES del cierre…
+    const heartbeatTicket = beginRequest()
 
     await cleanupUserSessions(fakeServer, 'u1', 'v1')     // …y el cierre ocurre después
     expect(getActiveSessions()).toHaveLength(0)
 
-    expect(isViewClosedAfter('u1', 'v1', heartbeatReceivedAt)).toBe(true)
-    touchView('u1', 'v1', heartbeatReceivedAt)            // llega tarde: se descarta
+    expect(isViewClosedAfter('u1', 'v1', heartbeatTicket)).toBe(true)
+    touchView('u1', 'v1', heartbeatTicket)                // llega tarde: se descarta
 
     expect(getActiveSessions()).toHaveLength(0)
   })
 
   it('un heartbeat POSTERIOR al cierre sí es legítimo (el usuario volvió a abrir)', () => {
     seedSub('u1', 'camA', 'v1', 0)
-    const closedAt = Date.now()
     __resetClosedViewsForTest()
-    expect(isViewClosedAfter('u1', 'v1', closedAt + 1000)).toBe(false)
+    const posterior = beginRequest()
+    expect(isViewClosedAfter('u1', 'v1', posterior)).toBe(false)
   })
 
   it('touchSession sobre una sesión inexistente no la crea', () => {

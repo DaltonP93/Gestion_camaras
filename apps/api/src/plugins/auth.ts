@@ -4,6 +4,7 @@ import fastifyJwt from '@fastify/jwt'
 import { redactUrlSecrets } from '../lib/log-redact'
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
 import type { Role } from '@prisma/client'
+import { beginRequest, type RequestTicket } from '../services/stream-manager'
 
 export interface JWTPayload {
   sub: string
@@ -21,6 +22,22 @@ declare module '@fastify/jwt' {
 }
 
 declare module 'fastify' {
+  interface FastifyRequest {
+    /**
+     * Ticket de llegada de ESTA petición: hora del servidor + secuencia
+     * monótona. Lo estampa un hook `onRequest`, que corre ANTES de la
+     * autenticación.
+     *
+     * Por qué no basta con tomarlo en la primera línea del handler: la
+     * autenticación es un `preHandler` que ya hizo `await request.jwtVerify()`.
+     * Si una petición vieja de start-stream entraba a autenticarse, el cierre
+     * que llegaba después terminaba su propia autenticación primero y marcaba
+     * el view; al reanudarse, la petición vieja tomaba un ticket con secuencia
+     * MAYOR y pasaba por reapertura legítima, recreando la sesión fantasma que
+     * esta barrera existe para impedir (revisión de #148).
+     */
+    requestTicket: RequestTicket
+  }
   interface FastifyInstance {
     authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>
     authorize: (roles: Role[]) => (request: FastifyRequest, reply: FastifyReply) => Promise<void>
@@ -29,6 +46,13 @@ declare module 'fastify' {
 }
 
 const authPlugin: FastifyPluginAsync = fp(async (server) => {
+  // PRIMER punto asíncrono de la petición. `onRequest` corre antes de
+  // preParsing, preValidation y preHandler — es decir, antes de jwtVerify.
+  server.decorateRequest('requestTicket', null as unknown as RequestTicket)
+  server.addHook('onRequest', async (request) => {
+    request.requestTicket = beginRequest()
+  })
+
   const jwtSecret = process.env.JWT_SECRET
   if (!jwtSecret || jwtSecret.length < 32) {
     throw new Error(
