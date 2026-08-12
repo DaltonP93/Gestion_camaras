@@ -375,3 +375,48 @@ describe('invariantes previos que siguen vigentes', () => {
     expect(stopped).toEqual(['p_ch09_main_h264'])
   })
 })
+
+// ─── Revisión de #148 ────────────────────────────────────────────────────────
+
+describe('#148 · el ticket se estampa ANTES de la autenticación', () => {
+  it('una petición vieja que se reanuda tras un cierre NO se toma por reapertura', async () => {
+    // La carrera real: `server.authenticate` es un preHandler que hace
+    // `await request.jwtVerify()`. Si el ticket se sacara en la primera línea
+    // del HANDLER —después de ese await— este sería el orden:
+    //
+    //   T1 entra start-stream (vieja) y empieza a autenticarse
+    //   T2 entra el cierre, termina SU autenticación y marca el view
+    //   T3 la vieja termina de autenticarse y recién ahí saca su ticket
+    //      → secuencia MAYOR que la del cierre → parecería una reapertura
+    //
+    // Con el ticket estampado en `onRequest` la vieja tiene secuencia MENOR.
+    const ticketVieja = beginRequest()      // T1: onRequest de la petición vieja
+
+    // T2: el cierre llega después y se completa antes.
+    markViewClosed('u1', 'tabA')
+
+    // T3: la vieja recién ahora llega al handler y arranca.
+    const result = await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', ticketVieja)
+
+    expect(result.error?.code).toBe('VIEW_CLOSED')
+    expect(getActiveSessions()).toHaveLength(0)
+    expect(removed).toEqual([])
+  })
+
+  it('el orden lo decide la secuencia, no el momento en que se usa el ticket', async () => {
+    const primera = beginRequest()
+    const segunda = beginRequest()
+    markViewClosed('u1', 'tabA')            // sella con la secuencia vigente
+    const tercera = beginRequest()          // posterior al cierre
+
+    // Las dos anteriores al cierre quedan invalidadas…
+    expect((await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', primera)).error?.code)
+      .toBe('VIEW_CLOSED')
+    expect((await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', segunda)).error?.code)
+      .toBe('VIEW_CLOSED')
+    // …y la posterior sí puede abrir.
+    expect((await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', tercera)).error)
+      .toBeUndefined()
+    expect(getActiveSessions()).toHaveLength(1)
+  })
+})

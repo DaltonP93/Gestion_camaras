@@ -1610,11 +1610,17 @@ export async function reconcileView(
   viewId: string,
   visibleCameraIds: string[],
   suppressStartCameraIds: string[] = [],
+  /**
+   * Ticket de llegada de la petición. Lo estampa el hook `onRequest`, antes de
+   * la autenticación. El default sólo cubre llamadores internos sin petición
+   * HTTP detrás; el camino HTTP debe pasarlo siempre.
+   */
+  incomingTicket: RequestTicket = beginRequest(),
 ): Promise<ReconcileResult> {
   const visibleSet = new Set(visibleCameraIds)
   const suppressSet = new Set(suppressStartCameraIds)
   const vk = vKey(userId, viewId)
-  const ticket = beginRequest()
+  const ticket = incomingTicket
 
   console.info(`[live] heartbeat userId=${userId} viewId=${viewId} cameraIds=[${visibleCameraIds.join(',')}]`)
 
