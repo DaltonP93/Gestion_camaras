@@ -44,7 +44,7 @@ const {
   startStream, stopStream, cleanupUserSessions, cleanupIdleSessions,
   getActiveSessions, getTranscodeCounts, getTranscodeSlots, markViewClosed, beginRequest,
   __seedSessionForTest, __setViewHeartbeatForTest, __setMediaActivityForTest,
-  __resetSessionsForTest, __resetClosedViewsForTest,
+  __resetSessionsForTest, __resetClosedViewsForTest, __isPathPublishedForTest,
 } = await import('./stream-manager')
 
 const secondsAgo = (s: number) => new Date(Date.now() - s * 1000)
@@ -185,7 +185,7 @@ describe('P1-2 · cada intento en vuelo tiene identidad propia', () => {
     expect(removed).toEqual([])
   })
 
-  it('(7)(8) cancelados TODOS los intentos de un sub/main, el path se retira UNA vez', async () => {
+  it('(7)(8) cancelados TODOS los intentos de un sub/main, el path NO queda publicado', async () => {
     let release!: () => void
     publishGate = new Promise<void>(r => { release = r })
 
@@ -199,7 +199,39 @@ describe('P1-2 · cada intento en vuelo tiene identidad propia', () => {
     await Promise.all([a, b])
 
     expect(getActiveSessions()).toHaveLength(0)
-    expect(removed.filter(c => c === 'camA')).toHaveLength(1)   // exactamente una
+    // El invariante que importa es que NO quede un path publicado sin dueño.
+    //
+    // No se exige "exactamente un removeStream": cuando la publicación del
+    // segundo intento termina DESPUÉS del retiro del primero, el segundo debe
+    // retirar también — saltárselo por una ventana temporal era justamente el
+    // defecto que señaló la revisión (deja el path recién publicado huérfano).
+    // Un retiro de más es inocuo; uno de menos deja basura en MediaMTX.
+    expect(removed.filter(c => c === 'camA').length).toBeGreaterThanOrEqual(1)
+    expect(__isPathPublishedForTest('p_camA_sub')).toBe(false)
+  })
+
+  it('una publicación posterior al primer retiro NO se salta su limpieza', async () => {
+    // El caso exacto de la revisión: A publica y se cancela; su limpieza retira
+    // el path. B publica DESPUÉS y también está cancelado: su limpieza debe
+    // ejecutarse igual, o el path queda publicado sin nadie que lo use.
+    let release!: () => void
+    publishGate = new Promise<void>(r => { release = r })
+
+    const a = startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', beginRequest())
+    const b = startStream(makeServer(), 'u2', 'camA', 'tabB', 'sub', beginRequest())
+    await tick()
+    markViewClosed('u1', 'tabA')
+    markViewClosed('u2', 'tabB')
+    release()
+    await Promise.all([a, b])
+
+    expect(__isPathPublishedForTest('p_camA_sub')).toBe(false)
+    expect(removed).toContain('camA')
+  })
+
+  it('el path queda marcado como publicado mientras alguien lo usa', async () => {
+    await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', beginRequest())
+    expect(__isPathPublishedForTest('p_camA_sub')).toBe(true)
   })
 
   it('(9) la misma garantía en main_h264: A cancelada no derriba el proceso de B', async () => {
@@ -418,5 +450,83 @@ describe('#148 · el ticket se estampa ANTES de la autenticación', () => {
     expect((await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', tercera)).error)
       .toBeUndefined()
     expect(getActiveSessions()).toHaveLength(1)
+  })
+})
+
+describe('#148b · el cierre se sella con SU propio ticket', () => {
+  it('una reapertura llegada DESPUÉS del cierre no queda invalidada por él', async () => {
+    // La carrera inversa: el cierre se demora en autenticarse y, mientras
+    // tanto, llega una reapertura legítima. Si el cierre se sellara con el
+    // contador GLOBAL vigente, ese sello ya incluiría a la reapertura y la
+    // rechazaría pese a haber llegado después.
+    const ticketCierre    = beginRequest()   // el cierre entra primero…
+    const ticketReapertura = beginRequest()  // …y la reapertura llega después
+
+    // El cierre se completa recién ahora (estuvo demorado en autenticación).
+    await cleanupUserSessions(makeServer(), 'u1', 'tabA', ticketCierre)
+
+    const r = await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', ticketReapertura)
+
+    expect(r.error).toBeUndefined()
+    expect(getActiveSessions()).toHaveLength(1)
+  })
+
+  it('una petición anterior al cierre sigue invalidada', async () => {
+    const ticketVieja  = beginRequest()
+    const ticketCierre = beginRequest()
+
+    await cleanupUserSessions(makeServer(), 'u1', 'tabA', ticketCierre)
+    const r = await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', ticketVieja)
+
+    expect(r.error?.code).toBe('VIEW_CLOSED')
+    expect(getActiveSessions()).toHaveLength(0)
+  })
+
+  it('lo mismo para el cierre de UNA cámara (stopStream)', async () => {
+    await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', beginRequest())
+
+    const ticketCierre     = beginRequest()
+    const ticketReapertura = beginRequest()
+    await stopStream(makeServer(), 'u1', 'camA', 'sub', 'viewport_change', 'tabA', ticketCierre)
+    expect(getActiveSessions()).toHaveLength(0)
+
+    const r = await startStream(makeServer(), 'u1', 'camA', 'tabA', 'sub', ticketReapertura)
+    expect(r.error).toBeUndefined()
+    expect(getActiveSessions()).toHaveLength(1)
+  })
+})
+
+describe('#148c · el ticket se estampa antes que TODO otro hook onRequest', () => {
+  it('el hook está registrado antes de rate-limit y de la autenticación', async () => {
+    // Fastify ejecuta los `onRequest` en orden de REGISTRO, y varios son
+    // asíncronos: `@fastify/rate-limit` hace su comprobación ahí. Si el ticket
+    // se estampara después, una petición vieja podría esperar en rate-limit
+    // mientras un cierre posterior la adelanta, y al reanudarse recibiría una
+    // secuencia mayor — reapertura falsa.
+    //
+    // El orden de registro no es observable en runtime sin levantar el
+    // servidor, así que se fija sobre el archivo de arranque: es la única
+    // defensa determinista contra que alguien inserte un plugin por delante.
+    const server = (await import('node:fs')).readFileSync(
+      new URL('../server.ts', import.meta.url), 'utf8')
+
+    const hook       = server.indexOf("addHook('onRequest'")
+    const helmet     = server.indexOf('register(helmet')
+    const rateLimit  = server.indexOf('register(rateLimit')
+    const authPlugin = server.indexOf('register(authPlugin')
+
+    expect(hook).toBeGreaterThan(-1)
+    expect(rateLimit).toBeGreaterThan(-1)
+    expect(hook).toBeLessThan(helmet)
+    expect(hook).toBeLessThan(rateLimit)
+    expect(hook).toBeLessThan(authPlugin)
+  })
+
+  it('la secuencia de tickets es estrictamente creciente', () => {
+    const a = beginRequest()
+    const b = beginRequest()
+    const c = beginRequest()
+    expect(b.seq).toBeGreaterThan(a.seq)
+    expect(c.seq).toBeGreaterThan(b.seq)
   })
 })
