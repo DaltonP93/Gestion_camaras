@@ -264,6 +264,34 @@ export function decideProcessTermination(
   return { terminate, keepAlive }
 }
 
+// ─── Autorización de reinicio del supervisor ─────────────────────────────────
+
+/**
+ * PURA. ¿Queda algún espectador REAL sobre este `streamPath`?
+ *
+ * El supervisor de FFmpeg usaba `lastMediaActivity` para decidir si valía la
+ * pena re-spawnear tras una caída. Eso contradice la regla del módulo: la
+ * actividad de medio es diagnóstico y no prueba que haya nadie mirando, así que
+ * podía resucitar un proceso sin propietario — la misma sesión fantasma que A1
+ * debía eliminar, por otra puerta.
+ *
+ * Un reinicio sólo se autoriza con una sesión de heartbeat de cliente FRESCO.
+ * El caso del arranque en vuelo lo evalúa el llamador, que es quien conoce el
+ * estado de `transcodeInFlight`.
+ */
+export function hasFreshClientViewer(input: {
+  sessions: SessionTruth[]
+  streamPath: string
+  nowMs: number
+  ttl: SessionTtl
+}): boolean {
+  const { sessions, streamPath, nowMs, ttl } = input
+  return sessions.some(s =>
+    s.streamPath === streamPath &&
+    nowMs - s.lastClientHeartbeatMs <= ttlForStreamType(s.streamType, ttl)
+  )
+}
+
 // ─── Índices auxiliares ──────────────────────────────────────────────────────
 
 /**

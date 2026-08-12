@@ -83,7 +83,7 @@ describe('closeWithKeepalive', () => {
 
 describe('closeStreamSession', () => {
   it('arma la ruta con streamType y reason', async () => {
-    await closeStreamSession('cam9', 'main_h264', 'exit_focus')
+    await closeStreamSession('cam9', 'main_h264', 'exit_focus', 'vp_1')
     const [url] = fetchMock.mock.calls[0]
     expect(url).toContain('/api/cameras/cam9/stream?')
     expect(url).toContain('streamType=main_h264')
@@ -91,15 +91,15 @@ describe('closeStreamSession', () => {
   })
 
   it('escapa identificadores con caracteres especiales', async () => {
-    await closeStreamSession('cam/../admin', 'sub', 'cleanup_unmount')
+    await closeStreamSession('cam/../admin', 'sub', 'cleanup_unmount', 'vp_1')
     const [url] = fetchMock.mock.calls[0]
     expect(url).toContain('cam%2F..%2Fadmin')
     expect(url).not.toContain('/cam/../admin/')
   })
 
   it('llamarla dos veces emite dos DELETE idempotentes (el servidor tolera el segundo)', async () => {
-    await closeStreamSession('cam1', 'sub', 'cleanup_unmount')
-    await closeStreamSession('cam1', 'sub', 'layout_change')
+    await closeStreamSession('cam1', 'sub', 'cleanup_unmount', 'vp_1')
+    await closeStreamSession('cam1', 'sub', 'layout_change', 'vp_1')
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock.mock.calls.every(([, init]) => init.method === 'DELETE')).toBe(true)
   })

@@ -13,6 +13,8 @@ import { useAuthStore } from '@/stores/authStore'
 import { apiGet, apiPost } from '@/lib/api'
 import { parseStreamError, parseRetryAfterMs } from '@/lib/streamErrors'
 import { closeViewSessions, closeStreamSession } from '@/lib/sessionClose'
+import { resolveHdSessionTtlMs } from '@/lib/hdSessionTtl'
+import { decideHdReacquire, finishHdReacquire, initialHdReacquireState, decideHdFallback } from '@/lib/hdReacquire'
 import { createQualitySwitchController } from '@/components/cameras/qualitySwitchController'
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
@@ -126,10 +128,6 @@ export function LiveViewPage() {
   focusStreamTypeRef.current = focusStreamType
   const [focusStreamInfo, setFocusStreamInfo]   = useState<StreamInfo | null>(null)
   const [focusStreamError, setFocusStreamError] = useState<CameraPlaybackError | null>(null)
-  // Espejo en ref: lo lee la readquisición de HD tras una ocultación larga sin
-  // depender del estado capturado en la clausura.
-  const focusStreamErrorRef = useRef<CameraPlaybackError | null>(null)
-  focusStreamErrorRef.current = focusStreamError
   const [diagnosticCamera, setDiagnosticCamera] = useState<{ id: string; name: string } | null>(null)
   const [streamCapabilities, setStreamCapabilities] = useState<{ ffmpegAvailable: boolean; transcodingEnabled: boolean } | null>(null)
   // Single-flight del cambio de calidad: deshabilita Baja/Alta/Trans mientras hay un
@@ -144,6 +142,12 @@ export function LiveViewPage() {
 
   // Stable ID for this browser tab — used by backend to track sessions per view
   const [viewId] = useState<string>(makeViewId)
+
+  // Resultado de entrar en foco. Discriminado a propósito: el llamador decide
+  // el fallback con ESTE valor, nunca leyendo estado de React recién fijado.
+  type EnterFocusResult =
+    | { ok: true; info: StreamInfo; actualType: 'sub' | 'main' | 'main_h264' }
+    | { ok: false; error: CameraPlaybackError }
 
   // Error codes that belong exclusively to focus/main_h264 streams.
   // Grid tiles show sub streams — showing these errors on a tile is always stale/misleading.
@@ -164,14 +168,15 @@ export function LiveViewPage() {
   const staggerTimers  = useRef<ReturnType<typeof setTimeout>[]>([])
   // Track when page became hidden to decide whether to reconcile on unhide
   const hiddenSince    = useRef<number | null>(null)
-  // TTL de la sesión HD en segundo plano. Debe reflejar STREAM_HD_IDLE_TIMEOUT
-  // del servidor (90 s por defecto): pasado ese plazo el backend ya expiró la
-  // sesión y liberó FFmpeg, así que al volver hay que volver a pedir alta
-  // calidad en vez de esperar que reviva sola.
-  const HD_SESSION_TTL_MS = 90_000
-  // Una sola readquisición de HD por cámara tras una ocultación larga: nunca un
-  // bucle de reintentos contra el límite de transcodificaciones.
-  const hdReacquireDone = useRef<string | null>(null)
+  // TTL EFECTIVO de la sesión HD en segundo plano. NO se supone 90 s: lo
+  // resuelve el backend (STREAM_HD_IDLE_TIMEOUT ya normalizado y acotado) y se
+  // recibe en /live-view/capabilities. El valor inicial es sólo el default
+  // documentado, vigente hasta que llega la respuesta.
+  const hdSessionTtlMs = useRef<number>(90_000)
+  // Estado de la readquisición de HD. La decisión vive en `@/lib/hdReacquire`
+  // (pura y testeada): una concesión por CICLO de ocultación, con single-flight
+  // para eventos duplicados.
+  const hdReacquire = useRef(initialHdReacquireState)
   // Puente al re-pedido de HD (definido más abajo, tras handleEnterFocus).
   const reacquireHdRef = useRef<((cam: Camera) => Promise<void>) | null>(null)
   // Rate-limit per-camera 401 auto-restarts: timestamp of last restart per cameraId
@@ -249,8 +254,19 @@ export function LiveViewPage() {
   }, [cameras, cameraFilter, gridLayout, focusParam]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    apiGet<{ ffmpegAvailable: boolean; transcodingEnabled: boolean }>('/live-view/capabilities')
-      .then(caps => setStreamCapabilities(caps))
+    apiGet<{
+      ffmpegAvailable: boolean; transcodingEnabled: boolean
+      streamIdleTimeoutMs?: number; streamHdIdleTimeoutMs?: number
+    }>('/live-view/capabilities')
+      .then(caps => {
+        setStreamCapabilities(caps)
+        // El TTL que rige lo resuelve el backend (ya normalizado y acotado).
+        const ttl = resolveHdSessionTtlMs(caps, hdSessionTtlMs.current)
+        if (ttl !== hdSessionTtlMs.current) {
+          hdSessionTtlMs.current = ttl
+          console.info(`[live-ui] hd_ttl_from_backend ms=${ttl}`)
+        }
+      })
       .catch(() => setStreamCapabilities({ ffmpegAvailable: false, transcodingEnabled: false }))
   }, [])
 
@@ -504,13 +520,13 @@ export function LiveViewPage() {
     // keepalive: un cambio de layout/cámara puede coincidir con una navegación;
     // sin él la petición se aborta y la sesión queda viva hasta el TTL.
     await Promise.allSettled(
-      toStop.map(id => closeStreamSession(id, 'sub', reason || 'stop_sessions'))
+      toStop.map(id => closeStreamSession(id, 'sub', reason || 'stop_sessions', viewId))
     )
     toStop.forEach(id => {
       activeSessions.current.delete(id)
       pendingStarts.current.delete(id)
     })
-  }, [])
+  }, [viewId])
 
   // ─── Clear stagger timers ────────────────────────────────────
   const clearStaggerTimers = useCallback(() => {
@@ -581,7 +597,9 @@ export function LiveViewPage() {
 
     try {
       const overrideType = gridStreamOverride.current[camera.id]
-      const body = overrideType ? { streamType: overrideType } : {}
+      // El viewId va SIEMPRE: sin él la sesión se registra bajo 'default' y su
+      // heartbeat de view nunca coincide con el de esta pestaña.
+      const body = overrideType ? { streamType: overrideType, viewId } : { viewId }
       const info = await apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, body)
       activeSessions.current.add(camera.id)
       if (info.hls) currentStreamUrls.current[camera.id] = info.hls
@@ -708,7 +726,8 @@ export function LiveViewPage() {
         return
       }
 
-      const hiddenMs = hiddenSince.current ? Date.now() - hiddenSince.current : 0
+      const hiddenAt = hiddenSince.current
+      const hiddenMs = hiddenAt ? Date.now() - hiddenAt : 0
       hiddenSince.current = null
       if (!useAuthStore.getState().isAuthenticated) return
 
@@ -724,14 +743,30 @@ export function LiveViewPage() {
       // mientras tanto — nunca se deja la tarjeta en negro.
       const focusId = focusCameraRef.current
       const wasHd = focusStreamTypeRef.current === 'main' || focusStreamTypeRef.current === 'main_h264'
-      if (focusId && wasHd && hiddenMs > HD_SESSION_TTL_MS && hdReacquireDone.current !== focusId) {
-        hdReacquireDone.current = focusId
-        const cam = filteredCamerasRef.current.find(c => c.id === focusId)
-        if (cam) {
-          console.info(`[live-ui] hd_reacquire_after_hidden cameraId=${focusId} hiddenMs=${hiddenMs}`)
-          void reacquireHdRef.current?.(cam)
-        }
+      // La decisión la toma el módulo puro: un intento por ciclo de ocultación,
+      // con single-flight ante eventos duplicados.
+      const decision = decideHdReacquire({
+        hiddenAt,
+        hiddenMs,
+        hdTtlMs: hdSessionTtlMs.current,
+        focusIsHd: !!focusId && wasHd,
+        state: hdReacquire.current,
+      })
+      hdReacquire.current = decision.nextState
+      if (!decision.shouldReacquire) return
+
+      const cam = filteredCamerasRef.current.find(c => c.id === focusId)
+      if (!cam) {
+        hdReacquire.current = finishHdReacquire(hdReacquire.current)
+        return
       }
+      console.info(
+        `[live-ui] hd_reacquire_after_hidden cameraId=${focusId}` +
+        ` hiddenMs=${hiddenMs} ttlMs=${hdSessionTtlMs.current} cycle=${hiddenAt}`
+      )
+      void reacquireHdRef.current?.(cam).finally(() => {
+        hdReacquire.current = finishHdReacquire(hdReacquire.current)
+      })
     }
     document.addEventListener('visibilitychange', handleVisibility)
     return () => document.removeEventListener('visibilitychange', handleVisibility)
@@ -818,7 +853,7 @@ export function LiveViewPage() {
 
   // ─── Retry a single grid camera (full stream restart) ───────
   const handleGridCameraRetry = useCallback((cameraId: string) => {
-    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'sub', reason: 'grid_retry' }).catch(() => {})
+    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'sub', reason: 'grid_retry', viewId }).catch(() => {})
     activeSessions.current.delete(cameraId)
     setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
     setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
@@ -873,7 +908,7 @@ export function LiveViewPage() {
       : (cameraId === focusCamera ? focusStreamType : 'sub')
     if (activeSessions.current.has(cameraId)) {
       console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${currentStreamType} reason=hls_fatal_error code=${err.code}`)
-      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: currentStreamType, reason: 'hls_fatal_error' }).catch(() => {})
+      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: currentStreamType, reason: 'hls_fatal_error', viewId }).catch(() => {})
       activeSessions.current.delete(cameraId)
     }
     // HLS manifest 404 on a grid (sub) camera = RTSP source returned 404 from NVR.
@@ -918,7 +953,12 @@ export function LiveViewPage() {
   }, [flushHlsExpiry, focusCamera, focusStreamType, bumpPlayerKeys])
 
   // ─── Enter focus/fullscreen — start main stream ─────────────
-  const handleEnterFocus = useCallback(async (camera: Camera) => {
+  // Devuelve un resultado DISCRIMINADO además de fijar el estado. El estado de
+  // React puede no haberse renderizado todavía cuando el llamador necesita
+  // decidir, así que leer un ref inmediatamente después daría `null` y el
+  // fallback nunca se activaría (revisión de #146). El valor de retorno es la
+  // fuente para decidir; el estado es sólo para pintar.
+  const handleEnterFocus = useCallback(async (camera: Camera): Promise<EnterFocusResult> => {
     console.info(`[live-ui] fullscreen_requested cameraId=${camera.id} streamType=main`)
     setFocusCamera(camera.id)
     setFocusStreamInfo(null)
@@ -936,7 +976,13 @@ export function LiveViewPage() {
         message: 'El flujo principal está en H.265/HEVC. Los navegadores no pueden reproducir H.265.',
         technicalDetail: `Codec: ${camera.mainCodec}${camera.mainResolution ? `, Resolución: ${camera.mainResolution}` : ''}`,
       })
-      return
+      return {
+        ok: false,
+        error: {
+          code: 'CODEC_UNSUPPORTED',
+          message: 'El flujo principal está en H.265/HEVC. Los navegadores no pueden reproducir H.265.',
+        },
+      }
     }
 
     try {
@@ -954,6 +1000,7 @@ export function LiveViewPage() {
       }
       setFocusStreamInfo(info)
       bumpPlayerKeys([camera.id])
+      return { ok: true, info, actualType }
     } catch (err: any) {
       // Contrato unificado: lee body.code ?? body.error (antes leía body.error y un 429
       // de límite caía en "Error desconocido").
@@ -966,43 +1013,52 @@ export function LiveViewPage() {
         console.info(`[live-ui] transcode_limit_reached cameraId=${camera.id}`)
         console.info(`[live-ui] fallback_to_substream cameraId=${camera.id} reason=transcode_limit_reached — user can click 'Usar baja calidad'`)
       }
-      setFocusStreamError({
+      const failure: CameraPlaybackError = {
         code: parsed.code,
         message: parsed.message,
         technicalDetail: parsed.technicalDetail,
-      })
+      }
+      setFocusStreamError(failure)
+      return { ok: false, error: failure }
     }
-  }, [bumpPlayerKeys, streamCapabilities, focusStreamType])
+  }, [bumpPlayerKeys, streamCapabilities, focusStreamType, viewId])
 
   // ─── Readquisición de HD tras expirar por pestaña oculta ────────────────────
-  // El servidor expiró la sesión HD a los STREAM_HD_IDLE_TIMEOUT segundos y
-  // liberó su FFmpeg. Al volver se pide alta calidad UNA vez; si no hay cupo o
-  // falla, se queda en baja calidad SIN overlay de error: la transición nunca
-  // debe dejar la tarjeta en negro.
+  // El servidor expiró la sesión HD y liberó su FFmpeg. Al volver se pide alta
+  // calidad UNA vez por ciclo de ocultación; si no hay cupo o falla, se
+  // restaura el substream SIN overlay de error: la transición nunca debe dejar
+  // la tarjeta en negro. El tratamiento general del 429 sigue siendo B1.
   useEffect(() => {
     reacquireHdRef.current = async (camera: Camera) => {
       const before = focusStreamTypeRef.current
+      let result: EnterFocusResult
       try {
-        await handleEnterFocus(camera)
-      } catch {
-        // handleEnterFocus captura sus propios errores; esto cubre lo inesperado.
+        result = await handleEnterFocus(camera)
+      } catch (e: any) {
+        result = { ok: false, error: { code: 'UNKNOWN', message: String(e?.message ?? e) } }
       }
-      // El error lo dejó handleEnterFocus en el estado; se lee por ref para no
-      // meter efectos dentro de un updater de React (que debe ser puro).
-      const failure = focusStreamErrorRef.current
-      if (!failure) return
-      console.info(
-        `[live-ui] hd_reacquire_failed cameraId=${camera.id} code=${failure.code}` +
-        ` prevType=${before} — se mantiene baja calidad, sin pantalla negra`
-      )
-      setFocusStreamError(null)
-      setFocusStreamInfo(null)
-      setFocusStreamType('sub')
-    }
-  }, [handleEnterFocus])
+      // El plan se decide con el RESULTADO devuelto, no con focusStreamError:
+      // el estado de React puede seguir sin renderizar en este punto.
+      const plan = decideHdFallback({
+        ok: result.ok,
+        errorCode: result.ok ? undefined : result.error.code,
+      })
+      if (result.ok) return
 
-  // Al cambiar de cámara en foco se rehabilita la readquisición para la nueva.
-  useEffect(() => { hdReacquireDone.current = null }, [focusCamera])
+      console.info(
+        `[live-ui] hd_reacquire_failed cameraId=${camera.id} code=${result.error.code}` +
+        ` prevType=${before} — se restaura baja calidad, sin pantalla negra`
+      )
+      if (!plan.showErrorOverlay) setFocusStreamError(null)
+      if (plan.clearStreamInfo) setFocusStreamInfo(null)
+      setFocusStreamType(plan.streamType)
+      if (plan.remountPlayer) bumpPlayerKeys([camera.id])
+    }
+  }, [handleEnterFocus, bumpPlayerKeys])
+
+  // La guarda pertenece al ciclo de ocultación, no a la cámara. Al cambiar de
+  // cámara en foco sólo se descarta un intento en vuelo que ya no aplica.
+  useEffect(() => { hdReacquire.current = finishHdReacquire(hdReacquire.current) }, [focusCamera])
 
   // Deep-link ?focus=1: entrar al modo FOCO REAL (calidad principal) una vez que la
   // cámara objetivo está en su NVR. Antes el deep-link sólo cambiaba a layout 1×1 y la
@@ -1053,8 +1109,8 @@ export function LiveViewPage() {
         // Explicitly switching back to sub — stop both main streams so FFmpeg is killed.
         console.info(`[LiveView] qualitySwitch cameraId=${cam} from=${focusStreamType} to=sub reason=switch_to_sub`)
         console.info(`[live-ui] fallback_to_substream cameraId=${cam} reason=user_selected_low_quality prevType=${focusStreamType}`)
-        void closeStreamSession(cam, 'main',      'switch_to_sub')
-        void closeStreamSession(cam, 'main_h264', 'switch_to_sub')
+        void closeStreamSession(cam, 'main',      'switch_to_sub', viewId)
+        void closeStreamSession(cam, 'main_h264', 'switch_to_sub', viewId)
         setFocusStreamInfo(null)
         setFocusStreamError(null)
         setFocusStreamType('sub')
@@ -1081,7 +1137,7 @@ export function LiveViewPage() {
       // b) Stopping main_h264 kills FFmpeg, then start-stream immediately re-spawns it
       //    causing the "closing existing publisher" duplicate in MediaMTX.
       if (prevType === 'main') {
-        apiPost(`/cameras/${cam}/stop-stream`, { streamType: 'main', reason: 'quality_switch' }).catch(() => {})
+        apiPost(`/cameras/${cam}/stop-stream`, { streamType: 'main', reason: 'quality_switch', viewId }).catch(() => {})
       }
 
       setFocusStreamInfo(null)
@@ -1141,8 +1197,8 @@ export function LiveViewPage() {
 
     // Stop main/main_h264 streams — sub stream stays alive for the grid
     if (prevFocusId) {
-      void closeStreamSession(prevFocusId, 'main',      'exit_focus')
-      void closeStreamSession(prevFocusId, 'main_h264', 'exit_focus')
+      void closeStreamSession(prevFocusId, 'main',      'exit_focus', viewId)
+      void closeStreamSession(prevFocusId, 'main_h264', 'exit_focus', viewId)
     }
 
     // Reconcile the grid cameras after returning from fullscreen.

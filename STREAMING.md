@@ -125,6 +125,42 @@ No se usa `navigator.sendBeacon`: no permite fijar `Authorization`, y poner el
 token en la URL o en una cookie ad-hoc empeoraría la seguridad para resolver
 algo que `keepalive` ya resuelve.
 
+### Pertenencia: la sesión es de la PESTAÑA
+
+La clave de una sesión es `(usuario, pestaña, cámara, tipo)`. Antes era
+`(usuario, cámara, tipo)`, con lo que dos pestañas del mismo usuario viendo la
+misma cámara colapsaban en una sola fila: la segunda se apropiaba de la primera
+y cerrar en una cerraba la de la otra.
+
+Todo arranque debe enviar su `viewId`. Si no lo hace, la sesión se registra bajo
+`default` y su heartbeat de view nunca coincide, de modo que expira por
+`view_heartbeat_missing` aunque el usuario la esté mirando.
+
+Un cierre o un heartbeat **sin** `viewId` sólo se resuelve cuando la pertenencia
+es inequívoca (una sola pestaña con esa cámara y tipo). Con varias, se rechaza y
+se registra `stop_ignored_ambiguous` / `touch_ignored_ambiguous`: una pestaña no
+puede cerrar la sesión de otra.
+
+### Cierre durante un arranque en vuelo
+
+Un arranque atraviesa varias operaciones asíncronas (consulta a la base,
+`publishStream`, spawn de FFmpeg, `waitForHlsReady`, espera de un
+`transcodeInFlight`). En cualquiera de ellas puede llegar el `pagehide`.
+
+- `cleanupUserSessions(userId, viewId)` marca el cierre **siempre**, aunque
+  todavía no exista ninguna sesión — ése era el hueco por el que nacía la sesión
+  fantasma.
+- El arranque vuelve a comprobar la cancelación después de cada etapa y justo
+  antes de registrar, reutilizar o devolver una sesión.
+- Si el view se cerró: no se registra nada, se resuelve el single-flight, y se
+  deshace lo creado **sin** tocar lo que otro espectador válido siga usando.
+
+### El supervisor no reinicia sin espectador
+
+El supervisor de FFmpeg sólo re-spawnea si hay una sesión con heartbeat de
+cliente fresco sobre ese `streamPath`, o un arranque en vuelo todavía válido.
+`lastMediaActivity` **no** autoriza un reinicio: es diagnóstico.
+
 ### Procesos compartidos
 
 Varias sesiones pueden compartir un mismo FFmpeg (mismo `streamPath`/perfil).

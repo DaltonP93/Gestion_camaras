@@ -383,6 +383,20 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       if (result.error.code === 'TRANSCODE_LIMIT_REACHED') {
         server.log.warn(`[live] start_stream_failed cameraId=${id} code=TRANSCODE_LIMIT_REACHED streamType=${streamType}`)
       }
+      // CANCELACIÓN, NO FALLO. Si la pestaña se cerró durante el arranque, el
+      // usuario simplemente se fue: no es un problema del pipeline. Sin este
+      // corte se escribiría streamHealthStatus=MEDIA_SERVER_ERROR y
+      // lastStreamFailureAt, y ese timestamp es justamente lo que el
+      // healthWorker toma como "alguien pidió video y no salió" — un cierre de
+      // pestaña normal acabaría fabricando CAMERA_STREAM_ERROR falsos, que es
+      // exactamente lo que este trabajo persigue eliminar (revisión de #147).
+      if (result.error.code === 'VIEW_CLOSED') {
+        server.log.info(
+          `[live] start_stream_cancelled userId=${user.sub} cameraId=${id}` +
+          ` streamType=${streamType} reason=view_closed_during_start`
+        )
+        return reply.status(409).send(result.error)
+      }
       // Si el error es del servidor de medios (no de límites ni de estado de salud),
       // marcar la cámara como MEDIA_SERVER_ERROR
       const isLimitError = result.error.code === 'STREAM_LIMIT_REACHED' || result.error.code === 'STREAM_LIMIT_GLOBAL'
@@ -509,7 +523,10 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const reason = typeof body?.reason === 'string' ? body.reason : undefined
-    await stopStream(server, user.sub, id, streamType, reason)
+    // viewId identifica la PESTAÑA dueña: una pestaña no puede cerrar la sesión
+    // de otra pestaña del mismo usuario.
+    const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+    await stopStream(server, user.sub, id, streamType, reason, viewId)
     return reply.send({ ok: true })
   })
 
@@ -539,7 +556,8 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       q?.streamType === 'main'      ? 'main'      :
       q?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const reason = typeof q?.reason === 'string' ? q.reason : undefined
-    await stopStream(server, user.sub, id, streamType, reason)
+    const viewId = typeof q?.viewId === 'string' && q.viewId.length > 0 ? q.viewId : undefined
+    await stopStream(server, user.sub, id, streamType, reason, viewId)
     return reply.send({ ok: true })
   })
 
@@ -556,7 +574,14 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
   server.post('/:id/touch-stream', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const user = request.user
-    touchSession(user.sub, id)
+    const body = request.body as any
+    const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+    const streamType: 'sub' | 'main' | 'main_h264' =
+      body?.streamType === 'main'      ? 'main'      :
+      body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
+    // Hora del SERVIDOR al recibir: descarta heartbeats en vuelo posteriores a
+    // un cierre explícito.
+    touchSession(user.sub, id, streamType, Date.now(), viewId)
     return reply.send({ ok: true })
   })
 
