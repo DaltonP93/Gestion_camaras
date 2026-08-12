@@ -531,3 +531,43 @@ describe('#151 · el path no se retira si aparece una sesión nueva durante la l
     expect(getActiveSessions().map(s => s.userId)).toEqual(['u9'])
   })
 })
+
+describe('#151b · el registro superado devuelve la sesión retenida', () => {
+  it('responde con el path de la sesión que quedó, no con el propio', async () => {
+    // Dos arranques concurrentes con la MISMA clave calculan paths distintos
+    // porque el canal de la cámara cambió entre sus lecturas de la base.
+    let release!: () => void
+    publishGate = new Promise<void>(r => { release = r })
+
+    let canal = 1
+    const servidorMutante: any = {
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      prisma: { camera: { findUnique: async ({ where }: any) => ({ ...h264(where.id), channel: canal }) } },
+    }
+
+    const start1 = ticket()
+    const pendiente = startStream(servidorMutante, 'u1', 'camA', 'v1', 'sub', start1)
+    await tick()
+
+    // El arranque posterior reclama la clave con otro path.
+    publishGate = null
+    canal = 2
+    const start2 = ticket()
+    await startStream(servidorMutante, 'u1', 'camA', 'v1', 'sub', start2)
+    const pathRetenido = getActiveSessions()[0].streamPath
+
+    release()
+    const r1 = await pendiente
+
+    // start 1 responde con el path RETENIDO, no con el suyo.
+    expect(r1.streamPath).toBe(pathRetenido)
+    expect(r1.hlsUrl).toContain(pathRetenido)
+    expect(getActiveSessions()).toHaveLength(1)
+  })
+
+  it('un registro NO superado sigue devolviendo su propio path', async () => {
+    const r = await startStream(makeServer(), 'u1', 'camA', 'v1', 'sub', ticket())
+    expect(r.error).toBeUndefined()
+    expect(r.streamPath).toBe(getActiveSessions()[0].streamPath)
+  })
+})

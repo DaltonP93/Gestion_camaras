@@ -1356,13 +1356,23 @@ async function startStreamCore(
     // de los cuales pudo solaparse con el `pagehide` de la pestaña.
     const registerTranscodeSession = (): boolean => {
       if (cancelled()) return false
-      registerSessionMonotonic(transcodeKey, {
+      const owned = registerSessionMonotonic(transcodeKey, {
         cameraId, userId, viewId: effectiveViewId, streamType: 'main_h264',
         streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(),
         generation: nextGeneration(),
         // La propiedad nace con el ticket de la petición que la creó.
         lastOwnerRequestSeq: ticket.seq,
       }, ticket)
+      // Si una petición posterior ya reclamó la clave con OTRO path, el proceso
+      // que este intento levantó queda sin dueño: se libera en vez de dejar un
+      // FFmpeg extra corriendo.
+      if (owned.streamPath !== streamPath) {
+        console.info(
+          `[transcode] register_superseded cameraId=${cameraId} discardedPath=${streamPath}` +
+          ` ownedPath=${owned.streamPath}`
+        )
+        void releaseUnownedStream(server, cameraId, streamPath, 'superseded_by_newer_registration')
+      }
       return true
     }
 
@@ -1660,7 +1670,7 @@ async function startStreamCore(
 
 
   // ── Register session ──────────────────────────────────────────────────
-  registerSessionMonotonic(key, {
+  const owned = registerSessionMonotonic(key, {
     cameraId, userId, viewId: effectiveViewId, streamType: effectiveType as 'sub' | 'main',
     streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(),
     generation: nextGeneration(),
@@ -1672,7 +1682,19 @@ async function startStreamCore(
     viewCameras.get(vk)!.add(cameraId)
     viewHeartbeat.set(vk, new Date())
   }
-  return { hlsUrl: getHlsUrl(streamPath), webrtcUrl: getWebRtcUrl(streamPath), streamPath }
+  // Se responde con el path de la sesión que QUEDÓ, no con el local. Si una
+  // petición posterior ya había reclamado la clave y —por un cambio de NVR o
+  // canal entre ambas lecturas de la base— calculó otro path, devolver el mío
+  // apuntaría a una publicación sin dueño. Y si el mío quedó descartado, se
+  // libera para no dejar el recurso colgado (revisión de #151).
+  if (owned.streamPath !== streamPath) {
+    console.info(
+      `[live] register_superseded cameraId=${cameraId} discardedPath=${streamPath}` +
+      ` ownedPath=${owned.streamPath}`
+    )
+    await releaseUnownedStream(server, cameraId, streamPath, 'superseded_by_newer_registration')
+  }
+  return { hlsUrl: getHlsUrl(owned.streamPath), webrtcUrl: getWebRtcUrl(owned.streamPath), streamPath: owned.streamPath }
 }
 
 // Detener stream para un usuario
