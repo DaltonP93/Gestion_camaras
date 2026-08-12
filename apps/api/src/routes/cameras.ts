@@ -510,7 +510,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const user = request.user
     const body = request.body as any
     const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
-    const cleaned = await cleanupUserSessions(server, user.sub, viewId)
+    const cleaned = await cleanupUserSessions(server, user.sub, viewId, request.requestTicket)
     return reply.send({ cleaned })
   })
 
@@ -532,7 +532,10 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     // viewId identifica la PESTAÑA dueña: una pestaña no puede cerrar la sesión
     // de otra pestaña del mismo usuario.
     const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
-    await stopStream(server, user.sub, id, streamType, reason, viewId)
+    // El cierre se sella con el ticket de SU propia petición, no con el
+    // contador global: si este cierre se demoró en autenticarse y mientras
+    // tanto llegó una reapertura legítima, sellar con el global la rechazaría.
+    await stopStream(server, user.sub, id, streamType, reason, viewId, request.requestTicket)
     return reply.send({ ok: true })
   })
 
@@ -563,7 +566,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       q?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const reason = typeof q?.reason === 'string' ? q.reason : undefined
     const viewId = typeof q?.viewId === 'string' && q.viewId.length > 0 ? q.viewId : undefined
-    await stopStream(server, user.sub, id, streamType, reason, viewId)
+    await stopStream(server, user.sub, id, streamType, reason, viewId, request.requestTicket)
     return reply.send({ ok: true })
   })
 
@@ -572,7 +575,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const q = request.query as any
     const user = request.user
     const viewId = typeof q?.viewId === 'string' && q.viewId.length > 0 ? q.viewId : undefined
-    const cleaned = await cleanupUserSessions(server, user.sub, viewId)
+    const cleaned = await cleanupUserSessions(server, user.sub, viewId, request.requestTicket)
     return reply.send({ cleaned })
   })
 

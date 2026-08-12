@@ -671,15 +671,21 @@ async function releaseUnownedStream(
 
   // El path de MediaMTX sólo se retira si NINGUNA sesión mira esa cámara.
   if (survivors.some(s => s.cameraId === cameraId)) return
-  // …y UNA SOLA VEZ: si dos intentos concurrentes del mismo path se cancelan
-  // juntos, ambos llegan hasta acá y sin esta guarda cada uno emitiría su
-  // `removeStream`.
-  const lastRelease = pathReleasedAt.get(streamPath)
-  if (lastRelease !== undefined && Date.now() - lastRelease < PATH_RELEASE_DEDUP_MS) {
-    console.info(`[live] path_release_skipped path=${streamPath} reason=already_released`)
+  // …y UNA SOLA VEZ POR PUBLICACIÓN. La ventana temporal que había antes era
+  // incorrecta: si dos intentos cancelados publicaban el mismo path, el primero
+  // podía retirarlo y sellar la ventana, y la publicación del segundo —que
+  // termina después— caía dentro de esos segundos y se saltaba su limpieza,
+  // dejando el path recién publicado huérfano (revisión de #148).
+  //
+  // Ahora se sigue el hecho concreto: el path está publicado o no lo está.
+  // Cada publicación exitosa lo marca; el primer retiro lo desmarca, y un
+  // segundo retiro concurrente ve que ya no hay nada que retirar. Una
+  // publicación POSTERIOR vuelve a marcarlo, así que su limpieza sí ocurre.
+  if (!publishedPaths.has(streamPath)) {
+    console.info(`[live] path_release_skipped path=${streamPath} reason=not_published`)
     return
   }
-  pathReleasedAt.set(streamPath, Date.now())
+  publishedPaths.delete(streamPath)
   const camera = await server.prisma.camera.findUnique({
     where: { id: cameraId }, include: { nvr: true },
   }).catch(() => null)
@@ -687,11 +693,13 @@ async function releaseUnownedStream(
 }
 
 /**
- * Último retiro de cada path, para no emitir `removeStream` dos veces cuando
- * varios intentos concurrentes se cancelan a la vez.
+ * Paths actualmente PUBLICADOS en MediaMTX por este proceso.
+ *
+ * Es el hecho que gobierna el retiro: se marca al publicar y se desmarca al
+ * retirar, de modo que dos cancelaciones concurrentes emiten un solo
+ * `removeStream` y una publicación posterior vuelve a habilitar su limpieza.
  */
-const pathReleasedAt = new Map<string, number>()
-const PATH_RELEASE_DEDUP_MS = 5_000
+const publishedPaths = new Set<string>()
 
 /** ¿Todos los arranques en vuelo de este path perdieron a su dueño? */
 function isStartCancelled(streamPath: string): boolean {
@@ -708,11 +716,21 @@ function isStartCancelled(streamPath: string): boolean {
  * VIEW_CLOSED un arranque en vuelo de la cámara B de la misma grilla: cambiar
  * de cámara mataba el arranque de las demás (revisión de #147).
  */
-export function markViewClosed(userId: string, viewId: string): void {
+export function markViewClosed(
+  userId: string,
+  viewId: string,
+  ticket: RequestTicket = beginRequest(),
+): void {
   const nowMs = Date.now()
-  // El cierre se sella con la secuencia VIGENTE: toda petición con ticket menor
-  // o igual llegó antes que él.
-  viewClosedAt.set(vKey(userId, viewId), { atMs: nowMs, seq: requestSeq })
+  // Se sella con la secuencia del TICKET DE ESTA PETICIÓN DE CIERRE, no con el
+  // contador global vigente.
+  //
+  // Usar el global era la carrera INVERSA: si el cierre se demoraba en
+  // autenticarse y mientras tanto llegaba una reapertura legítima, el contador
+  // global ya incluía esa reapertura; al sellar con él, la reapertura quedaba
+  // por debajo del sello y se rechazaba pese a haber llegado después
+  // (revisión de #148, segunda vuelta).
+  viewClosedAt.set(vKey(userId, viewId), { atMs: nowMs, seq: ticket.seq })
   // Poda perezosa: no conservar cierres viejos para siempre.
   for (const [vk, mark] of viewClosedAt.entries()) {
     if (nowMs - mark.atMs > CLOSED_VIEW_MEMORY_MS) viewClosedAt.delete(vk)
@@ -726,8 +744,8 @@ export function markViewClosed(userId: string, viewId: string): void {
  * Marca el cierre de UNA cámara concreta de un view. Sólo cancela heartbeats y
  * arranques en vuelo de ESA cámara y tipo; el resto de la grilla sigue.
  */
-function markTargetClosed(key: string): void {
-  targetClosedAt.set(key, { atMs: Date.now(), seq: requestSeq })
+function markTargetClosed(key: string, ticket: RequestTicket): void {
+  targetClosedAt.set(key, { atMs: Date.now(), seq: ticket.seq })
 }
 
 /**
@@ -756,10 +774,15 @@ export function isTargetClosedAfter(
 }
 
 /** Sólo tests: limpia la memoria de cierres. */
+/** Sólo tests: ¿el proceso considera este path publicado en MediaMTX? */
+export function __isPathPublishedForTest(streamPath: string): boolean {
+  return publishedPaths.has(streamPath)
+}
+
 export function __resetClosedViewsForTest(): void {
   viewClosedAt.clear()
   targetClosedAt.clear()
-  pathReleasedAt.clear()
+  publishedPaths.clear()
   inFlightStarts.clear()
   transcodeWaiters.clear()
 }
@@ -1315,6 +1338,7 @@ async function startStreamCore(
     try {
       // Register passive RTSP receiver path in MediaMTX (no runOnDemand)
       const published = await publishTranscodedStream(nvr as any, camera as any)
+      if (published) publishedPaths.add(streamPath)
       if (!published) {
         transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
         resolveInFlight(false)
@@ -1477,6 +1501,8 @@ async function startStreamCore(
     // Retira SÓLO este intento: un reemplazo del mismo dueño sigue registrado.
     removeInFlightStart(streamPath, startAttemptId)
   }
+  // El path quedó publicado: habilita su retiro si más tarde nadie lo usa.
+  if (published) publishedPaths.add(streamPath)
   if (!published) {
     console.error(
       `[startStream] publish_failed cameraId=${cameraId} nvrId=${camera.nvr.id} ch=${camera.channel} path=${streamPath}`
@@ -1492,9 +1518,7 @@ async function startStreamCore(
     return abortResult('before_register')
   }
 
-  // El path vuelve a estar en uso: se olvida cualquier retiro previo para que
-  // un cierre posterior sí pueda volver a retirarlo.
-  pathReleasedAt.delete(streamPath)
+
 
   // ── Register session ──────────────────────────────────────────────────
   sessions.set(key, {
@@ -1518,6 +1542,8 @@ export async function stopStream(
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
   reason?: string,
   viewId?: string,
+  /** Ticket de la petición de cierre; lo estampa el hook `onRequest`. */
+  ticket: RequestTicket = beginRequest(),
 ): Promise<void> {
   // Una pestaña no puede cerrar la sesión de otra pestaña del mismo usuario:
   // sin viewId sólo se resuelve si la pertenencia es inequívoca.
@@ -1534,7 +1560,7 @@ export async function stopStream(
   // cámara sigue en vuelo todavía no hay fila que borrar, y sin esta marca el
   // arranque terminaría después registrando una sesión que el usuario ya cerró
   // — el mismo hueco que se tapó en `cleanupUserSessions`, aquí a nivel cámara.
-  if (key) markTargetClosed(key)
+  if (key) markTargetClosed(key, ticket)
   let killedFfmpeg = false
   let clearedInFlight = false
 
@@ -1649,7 +1675,7 @@ export async function reconcileView(
     // Con viewId: sin él, si el usuario tiene otra pestaña sobre la misma
     // cámara el resolutor lo considera ambiguo y IGNORA el cierre, dejando la
     // sesión obsoleta contando cupo hasta el TTL.
-    await stopStream(server, userId, cameraId, 'sub', 'viewport_reconcile', viewId)
+    await stopStream(server, userId, cameraId, 'sub', 'viewport_reconcile', viewId, ticket)
     stoppedIds.push(cameraId)
   }
 
@@ -1727,6 +1753,8 @@ export async function cleanupUserSessions(
   server: FastifyInstance,
   userId: string,
   viewId?: string,
+  /** Ticket de la petición de cierre; lo estampa el hook `onRequest`. */
+  ticket: RequestTicket = beginRequest(),
 ): Promise<number> {
   let targetSessions: StreamSession[]
 
@@ -1738,7 +1766,7 @@ export async function cleanupUserSessions(
     // al encontrar sesiones, acá habría cero, no se marcaría nada, y el
     // arranque terminaría después registrando una sesión y un FFmpeg sin
     // espectador — exactamente la sesión fantasma que A1 debía eliminar.
-    markViewClosed(userId, viewId)
+    markViewClosed(userId, viewId, ticket)
     targetSessions = getSessionsForUser(userId).filter(s => s.viewId === viewId)
     console.info(`[live] cleanup_view userId=${userId} viewId=${viewId} sessions=${targetSessions.length}`)
   } else {
@@ -1777,7 +1805,7 @@ export async function cleanupUserSessions(
     if (!sessions.has(key)) continue     // idempotente: ya cerrada por otra vía
     sessions.delete(key)
     removed++
-    markViewClosed(userId, session.viewId)
+    markViewClosed(userId, session.viewId, ticket)
     console.info(
       `[stream-manager] view_session_closed cameraId=${session.cameraId}` +
       ` streamType=${session.streamType} viewId=${session.viewId}` +
