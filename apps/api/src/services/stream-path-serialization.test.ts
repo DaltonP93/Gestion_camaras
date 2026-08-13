@@ -25,6 +25,13 @@ const mediamtxPaths = new Set<string>()
 const calls: string[] = []
 let deleteGate: Promise<void> | null = null
 let postGate: Promise<void> | null = null
+/**
+ * Ganchos del POST, para las pruebas que miden el MOMENTO de la revalidación.
+ * `onPostStarted` se dispara con el cerrojo ya tomado y antes de la compuerta;
+ * `onPostCompleted`, una vez que el path quedó publicado.
+ */
+let onPostStarted: (() => void) | null = null
+let onPostCompleted: (() => void) | null = null
 
 const pathFromUrl = (url: string) => decodeURIComponent(url.split('/').pop() as string)
 
@@ -32,10 +39,12 @@ vi.mock('axios', () => {
   const instance = {
     post: async (url: string) => {
       if (url.startsWith('/v3/config/paths/add/')) {
+        onPostStarted?.()
         if (postGate) await postGate
         const p = pathFromUrl(url)
         calls.push(`POST ${p}`)
         mediamtxPaths.add(p)
+        onPostCompleted?.()
         return { status: 200, data: {} }
       }
       return { status: 200, data: {} }
@@ -95,11 +104,30 @@ beforeEach(() => {
   calls.length = 0
   deleteGate = null
   postGate = null
+  onPostStarted = null
+  onPostCompleted = null
   // Ambas cachés de registro: sin limpiarlas, un alta posterior se saltaría el
   // POST por fingerprint y el test mediría otra cosa.
   clearRegisteredPath(PATH)
   clearRegisteredPath(SUB)
 })
+
+// ─── Auditoría de los callbacks constantes (A1.8, punto 7) ───────────────────
+//
+// Un `() => true` / `() => false` es legítimo cuando el caso comprueba una
+// DECISIÓN, y engañoso cuando pretende comprobar un MOMENTO: con un veredicto
+// fijo, la aserción sale igual se evalúe donde se evalúe. Clasificación de los
+// tres que quedan en este archivo:
+//
+//   A · `() => true`  — guarda legítima. Neutraliza la revalidación A PROPÓSITO
+//                       para que lo único que pueda salvar el path sea el
+//                       cerrojo, que es lo que el caso mide.
+//   B · `() => true`  — guarda legítima. Borrado normal, sin solapamiento.
+//   C · `() => false` — guarda legítima. Mide la DECISIÓN (un path readoptado
+//                       no se borra); no afirma nada sobre cuándo se consulta.
+//
+// Los casos F y G sí afirmaban un momento y por eso se reescribieron con estado
+// mutable y registro de eventos.
 
 describe('altas y bajas del mismo path no pueden solaparse', () => {
   it('(A) el DELETE en vuelo no retira una publicación posterior', async () => {
@@ -177,45 +205,100 @@ describe('altas y bajas de paths sub/main tampoco se solapan', () => {
   })
 })
 
-// ─── El DELETE que queda DETRÁS del alta (revisión de #154) ──────────────────
+// ─── El DELETE que queda DETRÁS del alta ─────────────────────────────────────
 //
-// El cerrojo ordena, pero no decide: si `publishStream` lo toma primero, el
+// El cerrojo ORDENA, pero no DECIDE: si `publishStream` lo toma primero, el
 // DELETE se ejecuta después del alta y `hasActiveConsumers` puede seguir
 // devolviendo cero, porque sólo cuenta consumidores externos y no ve al viewer
 // de live que acaba de adoptar el path. Por eso la baja necesita su propia
 // revalidación bajo el cerrojo.
-describe('la baja se revalida cuando el alta se le adelanta', () => {
-  it('(F) un DELETE encolado detrás de un alta no retira el path readoptado', async () => {
+//
+// La versión anterior de estos dos casos pasaba un callback CONSTANTE
+// (`() => false` / `() => true`). Eso comprobaba la decisión pero no el
+// momento: el test daba verde igual si la revalidación se evaluaba antes de
+// esperar el cerrojo, antes de iniciar el POST, con el POST pendiente o
+// después — es decir, no demostraba lo que afirmaba (revisión de #154,
+// r3775323456). Ahora el veredicto depende de un estado que SÓLO cambia
+// cuando el POST terminó, y cada consulta queda registrada en `events`.
+describe('la baja se revalida DESPUÉS del alta que se le adelantó', () => {
+  /**
+   * Monta la carrera con barreras explícitas, sin depender de una cantidad
+   * arbitraria de `tick()`:
+   *
+   *   publishStream toma el cerrojo → el POST queda detenido en la compuerta
+   *   → removeStream se encola (el registro en la cola es síncrono)
+   *   → se comprueba que la revalidación TODAVÍA no corrió
+   *   → se libera el POST → termina y (opcionalmente) aparece el dueño
+   *   → removeStream toma el cerrojo → recién ahí se revalida
+   */
+  async function bajaDetrasDelAlta(opts: { elAltaRegistraDueno: boolean }) {
+    const events: string[] = []
+    let ownerRegistered = false
+
+    let marcarPostIniciado!: () => void
+    const postIniciado = new Promise<void>(r => { marcarPostIniciado = r })
+
     let abrirPost!: () => void
     postGate = new Promise<void>(r => { abrirPost = r })
 
-    const publicando = publishStream(nvr, camera, 'sub')   // toma el cerrojo
-    for (let i = 0; i < 10; i++) await tick()
+    onPostStarted = () => { events.push('post_started'); marcarPostIniciado() }
+    onPostCompleted = () => {
+      if (opts.elAltaRegistraDueno) ownerRegistered = true
+      events.push('post_completed')
+    }
 
-    // La baja se encola DETRÁS del alta. Su revalidación dirá que el path ya
-    // tiene dueño (el viewer que acaba de adoptarlo).
-    const borrando = removeStream(nvr, camera, 'sub', () => false)
-    for (let i = 0; i < 10; i++) await tick()
-
-    abrirPost()
-    await Promise.all([publicando, borrando])
-
-    expect(mediamtxPaths.has(SUB)).toBe(true)
-    expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(0)
-  })
-
-  it('(G) sin dueño nuevo, ese mismo DELETE encolado sí retira el path', async () => {
-    let abrirPost!: () => void
-    postGate = new Promise<void>(r => { abrirPost = r })
+    const stillUnowned = () => {
+      events.push(`revalidate:${ownerRegistered}`)
+      return !ownerRegistered
+    }
 
     const publicando = publishStream(nvr, camera, 'sub')
-    for (let i = 0; i < 10; i++) await tick()
-    const borrando = removeStream(nvr, camera, 'sub', () => true)
-    for (let i = 0; i < 10; i++) await tick()
+    await postIniciado                       // barrera: el alta tiene el cerrojo
+
+    // El encolado en `withPathLock` ocurre de forma síncrona al llamar, así que
+    // en cuanto esta línea retorna la baja YA está detrás del alta en la cola.
+    const borrando = removeStream(nvr, camera, 'sub', stillUnowned)
+
+    // Foto del instante anterior a liberar el POST. Se devuelve en vez de
+    // afirmarse acá: si la aserción fallara con las promesas todavía en vuelo,
+    // el POST no se abriría nunca y el fallo llegaría como un timeout en vez
+    // de como lo que es.
+    const eventosAntesDeAbrir = [...events]
 
     abrirPost()
     await Promise.all([publicando, borrando])
 
+    return { events, eventosAntesDeAbrir }
+  }
+
+  it('(F) con un dueño nuevo, la revalidación corre después del POST y veta el DELETE', async () => {
+    const { events, eventosAntesDeAbrir } = await bajaDetrasDelAlta({ elAltaRegistraDueno: true })
+
+    // Nada de la baja corrió mientras el alta tenía el cerrojo.
+    expect(eventosAntesDeAbrir).toEqual(['post_started'])
+
+    // El MOMENTO: la revalidación vio el estado posterior al alta.
+    expect(events).toEqual(['post_started', 'post_completed', 'revalidate:true'])
+    expect(events.indexOf('post_completed')).toBeLessThan(events.indexOf('revalidate:true'))
+    expect(events).not.toContain('revalidate:false')
+    // Se consultó UNA sola vez.
+    expect(events.filter(e => e.startsWith('revalidate:'))).toHaveLength(1)
+    // Y la DECISIÓN: no se borra, el path del viewer nuevo sobrevive.
+    expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(0)
+    expect(mediamtxPaths.has(SUB)).toBe(true)
+  })
+
+  it('(G) sin dueño nuevo, esa misma revalidación posterior autoriza el DELETE', async () => {
+    const { events, eventosAntesDeAbrir } = await bajaDetrasDelAlta({ elAltaRegistraDueno: false })
+
+    // Nada de la baja corrió mientras el alta tenía el cerrojo.
+    expect(eventosAntesDeAbrir).toEqual(['post_started'])
+
+    expect(events).toEqual(['post_started', 'post_completed', 'revalidate:false'])
+    expect(events.indexOf('post_completed')).toBeLessThan(events.indexOf('revalidate:false'))
+    expect(events).not.toContain('revalidate:true')
+    expect(events.filter(e => e.startsWith('revalidate:'))).toHaveLength(1)
+    expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(1)
     expect(mediamtxPaths.has(SUB)).toBe(false)
   })
 })
