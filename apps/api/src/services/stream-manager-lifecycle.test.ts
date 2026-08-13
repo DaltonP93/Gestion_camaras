@@ -15,6 +15,7 @@ vi.mock('./stream', () => ({
   getWebRtcUrl: (p: string) => `https://w/${p}/whep`,
   publishStream: async () => true,
   removeStream: async () => true,
+  removeTranscodedPath: async () => true,
   getStreamStatus: async () => ({ ready: true }),
   publishTranscodedStream: async () => true,
   getTranscodedStreamPath: (p: string) => `${p}_h264`,

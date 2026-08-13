@@ -1047,6 +1047,48 @@ export async function removeStream(nvr: NVR, camera: Camera, streamType?: 'sub' 
   }
 }
 
+/**
+ * Retira de MediaMTX el path PASIVO de transcodificación (`..._main_h264`).
+ *
+ * `removeStream` recorre los paths `sub`/`main` DERIVADOS de la cámara, así que
+ * nunca tocaba el receptor creado por `publishTranscodedStream`: cada arranque
+ * descartado dejaba su configuración registrada y, cambio de canal tras cambio
+ * de canal, se acumulaban rutas huérfanas (revisión de #153). Acá se borra el
+ * path EXACTO y se invalida su caché de registro, con el mismo refcount de
+ * consumidores que usa `removeStream`.
+ *
+ * Devuelve si el path se retiró. Es best-effort: si la API de MediaMTX falla,
+ * la caché ya quedó invalidada para que un alta posterior lo reconfigure.
+ */
+export async function removeTranscodedPath(
+  streamPath: string,
+  /**
+   * Revalidación SÍNCRONA que se ejecuta inmediatamente antes del DELETE.
+   * Entre la comprobación de consumidores —que es `await`— y el borrado, otra
+   * petición puede republicar el path y adoptarlo; sin este último vistazo se
+   * borraría de MediaMTX una ruta que su nuevo dueño da por buena.
+   */
+  stillUnowned?: () => boolean,
+): Promise<boolean> {
+  try {
+    if (await hasActiveConsumers(streamPath)) {
+      console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=active_consumers`)
+      return false
+    }
+    if (stillUnowned && !stillUnowned()) {
+      console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=republished`)
+      return false
+    }
+    registeredPaths.delete(streamPath)
+    await mediamtxApi.delete('/v3/config/paths/delete/' + streamPath)
+    console.info(`[stream] mediamtx_transcoded_path_removed path=${streamPath}`)
+    return true
+  } catch {
+    registeredPaths.delete(streamPath)
+    return false
+  }
+}
+
 // ─── Publicar todos los streams de un NVR ───────────────────
 export async function publishAllStreams(
   nvr: NVR,
