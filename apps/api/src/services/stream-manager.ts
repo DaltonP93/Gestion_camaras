@@ -39,6 +39,13 @@ interface TranscodeInFlight {
   state: 'starting' | 'ready' | 'failed'
   promise: Promise<boolean>        // resolves true=ready, false=failed
   resolve: (v: boolean) => void    // called by the starter when done
+  /**
+   * Intento que escribió este estado. Sin identidad, un arranque viejo que se
+   * reanuda tarde pisaba el single-flight de otro que ya había tomado el path.
+   * El supervisor escribe sin `attemptId`: su estado describe al proceso, no a
+   * una petición, y cualquier intento puede reemplazarlo.
+   */
+  attemptId?: string
 }
 const transcodeInFlight = new Map<string, TranscodeInFlight>()
 
@@ -784,11 +791,67 @@ function dropSessionsByStreamPath(streamPath: string, reason: string): void {
  * dueño" (dos pestañas publicando el mismo path a la vez).
  */
 function pathHasOwner(streamPath: string, excludeAttemptId?: string): boolean {
+  // Un waiter tampoco adopta un arranque ya declarado FALLIDO: va a recibir el
+  // fallo y retirarse, así que contarlo como dueño dejaría el path conservado
+  // sin nadie detrás. Esto hace que la limpieza de un arranque fallido no
+  // dependa de cuándo se reanuden los que esperaban.
+  const waiterAdoptable =
+    hasWaiters(streamPath) &&
+    isTranscodeProcessAlive(streamPath) &&
+    transcodeInFlight.get(streamPath)?.state !== 'failed'
   return (
     toSessionTruths().some(s => s.streamPath === streamPath) ||
-    (hasWaiters(streamPath) && isTranscodeProcessAlive(streamPath)) ||
+    waiterAdoptable ||
     hasValidInFlightOwner(streamPath, excludeAttemptId)
   )
+}
+
+/**
+ * Escribe el estado del single-flight SÓLO si este intento sigue siendo su
+ * dueño. Un arranque viejo que se reanuda tarde no puede pisar el estado del
+ * que ya tomó el path. Devuelve si la escritura ocurrió.
+ */
+function setTranscodeInFlightOwned(
+  streamPath: string,
+  attemptId: string,
+  next: Omit<TranscodeInFlight, 'attemptId'>,
+): boolean {
+  const current = transcodeInFlight.get(streamPath)
+  if (current?.attemptId && current.attemptId !== attemptId) {
+    console.info(
+      `[transcode] inflight_write_skipped path=${streamPath}` +
+      ` owner=${current.attemptId} writer=${attemptId} state=${next.state}`
+    )
+    return false
+  }
+  transcodeInFlight.set(streamPath, { ...next, attemptId })
+  return true
+}
+
+/**
+ * ¿El single-flight guardado ya NO describe la realidad del path?
+ *
+ * Conservar un path porque tiene dueño no autoriza a conservar cualquier
+ * estado viejo: un `ready` sin proceso anunciaría un FFmpeg muerto, un
+ * `starting` sin arranque válido bloquearía el cupo para siempre, y un
+ * `failed` no describe a un path que se está conservando.
+ */
+function inFlightStateIsStale(streamPath: string, excludeAttemptId?: string): boolean {
+  const f = transcodeInFlight.get(streamPath)
+  if (!f) return false
+  // READY sólo vale mientras haya proceso detrás.
+  if (f.state === 'ready') return !isTranscodeProcessAlive(streamPath)
+  if (f.state === 'starting') {
+    // STARTING vale si OTRO arranque válido lo sostiene —el que se está
+    // descartando no cuenta— o si un waiter puede adoptar su proceso vivo.
+    // Sin la exclusión, el `starting` del intento descartado sobrevivía sin
+    // nadie que lo resolviera y ocupaba cupo para siempre.
+    const otroArranque  = hasValidInFlightOwner(streamPath, excludeAttemptId)
+    const waiterAdopta  = hasWaiters(streamPath) && isTranscodeProcessAlive(streamPath)
+    return !otroArranque && !waiterAdopta
+  }
+  // FAILED nunca describe a un path que se está conservando.
+  return true
 }
 
 async function releaseUnownedStream(
@@ -806,14 +869,29 @@ async function releaseUnownedStream(
     transcodeSourceInfo.has(streamPath) ||
     isTranscodeProcessAlive(streamPath)
 
-  transcodeInFlight.delete(streamPath)
-
-  const survivors = toSessionTruths()
-  const stillOwned = pathHasOwner(streamPath, excludeAttemptId)
-  if (stillOwned) {
+  // La propiedad se comprueba ANTES de tocar nada. Antes se borraba
+  // `transcodeInFlight` en la primera línea, así que un path CONSERVADO por
+  // otra sesión, un waiter o un arranque válido perdía igual su readiness: el
+  // proceso seguía vivo pero sin su estado compartido, y el arranque siguiente
+  // no lo adoptaba o levantaba un segundo FFmpeg (A1.7).
+  if (pathHasOwner(streamPath, excludeAttemptId)) {
+    // Conservar no es conservar a ciegas. Un estado que ya no describe al path
+    // vigente se descarta igual: es lo único que se toca de un path con dueño.
+    if (inFlightStateIsStale(streamPath, excludeAttemptId)) {
+      const dropped = transcodeInFlight.get(streamPath)?.state
+      transcodeInFlight.delete(streamPath)
+      console.info(
+        `[live] inflight_state_dropped path=${streamPath} state=${dropped} reason=stale_while_kept`
+      )
+    }
     console.info(`[live] start_aborted_keepalive path=${streamPath} reason=${reason} — otro viewer lo usa`)
     return true
   }
+
+  // Sin dueño: recién acá se retira el estado del path. El borrado ya no
+  // necesita respetar identidades —no hay nada de nadie que proteger—, pero la
+  // ESCRITURA sí (`setTranscodeInFlightOwned`).
+  transcodeInFlight.delete(streamPath)
 
   if (isTranscodeProcessAlive(streamPath)) {
     stopTranscodeProcess(streamPath)
@@ -872,14 +950,23 @@ async function releaseUnownedStream(
 
   // `removeStream` retira los paths `sub`/`main` DE LA CÁMARA, no este path en
   // concreto, así que sólo corresponde cuando ninguna sesión mira esa cámara.
-  if (survivors.some(s => s.cameraId === cameraId)) {
+  //
+  // Se RELEE después del `await` anterior: la lista capturada al principio de
+  // la función ya envejeció, y con ella se podía retirar los paths de una
+  // cámara que volvió a tener espectadores durante el borrado.
+  if (toSessionTruths().some(s => s.cameraId === cameraId)) {
     console.info(`[live] path_kept cameraId=${cameraId} reason=camera_still_watched`)
     return false
   }
   const camera = await server.prisma.camera.findUnique({
     where: { id: cameraId }, include: { nvr: true },
   }).catch(() => null)
-  if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
+  // La baja lleva su propia revalidación por path, que MediaMTX ejecuta con el
+  // cerrojo tomado: si un alta se le adelantó en la cola, el path vuelve a
+  // tener dueño y no se retira.
+  if (camera?.nvr) {
+    removeStream(camera.nvr, camera, undefined, p => !pathHasOwner(p)).catch(() => {})
+  }
   return false
 }
 
@@ -1001,6 +1088,73 @@ export function __hasMediaActivityForTest(streamPath: string): boolean {
 /** Sólo tests: paths con estado `transcodeInFlight` registrado. */
 export function __getTranscodeInFlightPathsForTest(): string[] {
   return Array.from(transcodeInFlight.keys())
+}
+
+/** Sólo tests: estado e identidad del single-flight de un path. */
+export function __getTranscodeInFlightForTest(
+  streamPath: string,
+): { state: string; attemptId?: string } | undefined {
+  const f = transcodeInFlight.get(streamPath)
+  return f ? { state: f.state, attemptId: f.attemptId } : undefined
+}
+
+/** Sólo tests: siembra historial de reinicios del supervisor para un path. */
+export function __setTranscodeRestartsForTest(streamPath: string): void {
+  transcodeRestarts.set(streamPath, {
+    count: 2, windowStart: Date.now(), lastExitCode: 1,
+    lastExitReason: 'RTSP_INPUT_EOF', lastExitAt: Date.now(),
+  })
+}
+
+/** Sólo tests: siembra un single-flight con dueño e identidad. */
+export function __setTranscodeInFlightForTest(
+  streamPath: string,
+  state: 'starting' | 'ready' | 'failed',
+  attemptId?: string,
+): (v: boolean) => void {
+  let resolve!: (v: boolean) => void
+  const promise = new Promise<boolean>(r => { resolve = r })
+  transcodeInFlight.set(streamPath, { state, promise, resolve, attemptId })
+  return resolve
+}
+
+/** Sólo tests: registra un arranque en vuelo sobre un path. */
+export function __addInFlightStartForTest(
+  streamPath: string, attemptId: string,
+  o: { userId: string; viewId: string; cameraId: string; ticket: RequestTicket },
+): void {
+  addInFlightStart(streamPath, attemptId, {
+    userId: o.userId, viewId: o.viewId, cameraId: o.cameraId,
+    streamType: 'main_h264', ticket: o.ticket,
+    sessionKey: sessionKey({ userId: o.userId, viewId: o.viewId, cameraId: o.cameraId, streamType: 'main_h264' }),
+  })
+}
+
+/** Sólo tests: suma una pestaña esperando el arranque compartido del path. */
+export function __addWaiterForTest(streamPath: string): void {
+  addWaiter(streamPath)
+}
+
+/** Sólo tests: marca el path como publicado en MediaMTX. */
+export function __markPathPublishedForTest(streamPath: string): void {
+  publishedPaths.add(streamPath)
+}
+
+/**
+ * Sólo tests: ejecuta la liberación tal cual la invoca el runtime.
+ *
+ * Es la unidad que A1.7 corrige, y sus entradas —sesiones, waiters, arranques
+ * en vuelo y estado por path— son todas internas del módulo. Llamarla directo
+ * permite fijar cada combinación sin montar una carrera distinta para cada una.
+ */
+export function __releaseUnownedStreamForTest(
+  server: FastifyInstance,
+  cameraId: string,
+  streamPath: string,
+  reason: string,
+  excludeAttemptId?: string,
+): Promise<boolean> {
+  return releaseUnownedStream(server, cameraId, streamPath, reason, excludeAttemptId)
 }
 
 /** Sólo tests: ¿queda información de origen para reiniciar este path? */
@@ -1565,7 +1719,9 @@ async function startStreamCore(
         // resuelve su propio single-flight como disponible. Sin `await` entre
         // esta relectura y el retorno.
         lastMediaActivity.set(current.streamPath, Date.now())
-        transcodeInFlight.set(current.streamPath, {
+        // Con identidad: si otro intento ya tomó el path, no se le pisa el
+        // estado (A1.7).
+        setTranscodeInFlightOwned(current.streamPath, opts.attemptId, {
           state: 'ready',
           promise: opts.inFlightPromise ?? Promise.resolve(true),
           resolve: () => {},
@@ -1728,22 +1884,92 @@ async function startStreamCore(
     let resolveInFlight!: (v: boolean) => void
     const readyPromise = new Promise<boolean>(r => { resolveInFlight = r })
     resolveInFlightRef = resolveInFlight
-    transcodeInFlight.set(streamPath, { state: 'starting', promise: readyPromise, resolve: resolveInFlight })
+    // RECLAMO del single-flight. Un estado OBSOLETO no puede bloquearlo: el
+    // caso concreto es un `ready` cuyo FFmpeg murió mientras el supervisor
+    // espera su backoff. Si la escritura se rechazaba en silencio, este
+    // arranque seguía sin publicar su promesa `starting` y otra petición
+    // concurrente levantaba un segundo FFmpeg o adoptaba un proceso que
+    // todavía no estaba listo (revisión de #154).
+    if (inFlightStateIsStale(streamPath)) {
+      const previo = transcodeInFlight.get(streamPath)?.state
+      transcodeInFlight.delete(streamPath)
+      console.info(`[transcode] inflight_state_dropped path=${streamPath} state=${previo} reason=stale_before_claim`)
+    }
+    const claimed = setTranscodeInFlightOwned(streamPath, startAttemptId, {
+      state: 'starting', promise: readyPromise, resolve: resolveInFlight,
+    })
+    if (!claimed) {
+      // Otro intento VIGENTE se adueñó del path entre la comprobación de
+      // reutilización y esta línea. No se spawnea un segundo FFmpeg encima:
+      // el cliente reintenta y caerá en la rama que espera al arranque en
+      // curso. Todavía no se registró nada, así que no hay nada que limpiar.
+      console.warn(`[transcode] claim_lost path=${streamPath} cameraId=${cameraId} attempt=${startAttemptId}`)
+      return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'TRANSCODE_NOT_READY',
+          message: 'Otro arranque tomó este stream. Intenta de nuevo.' } }
+    }
     // El arranque queda registrado con su dueño: si la pestaña se cierra, el
     // supervisor sabrá que este in-flight ya no autoriza ningún reinicio.
     addInFlightStart(streamPath, startAttemptId, {
       userId, viewId: effectiveViewId, cameraId, streamType, ticket, sessionKey: transcodeKey,
     })
 
+    /**
+     * Terminación ÚNICA de un arranque que ya había publicado (o intentado
+     * publicar) el path.
+     *
+     * Antes cada salida fallida posterior a `publishTranscodedStream` hacía su
+     * propia media limpieza —marcar `failed`, resolver el single-flight y, a
+     * veces, matar FFmpeg— y ninguna llamaba a la liberación. Quedaban el path
+     * pasivo en MediaMTX, `publishedPaths`, `transcodeSourceInfo`,
+     * `transcodeRestarts` y `lastMediaActivity` sin dueño (A1.7).
+     *
+     * Se ejecuta UNA SOLA VEZ aunque coincidan una salida explícita, el `catch`
+     * y el `finally`. No recibe `server`/`cameraId`/`streamPath`/`attemptId`
+     * como parámetros a propósito: son los del cierre, así que no pueden
+     * desincronizarse entre los cinco puntos de llamada — la duplicación de
+     * esos valores es justamente lo que produjo los defectos de #153.
+     */
+    let startFailureHandled = false
+    const cleanupFailedStart = async (reason: string): Promise<void> => {
+      if (startFailureHandled) return
+      startFailureHandled = true
+
+      // 1. El single-flight de ESTE intento pasa a `failed`. Si otro intento ya
+      //    se adueñó del path, la escritura se salta y su estado queda intacto.
+      setTranscodeInFlightOwned(streamPath, startAttemptId, {
+        state: 'failed', promise: readyPromise, resolve: resolveInFlight,
+      })
+      // 2. Los que esperaban se enteran ANTES de la limpieza. Un `failed` los
+      //    saca de la lista de adoptantes en `pathHasOwner`, así que la
+      //    liberación puede retirar el path sin depender de cuándo se reanuden.
+      resolveInFlight(false)
+      // 3. Limpieza ESPERADA, excluyendo este intento al comprobar propiedad.
+      //    Si apareció otro dueño real, `releaseUnownedStream` conserva todo.
+      const kept = await releaseUnownedStream(
+        server, cameraId, streamPath, reason, startAttemptId,
+      )
+      // 4. Si el path quedó sin dueño y este intento llegó a spawnear, se
+      //    recoge el proceso aunque ya hubiera salido solo: `stopTranscodeProcess`
+      //    es idempotente y libera el handle y su stderr.
+      if (!kept && spawnedByThisAttempt) stopTranscodeProcess(streamPath)
+    }
+    /** Igual que arriba, pero devolviendo el error TAL CUAL lo define el llamador. */
+    const failTranscodeStart = async (o: { reason: string; error: StreamError }) => {
+      await cleanupFailedStart(o.reason)
+      return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: o.error }
+    }
+    let spawnedByThisAttempt = false
+
     try {
       // Register passive RTSP receiver path in MediaMTX (no runOnDemand)
       const published = await publishTranscodedStream(nvr as any, camera as any)
       if (published) publishedPaths.add(streamPath)
       if (!published) {
-        transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
-        resolveInFlight(false)
-        return { hlsUrl: '', webrtcUrl: '', streamPath: '',
-          error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar path transcodificado en MediaMTX' } }
+        return await failTranscodeStart({
+          reason: 'publish_failed',
+          error: { code: 'MEDIA_SERVER_ERROR', message: 'Error al registrar path transcodificado en MediaMTX' },
+        })
       }
 
       // Spawn FFmpeg in the API container — MediaMTX container doesn't have FFmpeg
@@ -1751,14 +1977,15 @@ async function startStreamCore(
       // The spawn_abort log in stream.ts explains the reason; show it in the error detail too.
       const proc = spawnTranscodeProcess(nvr as any, camera as any, streamPath)
       if (!proc) {
-        transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
-        resolveInFlight(false)
         console.error(`[transcode] spawn_null cameraId=${cameraId} ch=${ch} path=${streamPath} — spawnTranscodeProcess returned null (see spawn_abort log above)`)
-        return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+        return await failTranscodeStart({
+          reason: 'spawn_null',
           error: { code: 'TRANSCODE_PROCESS_EXITED',
             message: 'FFmpeg no pudo iniciarse. Verifica credenciales NVR y que FFmpeg esté instalado en el contenedor API.',
-            details: `path=${streamPath} — ver logs [transcode] spawn_abort para causa exacta` } }
+            details: `path=${streamPath} — ver logs [transcode] spawn_abort para causa exacta` },
+        })
       }
+      spawnedByThisAttempt = true
       console.info(`[transcode] spawn_ok cameraId=${cameraId} ch=${ch} path=${streamPath} pid=${proc.pid ?? 'pending'}`)
 
       // Store source info for supervisor restarts and attach the supervisor
@@ -1777,14 +2004,13 @@ async function startStreamCore(
       if (!ready) {
         const stderrSnippet = getTranscodeStderr(streamPath)
         if (processExited) {
-          stopTranscodeProcess(streamPath)
-          transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
-          resolveInFlight(false)
           console.error(`[transcode] process_exited_early path=${streamPath} stderr=${stderrSnippet}`)
-          return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+          return await failTranscodeStart({
+            reason: 'process_exited_early',
             error: { code: 'TRANSCODE_PROCESS_EXITED',
               message: 'FFmpeg finalizó antes de que HLS estuviese listo. Verifica la conexión RTSP al NVR.',
-              details: stderrSnippet.slice(-200) } }
+              details: stderrSnippet.slice(-200) },
+          })
         }
         if (manifestVisible) {
           // MediaMTX is serving a manifest (status=200 + #EXTM3U) but segment
@@ -1817,14 +2043,13 @@ async function startStreamCore(
             inFlightPromise: readyPromise, resolveLocalReady: resolveInFlight,
           })
         }
-        stopTranscodeProcess(streamPath)
-        transcodeInFlight.set(streamPath, { state: 'failed', promise: readyPromise, resolve: resolveInFlight })
-        resolveInFlight(false)
         console.error(`[transcode] hls_not_ready_killing path=${streamPath} elapsedMs=${elapsedMs} lastStatus=${lastStatus} rtspActive=${rtspActive}`)
-        return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+        return await failTranscodeStart({
+          reason: 'hls_not_ready',
           error: { code: 'TRANSCODE_NOT_READY',
             message: 'El stream transcodificado no pudo iniciar a tiempo. Intenta de nuevo.',
-            details: `lastStatus=${lastStatus} elapsed=${elapsedMs}ms` } }
+            details: `lastStatus=${lastStatus} elapsed=${elapsedMs}ms` },
+        })
       }
 
       const reg = await registerTranscodeSession()
@@ -1835,9 +2060,10 @@ async function startStreamCore(
         inFlightPromise: readyPromise, resolveLocalReady: resolveInFlight,
       })
     } catch (err) {
-      stopTranscodeProcess(streamPath)
-      transcodeInFlight.delete(streamPath)
-      resolveInFlight(false)
+      // Misma limpieza que cualquier otra salida fallida, y el error ORIGINAL
+      // se relanza intacto. Si una salida explícita ya la ejecutó, el guardia
+      // la vuelve un no-op.
+      await cleanupFailedStart('exception_after_publish')
       throw err
     } finally {
       // El arranque dejó de estar en vuelo por cualquier vía (éxito, error o
@@ -2294,7 +2520,9 @@ export async function cleanupUserSessions(
       console.info(`[live] path_keep cameraId=${cameraId} reason=newer_session_registered`)
       continue
     }
-    if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
+    if (camera?.nvr) {
+      removeStream(camera.nvr, camera, undefined, p => !pathHasOwner(p)).catch(() => {})
+    }
   }
 
   // TERMINACIÓN: la decisión se calcula ACÁ, después del último `await`.
