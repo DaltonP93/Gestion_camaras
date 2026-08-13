@@ -32,6 +32,15 @@ let postGate: Promise<void> | null = null
  */
 let onPostStarted: (() => void) | null = null
 let onPostCompleted: (() => void) | null = null
+/**
+ * Lo mismo para la consulta de consumidores (`hasActiveConsumers`), que es el
+ * `await` que separa la toma del cerrojo de la revalidación. Sin una compuerta
+ * acá, una revalidación colocada DENTRO del cerrojo pero ANTES de esta consulta
+ * produce exactamente los mismos eventos (revisión de #155).
+ */
+let refcountGate: Promise<void> | null = null
+let onRefcountStarted: (() => void) | null = null
+let onRefcountCompleted: (() => void) | null = null
 
 const pathFromUrl = (url: string) => decodeURIComponent(url.split('/').pop() as string)
 
@@ -64,7 +73,12 @@ vi.mock('axios', () => {
 
 vi.mock('./stream-consumer-registry', () => ({
   getStreamConsumerRegistry: () => ({
-    count: async () => 0,
+    count: async () => {
+      onRefcountStarted?.()
+      if (refcountGate) await refcountGate
+      onRefcountCompleted?.()
+      return 0
+    },
     acquire: async () => {},
     release: async () => {},
   }),
@@ -106,6 +120,9 @@ beforeEach(() => {
   postGate = null
   onPostStarted = null
   onPostCompleted = null
+  refcountGate = null
+  onRefcountStarted = null
+  onRefcountCompleted = null
   // Ambas cachés de registro: sin limpiarlas, un alta posterior se saltaría el
   // POST por fingerprint y el test mediría otra cosa.
   clearRegisteredPath(PATH)
@@ -213,39 +230,58 @@ describe('altas y bajas de paths sub/main tampoco se solapan', () => {
 // de live que acaba de adoptar el path. Por eso la baja necesita su propia
 // revalidación bajo el cerrojo.
 //
-// La versión anterior de estos dos casos pasaba un callback CONSTANTE
-// (`() => false` / `() => true`). Eso comprobaba la decisión pero no el
-// momento: el test daba verde igual si la revalidación se evaluaba antes de
-// esperar el cerrojo, antes de iniciar el POST, con el POST pendiente o
-// después — es decir, no demostraba lo que afirmaba (revisión de #154,
-// r3775323456). Ahora el veredicto depende de un estado que SÓLO cambia
-// cuando el POST terminó, y cada consulta queda registrada en `events`.
-describe('la baja se revalida DESPUÉS del alta que se le adelantó', () => {
+// Estos casos comprueban el MOMENTO en el que se consulta esa revalidación, no
+// sólo su veredicto. Dos correcciones sucesivas los trajeron hasta acá:
+//
+//   · La primera versión pasaba un callback CONSTANTE (`() => false`), así que
+//     daba verde se evaluara donde se evaluara (revisión de #154, r3775323456).
+//   · La segunda demostraba "después del POST", pero no "después de
+//     `hasActiveConsumers`": una revalidación colocada dentro del cerrojo y
+//     antes de esa consulta producía los mismos eventos, y usaría un veredicto
+//     obsoleto si el dueño aparece mientras la consulta está pendiente
+//     (revisión de #155, r3777041102).
+//
+// Ahora el veredicto depende de un estado que cambia en un punto elegido por
+// cada caso, y las dos esperas del camino —el POST y el refcount— tienen su
+// propia compuerta y quedan registradas en `events`.
+describe('la baja se revalida DESPUÉS del alta y DESPUÉS del refcount', () => {
   /**
    * Monta la carrera con barreras explícitas, sin depender de una cantidad
    * arbitraria de `tick()`:
    *
-   *   publishStream toma el cerrojo → el POST queda detenido en la compuerta
+   *   publishStream toma el cerrojo → el POST se detiene en su compuerta
    *   → removeStream se encola (el registro en la cola es síncrono)
-   *   → se comprueba que la revalidación TODAVÍA no corrió
-   *   → se libera el POST → termina y (opcionalmente) aparece el dueño
-   *   → removeStream toma el cerrojo → recién ahí se revalida
+   *   → se fotografía que la revalidación todavía no corrió
+   *   → se libera el POST → termina el alta
+   *   → removeStream toma el cerrojo → consulta el refcount, que se detiene
+   *   → se libera el refcount → recién ahí se revalida
+   *
+   * `momentoDelDueno` elige en qué instante aparece el propietario nuevo, que
+   * es lo que distingue una revalidación bien ubicada de una prematura.
    */
-  async function bajaDetrasDelAlta(opts: { elAltaRegistraDueno: boolean }) {
+  async function bajaDetrasDelAlta(opts: {
+    momentoDelDueno: 'durante_el_post' | 'durante_el_refcount' | 'nunca'
+  }) {
     const events: string[] = []
     let ownerRegistered = false
 
     let marcarPostIniciado!: () => void
     const postIniciado = new Promise<void>(r => { marcarPostIniciado = r })
+    let marcarRefcountIniciado!: () => void
+    const refcountIniciado = new Promise<void>(r => { marcarRefcountIniciado = r })
 
     let abrirPost!: () => void
     postGate = new Promise<void>(r => { abrirPost = r })
+    let abrirRefcount!: () => void
+    refcountGate = new Promise<void>(r => { abrirRefcount = r })
 
     onPostStarted = () => { events.push('post_started'); marcarPostIniciado() }
     onPostCompleted = () => {
-      if (opts.elAltaRegistraDueno) ownerRegistered = true
+      if (opts.momentoDelDueno === 'durante_el_post') ownerRegistered = true
       events.push('post_completed')
     }
+    onRefcountStarted = () => { events.push('refcount_started'); marcarRefcountIniciado() }
+    onRefcountCompleted = () => { events.push('refcount_completed') }
 
     const stillUnowned = () => {
       events.push(`revalidate:${ownerRegistered}`)
@@ -261,43 +297,73 @@ describe('la baja se revalida DESPUÉS del alta que se le adelantó', () => {
 
     // Foto del instante anterior a liberar el POST. Se devuelve en vez de
     // afirmarse acá: si la aserción fallara con las promesas todavía en vuelo,
-    // el POST no se abriría nunca y el fallo llegaría como un timeout en vez
-    // de como lo que es.
+    // las compuertas no se abrirían y el fallo llegaría como un timeout.
     const eventosAntesDeAbrir = [...events]
 
     abrirPost()
+    // Barrera: la baja ya tiene el cerrojo y está consultando el refcount. Se
+    // compite contra el fin de la baja para que un camino que NUNCA llegue a
+    // consultarlo —una revalidación mal ubicada que retorna antes— falle por
+    // sus aserciones y no por un timeout.
+    await Promise.race([refcountIniciado, borrando])
+
+    // Foto del instante en que la consulta de consumidores está PENDIENTE.
+    const eventosDuranteElRefcount = [...events]
+    if (opts.momentoDelDueno === 'durante_el_refcount') ownerRegistered = true
+
+    abrirRefcount()
     await Promise.all([publicando, borrando])
 
-    return { events, eventosAntesDeAbrir }
+    return { events, eventosAntesDeAbrir, eventosDuranteElRefcount }
   }
 
-  it('(F) con un dueño nuevo, la revalidación corre después del POST y veta el DELETE', async () => {
-    const { events, eventosAntesDeAbrir } = await bajaDetrasDelAlta({ elAltaRegistraDueno: true })
+  /** Orden fijo del camino, sin contar la consulta de la revalidación. */
+  const CAMINO = ['post_started', 'post_completed', 'refcount_started', 'refcount_completed']
 
-    // Nada de la baja corrió mientras el alta tenía el cerrojo.
+  it('(F) con un dueño registrado durante el alta, la revalidación posterior veta el DELETE', async () => {
+    const { events, eventosAntesDeAbrir, eventosDuranteElRefcount } =
+      await bajaDetrasDelAlta({ momentoDelDueno: 'durante_el_post' })
+
+    // Nada de la baja corrió mientras el alta tenía el cerrojo…
     expect(eventosAntesDeAbrir).toEqual(['post_started'])
+    // …ni mientras la consulta de consumidores seguía pendiente.
+    expect(eventosDuranteElRefcount).toEqual(['post_started', 'post_completed', 'refcount_started'])
 
-    // El MOMENTO: la revalidación vio el estado posterior al alta.
-    expect(events).toEqual(['post_started', 'post_completed', 'revalidate:true'])
+    expect(events).toEqual([...CAMINO, 'revalidate:true'])
     expect(events.indexOf('post_completed')).toBeLessThan(events.indexOf('revalidate:true'))
+    expect(events.indexOf('refcount_completed')).toBeLessThan(events.indexOf('revalidate:true'))
     expect(events).not.toContain('revalidate:false')
-    // Se consultó UNA sola vez.
     expect(events.filter(e => e.startsWith('revalidate:'))).toHaveLength(1)
-    // Y la DECISIÓN: no se borra, el path del viewer nuevo sobrevive.
+
+    expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(0)
+    expect(mediamtxPaths.has(SUB)).toBe(true)
+  })
+
+  it('(H) un dueño que aparece MIENTRAS se consulta el refcount también veta el DELETE', async () => {
+    // Éste es el caso que distingue una revalidación bien ubicada de una que
+    // corre dentro del cerrojo pero antes de la consulta asíncrona: en ese
+    // momento el dueño todavía no existía.
+    const { events, eventosDuranteElRefcount } =
+      await bajaDetrasDelAlta({ momentoDelDueno: 'durante_el_refcount' })
+
+    expect(eventosDuranteElRefcount).toEqual(['post_started', 'post_completed', 'refcount_started'])
+    expect(events).toEqual([...CAMINO, 'revalidate:true'])
+    expect(events).not.toContain('revalidate:false')
+
     expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(0)
     expect(mediamtxPaths.has(SUB)).toBe(true)
   })
 
   it('(G) sin dueño nuevo, esa misma revalidación posterior autoriza el DELETE', async () => {
-    const { events, eventosAntesDeAbrir } = await bajaDetrasDelAlta({ elAltaRegistraDueno: false })
+    const { events, eventosAntesDeAbrir } =
+      await bajaDetrasDelAlta({ momentoDelDueno: 'nunca' })
 
-    // Nada de la baja corrió mientras el alta tenía el cerrojo.
     expect(eventosAntesDeAbrir).toEqual(['post_started'])
-
-    expect(events).toEqual(['post_started', 'post_completed', 'revalidate:false'])
-    expect(events.indexOf('post_completed')).toBeLessThan(events.indexOf('revalidate:false'))
+    expect(events).toEqual([...CAMINO, 'revalidate:false'])
+    expect(events.indexOf('refcount_completed')).toBeLessThan(events.indexOf('revalidate:false'))
     expect(events).not.toContain('revalidate:true')
     expect(events.filter(e => e.startsWith('revalidate:'))).toHaveLength(1)
+
     expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(1)
     expect(mediamtxPaths.has(SUB)).toBe(false)
   })
