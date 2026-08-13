@@ -25,6 +25,36 @@ const registeredPaths = new Map<string, string>()
 // Evita solicitudes concurrentes duplicadas para el mismo path
 const inFlightPaths   = new Set<string>()
 
+// ─── Serialización de altas y bajas POR PATH ────────────────────────────────
+// `inFlightPaths` es un "saltear si ya hay una en curso", no un cerrojo, y el
+// borrado ni siquiera participaba de él. Eso dejaba esta secuencia abierta:
+//
+//   la revalidación autoriza el borrado → se emite el DELETE y queda en vuelo
+//   → un arranque nuevo publica el MISMO path → termina el DELETE anterior
+//
+// El alta NO reparaba la ruta: el DELETE viejo retiraba la publicación nueva y
+// el espectador quedaba apuntando a un path inexistente. Está reproducido en
+// `stream-path-serialization.test.ts` (A1.7). Con este cerrojo FIFO por path,
+// un alta y una baja del mismo path no pueden solaparse nunca.
+const pathLocks = new Map<string, Promise<void>>()
+
+async function withPathLock<T>(streamPath: string, fn: () => Promise<T>): Promise<T> {
+  const previous = pathLocks.get(streamPath) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>(r => { release = r })
+  pathLocks.set(streamPath, gate)
+  // `previous` es siempre una compuerta que sólo se resuelve: esperar acá no
+  // puede propagar el error de la operación anterior.
+  await previous
+  try {
+    return await fn()
+  } finally {
+    release()
+    // Si nadie encoló detrás, se suelta la clave para no acumular entradas.
+    if (pathLocks.get(streamPath) === gate) pathLocks.delete(streamPath)
+  }
+}
+
 // ─── Refcount de consumidores por path (Analytics ⇄ Live View) ──────
 // MediaMTX ya cuenta lectores para el pull RTSP (sourceOnDemand), pero el
 // stream-manager de Node puede BORRAR el path (removeStream) cuando el último
@@ -944,6 +974,10 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
     return false
   }
 
+  // El resto —incluida la consulta a la caché de registro— va DENTRO del
+  // cerrojo del path: si hay un borrado en vuelo, esta alta espera a que
+  // termine en vez de cruzarse con él.
+  return withPathLock(streamPath, async () => {
   if (inFlightPaths.has(streamPath)) {
     console.info(`[transcode] register_path_skip path=${streamPath} reason=in_flight`)
     return true
@@ -1025,6 +1059,7 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
   } finally {
     inFlightPaths.delete(streamPath)
   }
+  })
 }
 
 // ─── Eliminar stream de MediaMTX ────────────────────────────
@@ -1070,6 +1105,10 @@ export async function removeTranscodedPath(
    */
   stillUnowned?: () => boolean,
 ): Promise<boolean> {
+  // Bajo el mismo cerrojo que las altas: un alta que llegue mientras el DELETE
+  // está en vuelo espera su turno y vuelve a registrar el path, en vez de que
+  // el DELETE viejo le retire la publicación nueva.
+  return withPathLock(streamPath, async () => {
   try {
     if (await hasActiveConsumers(streamPath)) {
       console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=active_consumers`)
@@ -1087,6 +1126,7 @@ export async function removeTranscodedPath(
     registeredPaths.delete(streamPath)
     return false
   }
+  })
 }
 
 // ─── Publicar todos los streams de un NVR ───────────────────
