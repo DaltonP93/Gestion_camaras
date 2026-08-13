@@ -877,6 +877,9 @@ export async function publishStream(nvr: NVR, camera: Camera, streamType: 'sub' 
     return false
   }
 
+  // Bajo el mismo cerrojo por path que las bajas: un `removeStream` en vuelo no
+  // puede cruzarse con esta alta y retirarla después (revisión de #154).
+  return withPathLock(streamPath, async () => {
   // Evitar solicitudes concurrentes duplicadas para el mismo path
   if (inFlightPaths.has(streamPath)) return true
 
@@ -958,6 +961,7 @@ export async function publishStream(nvr: NVR, camera: Camera, streamType: 'sub' 
   } finally {
     inFlightPaths.delete(streamPath)
   }
+  })
 }
 
 // ─── Publicar path receptor pasivo para stream transcodificado ──
@@ -1066,19 +1070,24 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
 export async function removeStream(nvr: NVR, camera: Camera, streamType?: 'sub' | 'main'): Promise<void> {
   const typesToRemove: ('sub' | 'main')[] = streamType ? [streamType] : ['sub', 'main']
   for (const t of typesToRemove) {
-    try {
-      const streamPath = getStreamPath(nvr, camera, t)
-      // Refcount: no borrar el path si aún tiene consumidores vigentes
-      // (analytics/recording/diagnostic). Solo se fue el viewer de live.
-      if (await hasActiveConsumers(streamPath)) {
-        console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=active_consumers`)
-        continue
+    const streamPath = getStreamPath(nvr, camera, t)
+    // Cada path se retira bajo SU cerrojo: la comprobación de consumidores es
+    // un `await`, y sin serializar contra `publishStream` un alta que llegara
+    // en esa ventana quedaba retirada por este DELETE (revisión de #154).
+    await withPathLock(streamPath, async () => {
+      try {
+        // Refcount: no borrar el path si aún tiene consumidores vigentes
+        // (analytics/recording/diagnostic). Solo se fue el viewer de live.
+        if (await hasActiveConsumers(streamPath)) {
+          console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=active_consumers`)
+          return
+        }
+        registeredPaths.delete(streamPath)
+        await mediamtxApi.delete('/v3/config/paths/delete/' + streamPath)
+      } catch {
+        // Ignorar errores al eliminar
       }
-      registeredPaths.delete(streamPath)
-      await mediamtxApi.delete('/v3/config/paths/delete/' + streamPath)
-    } catch {
-      // Ignorar errores al eliminar
-    }
+    })
   }
 }
 

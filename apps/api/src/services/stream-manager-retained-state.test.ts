@@ -23,6 +23,10 @@ const removedPaths: string[] = []
 const spawned: string[] = []
 const aliveProcesses = new Set<string>()
 let hlsReadyGate: Promise<void> | null = null
+/** Compuerta DENTRO del borrado en MediaMTX: modela el await de consumidores. */
+let removalGate: Promise<void> | null = null
+/** Paths que la revalidación previa al DELETE decidió conservar. */
+const keptPaths: string[] = []
 /** Resultado forzado de waitForHlsReady, para recorrer cada salida fallida. */
 let hlsOutcome: 'ready' | 'exited' | 'timeout' = 'ready'
 /** Si es true, `spawnTranscodeProcess` devuelve null (falla el arranque). */
@@ -40,8 +44,11 @@ vi.mock('./stream', () => ({
   getWebRtcUrl: (p: string) => `https://w/${p}/whep`,
   publishStream: async () => true,
   removeStream: async (_n: any, cam: any) => { removed.push(cam.id); return true },
+  // Réplica fiel del helper real: la comprobación de consumidores es un
+  // `await` (acá, la compuerta) y la revalidación síncrona corre DESPUÉS.
   removeTranscodedPath: async (p: string, stillUnowned?: () => boolean) => {
-    if (stillUnowned && !stillUnowned()) return false
+    if (removalGate) await removalGate
+    if (stillUnowned && !stillUnowned()) { keptPaths.push(p); return false }
     removedPaths.push(p); return true
   },
   getStreamStatus: async () => ({ ready: true }),
@@ -133,7 +140,9 @@ function seedPathVivo(): void {
 beforeEach(() => {
   __resetSessionsForTest()
   __resetClosedViewsForTest()
-  stopped.length = 0; removed.length = 0; spawned.length = 0; removedPaths.length = 0
+  stopped.length = 0; removed.length = 0; spawned.length = 0
+  removedPaths.length = 0; keptPaths.length = 0
+  removalGate = null
   aliveProcesses.clear()
   hlsReadyGate = null
   hlsOutcome = 'ready'
@@ -217,17 +226,27 @@ describe('P1 · conservar el path es conservar también su estado', () => {
     expect(__isPathPublishedForTest(PATH)).toBe(true)
   })
 
-  it('(9) un dueño que aparece durante la limpieza impide retirar su path', async () => {
-    // La revalidación del borrado se ejecuta con el dueño ya registrado.
+  it('(9) un dueño que aparece DURANTE la limpieza impide retirar su path', async () => {
+    // La liberación arranca SIN dueño —si no, retornaría en la primera
+    // comprobación y nunca llegaría a la revalidación que este caso audita—.
+    // El dueño se registra mientras el borrado espera a los consumidores, y la
+    // revalidación síncrona previa al DELETE es la única que puede verlo.
     seedPathVivo()
     __setTranscodeInFlightForTest(PATH, 'starting', 'intentoViejo')
+
+    let abrirBorrado!: () => void
+    removalGate = new Promise<void>(r => { abrirBorrado = r })
+
+    const liberando = __releaseUnownedStreamForTest(makeServer(), 'camH', PATH, 'test', 'intentoViejo')
+    for (let i = 0; i < 20; i++) await tick()
+    expect(removedPaths).toEqual([])            // detenido dentro del borrado
+
     seedSesion({ userId: 'u9', viewId: 'v9', cameraId: 'camH', streamPath: PATH })
+    abrirBorrado()
+    await liberando
 
-    const kept = await __releaseUnownedStreamForTest(makeServer(), 'camH', PATH, 'test', 'intentoViejo')
-
-    expect(kept).toBe(true)
-    expect(removedPaths).toEqual([])
-    expect(stopped).toEqual([])
+    expect(keptPaths).toContain(PATH)           // la revalidación lo vio
+    expect(removedPaths).toEqual([])            // y no se emitió el DELETE
   })
 
   it('(10)(13) la limpieza concurrente es idempotente y emite un solo DELETE', async () => {

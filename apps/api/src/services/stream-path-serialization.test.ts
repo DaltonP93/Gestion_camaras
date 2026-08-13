@@ -77,6 +77,7 @@ vi.mock('child_process', () => ({
 
 const {
   publishTranscodedStream, removeTranscodedPath, clearRegisteredPath, getTranscodedStreamPath,
+  publishStream, removeStream, getStreamPath,
 } = await import('./stream')
 
 const nvr: any = {
@@ -85,6 +86,7 @@ const nvr: any = {
 }
 const camera: any = { id: 'camX', channel: 9, name: 'cam' }
 const PATH = getTranscodedStreamPath(nvr, camera)
+const SUB  = getStreamPath(nvr, camera, 'sub')
 
 const tick = () => new Promise(r => setImmediate(r))
 
@@ -93,7 +95,10 @@ beforeEach(() => {
   calls.length = 0
   deleteGate = null
   postGate = null
+  // Ambas cachés de registro: sin limpiarlas, un alta posterior se saltaría el
+  // POST por fingerprint y el test mediría otra cosa.
   clearRegisteredPath(PATH)
+  clearRegisteredPath(SUB)
 })
 
 describe('altas y bajas del mismo path no pueden solaparse', () => {
@@ -134,5 +139,40 @@ describe('altas y bajas del mismo path no pueden solaparse', () => {
     expect(retirado).toBe(false)
     expect(mediamtxPaths.has(PATH)).toBe(true)
     expect(calls.filter(c => c.startsWith('DELETE')).length).toBe(0)
+  })
+})
+
+// ─── Los paths `sub`/`main` corren el mismo riesgo (revisión de #154) ────────
+//
+// `publishStream` y `removeStream` no participaban del cerrojo, y `removeStream`
+// espera a `hasActiveConsumers` antes de borrar: en esa ventana un arranque
+// nuevo podía publicar el path y quedarse sin él. Además, la caché de registro
+// permitía que el alta retornara sin emitir un POST propio, de modo que nadie
+// reparaba la ruta.
+describe('altas y bajas de paths sub/main tampoco se solapan', () => {
+  it('(D) el DELETE de removeStream no retira una publicación posterior', async () => {
+    await publishStream(nvr, camera, 'sub')
+    expect(mediamtxPaths.has(SUB)).toBe(true)
+
+    let abrirDelete!: () => void
+    deleteGate = new Promise<void>(r => { abrirDelete = r })
+    const borrando = removeStream(nvr, camera, 'sub')
+    for (let i = 0; i < 10; i++) await tick()
+
+    // Un viewer nuevo adopta el mismo path mientras el DELETE está en vuelo.
+    const publicando = publishStream(nvr, camera, 'sub')
+    for (let i = 0; i < 10; i++) await tick()
+
+    abrirDelete()
+    await Promise.all([borrando, publicando])
+
+    expect(mediamtxPaths.has(SUB)).toBe(true)
+  })
+
+  it('(E) sin solapamiento, removeStream sigue retirando el path', async () => {
+    await publishStream(nvr, camera, 'sub')
+    await removeStream(nvr, camera, 'sub')
+
+    expect(mediamtxPaths.has(SUB)).toBe(false)
   })
 })
