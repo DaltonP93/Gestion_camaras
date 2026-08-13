@@ -320,6 +320,25 @@ describe('la baja se revalida DESPUÉS del alta y DESPUÉS del refcount', () => 
   /** Orden fijo del camino, sin contar la consulta de la revalidación. */
   const CAMINO = ['post_started', 'post_completed', 'refcount_started', 'refcount_completed']
 
+  /**
+   * Vuelve a publicar el mismo path, sin ganchos ni compuertas.
+   *
+   * Sirve para observar la CACHÉ DE REGISTRO sin instrumentar internals: si el
+   * fingerprint sigue vigente, `publishStream` corta sin emitir POST. Es lo que
+   * distingue una revalidación que precede a TODA la parte destructiva de una
+   * que corre después de `registeredPaths.delete()` — esa invalida la caché
+   * aunque después vete el DELETE, y la publicación siguiente reintenta un POST
+   * duplicado que en MediaMTX real termina en un PATCH sobre una ruta en uso
+   * (revisión de #155, r3777261444).
+   */
+  async function republicarSinCompuertas() {
+    onPostStarted = null
+    onPostCompleted = null
+    postGate = null
+    await publishStream(nvr, camera, 'sub')
+  }
+  const postsDe = (path: string) => calls.filter(c => c === `POST ${path}`)
+
   it('(F) con un dueño registrado durante el alta, la revalidación posterior veta el DELETE', async () => {
     const { events, eventosAntesDeAbrir, eventosDuranteElRefcount } =
       await bajaDetrasDelAlta({ momentoDelDueno: 'durante_el_post' })
@@ -337,6 +356,12 @@ describe('la baja se revalida DESPUÉS del alta y DESPUÉS del refcount', () => 
 
     expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(0)
     expect(mediamtxPaths.has(SUB)).toBe(true)
+
+    // El veto llegó ANTES de cualquier efecto destructivo: la caché de registro
+    // quedó intacta, así que republicar no emite un POST nuevo.
+    expect(postsDe(SUB)).toHaveLength(1)
+    await republicarSinCompuertas()
+    expect(postsDe(SUB)).toHaveLength(1)
   })
 
   it('(H) un dueño que aparece MIENTRAS se consulta el refcount también veta el DELETE', async () => {
@@ -352,6 +377,10 @@ describe('la baja se revalida DESPUÉS del alta y DESPUÉS del refcount', () => 
 
     expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(0)
     expect(mediamtxPaths.has(SUB)).toBe(true)
+
+    // Igual que en F: nada destructivo ocurrió, ni siquiera la invalidación.
+    await republicarSinCompuertas()
+    expect(postsDe(SUB)).toHaveLength(1)
   })
 
   it('(G) sin dueño nuevo, esa misma revalidación posterior autoriza el DELETE', async () => {
@@ -366,5 +395,12 @@ describe('la baja se revalida DESPUÉS del alta y DESPUÉS del refcount', () => 
 
     expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(1)
     expect(mediamtxPaths.has(SUB)).toBe(false)
+
+    // El inverso de F y H: acá el borrado sí ocurrió, así que la caché quedó
+    // invalidada y la publicación siguiente vuelve a registrar el path. Sin
+    // esta comprobación, la de F/H podría pasar por no invalidarse NUNCA.
+    await republicarSinCompuertas()
+    expect(postsDe(SUB)).toHaveLength(2)
+    expect(mediamtxPaths.has(SUB)).toBe(true)
   })
 })
