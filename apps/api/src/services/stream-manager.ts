@@ -772,6 +772,25 @@ function dropSessionsByStreamPath(streamPath: string, reason: string): void {
  * quedó sin dueño. El llamador lo necesita para no anunciar como caído un
  * proceso que sigue vivo y con espectadores.
  */
+/**
+ * Regla ÚNICA de propiedad de un path. Se evalúa en el momento: es una lectura
+ * síncrona, así que sirve tanto para decidir la liberación como para revalidar
+ * justo antes de un borrado, después de cualquier `await`.
+ *
+ * Dueños válidos: sesiones ya registradas, pestañas esperando un arranque
+ * compartido —pero sólo si el proceso sigue vivo, porque un waiter no puede
+ * adoptar lo que ya no existe— y OTROS arranques en vuelo no cancelados sobre
+ * el mismo path, que es el caso legítimo de "todavía no hay proceso pero sí
+ * dueño" (dos pestañas publicando el mismo path a la vez).
+ */
+function pathHasOwner(streamPath: string, excludeAttemptId?: string): boolean {
+  return (
+    toSessionTruths().some(s => s.streamPath === streamPath) ||
+    (hasWaiters(streamPath) && isTranscodeProcessAlive(streamPath)) ||
+    hasValidInFlightOwner(streamPath, excludeAttemptId)
+  )
+}
+
 async function releaseUnownedStream(
   server: FastifyInstance,
   cameraId: string,
@@ -789,22 +808,8 @@ async function releaseUnownedStream(
 
   transcodeInFlight.delete(streamPath)
 
-  // Dueños válidos: sesiones ya registradas, pestañas esperando el arranque
-  // compartido, y OTROS arranques en vuelo no cancelados sobre el mismo path
-  // (el caso de dos pestañas publicando el mismo `sub` a la vez, que
-  // `transcodeWaiters` no cubre porque sólo sigue transcodificaciones).
   const survivors = toSessionTruths()
-  // Un WAITER sólo es dueño de algo que todavía existe. Si el proceso ya murió,
-  // los que esperan van a recibir un fallo y retirarse, y nadie volvería a
-  // ejecutar esta liberación: contarlos como dueños dejaba el path publicado y
-  // con su info de origen, sus reinicios y su actividad colgando sin nadie
-  // detrás (revisión de #153). El arranque en vuelo ajeno se comprueba aparte,
-  // que es el caso legítimo de "todavía no hay proceso pero sí dueño".
-  const waiterAdoptable = hasWaiters(streamPath) && isTranscodeProcessAlive(streamPath)
-  const stillOwned =
-    survivors.some(s => s.streamPath === streamPath) ||
-    waiterAdoptable ||
-    hasValidInFlightOwner(streamPath, excludeAttemptId)
+  const stillOwned = pathHasOwner(streamPath, excludeAttemptId)
   if (stillOwned) {
     console.info(`[live] start_aborted_keepalive path=${streamPath} reason=${reason} — otro viewer lo usa`)
     return true
@@ -851,8 +856,18 @@ async function releaseUnownedStream(
   // `main_h264` quedaba configurado en MediaMTX para siempre y cada repunte de
   // canal acumulaba una ruta huérfana más (revisión de #153). No sustituye a la
   // limpieza por cámara de abajo: son paths distintos.
+  //
+  // El borrado espera a `hasActiveConsumers`, y en esa ventana otra petición
+  // puede volver a publicar el MISMO path y adoptarlo —un repunte rápido que
+  // regresa al canal anterior—. Por eso se le pasa una revalidación SÍNCRONA
+  // que el helper ejecuta inmediatamente antes del DELETE: la propiedad se
+  // comprueba de nuevo, y la republicación se detecta porque el alta registra
+  // su arranque en vuelo ANTES de publicar y vuelve a marcar `publishedPaths`
+  // (revisión de #153).
   if (isTranscodePath) {
-    await removeTranscodedPath(streamPath).catch(() => false)
+    const sigueSinDueno = () =>
+      !pathHasOwner(streamPath, excludeAttemptId) && !publishedPaths.has(streamPath)
+    await removeTranscodedPath(streamPath, sigueSinDueno).catch(() => false)
   }
 
   // `removeStream` retira los paths `sub`/`main` DE LA CÁMARA, no este path en

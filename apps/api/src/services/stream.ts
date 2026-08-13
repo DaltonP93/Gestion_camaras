@@ -1060,10 +1060,23 @@ export async function removeStream(nvr: NVR, camera: Camera, streamType?: 'sub' 
  * Devuelve si el path se retiró. Es best-effort: si la API de MediaMTX falla,
  * la caché ya quedó invalidada para que un alta posterior lo reconfigure.
  */
-export async function removeTranscodedPath(streamPath: string): Promise<boolean> {
+export async function removeTranscodedPath(
+  streamPath: string,
+  /**
+   * Revalidación SÍNCRONA que se ejecuta inmediatamente antes del DELETE.
+   * Entre la comprobación de consumidores —que es `await`— y el borrado, otra
+   * petición puede republicar el path y adoptarlo; sin este último vistazo se
+   * borraría de MediaMTX una ruta que su nuevo dueño da por buena.
+   */
+  stillUnowned?: () => boolean,
+): Promise<boolean> {
   try {
     if (await hasActiveConsumers(streamPath)) {
       console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=active_consumers`)
+      return false
+    }
+    if (stillUnowned && !stillUnowned()) {
+      console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=republished`)
       return false
     }
     registeredPaths.delete(streamPath)

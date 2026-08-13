@@ -24,6 +24,10 @@ const removedPaths: string[] = []
 const spawned: string[] = []
 const aliveProcesses = new Set<string>()
 let hlsReadyGate: Promise<void> | null = null
+/** Compuerta dentro del borrado en MediaMTX: modela el await de consumidores. */
+let removalGate: Promise<void> | null = null
+/** Paths que el borrado conservó porque la revalidación dijo que tenían dueño. */
+const keptPaths: string[] = []
 
 vi.mock('./stream', () => ({
   getStreamPath: (_n: any, cam: any, type = 'sub') => `p_${cam?.id ?? 'cam'}_${type}`,
@@ -31,7 +35,13 @@ vi.mock('./stream', () => ({
   getWebRtcUrl: (p: string) => `https://w/${p}/whep`,
   publishStream: async () => true,
   removeStream: async (_n: any, cam: any) => { removed.push(cam.id); return true },
-  removeTranscodedPath: async (p: string) => { removedPaths.push(p); return true },
+  // Réplica fiel del helper real: espera (como `hasActiveConsumers`) y sólo
+  // entonces revalida de forma síncrona antes de borrar.
+  removeTranscodedPath: async (p: string, stillUnowned?: () => boolean) => {
+    if (removalGate) await removalGate
+    if (stillUnowned && !stillUnowned()) { keptPaths.push(p); return false }
+    removedPaths.push(p); return true
+  },
   getStreamStatus: async () => ({ ready: true }),
   publishTranscodedStream: async () => true,
   // El path depende del CANAL: cambiarlo entre dos lecturas de la base es lo
@@ -151,7 +161,9 @@ async function repunteTrasRegistro(extras?: {
 beforeEach(() => {
   __resetSessionsForTest()
   __resetClosedViewsForTest()
-  stopped.length = 0; removed.length = 0; spawned.length = 0; removedPaths.length = 0
+  stopped.length = 0; removed.length = 0; spawned.length = 0
+  removedPaths.length = 0; keptPaths.length = 0
+  removalGate = null
   aliveProcesses.clear()
   hlsReadyGate = null
 })
@@ -448,5 +460,55 @@ describe('el path transcodificado descartado se retira de MediaMTX', () => {
     await Promise.all([iniciador, waiter])
 
     expect(removedPaths).toContain(PATH_A)
+  })
+})
+
+// ─── El borrado se revalida contra republicaciones (revisión de #153) ────────
+
+describe('el borrado en MediaMTX no pisa una republicación del mismo path', () => {
+  it('(23) si otra petición readopta el path durante el borrado, no se retira', async () => {
+    let abrirHls!: () => void
+    hlsReadyGate = new Promise<void>(r => { abrirHls = r })
+    let abrirBorrado!: () => void
+    removalGate = new Promise<void>(r => { abrirBorrado = r })
+
+    let canal = 1
+    const server = makeServerCanal(() => canal)
+
+    const viejo = startStream(server, 'u1', 'camH', 'v1', 'main_h264', ticket())
+    await esperarSpawn(1)
+    canal = 2
+    const nuevo = startStream(server, 'u1', 'camH', 'v1', 'main_h264', ticket())
+    await esperarSpawn(2)
+
+    abrirHls()
+    // El repunte libera PATH_A y queda detenido dentro del borrado.
+    for (let i = 0; i < 30; i++) await tick()
+    expect(removedPaths).not.toContain(PATH_A)      // todavía no borró nada
+
+    // Otra pestaña vuelve al canal 1: republica y readopta PATH_A.
+    canal = 1
+    hlsReadyGate = null
+    const tercero = startStream(server, 'u3', 'camH', 'v3', 'main_h264', ticket())
+    await esperarSpawn(3)
+
+    abrirBorrado()
+    const [, , r3] = await Promise.all([viejo, nuevo, tercero])
+
+    // La revalidación síncrona ve al dueño nuevo y conserva la ruta.
+    expect(keptPaths).toContain(PATH_A)
+    expect(removedPaths).not.toContain(PATH_A)
+    expect(r3.error).toBeUndefined()
+    expect(r3.streamPath).toBe(PATH_A)
+    expect(aliveProcesses.has(PATH_A)).toBe(true)
+    expect(__isPathPublishedForTest(PATH_A)).toBe(true)
+  })
+
+  it('(24) sin republicación, la revalidación deja borrar', async () => {
+    removalGate = Promise.resolve()
+    await repunteTrasRegistro()
+
+    expect(removedPaths).toContain(PATH_A)
+    expect(keptPaths).not.toContain(PATH_A)
   })
 })
