@@ -961,7 +961,12 @@ async function releaseUnownedStream(
   const camera = await server.prisma.camera.findUnique({
     where: { id: cameraId }, include: { nvr: true },
   }).catch(() => null)
-  if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
+  // La baja lleva su propia revalidación por path, que MediaMTX ejecuta con el
+  // cerrojo tomado: si un alta se le adelantó en la cola, el path vuelve a
+  // tener dueño y no se retira.
+  if (camera?.nvr) {
+    removeStream(camera.nvr, camera, undefined, p => !pathHasOwner(p)).catch(() => {})
+  }
   return false
 }
 
@@ -1091,6 +1096,14 @@ export function __getTranscodeInFlightForTest(
 ): { state: string; attemptId?: string } | undefined {
   const f = transcodeInFlight.get(streamPath)
   return f ? { state: f.state, attemptId: f.attemptId } : undefined
+}
+
+/** Sólo tests: siembra historial de reinicios del supervisor para un path. */
+export function __setTranscodeRestartsForTest(streamPath: string): void {
+  transcodeRestarts.set(streamPath, {
+    count: 2, windowStart: Date.now(), lastExitCode: 1,
+    lastExitReason: 'RTSP_INPUT_EOF', lastExitAt: Date.now(),
+  })
 }
 
 /** Sólo tests: siembra un single-flight con dueño e identidad. */
@@ -1871,7 +1884,30 @@ async function startStreamCore(
     let resolveInFlight!: (v: boolean) => void
     const readyPromise = new Promise<boolean>(r => { resolveInFlight = r })
     resolveInFlightRef = resolveInFlight
-    setTranscodeInFlightOwned(streamPath, startAttemptId, { state: 'starting', promise: readyPromise, resolve: resolveInFlight })
+    // RECLAMO del single-flight. Un estado OBSOLETO no puede bloquearlo: el
+    // caso concreto es un `ready` cuyo FFmpeg murió mientras el supervisor
+    // espera su backoff. Si la escritura se rechazaba en silencio, este
+    // arranque seguía sin publicar su promesa `starting` y otra petición
+    // concurrente levantaba un segundo FFmpeg o adoptaba un proceso que
+    // todavía no estaba listo (revisión de #154).
+    if (inFlightStateIsStale(streamPath)) {
+      const previo = transcodeInFlight.get(streamPath)?.state
+      transcodeInFlight.delete(streamPath)
+      console.info(`[transcode] inflight_state_dropped path=${streamPath} state=${previo} reason=stale_before_claim`)
+    }
+    const claimed = setTranscodeInFlightOwned(streamPath, startAttemptId, {
+      state: 'starting', promise: readyPromise, resolve: resolveInFlight,
+    })
+    if (!claimed) {
+      // Otro intento VIGENTE se adueñó del path entre la comprobación de
+      // reutilización y esta línea. No se spawnea un segundo FFmpeg encima:
+      // el cliente reintenta y caerá en la rama que espera al arranque en
+      // curso. Todavía no se registró nada, así que no hay nada que limpiar.
+      console.warn(`[transcode] claim_lost path=${streamPath} cameraId=${cameraId} attempt=${startAttemptId}`)
+      return { hlsUrl: '', webrtcUrl: '', streamPath: '',
+        error: { code: 'TRANSCODE_NOT_READY',
+          message: 'Otro arranque tomó este stream. Intenta de nuevo.' } }
+    }
     // El arranque queda registrado con su dueño: si la pestaña se cierra, el
     // supervisor sabrá que este in-flight ya no autoriza ningún reinicio.
     addInFlightStart(streamPath, startAttemptId, {
@@ -2484,7 +2520,9 @@ export async function cleanupUserSessions(
       console.info(`[live] path_keep cameraId=${cameraId} reason=newer_session_registered`)
       continue
     }
-    if (camera?.nvr) removeStream(camera.nvr, camera).catch(() => {})
+    if (camera?.nvr) {
+      removeStream(camera.nvr, camera, undefined, p => !pathHasOwner(p)).catch(() => {})
+    }
   }
 
   // TERMINACIÓN: la decisión se calcula ACÁ, después del último `await`.

@@ -1067,7 +1067,20 @@ export async function publishTranscodedStream(nvr: NVR, camera: Camera): Promise
 }
 
 // ─── Eliminar stream de MediaMTX ────────────────────────────
-export async function removeStream(nvr: NVR, camera: Camera, streamType?: 'sub' | 'main'): Promise<void> {
+export async function removeStream(
+  nvr: NVR,
+  camera: Camera,
+  streamType?: 'sub' | 'main',
+  /**
+   * Revalidación SÍNCRONA por path, ejecutada BAJO EL CERROJO y justo antes del
+   * DELETE. `hasActiveConsumers` sólo cuenta consumidores externos
+   * (analytics/recording), así que no ve a un viewer de live que acaba de
+   * adoptar el path. Si un `publishStream` tomó el cerrojo primero, este DELETE
+   * se encola detrás y, sin este último vistazo, retiraba de forma
+   * determinista la publicación recién hecha (revisión de #154).
+   */
+  stillUnowned?: (streamPath: string) => boolean,
+): Promise<void> {
   const typesToRemove: ('sub' | 'main')[] = streamType ? [streamType] : ['sub', 'main']
   for (const t of typesToRemove) {
     const streamPath = getStreamPath(nvr, camera, t)
@@ -1080,6 +1093,13 @@ export async function removeStream(nvr: NVR, camera: Camera, streamType?: 'sub' 
         // (analytics/recording/diagnostic). Solo se fue el viewer de live.
         if (await hasActiveConsumers(streamPath)) {
           console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=active_consumers`)
+          return
+        }
+        // Última comprobación con el cerrojo en la mano: cubre tanto un alta
+        // que se adelantó en la cola como una que ocurrió durante el `await`
+        // de arriba.
+        if (stillUnowned && !stillUnowned(streamPath)) {
+          console.info(`[stream] mediamtx_path_kept path=${streamPath} reason=republished`)
           return
         }
         registeredPaths.delete(streamPath)

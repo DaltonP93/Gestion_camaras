@@ -91,6 +91,7 @@ const {
   __hasTranscodeRestartsForTest, __hasMediaActivityForTest,
   __getTranscodeInFlightForTest, __setTranscodeInFlightForTest,
   __addInFlightStartForTest, __addWaiterForTest, __markPathPublishedForTest,
+  __setTranscodeRestartsForTest,
   __releaseUnownedStreamForTest,
 } = await import('./stream-manager')
 
@@ -323,13 +324,56 @@ describe('P2 · las salidas fallidas después de publicar limpian todo', () => {
   })
 
   it('(12) también se limpian los reinicios y la actividad sembrados antes', async () => {
+    // Los dos mapas se siembran de verdad: si `transcodeRestarts` quedara
+    // vacío, la aserción sobre él no distinguiría nada.
     __setMediaActivityForTest(PATH, Date.now())
+    __setTranscodeRestartsForTest(PATH)
+    expect(__hasTranscodeRestartsForTest(PATH)).toBe(true)
     hlsOutcome = 'timeout'
 
     await startStream(makeServer(), 'u1', 'camH', 'v1', 'main_h264', ticket())
 
     esperarPathLimpio()
   })
+
+  it('(16) un `ready` obsoleto no impide reclamar el single-flight', async () => {
+    // FFmpeg murió y el supervisor está en su backoff: la entrada quedó en
+    // `ready` con la identidad del arranque anterior. Un arranque nuevo debe
+    // poder tomar el path, o seguiría sin publicar su promesa `starting` y
+    // otra petición levantaría un segundo FFmpeg.
+    __setTranscodeInFlightForTest(PATH, 'ready', 'intentoAnterior')   // sin proceso vivo
+
+    const r = await startStream(makeServer(), 'u1', 'camH', 'v1', 'main_h264', ticket())
+
+    expect(r.error).toBeUndefined()
+    expect(r.streamPath).toBe(PATH)
+    expect(spawned).toEqual([PATH])                     // un solo FFmpeg
+    const f = __getTranscodeInFlightForTest(PATH)
+    expect(f?.state).toBe('ready')
+    expect(f?.attemptId).not.toBe('intentoAnterior')    // lo reclamó el nuevo
+  })
+
+  it('(17) un `ready` con proceso vivo se reutiliza en vez de reclamarse', async () => {
+    // El contrapeso del caso anterior: si el proceso está vivo, el arranque
+    // nuevo NO spawnea ni pisa el estado, lo adopta.
+    __setTranscodeInFlightForTest(PATH, 'ready', 'intentoAnterior')
+    aliveProcesses.add(PATH)
+
+    const r = await startStream(makeServer(), 'u1', 'camH', 'v1', 'main_h264', ticket())
+
+    expect(r.error).toBeUndefined()
+    expect(r.streamPath).toBe(PATH)
+    expect(spawned).toEqual([])                  // reutilizó el FFmpeg vivo
+  })
+
+  // Lo que NO se prueba acá: la rama `claim_lost`. Desde fuera no es
+  // alcanzable de forma determinista, porque las cuatro combinaciones previas
+  // desvían antes: `ready` con proceso vivo va a la reutilización, `ready` sin
+  // proceso es obsoleto y se reclama, `starting` va a la rama que espera el
+  // arranque en curso, y `failed` se borra antes de llegar. Sólo puede
+  // colarse una microtarea entre esas comprobaciones y el reclamo, que es
+  // justamente contra lo que protege. Prefiero dejarlo dicho antes que
+  // escribir un test que aparente cubrirla.
 
   it('(13) el fallo emite un solo DELETE del path exacto', async () => {
     hlsOutcome = 'timeout'

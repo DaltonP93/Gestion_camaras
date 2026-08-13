@@ -176,3 +176,46 @@ describe('altas y bajas de paths sub/main tampoco se solapan', () => {
     expect(mediamtxPaths.has(SUB)).toBe(false)
   })
 })
+
+// ─── El DELETE que queda DETRÁS del alta (revisión de #154) ──────────────────
+//
+// El cerrojo ordena, pero no decide: si `publishStream` lo toma primero, el
+// DELETE se ejecuta después del alta y `hasActiveConsumers` puede seguir
+// devolviendo cero, porque sólo cuenta consumidores externos y no ve al viewer
+// de live que acaba de adoptar el path. Por eso la baja necesita su propia
+// revalidación bajo el cerrojo.
+describe('la baja se revalida cuando el alta se le adelanta', () => {
+  it('(F) un DELETE encolado detrás de un alta no retira el path readoptado', async () => {
+    let abrirPost!: () => void
+    postGate = new Promise<void>(r => { abrirPost = r })
+
+    const publicando = publishStream(nvr, camera, 'sub')   // toma el cerrojo
+    for (let i = 0; i < 10; i++) await tick()
+
+    // La baja se encola DETRÁS del alta. Su revalidación dirá que el path ya
+    // tiene dueño (el viewer que acaba de adoptarlo).
+    const borrando = removeStream(nvr, camera, 'sub', () => false)
+    for (let i = 0; i < 10; i++) await tick()
+
+    abrirPost()
+    await Promise.all([publicando, borrando])
+
+    expect(mediamtxPaths.has(SUB)).toBe(true)
+    expect(calls.filter(c => c === `DELETE ${SUB}`)).toHaveLength(0)
+  })
+
+  it('(G) sin dueño nuevo, ese mismo DELETE encolado sí retira el path', async () => {
+    let abrirPost!: () => void
+    postGate = new Promise<void>(r => { abrirPost = r })
+
+    const publicando = publishStream(nvr, camera, 'sub')
+    for (let i = 0; i < 10; i++) await tick()
+    const borrando = removeStream(nvr, camera, 'sub', () => true)
+    for (let i = 0; i < 10; i++) await tick()
+
+    abrirPost()
+    await Promise.all([publicando, borrando])
+
+    expect(mediamtxPaths.has(SUB)).toBe(false)
+  })
+})
