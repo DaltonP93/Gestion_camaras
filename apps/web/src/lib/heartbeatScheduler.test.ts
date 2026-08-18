@@ -392,7 +392,7 @@ describe('(10) regresión de la validación A1', () => {
 // "uno a la vez", la guarda de visibilidad y la señal de cancelación.
 
 describe('(F) runNow comparte cerrojo, guarda y señal con la cadencia', () => {
-  it('devuelve el resultado sin aplicarlo por su cuenta', async () => {
+  it('aplica el resultado UNA vez y también se lo devuelve a quien lo pidió', async () => {
     const t = makeTimers()
     const aplicados: string[] = []
     const sched = createHeartbeatScheduler<string>({
@@ -406,9 +406,10 @@ describe('(F) runNow comparte cerrojo, guarda y señal con la cadencia', () => {
     const outcome = await sched.runNow()
 
     expect(outcome).toEqual({ status: 'ok', result: 'respuesta' })
-    // `onResult` es de la CADENCIA: si runNow también lo invocara, la respuesta
-    // se aplicaría dos veces y se duplicarían los remontes de players.
-    expect(aplicados).toEqual([])
+    // Una solicitud, una aplicación. Quien la pidió recibe el resultado para
+    // decidir SUS efectos (qué players remontar), no para volver a aplicarlo:
+    // con la unión al vuelo, dos rutas comparten una misma respuesta.
+    expect(aplicados).toEqual(['respuesta'])
   })
 
   it('la cadencia sí aplica su propio resultado', async () => {
@@ -438,15 +439,36 @@ describe('(F) runNow comparte cerrojo, guarda y señal con la cadencia', () => {
     expect(s.count()).toBe(0)
   })
 
-  it('no se solapa con el latido periódico: como mucho una solicitud en vuelo', async () => {
+  it('se UNE al latido en vuelo en vez de perder el trabajo de quien llamó', async () => {
+    // Antes devolvía `busy` y la reconciliación perdía sus cámaras: hls.js no
+    // vuelve a emitir el 401, así que el player quedaba cargando para siempre
+    // (revisión de #157). Ahora comparte el resultado del que ya viaja.
+    const t = makeTimers()
+    let resolver!: (v: string) => void
+    const sched = createHeartbeatScheduler<string>({
+      intervalMs: INTERVAL,
+      isHidden: () => oculta.valor,
+      send: () => new Promise<string>(r => { resolver = r }),
+      timers: t.timers,
+    })
+
+    sched.start()                       // deja una en vuelo
+    const unido = sched.runNow()        // se une, no dispara otra
+    resolver('compartida')
+
+    expect(await unido).toEqual({ status: 'ok', result: 'compartida' })
+  })
+
+  it('esa unión no produce una segunda solicitud', async () => {
     const { sched, s } = setup(oculta)
     s.dejarEnVuelo()
-    sched.start()                       // deja una en vuelo
+    sched.start()
 
-    const outcome = await sched.runNow()
+    const unido = sched.runNow()
+    s.resolver()
+    await unido
 
-    expect(outcome).toEqual({ status: 'busy' })
-    expect(s.count()).toBe(1)           // no salió una segunda
+    expect(s.count()).toBe(1)           // una sola salida a la red
   })
 
   it('informa `aborted` —no un resultado— si la pestaña se oculta mientras viaja', async () => {

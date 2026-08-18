@@ -107,6 +107,26 @@ describe('(D) toda llamada al endpoint es cancelable', () => {
   })
 })
 
+describe('(9) el trabajo pendiente no sobrevive al cierre de la vista', () => {
+  const src = () => read('./LiveViewPage.tsx')
+
+  it('las expiraciones pendientes se conservan mientras la pestaña está oculta', () => {
+    // No se descartan: hls.js no vuelve a emitir el 401.
+    expect(src()).toContain('pendingExpiry.current.add')
+  })
+
+  it('y se limpian al desmontar o cambiar de NVR', () => {
+    // Recuperar una cámara de la vista anterior arrancaría un stream sin
+    // espectador.
+    expect(src()).toContain('pendingExpiry.current.clear()')
+    expect(src()).toContain('pendingFocusExpiry.current = null')
+  })
+
+  it('el conjunto pendiente se consume por el punto único de aplicación', () => {
+    expect(src()).toContain('consumePendingExpiryRef.current(result)')
+  })
+})
+
 describe('regresión: el viewId nunca puede ser "default"', () => {
   it.each(HEARTBEAT_PAGES)('%s envía un viewId propio en cada heartbeat', (rel) => {
     const src = read(rel)
