@@ -384,3 +384,103 @@ describe('(10) regresión de la validación A1', () => {
     expect(s.count()).toBe(antes)
   })
 })
+
+// ─── (F) runNow: la ruta cancelable compartida ───────────────────────────────
+//
+// Añadido tras la revisión de #156: el vaciado de sesiones HLS expiradas usaba
+// su propia llamada a la API. Ahora pasa por acá, así que hereda el cerrojo de
+// "uno a la vez", la guarda de visibilidad y la señal de cancelación.
+
+describe('(F) runNow comparte cerrojo, guarda y señal con la cadencia', () => {
+  it('devuelve el resultado sin aplicarlo por su cuenta', async () => {
+    const t = makeTimers()
+    const aplicados: string[] = []
+    const sched = createHeartbeatScheduler<string>({
+      intervalMs: INTERVAL,
+      isHidden: () => oculta.valor,
+      send: async () => 'respuesta',
+      onResult: (r) => aplicados.push(r),
+      timers: t.timers,
+    })
+
+    const outcome = await sched.runNow()
+
+    expect(outcome).toEqual({ status: 'ok', result: 'respuesta' })
+    // `onResult` es de la CADENCIA: si runNow también lo invocara, la respuesta
+    // se aplicaría dos veces y se duplicarían los remontes de players.
+    expect(aplicados).toEqual([])
+  })
+
+  it('la cadencia sí aplica su propio resultado', async () => {
+    const t = makeTimers()
+    const aplicados: string[] = []
+    const sched = createHeartbeatScheduler<string>({
+      intervalMs: INTERVAL,
+      isHidden: () => oculta.valor,
+      send: async () => 'periodico',
+      onResult: (r) => aplicados.push(r),
+      timers: t.timers,
+    })
+
+    sched.start()
+    await flush()
+
+    expect(aplicados).toEqual(['periodico'])
+  })
+
+  it('con la pestaña oculta no envía nada y lo informa', async () => {
+    const { sched, s } = setup(oculta)
+    oculta.valor = true
+
+    const outcome = await sched.runNow()
+
+    expect(outcome).toEqual({ status: 'hidden' })
+    expect(s.count()).toBe(0)
+  })
+
+  it('no se solapa con el latido periódico: como mucho una solicitud en vuelo', async () => {
+    const { sched, s } = setup(oculta)
+    s.dejarEnVuelo()
+    sched.start()                       // deja una en vuelo
+
+    const outcome = await sched.runNow()
+
+    expect(outcome).toEqual({ status: 'busy' })
+    expect(s.count()).toBe(1)           // no salió una segunda
+  })
+
+  it('informa `aborted` —no un resultado— si la pestaña se oculta mientras viaja', async () => {
+    const { sched, s } = setup(oculta)
+    s.dejarEnVuelo()
+
+    const pendiente = sched.runNow()
+    oculta.valor = true
+    sched.handleVisibilityChange()      // aborta la señal en vuelo
+    s.resolver()
+
+    expect(await pendiente).toEqual({ status: 'aborted' })
+    expect(s.abortadas()).toBe(1)
+  })
+
+  it('un error se devuelve clasificado, sin lanzar', async () => {
+    const t = makeTimers()
+    const sched = createHeartbeatScheduler<string>({
+      intervalMs: INTERVAL,
+      isHidden: () => oculta.valor,
+      send: async () => { throw new Error('boom') },
+      timers: t.timers,
+    })
+
+    const outcome = await sched.runNow()
+
+    expect(outcome.status).toBe('error')
+  })
+
+  it('tras detenerse no envía nada', async () => {
+    const { sched, s } = setup(oculta)
+    sched.stop()
+
+    expect(await sched.runNow()).toEqual({ status: 'hidden' })
+    expect(s.count()).toBe(0)
+  })
+})
