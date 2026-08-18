@@ -19,7 +19,7 @@ import { createQualitySwitchController } from '@/components/cameras/qualitySwitc
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
 import { createHeartbeatScheduler, type HeartbeatScheduler } from '@/lib/heartbeatScheduler'
-import { reconcileHlsExpiry } from '@/lib/hlsExpiryReconcile'
+import { reconcileHlsExpiry, decideExpiryRecovery } from '@/lib/hlsExpiryReconcile'
 
 function isHevcCodec(codec?: string): boolean {
   if (!codec) return false
@@ -202,6 +202,16 @@ export function LiveViewPage() {
   // and flushes them as a single heartbeat after a 2s window
   const hlsExpiryQueue    = useRef<Set<string>>(new Set())
   const hlsExpiryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /**
+   * Expiraciones que NO se pudieron reconciliar todavía: las que llegaron con
+   * la pestaña oculta y las que un heartbeat abortado dejó sin recuperar.
+   *
+   * hls.js considera fatal el 401 y no vuelve a emitirlo: si se pierde este
+   * conjunto, el player se queda cargando para siempre (revisión de #157).
+   */
+  const pendingExpiry = useRef<Set<string>>(new Set())
+  /** ¿La cámara en foco quedó con su sesión HD expirada y sin recuperar? */
+  const pendingFocusExpiry = useRef<string | null>(null)
   // Ref to loadStream so flushHlsExpiry (declared before loadStream) can call it
   // without a forward-reference compile error.
   const loadStreamRef = useRef<((camera: Camera) => Promise<void>) | null>(null)
@@ -488,7 +498,6 @@ export function LiveViewPage() {
         // latido periódico y el de regreso.
         runHeartbeat: () =>
           heartbeatRef.current?.runNow() ?? Promise.resolve({ status: 'hidden' as const }),
-        applyHeartbeat: (r) => { if (r) applyHeartbeat(r) },
         bumpPlayerKeys,
         clearLoading: (ids) => setLoadingStreams(prev => {
           const n = { ...prev }; ids.forEach(id => { n[id] = false }); return n
@@ -517,10 +526,17 @@ export function LiveViewPage() {
         `[live-ui] hls_reattach_after_expiry ids=[${outcome.remounted.join(',')}]` +
         ' reason=session_alive_cookie_expired'
       )
-    } else if (outcome.status !== 'reconciled' && outcome.status !== 'empty') {
-      console.info(`[live-ui] hls_expiry_flush outcome=${outcome.status}`)
+      return
     }
-  }, [applyHeartbeat, bumpPlayerKeys])
+    if (outcome.status === 'reconciled' || outcome.status === 'empty' ||
+        outcome.status === 'throttled' || outcome.status === 'failed') return
+
+    // Quedaron cámaras sin recuperar (abortado, 401, o sin cámaras visibles).
+    // Se CONSERVAN: hls.js no volverá a avisar, así que el próximo heartbeat
+    // exitoso —el periódico o el de regreso— es quien debe rescatarlas.
+    console.info(`[live-ui] hls_expiry_flush outcome=${outcome.status} pending=${outcome.pending.length}`)
+    outcome.pending.forEach(id => pendingExpiry.current.add(id))
+  }, [bumpPlayerKeys])
 
   // ─── Heartbeat periódico de la vista (30 s) ─────────────────
   // Reemplaza el touch-stream por cámara (N solicitudes → 1).
@@ -539,6 +555,52 @@ export function LiveViewPage() {
   sendHeartbeatRef.current = sendHeartbeat
   const applyHeartbeatRef = useRef(applyHeartbeat)
   applyHeartbeatRef.current = applyHeartbeat
+
+  /**
+   * Consume las expiraciones pendientes con el resultado de UN heartbeat.
+   *
+   * Se ejecuta exactamente una vez por respuesta: las cámaras que el backend
+   * reinició llegan en `startedIds` y ya las remonta `applyHeartbeat`; las que
+   * no llegan es porque su sesión seguía viva —regreso antes del TTL— y
+   * necesitan un remonte para renovar la cookie HLS.
+   */
+  const consumePendingExpiry = useCallback((result: HeartbeatResponse) => {
+    const pendientes = Array.from(pendingExpiry.current)
+    const foco = pendingFocusExpiry.current
+    if (pendientes.length === 0 && !foco) return
+    pendingExpiry.current.clear()
+    pendingFocusExpiry.current = null
+
+    const { remount: aRemontar, focus } = decideExpiryRecovery({
+      pending: pendientes,
+      pendingFocus: foco,
+      startedIds: result.startedIds,
+      visibleIds: filteredCamerasRef.current.map(c => c.id),
+      currentFocus: focusCameraRef.current,
+    })
+    if (aRemontar.length > 0) {
+      console.info(`[live-ui] hls_expiry_recovered ids=[${aRemontar.join(',')}] reason=session_alive_after_return`)
+      bumpPlayerKeys(aRemontar)
+      setLoadingStreams(prev => {
+        const n = { ...prev }; aRemontar.forEach(id => { n[id] = false }); return n
+      })
+    }
+
+    // La cámara en foco se recupera igual antes y después del TTL: si el
+    // backend la reinició ya está en `startedIds`, y si no, basta remontar el
+    // player. En ambos casos hay que quitar el "Reconectando…", o la tarjeta
+    // queda trabada con un error que ya no describe nada.
+    if (focus) {
+      console.info(
+        `[live-ui] focus_expiry_recovered cameraId=${focus}` +
+        ` restarted=${result.startedIds.includes(focus)}`
+      )
+      setFocusStreamError(null)
+      bumpPlayerKeys([focus])
+    }
+  }, [bumpPlayerKeys])
+  const consumePendingExpiryRef = useRef(consumePendingExpiry)
+  consumePendingExpiryRef.current = consumePendingExpiry
   useEffect(() => {
     const scheduler = createHeartbeatScheduler<HeartbeatResponse | null>({
       intervalMs: 30_000,
@@ -546,13 +608,29 @@ export function LiveViewPage() {
       send: (signal) => sendHeartbeatRef.current(filteredCamerasRef.current.map(c => c.id), signal),
       // La cadencia aplica su propio resultado; `runNow` no, para que la
       // reconciliación de sesiones HLS lo aplique una sola vez.
-      onResult: (result) => { if (result) applyHeartbeatRef.current(result) },
+      // Punto ÚNICO de aplicación, sea cual sea la ruta que originó la
+      // solicitud (cadencia, regreso o reconciliación que se unió a ella).
+      onResult: (result) => {
+        if (!result) return
+        applyHeartbeatRef.current(result)
+        consumePendingExpiryRef.current(result)
+      },
     })
     heartbeatRef.current = scheduler
     scheduler.start()
     return () => {
       scheduler.stop()
       if (heartbeatRef.current === scheduler) heartbeatRef.current = null
+      // Nada de la vista anterior sobrevive al desmontaje o al cambio de NVR:
+      // recuperar una cámara que ya no se muestra arrancaría un stream sin
+      // espectador.
+      if (hlsExpiryTimerRef.current) {
+        clearTimeout(hlsExpiryTimerRef.current)
+        hlsExpiryTimerRef.current = null
+      }
+      hlsExpiryQueue.current.clear()
+      pendingExpiry.current.clear()
+      pendingFocusExpiry.current = null
     }
   }, [])
 
@@ -779,6 +857,9 @@ export function LiveViewPage() {
           clearTimeout(hlsExpiryTimerRef.current)
           hlsExpiryTimerRef.current = null
         }
+        // La cola NO se descarta: se traslada al conjunto pendiente, que el
+        // heartbeat de regreso consume una sola vez.
+        hlsExpiryQueue.current.forEach(id => pendingExpiry.current.add(id))
         hlsExpiryQueue.current.clear()
         hiddenSince.current = Date.now()
         console.info('[live-ui] heartbeat_suspended reason=document_hidden')
@@ -938,14 +1019,19 @@ export function LiveViewPage() {
       if (isFocusH264) {
         console.info(`[LiveView] HLS_SESSION_EXPIRED focus cameraId=${cameraId} — reconnecting transcodificación`)
         setFocusStreamError({ code: 'TRANSCODE_NOT_READY', message: 'Reconectando transcodificación...' })
+        // Se ANOTA aunque la pestaña esté visible: si no se recupera antes de
+        // ocultarse, el regreso tiene que rescatarla. Sin esto el foco quedaba
+        // con "Reconectando…" para siempre al volver antes del TTL, porque
+        // `decideHdReacquire` sólo actúa pasado el TTL (revisión de #157).
+        pendingFocusExpiry.current = cameraId
         return
       }
-      // Con la pestaña oculta hls.js sigue cargando y sus 401 llegan en serie:
-      // encolarlos sólo alimentaría actividad repetitiva sobre una vista que el
-      // servidor debe poder expirar. Al volver, el heartbeat de regreso
-      // reconcilia todo de una vez.
+      // Con la pestaña oculta no se envía nada ni se programan reintentos, pero
+      // el cameraId SÍ se conserva: hls.js considera fatal el 401 y no vuelve a
+      // emitirlo, así que descartarlo dejaba el player cargando para siempre.
       if (tabIsHidden()) {
-        console.info(`[live-ui] hls_expiry_enqueue_skipped cameraId=${cameraId} reason=document_hidden`)
+        console.info(`[live-ui] hls_expiry_deferred cameraId=${cameraId} reason=document_hidden`)
+        pendingExpiry.current.add(cameraId)
         return
       }
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })

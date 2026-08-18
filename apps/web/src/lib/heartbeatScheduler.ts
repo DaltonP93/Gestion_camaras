@@ -46,7 +46,11 @@ export type HeartbeatOutcome<T> =
   | { status: 'ok'; result: T }
   /** La pestaña está oculta: no se envió nada. */
   | { status: 'hidden' }
-  /** Ya hay un heartbeat en vuelo: no se solapan. */
+  /**
+   * Ya había un heartbeat en vuelo y quien llamó NO quiso unirse a él.
+   * Con `runNow` no se devuelve nunca: ahí se comparte el resultado, porque
+   * perder el trabajo de quien llamó era el defecto de la revisión de #157.
+   */
   | { status: 'busy' }
   /** Se abortó por ocultarse o detenerse mientras viajaba. */
   | { status: 'aborted' }
@@ -63,9 +67,14 @@ export interface HeartbeatSchedulerOptions<T = unknown> {
    */
   send: (signal: AbortSignal) => Promise<T>
   /**
-   * Resultado de un latido de la CADENCIA (periódico o de regreso). No se
-   * invoca para `runNow`: ahí el resultado se le devuelve a quien lo pidió, y
-   * aplicarlo dos veces duplicaría remontes de players.
+   * Se invoca UNA VEZ por solicitud realmente enviada y exitosa, sea cual sea
+   * la ruta que la originó. Es el único punto donde se aplica la respuesta.
+   *
+   * Antes sólo corría para la cadencia y `runNow` devolvía el resultado para
+   * que el llamador lo aplicara. Con la unión al heartbeat en curso eso ya no
+   * sirve: dos rutas comparten una misma respuesta y la aplicarían dos veces,
+   * duplicando remontes. Ahora aplica el dueño de la solicitud, y quien se une
+   * sólo lee el resultado para decidir SUS efectos (qué players remontar).
    */
   onResult?: (result: T) => void
   /** Diagnóstico opcional (logs de la página). */
@@ -110,6 +119,11 @@ export function createHeartbeatScheduler<T = unknown>(
   let stopped = false
   let intervalId: any = null
   let controller: AbortController | null = null
+  /**
+   * Promesa de la solicitud en vuelo. Quien llegue mientras haya una se UNE a
+   * ella en vez de perder su trabajo: misma respuesta, una sola solicitud.
+   */
+  let inFlight: Promise<HeartbeatOutcome<T>> | null = null
 
   /** Arma el intervalo. Idempotente: si ya hay uno, no crea un segundo. */
   function arm(): void {
@@ -128,6 +142,11 @@ export function createHeartbeatScheduler<T = unknown>(
     if (!controller) return
     controller.abort()
     controller = null
+    // El hueco queda libre de inmediato. Si no, al volver a visible el latido
+    // de regreso se encontraría con una solicitud "en vuelo" que ya está
+    // abortada y se saltaría el turno: no habría heartbeat inmediato.
+    // Quien se haya unido a esa promesa sigue recibiendo su `aborted`.
+    inFlight = null
   }
 
   /**
@@ -136,12 +155,7 @@ export function createHeartbeatScheduler<T = unknown>(
    * de visibilidad, el cerrojo de "uno a la vez" y la señal de cancelación se
    * aplican por igual y no pueden divergir.
    */
-  async function run(): Promise<HeartbeatOutcome<T>> {
-    if (stopped || opts.isHidden()) return { status: 'hidden' }
-    // Sin solapamiento: si el anterior sigue en vuelo, este intento se salta.
-    // La cadencia la mantiene el intervalo, así que saltarse uno no desarma nada.
-    if (controller) return { status: 'busy' }
-
+  async function execute(): Promise<HeartbeatOutcome<T>> {
     const mine = new AbortController()
     controller = mine
     try {
@@ -149,6 +163,9 @@ export function createHeartbeatScheduler<T = unknown>(
       // La pestaña pudo ocultarse mientras la solicitud viajaba: el resultado
       // ya no describe lo que el usuario ve, y aplicarlo reviviría sesiones.
       if (mine.signal.aborted || opts.isHidden()) return { status: 'aborted' }
+      // Punto ÚNICO de aplicación: una solicitud, una aplicación, sin importar
+      // cuántas rutas compartan su resultado.
+      opts.onResult?.(result)
       return { status: 'ok', result }
     } catch (error) {
       if (mine.signal.aborted) return { status: 'aborted' }
@@ -161,10 +178,27 @@ export function createHeartbeatScheduler<T = unknown>(
     }
   }
 
+  /**
+   * Única puerta de salida hacia la API.
+   *
+   * `join` decide qué pasa si ya hay una solicitud en vuelo: la cadencia se
+   * salta el turno (`busy`, porque el intervalo ya traerá el siguiente), y una
+   * reconciliación puntual se UNE a la que está viajando. Sin esa unión, un
+   * `busy` perdía las cámaras que esperaban recuperación y el player se quedaba
+   * cargando para siempre (revisión de #157).
+   */
+  function run(join: boolean): Promise<HeartbeatOutcome<T>> {
+    if (stopped || opts.isHidden()) return Promise.resolve({ status: 'hidden' as const })
+    if (inFlight) {
+      return join ? inFlight : Promise.resolve({ status: 'busy' as const })
+    }
+    const promesa = execute().finally(() => { if (inFlight === promesa) inFlight = null })
+    inFlight = promesa
+    return promesa
+  }
+
   function fire(): void {
-    void run().then(outcome => {
-      if (outcome.status === 'ok') opts.onResult?.(outcome.result)
-    })
+    void run(false)
   }
 
   function suspend(): void {
@@ -202,6 +236,6 @@ export function createHeartbeatScheduler<T = unknown>(
     },
     isArmed() { return intervalId !== null },
     isInFlight() { return controller !== null },
-    runNow() { return run() },
+    runNow() { return run(true) },
   }
 }
