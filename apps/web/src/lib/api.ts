@@ -156,8 +156,20 @@ export function resolveAssetUrl(url: string | null | undefined): string | null {
 export const apiGet = <T>(url: string, params?: object, headers?: Record<string, string>) =>
   api.get<T>(url, { params, ...(headers ? { headers } : {}) }).then((r) => r.data)
 
-export const apiPost = <T>(url: string, data?: object, headers?: Record<string, string>) =>
-  api.post<T>(url, data, headers ? { headers } : undefined).then((r) => r.data)
+// `signal` es opcional y aditivo: los llamadores existentes no cambian. Lo usa
+// el heartbeat de vista en vivo para cancelar una solicitud cuando la pestaña
+// se oculta — y, como el interceptor reintenta con la MISMA config tras renovar
+// el JWT, ese reintento hereda la señal y también queda cancelado.
+export const apiPost = <T>(
+  url: string,
+  data?: object,
+  headers?: Record<string, string>,
+  signal?: AbortSignal,
+) =>
+  api.post<T>(url, data, {
+    ...(headers ? { headers } : {}),
+    ...(signal ? { signal } : {}),
+  }).then((r) => r.data)
 
 export const apiPut = <T>(url: string, data?: object, headers?: Record<string, string>) =>
   api.put<T>(url, data, headers ? { headers } : undefined).then((r) => r.data)

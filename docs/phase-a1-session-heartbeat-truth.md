@@ -166,6 +166,77 @@ Ninguno incluye credenciales, tokens ni URI RTSP.
 Estas verificaciones requieren la ventana controlada descrita en la Fase 0
 (canales 17, 23, 24 y 29 de `NVR_32_SAA_2023`), y **autorización explícita**.
 
+## 9 bis. Validación A1 en producción: plazos reales y condiciones
+
+Añadido tras la validación sobre `9efc680`, que dio PASS en todo salvo un punto:
+la pestaña oculta siguió latiendo. Esta sección fija los números con los que se
+mide, para que una espera corta no vuelva a leerse como un defecto —ni un
+defecto como una espera corta—.
+
+### Plazos reales
+
+| Concepto | Valor | Dónde se define |
+|---|---|---|
+| TTL de `view_session` (grilla / substream) | **90 s** | `DEFAULT_STREAM_IDLE_TIMEOUT_SEC`, override `STREAM_IDLE_TIMEOUT` |
+| TTL de sesión HD / transcodificada | **90 s** | `DEFAULT_STREAM_HD_IDLE_TIMEOUT_SEC`, override `STREAM_HD_IDLE_TIMEOUT` |
+| Frecuencia del prune | **cada 2 min** (`*/2 * * * *`) | `cron.schedule` en `apps/api/src/jobs/healthWorker.ts` |
+| Margen recomendado | **30 s** | criterio de esta validación |
+
+El prune corre en minutos pares del reloj, no a partir del momento en que la
+sesión vence: entre el vencimiento y la barrida puede pasar desde ~0 s hasta el
+intervalo completo.
+
+### Espera necesaria antes de declarar un fallo
+
+```
+espera = TTL + intervalo de prune + margen
+       = 90 s + 120 s + 30 s
+       = 240 s  (4 minutos)
+```
+
+**Los 150 s de la ejecución fallida no alcanzaban** ni con el heartbeat
+detenido: 150 < 210. Cualquier prueba que verifique liberación por TTL debe
+esperar **240 s** desde el último heartbeat y recién entonces mirar
+`expiraciones`, lectores de MediaMTX y procesos FFmpeg.
+
+Si se necesita una ventana más corta para iterar, bajar `STREAM_IDLE_TIMEOUT`
+—no acortar la espera— y dejar constancia del valor usado en el informe.
+
+### Condiciones de la corrida
+
+- **NVR_32 debe mostrar 16 cámaras reales.** La ejecución que reportó 9 en la
+  pestaña B no es válida como validación final: con 9 cámaras el cupo de
+  transcodificación y el límite por usuario no se ejercitan igual.
+- Ambas pestañas deben tener **viewId distintos** y ninguno puede ser
+  `default`.
+- La pestaña que se oculta debe permanecer oculta de verdad
+  (`document.visibilityState === 'hidden'`), no simplemente detrás de otra
+  ventana: un cambio de foco sin cambio de visibilidad no suspende el heartbeat
+  y no es el caso que se está midiendo.
+
+### Scripts interactivos por heredoc
+
+Un script lanzado con `bash <<'EOF' … EOF` recibe el propio script por su
+entrada estándar: cualquier `read` de una pausa consume el texto del script en
+lugar de esperar al operador, y la corrida se desordena en silencio.
+
+Las pausas deben leerse **explícitamente desde la terminal**:
+
+```bash
+read -rp "Ocultá la pestaña A y presioná Enter… " _ < /dev/tty
+```
+
+Lo mismo para cualquier confirmación intermedia. Si el script no tiene terminal
+asociada (`[ -t 0 ]` falso y `/dev/tty` no disponible), debe **abortar con un
+mensaje**, no continuar sin la pausa.
+
+### Qué mirar al volver a la pestaña
+
+1. Un único heartbeat inmediato (no una ráfaga).
+2. `startedIds` no vacío si se superó el TTL → readquisición automática.
+3. Sin `STREAM_LIMIT_REACHED`.
+4. Reproducción restaurada sin recargar la página.
+
 ## 10. Rollback
 
 Sin migraciones ni cambios de esquema: revertir el código alcanza.

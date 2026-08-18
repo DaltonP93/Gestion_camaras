@@ -8,6 +8,7 @@ import {
   Loader2,
 } from 'lucide-react'
 import { apiGet, apiPost } from '@/lib/api'
+import { createHeartbeatScheduler } from '@/lib/heartbeatScheduler'
 import { closeStreamSession, closeViewSessions } from '@/lib/sessionClose'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
 import type { CameraPlaybackError } from '@/components/cameras/VideoPlayer'
@@ -151,6 +152,9 @@ function CameraCell({
 }
 
 // ─── Main component ───────────────────────────────────────────────────────────
+
+/** Visibilidad leída en el momento (evita el estrechamiento de TypeScript). */
+const tabIsHidden = (): boolean => document.visibilityState === 'hidden'
 
 export function ViewPlayerPage() {
   const { id } = useParams<{ id: string }>()
@@ -393,7 +397,13 @@ export function ViewPlayerPage() {
   const prevPage = useCallback(() => setCurrentPage((p) => (p - 1 + totalPages) % totalPages), [totalPages])
   const nextPage = useCallback(() => setCurrentPage((p) => (p + 1) % totalPages), [totalPages])
 
-  // ─── Heartbeat — keeps stream sessions alive (prevents 90s idle expiry) ──
+  // ─── Heartbeat — mantiene vivas las sesiones (TTL de 90 s) ───────────────
+  //
+  // Este intervalo NO tenía guarda de visibilidad: con la pestaña oculta seguía
+  // latiendo cada 30 s, el servidor veía un espectador y nunca expiraba las
+  // sesiones ni liberaba FFmpeg (validación A1). Ahora el intervalo lo posee
+  // `heartbeatScheduler`: se cancela al ocultarse y se rearma —uno solo, con un
+  // latido inmediato— al volver.
   useEffect(() => {
     if (!view || filledSlots.length === 0) return
     const perPage     = getSlotsPerPage(view.layout)
@@ -401,14 +411,16 @@ export function ViewPlayerPage() {
     const visibleIds  = pageSlots.map((s) => s.cameraId!).filter(Boolean)
     if (visibleIds.length === 0) return
 
-    const sendBeat = () =>
+    const sendBeat = (signal: AbortSignal) =>
       apiPost('/live-view/heartbeat', {
         viewId:           viewIdRef.current,
         visibleCameraIds: visibleIds,
         layout:           perPage,
         page:             currentPage,
-      }).then((result: any) => {
+      }, undefined, signal).then((result: any) => {
         if (!result?.streams) return
+        // La pestaña pudo ocultarse mientras la solicitud viajaba.
+        if (tabIsHidden()) return
         setSlots((prev) => prev.map((s) => {
           if (!s.cameraId) return s
           const info = result.streams[s.cameraId]
@@ -416,9 +428,18 @@ export function ViewPlayerPage() {
         }))
       }).catch(() => {})
 
-    sendBeat()
-    const id = setInterval(sendBeat, 30_000)
-    return () => clearInterval(id)
+    const scheduler = createHeartbeatScheduler({
+      intervalMs: 30_000,
+      isHidden: tabIsHidden,
+      send: sendBeat,
+    })
+    const onVisibility = () => scheduler.handleVisibilityChange()
+    document.addEventListener('visibilitychange', onVisibility)
+    scheduler.start()
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      scheduler.stop()
+    }
   }, [view, currentPage, filledSlots.map((s) => s.cameraId).join(',')]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Loading / error UI ───────────────────────────────────────────────────
