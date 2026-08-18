@@ -18,6 +18,7 @@ import { decideHdReacquire, finishHdReacquire, initialHdReacquireState, decideHd
 import { createQualitySwitchController } from '@/components/cameras/qualitySwitchController'
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
+import { createHeartbeatScheduler, type HeartbeatScheduler } from '@/lib/heartbeatScheduler'
 
 function isHevcCodec(codec?: string): boolean {
   if (!codec) return false
@@ -87,6 +88,16 @@ const GRID_OPTIONS: { value: GridLayout; label: string; icon: React.ReactNode; c
 ]
 
 // Genera un ID estable para este tab/view del navegador
+/**
+ * Visibilidad de la pestaña, leída SIEMPRE en el momento.
+ *
+ * Es una función y no una comparación en línea a propósito: TypeScript estrecha
+ * `document.visibilityState` tras la primera comparación dentro de una función
+ * y marcaría la segunda —la que corre DESPUÉS de un `await`, justo cuando el
+ * valor pudo cambiar— como imposible.
+ */
+const tabIsHidden = (): boolean => document.visibilityState === 'hidden'
+
 function makeViewId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
   return `view-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -402,9 +413,20 @@ export function LiveViewPage() {
   // ─── Send viewport heartbeat ────────────────────────────────
   // Single call replaces N per-camera touch-stream calls.
   // Backend reconciles: starts missing streams, stops removed streams, touches existing.
-  const sendHeartbeat = useCallback(async (visibleCameraIds: string[]): Promise<void> => {
+  const sendHeartbeat = useCallback(async (
+    visibleCameraIds: string[],
+    signal?: AbortSignal,
+  ): Promise<void> => {
     if (visibleCameraIds.length === 0) return
     if (!useAuthStore.getState().isAuthenticated) return
+    // PUNTO ÚNICO de la regla de visibilidad para el heartbeat. Antes vivía en
+    // el callback del intervalo, y las otras rutas —el vaciado de sesiones HLS
+    // expiradas, que dispara hls.js mientras sigue cargando en segundo plano—
+    // llamaban al endpoint sin guarda: la vista nunca expiraba (validación A1).
+    if (tabIsHidden()) {
+      console.info('[live-ui] heartbeat_skipped reason=document_hidden')
+      return
+    }
     try {
       // Don't re-queue cameras with permanent blocking errors — prevents MediaMTX RTSP retry spam
       const PERMANENT_ERROR_CODES: CameraPlaybackError['code'][] = [
@@ -427,7 +449,10 @@ export function LiveViewPage() {
         viewId,
         visibleCameraIds: filteredIds,
         ...(suppressStartCameraIds.length > 0 ? { suppressStartCameraIds } : {}),
-      })
+      }, undefined, signal)
+      // La pestaña pudo ocultarse mientras la solicitud estaba en vuelo: no se
+      // aplica un estado que ya no corresponde a lo que el usuario ve.
+      if (tabIsHidden()) return
       applyHeartbeat(result)
     } catch (err: any) {
       const status = err?.response?.status
@@ -450,6 +475,13 @@ export function LiveViewPage() {
     const expiredIds = Array.from(hlsExpiryQueue.current)
     hlsExpiryQueue.current.clear()
     if (expiredIds.length === 0) return
+    // Con la pestaña oculta no se reconcilia nada: hls.js sigue cargando en
+    // segundo plano y sus 401 encolaban aquí un heartbeat cada ~30 s, que era
+    // exactamente lo que mantenía viva la vista (validación A1).
+    if (tabIsHidden()) {
+      console.info('[live-ui] hls_expiry_flush_skipped reason=document_hidden')
+      return
+    }
 
     console.warn(`[LiveView] HLS_SESSION_EXPIRED batch: ${expiredIds.length} cámara(s) [${expiredIds.join(', ')}]`)
 
@@ -498,19 +530,34 @@ export function LiveViewPage() {
     }
   }, [viewId, applyHeartbeat, bumpPlayerKeys])
 
-  // ─── Periodic viewport heartbeat every 30s ──────────────────
-  // Replaces per-camera touch-stream (N requests → 1 request).
-  // Also reconciles state if any camera was stopped by backend idle cleanup.
+  // ─── Heartbeat periódico de la vista (30 s) ─────────────────
+  // Reemplaza el touch-stream por cámara (N solicitudes → 1).
+  //
+  // El intervalo lo posee `heartbeatScheduler`: con la pestaña oculta se
+  // CANCELA —no se limita a saltarse el tick— y al volver se envía uno
+  // inmediato y se rearma exactamente uno. Antes el intervalo seguía vivo con
+  // una guarda dentro del callback, y esa guarda no cubría las demás rutas.
+  const heartbeatRef = useRef<HeartbeatScheduler | null>(null)
+  // El envío se lee por ref y el efecto no tiene dependencias A PROPÓSITO: si
+  // dependiera de `sendHeartbeat`, cada cambio de su identidad destruiría el
+  // programador y crearía otro, y como el nuevo late de inmediato eso sería una
+  // ráfaga de heartbeats en vez de una cadencia. Un solo programador por
+  // montaje; su contenido siempre el más reciente.
+  const sendHeartbeatRef = useRef(sendHeartbeat)
+  sendHeartbeatRef.current = sendHeartbeat
   useEffect(() => {
-    const interval = setInterval(() => {
-      // No enviar heartbeat con la pestaña oculta — evita polling en background
-      // que contribuye a la acumulación de sesiones y a los 429.
-      if (document.visibilityState === 'hidden') return
-      const ids = filteredCamerasRef.current.map(c => c.id)
-      sendHeartbeat(ids)
-    }, 30_000)
-    return () => clearInterval(interval)
-  }, [sendHeartbeat])
+    const scheduler = createHeartbeatScheduler({
+      intervalMs: 30_000,
+      isHidden: tabIsHidden,
+      send: (signal) => sendHeartbeatRef.current(filteredCamerasRef.current.map(c => c.id), signal),
+    })
+    heartbeatRef.current = scheduler
+    scheduler.start()
+    return () => {
+      scheduler.stop()
+      if (heartbeatRef.current === scheduler) heartbeatRef.current = null
+    }
+  }, [])
 
   // ─── Stop sessions for a set of cameraIds ───────────────────
   const stopSessions = useCallback(async (cameraIds: string[], reason?: string) => {
@@ -717,10 +764,16 @@ export function LiveViewPage() {
   // the backend stopped → returned as startedIds → get bumped player keys.
   useEffect(() => {
     const handleVisibility = () => {
-      if (document.visibilityState === 'hidden') {
+      // UN SOLO listener para toda la página: el programador decide el latido y
+      // acá queda únicamente lo que es específico de la vista (HD y el reloj de
+      // ocultación). Dos listeners separados era la puerta a dos heartbeats de
+      // regreso y a dos intervalos.
+      heartbeatRef.current?.handleVisibilityChange()
+
+      if (tabIsHidden()) {
         // Se suspende el heartbeat (incluido el de HD): con la pestaña oculta no
         // hay espectador, y el servidor debe poder expirar la sesión y liberar
-        // FFmpeg. El intervalo periódico ya no late mientras document.hidden.
+        // FFmpeg. El intervalo queda CANCELADO, no dormido.
         hiddenSince.current = Date.now()
         console.info('[live-ui] heartbeat_suspended reason=document_hidden')
         return
@@ -731,12 +784,10 @@ export function LiveViewPage() {
       hiddenSince.current = null
       if (!useAuthStore.getState().isAuthenticated) return
 
-      // Reanudar SIEMPRE y de inmediato: si la sesión todavía existe (oculta
-      // menos que el TTL) este heartbeat la conserva; si el servidor ya la
-      // expiró, la reconciliación devuelve startedIds y se remonta el player.
+      // El heartbeat inmediato de regreso ya lo envió el programador: si la
+      // sesión sigue viva la conserva, y si el servidor la expiró la
+      // reconciliación devuelve startedIds y se remonta el player.
       console.info(`[live-ui] heartbeat_resumed hiddenMs=${hiddenMs}`)
-      const ids = filteredCamerasRef.current.map(c => c.id)
-      if (ids.length > 0) sendHeartbeat(ids)
 
       // HD tras una ocultación larga: el servidor ya liberó el FFmpeg. Se pide
       // alta calidad UNA sola vez, y la baja calidad sigue reproduciéndose
@@ -770,7 +821,11 @@ export function LiveViewPage() {
     }
     document.addEventListener('visibilitychange', handleVisibility)
     return () => document.removeEventListener('visibilitychange', handleVisibility)
-  }, [sendHeartbeat])
+    // Sin dependencias: el listener se registra UNA vez por montaje y todo lo
+    // que consulta —el programador, las cámaras visibles, el foco— lo lee por
+    // ref. Re-registrarlo en cada cambio de identidad de un callback era churn
+    // innecesario sobre un evento global.
+  }, [])
 
   // ─── React to visible camera set changes ────────────────────
   const prevVisibleIds = useRef<string[]>([])
