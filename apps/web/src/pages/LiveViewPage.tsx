@@ -19,6 +19,7 @@ import { createQualitySwitchController } from '@/components/cameras/qualitySwitc
 import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
 import { createHeartbeatScheduler, type HeartbeatScheduler } from '@/lib/heartbeatScheduler'
+import { reconcileHlsExpiry } from '@/lib/hlsExpiryReconcile'
 
 function isHevcCodec(codec?: string): boolean {
   if (!codec) return false
@@ -413,21 +414,26 @@ export function LiveViewPage() {
   // ─── Send viewport heartbeat ────────────────────────────────
   // Single call replaces N per-camera touch-stream calls.
   // Backend reconciles: starts missing streams, stops removed streams, touches existing.
+  //
+  // SÓLO envía y devuelve la respuesta: aplicarla es responsabilidad de quien
+  // la pidió. Así una misma respuesta no se aplica dos veces cuando la
+  // reconciliación de sesiones HLS expiradas usa el mismo camino.
+  //
+  // Devuelve `null` cuando no había nada que enviar (sin cámaras, sin sesión,
+  // pestaña oculta o todas las cámaras filtradas). Los errores se propagan: el
+  // programador los clasifica.
   const sendHeartbeat = useCallback(async (
     visibleCameraIds: string[],
     signal?: AbortSignal,
-  ): Promise<void> => {
-    if (visibleCameraIds.length === 0) return
-    if (!useAuthStore.getState().isAuthenticated) return
-    // PUNTO ÚNICO de la regla de visibilidad para el heartbeat. Antes vivía en
-    // el callback del intervalo, y las otras rutas —el vaciado de sesiones HLS
-    // expiradas, que dispara hls.js mientras sigue cargando en segundo plano—
-    // llamaban al endpoint sin guarda: la vista nunca expiraba (validación A1).
+  ): Promise<HeartbeatResponse | null> => {
+    if (visibleCameraIds.length === 0) return null
+    if (!useAuthStore.getState().isAuthenticated) return null
+    // Guarda de visibilidad, en el único punto por el que sale una solicitud.
     if (tabIsHidden()) {
       console.info('[live-ui] heartbeat_skipped reason=document_hidden')
-      return
+      return null
     }
-    try {
+    {
       // Don't re-queue cameras with permanent blocking errors — prevents MediaMTX RTSP retry spam
       const PERMANENT_ERROR_CODES: CameraPlaybackError['code'][] = [
         'RTSP_CHANNEL_NOT_FOUND', 'CAMERA_OFFLINE', 'AUTH_FAILED',
@@ -438,7 +444,7 @@ export function LiveViewPage() {
         const err = streamErrorsRef.current[id]
         return !err || !PERMANENT_ERROR_CODES.includes(err.code)
       })
-      if (filteredIds.length === 0) return
+      if (filteredIds.length === 0) return null
       // Cámaras con backoff de límite vigente y sin sesión activa: se mantienen
       // visibles pero se pide al backend NO iniciarlas (evita que reconcileView
       // se salte el backoff del frontend y golpee el límite en cada heartbeat).
@@ -450,85 +456,71 @@ export function LiveViewPage() {
         visibleCameraIds: filteredIds,
         ...(suppressStartCameraIds.length > 0 ? { suppressStartCameraIds } : {}),
       }, undefined, signal)
-      // La pestaña pudo ocultarse mientras la solicitud estaba en vuelo: no se
-      // aplica un estado que ya no corresponde a lo que el usuario ve.
-      if (tabIsHidden()) return
-      applyHeartbeat(result)
-    } catch (err: any) {
-      const status = err?.response?.status
-      if (status === 401) {
-        // Interceptor already attempted token refresh + retry.
-        // If refresh succeeded: should not reach here (interceptor returned retried response).
-        // If refresh failed: dispatchAuthExpired fired → isAuthenticated=false → login redirect.
-        // Either way: do NOT modify camera state — user view must stay intact during auth recovery.
-        console.warn(`[LiveView] heartbeat 401 — token refresh attempted by interceptor`)
-      }
-      // Network errors / 5xx: next 30s heartbeat will retry automatically
+      return result
     }
-  }, [viewId, applyHeartbeat])
+  }, [viewId])
 
-  // ─── Flush coalesced HLS_SESSION_EXPIRED batch ──────────────
-  // Called 2s after the first 401 to batch simultaneous muxer expirations
-  // into a single heartbeat instead of N individual restarts.
+  // ─── Vaciado de sesiones HLS expiradas ──────────────────────
+  //
+  // Se llama 2 s después del primer 401 para agrupar las expiraciones
+  // simultáneas en UNA sola reconciliación.
+  //
+  // Ya no habla con la API: delega en `reconcileHlsExpiry`, que usa la
+  // operación cancelable del programador. Antes llamaba a `apiPost` por su
+  // cuenta —sin señal, sin releer la visibilidad tras el `await`— y su `catch`
+  // programaba un `loadStream` aunque la pestaña estuviera oculta: era la única
+  // ruta que sobrevivía a la corrección de #156.
   const flushHlsExpiry = useCallback(async () => {
     hlsExpiryTimerRef.current = null
     const expiredIds = Array.from(hlsExpiryQueue.current)
     hlsExpiryQueue.current.clear()
     if (expiredIds.length === 0) return
-    // Con la pestaña oculta no se reconcilia nada: hls.js sigue cargando en
-    // segundo plano y sus 401 encolaban aquí un heartbeat cada ~30 s, que era
-    // exactamente lo que mantenía viva la vista (validación A1).
-    if (tabIsHidden()) {
-      console.info('[live-ui] hls_expiry_flush_skipped reason=document_hidden')
-      return
+
+    const outcome = await reconcileHlsExpiry<HeartbeatResponse | null>(
+      expiredIds,
+      filteredCamerasRef.current.map(c => c.id),
+      {
+        isHidden: tabIsHidden,
+        now: () => Date.now(),
+        lastRestartAt: lastRestartAt.current,
+        // TODA la red pasa por el programador: mismo cerrojo de "uno a la vez",
+        // misma guarda de visibilidad y misma señal de cancelación que el
+        // latido periódico y el de regreso.
+        runHeartbeat: () =>
+          heartbeatRef.current?.runNow() ?? Promise.resolve({ status: 'hidden' as const }),
+        applyHeartbeat: (r) => { if (r) applyHeartbeat(r) },
+        bumpPlayerKeys,
+        clearLoading: (ids) => setLoadingStreams(prev => {
+          const n = { ...prev }; ids.forEach(id => { n[id] = false }); return n
+        }),
+        scheduleReload: (ids) => {
+          ids.forEach(id => {
+            const cam = filteredCamerasRef.current.find(c => c.id === id)
+            if (!cam) return
+            bumpPlayerKeys([id])
+            const timer = setTimeout(() => {
+              // Última guarda: la pestaña pudo ocultarse durante estos 500 ms y
+              // arrancar un stream ahí resucitaría la sesión.
+              if (tabIsHidden()) return
+              loadStreamRef.current?.(cam)
+            }, 500)
+            staggerTimers.current.push(timer)
+          })
+        },
+        startedIdsOf: (r) => r?.startedIds ?? [],
+        isAuthError: (e: any) => e?.response?.status === 401,
+      },
+    )
+
+    if (outcome.status === 'reconciled' && outcome.remounted.length > 0) {
+      console.info(
+        `[live-ui] hls_reattach_after_expiry ids=[${outcome.remounted.join(',')}]` +
+        ' reason=session_alive_cookie_expired'
+      )
+    } else if (outcome.status !== 'reconciled' && outcome.status !== 'empty') {
+      console.info(`[live-ui] hls_expiry_flush outcome=${outcome.status}`)
     }
-
-    console.warn(`[LiveView] HLS_SESSION_EXPIRED batch: ${expiredIds.length} cámara(s) [${expiredIds.join(', ')}]`)
-
-    const now = Date.now()
-    const toRestart = expiredIds.filter(id => (now - (lastRestartAt.current[id] ?? 0)) >= 30_000)
-    const tooRecent = expiredIds.filter(id => (now - (lastRestartAt.current[id] ?? 0)) < 30_000)
-
-    if (tooRecent.length > 0) {
-      // Too soon to restart via heartbeat — remount the player so HLS.js
-      // re-establishes its session cookie against the still-running MediaMTX source.
-      // Don't show error; let VideoPlayer recover silently or report a different error.
-      bumpPlayerKeys(tooRecent)
-      setLoadingStreams(prev => { const n = { ...prev }; tooRecent.forEach(id => { n[id] = false }); return n })
-    }
-
-    if (toRestart.length === 0) return
-    toRestart.forEach(id => { lastRestartAt.current[id] = now })
-
-    const visibleIds = filteredCamerasRef.current.map(c => c.id)
-    if (visibleIds.length === 0) return
-
-    try {
-      const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', { viewId, visibleCameraIds: visibleIds })
-      applyHeartbeat(result)
-      // Always remount players for cameras that had expired sessions but were NOT freshly
-      // started by the backend (freshly started ones are already bumped in applyHeartbeat).
-      // This forces HLS.js to re-establish its session cookie even when the backend
-      // kept the session alive (session still active → not in startedIds → would stay stuck).
-      const notFreshlyStarted = toRestart.filter(id => !result.startedIds.includes(id))
-      if (notFreshlyStarted.length > 0) {
-        console.info(`[live-ui] hls_reattach_after_expiry ids=[${notFreshlyStarted.join(',')}] reason=session_alive_cookie_expired`)
-        bumpPlayerKeys(notFreshlyStarted)
-      }
-    } catch (err: any) {
-      if (err?.response?.status === 401) return  // auth expired; interceptor handles redirect
-      // Fallback: individual restart per camera (non-auth errors only).
-      // Uses loadStreamRef to avoid forward-reference compile error (loadStream
-      // is declared later in this component but ref is always current).
-      toRestart.forEach(id => {
-        const cam = filteredCamerasRef.current.find(c => c.id === id)
-        if (cam) {
-          bumpPlayerKeys([id])
-          setTimeout(() => loadStreamRef.current?.(cam), 500)
-        }
-      })
-    }
-  }, [viewId, applyHeartbeat, bumpPlayerKeys])
+  }, [applyHeartbeat, bumpPlayerKeys])
 
   // ─── Heartbeat periódico de la vista (30 s) ─────────────────
   // Reemplaza el touch-stream por cámara (N solicitudes → 1).
@@ -537,7 +529,7 @@ export function LiveViewPage() {
   // CANCELA —no se limita a saltarse el tick— y al volver se envía uno
   // inmediato y se rearma exactamente uno. Antes el intervalo seguía vivo con
   // una guarda dentro del callback, y esa guarda no cubría las demás rutas.
-  const heartbeatRef = useRef<HeartbeatScheduler | null>(null)
+  const heartbeatRef = useRef<HeartbeatScheduler<HeartbeatResponse | null> | null>(null)
   // El envío se lee por ref y el efecto no tiene dependencias A PROPÓSITO: si
   // dependiera de `sendHeartbeat`, cada cambio de su identidad destruiría el
   // programador y crearía otro, y como el nuevo late de inmediato eso sería una
@@ -545,11 +537,16 @@ export function LiveViewPage() {
   // montaje; su contenido siempre el más reciente.
   const sendHeartbeatRef = useRef(sendHeartbeat)
   sendHeartbeatRef.current = sendHeartbeat
+  const applyHeartbeatRef = useRef(applyHeartbeat)
+  applyHeartbeatRef.current = applyHeartbeat
   useEffect(() => {
-    const scheduler = createHeartbeatScheduler({
+    const scheduler = createHeartbeatScheduler<HeartbeatResponse | null>({
       intervalMs: 30_000,
       isHidden: tabIsHidden,
       send: (signal) => sendHeartbeatRef.current(filteredCamerasRef.current.map(c => c.id), signal),
+      // La cadencia aplica su propio resultado; `runNow` no, para que la
+      // reconciliación de sesiones HLS lo aplique una sola vez.
+      onResult: (result) => { if (result) applyHeartbeatRef.current(result) },
     })
     heartbeatRef.current = scheduler
     scheduler.start()
@@ -774,6 +771,15 @@ export function LiveViewPage() {
         // Se suspende el heartbeat (incluido el de HD): con la pestaña oculta no
         // hay espectador, y el servidor debe poder expirar la sesión y liberar
         // FFmpeg. El intervalo queda CANCELADO, no dormido.
+        //
+        // Y con él, el vaciado de sesiones HLS: su temporizador pendiente se
+        // cancela y la cola se descarta. Al volver, el heartbeat de regreso
+        // reconcilia el estado real en una sola pasada.
+        if (hlsExpiryTimerRef.current) {
+          clearTimeout(hlsExpiryTimerRef.current)
+          hlsExpiryTimerRef.current = null
+        }
+        hlsExpiryQueue.current.clear()
         hiddenSince.current = Date.now()
         console.info('[live-ui] heartbeat_suspended reason=document_hidden')
         return
@@ -932,6 +938,14 @@ export function LiveViewPage() {
       if (isFocusH264) {
         console.info(`[LiveView] HLS_SESSION_EXPIRED focus cameraId=${cameraId} — reconnecting transcodificación`)
         setFocusStreamError({ code: 'TRANSCODE_NOT_READY', message: 'Reconectando transcodificación...' })
+        return
+      }
+      // Con la pestaña oculta hls.js sigue cargando y sus 401 llegan en serie:
+      // encolarlos sólo alimentaría actividad repetitiva sobre una vista que el
+      // servidor debe poder expirar. Al volver, el heartbeat de regreso
+      // reconcilia todo de una vez.
+      if (tabIsHidden()) {
+        console.info(`[live-ui] hls_expiry_enqueue_skipped cameraId=${cameraId} reason=document_hidden`)
         return
       }
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })

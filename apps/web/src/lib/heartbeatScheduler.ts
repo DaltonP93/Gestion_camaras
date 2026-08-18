@@ -37,7 +37,22 @@ export interface HeartbeatTimers {
   clearInterval: (id: any) => void
 }
 
-export interface HeartbeatSchedulerOptions {
+/**
+ * Resultado de una ejecución puntual. `runNow` NUNCA lanza: quien la llama
+ * decide qué hacer con cada desenlace, y "oculta", "ocupada" o "abortada" son
+ * desenlaces normales, no errores.
+ */
+export type HeartbeatOutcome<T> =
+  | { status: 'ok'; result: T }
+  /** La pestaña está oculta: no se envió nada. */
+  | { status: 'hidden' }
+  /** Ya hay un heartbeat en vuelo: no se solapan. */
+  | { status: 'busy' }
+  /** Se abortó por ocultarse o detenerse mientras viajaba. */
+  | { status: 'aborted' }
+  | { status: 'error'; error: unknown }
+
+export interface HeartbeatSchedulerOptions<T = unknown> {
   /** Cadencia del latido periódico, en ms. */
   intervalMs: number
   /** Estado de visibilidad. Se consulta en cada decisión, nunca se cachea. */
@@ -46,14 +61,20 @@ export interface HeartbeatSchedulerOptions {
    * Envío real. Recibe la señal del ciclo actual: si la pestaña se oculta
    * mientras está en vuelo, la señal se aborta.
    */
-  send: (signal: AbortSignal) => Promise<unknown>
+  send: (signal: AbortSignal) => Promise<T>
+  /**
+   * Resultado de un latido de la CADENCIA (periódico o de regreso). No se
+   * invoca para `runNow`: ahí el resultado se le devuelve a quien lo pidió, y
+   * aplicarlo dos veces duplicaría remontes de players.
+   */
+  onResult?: (result: T) => void
   /** Diagnóstico opcional (logs de la página). */
   onSuspend?: () => void
   onResume?: () => void
   timers?: HeartbeatTimers
 }
 
-export interface HeartbeatScheduler {
+export interface HeartbeatScheduler<T = unknown> {
   /** Arranca. Si la pestaña ya está oculta, no late ni arma nada. */
   start(): void
   /** Conectar a `visibilitychange`: decide suspender o reanudar. */
@@ -64,6 +85,15 @@ export interface HeartbeatScheduler {
   isArmed(): boolean
   /** Sólo tests/diagnóstico: ¿hay un envío en vuelo? */
   isInFlight(): boolean
+  /**
+   * Ejecuta un heartbeat FUERA de la cadencia (reconciliación puntual), por el
+   * mismo camino cancelable y con el mismo cerrojo de "uno a la vez".
+   *
+   * Existe para que ninguna ruta de la página tenga que hablar con la API por
+   * su cuenta: ésa fue exactamente la grieta por la que `flushHlsExpiry` seguía
+   * latiendo con la pestaña oculta.
+   */
+  runNow(): Promise<HeartbeatOutcome<T>>
 }
 
 const defaultTimers: HeartbeatTimers = {
@@ -71,7 +101,9 @@ const defaultTimers: HeartbeatTimers = {
   clearInterval: (id) => clearInterval(id),
 }
 
-export function createHeartbeatScheduler(opts: HeartbeatSchedulerOptions): HeartbeatScheduler {
+export function createHeartbeatScheduler<T = unknown>(
+  opts: HeartbeatSchedulerOptions<T>,
+): HeartbeatScheduler<T> {
   const timers = opts.timers ?? defaultTimers
 
   let started = false
@@ -98,20 +130,41 @@ export function createHeartbeatScheduler(opts: HeartbeatSchedulerOptions): Heart
     controller = null
   }
 
-  function fire(): void {
-    if (stopped || opts.isHidden()) return
-    // Sin solapamiento: si el anterior sigue en vuelo, este tick se salta. La
-    // cadencia la mantiene el intervalo, así que saltarse uno no desarma nada.
-    if (controller) return
+  /**
+   * Única puerta de salida hacia la API. Todo —el tick periódico, el latido de
+   * regreso y las reconciliaciones puntuales— pasa por acá, así que la guarda
+   * de visibilidad, el cerrojo de "uno a la vez" y la señal de cancelación se
+   * aplican por igual y no pueden divergir.
+   */
+  async function run(): Promise<HeartbeatOutcome<T>> {
+    if (stopped || opts.isHidden()) return { status: 'hidden' }
+    // Sin solapamiento: si el anterior sigue en vuelo, este intento se salta.
+    // La cadencia la mantiene el intervalo, así que saltarse uno no desarma nada.
+    if (controller) return { status: 'busy' }
 
     const mine = new AbortController()
     controller = mine
-    // El resultado no rearma ni reprograma NADA: por eso una respuesta tardía
-    // —o el reintento tras renovar el JWT— no puede resucitar el latido con la
-    // pestaña oculta.
-    void Promise.resolve(opts.send(mine.signal))
-      .catch(() => {})
-      .finally(() => { if (controller === mine) controller = null })
+    try {
+      const result = await opts.send(mine.signal)
+      // La pestaña pudo ocultarse mientras la solicitud viajaba: el resultado
+      // ya no describe lo que el usuario ve, y aplicarlo reviviría sesiones.
+      if (mine.signal.aborted || opts.isHidden()) return { status: 'aborted' }
+      return { status: 'ok', result }
+    } catch (error) {
+      if (mine.signal.aborted) return { status: 'aborted' }
+      return { status: 'error', error }
+    } finally {
+      // El resultado no rearma ni reprograma NADA: por eso una respuesta tardía
+      // —o el reintento tras renovar el JWT— no puede resucitar el latido con
+      // la pestaña oculta.
+      if (controller === mine) controller = null
+    }
+  }
+
+  function fire(): void {
+    void run().then(outcome => {
+      if (outcome.status === 'ok') opts.onResult?.(outcome.result)
+    })
   }
 
   function suspend(): void {
@@ -149,5 +202,6 @@ export function createHeartbeatScheduler(opts: HeartbeatSchedulerOptions): Heart
     },
     isArmed() { return intervalId !== null },
     isInFlight() { return controller !== null },
+    runNow() { return run() },
   }
 }

@@ -62,6 +62,51 @@ describe('la cadencia del heartbeat tiene un solo dueño', () => {
   })
 })
 
+describe('(D) toda llamada al endpoint es cancelable', () => {
+  /** Extrae cada `apiPost(...)` cuyo primer argumento es el heartbeat. */
+  function heartbeatCalls(src: string): string[] {
+    const out: string[] = []
+    const re = /apiPost(?:<[^>]*>)?\(\s*'\/live-view\/heartbeat'/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(src)) !== null) {
+      // Se recorta hasta el cierre del paréntesis de la llamada, contando
+      // anidamientos, para no confundirse con el objeto del cuerpo.
+      let depth = 0
+      let i = src.indexOf('(', m.index)
+      const start = i
+      for (; i < src.length; i++) {
+        if (src[i] === '(') depth++
+        else if (src[i] === ')') { depth--; if (depth === 0) break }
+      }
+      out.push(src.slice(start, i + 1))
+    }
+    return out
+  }
+
+  it.each(HEARTBEAT_PAGES)('%s hace exactamente una llamada al endpoint', (rel) => {
+    // Una sola boca de salida por página. Dos era justamente el defecto: la
+    // segunda —el vaciado de sesiones HLS expiradas— no pasaba por el
+    // programador y no se podía cancelar.
+    expect(heartbeatCalls(read(rel))).toHaveLength(1)
+  })
+
+  it.each(HEARTBEAT_PAGES)('%s pasa una señal de cancelación en esa llamada', (rel) => {
+    const llamadas = heartbeatCalls(read(rel))
+    expect(llamadas.length).toBeGreaterThan(0)
+    for (const llamada of llamadas) {
+      expect(llamada).toMatch(/\bsignal\b/)
+    }
+  })
+
+  it('LiveViewPage no reconcilia sesiones HLS expiradas por su cuenta', () => {
+    const src = read('./LiveViewPage.tsx')
+    // Debe delegar en el módulo puro, que a su vez usa la operación cancelable
+    // del programador.
+    expect(src).toContain('reconcileHlsExpiry')
+    expect(src).toContain('runNow()')
+  })
+})
+
 describe('regresión: el viewId nunca puede ser "default"', () => {
   it.each(HEARTBEAT_PAGES)('%s envía un viewId propio en cada heartbeat', (rel) => {
     const src = read(rel)
