@@ -117,25 +117,50 @@ describe('(G) la invalidación del viewport se EJECUTA en cada cambio', () => {
   // de la invalidación se prueban ejecutándola en `viewportWork.test.ts`; acá
   // sólo se verifica que los cuatro caminos pasen por ella.
 
-  it('stopAllSessions invalida ANTES de detener nada', () => {
-    const cuerpo = src().slice(src().indexOf('const stopAllSessions'))
-    const hastaElAwait = cuerpo.slice(0, cuerpo.indexOf('await stopSessions'))
-    expect(hastaElAwait).toContain("viewportWork.invalidate(")
+  it('stopAllSessions NO invalida por su cuenta: la transacción es la dueña', () => {
+    // Invalidar desde dentro del cierre avanzaría la generación a mitad de la
+    // transacción y anularía el token que ella misma acaba de emitir, con lo
+    // que su propio commit se descartaría por "superseded".
+    const desde = src().indexOf('const stopAllSessions = useCallback')
+    expect(desde).toBeGreaterThan(-1)
+    const fin = src().indexOf('stopAllSessionsRef.current = stopAllSessions', desde)
+    expect(fin).toBeGreaterThan(desde)
+    const cuerpo = src().slice(desde, fin)
+    expect(cuerpo).not.toMatch(/viewportWork\.invalidate\(/)
   })
 
   it.each([
     ['handleNVRChange', 'nvr_change'],
     ['handlePageChange', 'page_change'],
     ['handleLayoutChange', 'layout_change'],
-  ])('%s pasa por stopAllSessions con razón %s', (handler, razon) => {
+  ])('%s pasa por la transacción con razón %s', (handler, razon) => {
     const i = src().indexOf(`const ${handler}`)
     expect(i).toBeGreaterThan(-1)
     const cuerpo = src().slice(i, i + 400)
-    expect(cuerpo).toContain(`stopAllSessions('${razon}')`)
+    // Nunca el cierre suelto: sin la transacción el intervalo sigue armado y un
+    // tick puede latir con los IDs del viewport anterior mientras se cierra.
+    expect(cuerpo).toContain(`transition.run('${razon}'`)
+    expect(cuerpo).not.toMatch(/stopAllSessions\(/)
   })
 
-  it('la transición por camera_query también pasa por stopAllSessions', () => {
-    expect(src()).toContain("stopAllSessions('camera_query')")
+  it('la transición por camera_query también pasa por la transacción', () => {
+    expect(src()).toContain("transition.run('camera_query'")
+  })
+
+  it('los cambios de viewport son los únicos que llaman a la transacción', () => {
+    const razones = Array.from(src().matchAll(/transition\.run\('([a-z_]+)'/g)).map(m => m[1])
+    expect(razones.sort()).toEqual(
+      ['camera_query', 'layout_change', 'nvr_change', 'page_change'],
+    )
+  })
+
+  it('el cierre de sesiones sólo lo invoca el coordinador', () => {
+    // Nadie la LLAMA directamente: sólo se define y se publica en la ref que
+    // lee `closeSessions`. Una llamada suelta sería un cierre fuera de la
+    // transacción, con la cadencia todavía armada.
+    const llamadas = Array.from(src().matchAll(/(?<!Ref\.current = )\bstopAllSessions\(/g))
+    expect(llamadas).toEqual([])
+    expect(src()).toContain('closeSessions: (reason) => stopAllSessionsRef.current(reason)')
   })
 
   it('el cierre de la vista (pagehide y desmontaje) invalida', () => {
@@ -153,10 +178,74 @@ describe('(G) la invalidación del viewport se EJECUTA en cada cambio', () => {
     expect(s).not.toContain('hlsExpiryTimerRef.current')
   })
 
-  it('todo trabajo diferido comprueba la generación antes de aplicar', () => {
+  it('la identidad de cada solicitud es un token LOCAL, no una ref compartida', () => {
     const s = src()
-    expect(s).toContain('viewportWork.isCurrent(epoch)')
-    expect(s).toContain('viewportWork.isCurrent(epochDeEnvio.current)')
+    // Cada camino que puede resolver tarde captura su propio token en una
+    // variable local antes de salir. Ése era el defecto de #159: la generación
+    // vivía en una ref que la transición nueva ya había pisado, así que el
+    // resultado viejo pasaba la comprobación.
+    const capturas = Array.from(s.matchAll(/const token = transition\.current\(\)/g))
+    // heartbeat, scheduleStart, loadStream, foco/HD y cambio de calidad.
+    expect(capturas.length).toBeGreaterThanOrEqual(5)
+    // Todas menos la del heartbeat comparan el token local directamente; la del
+    // heartbeat pasa por `tokenDelVuelo` y la cubre el test siguiente.
+    const comparaciones = Array.from(s.matchAll(/transition\.isCurrent\(token\)/g))
+    expect(comparaciones.length).toBe(capturas.length - 1)
+    // Y no vuelve la ref mutable como identidad de varias solicitudes.
+    expect(s).not.toContain('epochDeEnvio')
+  })
+
+  it('el único token en ref es el del heartbeat, y el propio envío lo escribe', () => {
+    const s = src()
+    // El programador garantiza una sola solicitud en vuelo, así que un único
+    // casillero alcanza — pero tiene que escribirse en `send`, no antes.
+    const i = s.indexOf('send: (signal) =>')
+    expect(i).toBeGreaterThan(-1)
+    const cuerpo = s.slice(i, i + 600)
+    expect(cuerpo).toContain('const token = transition.current()')
+    expect(cuerpo).toContain('tokenDelVuelo.current = token')
+    expect(s).toContain('if (!transition.isCurrent(tokenDelVuelo.current))')
+  })
+
+  it('el programador se comporta como oculto mientras hay una transición', () => {
+    expect(src()).toContain('isHidden: () => tabIsHidden() || transition.isTransitioning()')
+  })
+
+  it('ningún arranque diferido usa un setTimeout suelto', () => {
+    const s = src()
+    // Todos pasan por `scheduleStart`, que captura token, registra el timer
+    // para que la invalidación pueda cancelarlo y comprueba antes de arrancar.
+    const ventanas: string[] = []
+    const re = /setTimeout\s*\(/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(s)) !== null) ventanas.push(s.slice(m.index, m.index + 200))
+    const sospechosas = ventanas.filter(v => /loadStream/i.test(v))
+    expect(sospechosas).toEqual([])
+    // El registro del temporizador —lo que permite cancelarlo al invalidar— lo
+    // hace el módulo compartido, no cada sitio por su cuenta.
+    expect(s).toContain('scheduleDeferredStart({')
+    expect(s).toContain('track: (id) => viewportWork.trackTimer(id)')
+  })
+
+  it('todo start-stream pasa por el ciclo de vida guardado', () => {
+    const s = src()
+    const arranques = Array.from(s.matchAll(/\/start-stream`/g)).length
+    const guardados  = Array.from(s.matchAll(/runViewportRequest</g)).length
+    // Grid, foco/HD y cambio de calidad: tres arranques, tres ciclos guardados.
+    // Un cuarto arranque sin ciclo sería una respuesta vieja capaz de dejar un
+    // FFmpeg sin espectador hasta el TTL.
+    expect(arranques).toBe(3)
+    expect(guardados).toBe(3)
+  })
+
+  it('cada ciclo guardado cierra en `discard` lo que el backend creó', () => {
+    const s = src()
+    const cierres = Array.from(s.matchAll(/'viewport_changed', viewId\)/g)).length
+    expect(cierres).toBe(3)
+  })
+
+  it('el trabajo por generación sigue vigente para las expiraciones HLS', () => {
+    expect(src()).toContain('viewportWork.isCurrent(epoch)')
   })
 })
 
