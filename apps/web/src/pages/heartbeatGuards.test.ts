@@ -107,23 +107,56 @@ describe('(D) toda llamada al endpoint es cancelable', () => {
   })
 })
 
-describe('(9) el trabajo pendiente no sobrevive al cierre de la vista', () => {
+describe('(G) la invalidación del viewport se EJECUTA en cada cambio', () => {
   const src = () => read('./LiveViewPage.tsx')
 
-  it('las expiraciones pendientes se conservan mientras la pestaña está oculta', () => {
-    // No se descartan: hls.js no vuelve a emitir el 401.
-    expect(src()).toContain('pendingExpiry.current.add')
+  // La versión anterior de estas guardas comprobaba que el archivo CONTUVIERA
+  // `pendingExpiry.current.clear()`. Eso pasaba aunque la línea no se ejecutara
+  // nunca en un cambio de NVR: la limpieza vivía en el cleanup de un efecto que
+  // sólo corre al desmontar, y cambiar de NVR no desmonta la vista. Los efectos
+  // de la invalidación se prueban ejecutándola en `viewportWork.test.ts`; acá
+  // sólo se verifica que los cuatro caminos pasen por ella.
+
+  it('stopAllSessions invalida ANTES de detener nada', () => {
+    const cuerpo = src().slice(src().indexOf('const stopAllSessions'))
+    const hastaElAwait = cuerpo.slice(0, cuerpo.indexOf('await stopSessions'))
+    expect(hastaElAwait).toContain("viewportWork.invalidate(")
   })
 
-  it('y se limpian al desmontar o cambiar de NVR', () => {
-    // Recuperar una cámara de la vista anterior arrancaría un stream sin
-    // espectador.
-    expect(src()).toContain('pendingExpiry.current.clear()')
-    expect(src()).toContain('pendingFocusExpiry.current = null')
+  it.each([
+    ['handleNVRChange', 'nvr_change'],
+    ['handlePageChange', 'page_change'],
+    ['handleLayoutChange', 'layout_change'],
+  ])('%s pasa por stopAllSessions con razón %s', (handler, razon) => {
+    const i = src().indexOf(`const ${handler}`)
+    expect(i).toBeGreaterThan(-1)
+    const cuerpo = src().slice(i, i + 400)
+    expect(cuerpo).toContain(`stopAllSessions('${razon}')`)
   })
 
-  it('el conjunto pendiente se consume por el punto único de aplicación', () => {
-    expect(src()).toContain('consumePendingExpiryRef.current(result)')
+  it('la transición por camera_query también pasa por stopAllSessions', () => {
+    expect(src()).toContain("stopAllSessions('camera_query')")
+  })
+
+  it('el cierre de la vista (pagehide y desmontaje) invalida', () => {
+    const i = src().indexOf('const closeThisView')
+    const cuerpo = src().slice(i, i + 300)
+    expect(cuerpo).toContain("viewportWork.invalidate('close_view')")
+  })
+
+  it('el trabajo transitorio ya no vive en refs sueltas de la página', () => {
+    // Si vuelven a aparecer, vuelve el defecto: limpiarlas exige acordarse en
+    // cada camino, y ése es justamente el olvido que hubo.
+    const s = src()
+    expect(s).not.toContain('pendingExpiry.current')
+    expect(s).not.toContain('hlsExpiryQueue.current')
+    expect(s).not.toContain('hlsExpiryTimerRef.current')
+  })
+
+  it('todo trabajo diferido comprueba la generación antes de aplicar', () => {
+    const s = src()
+    expect(s).toContain('viewportWork.isCurrent(epoch)')
+    expect(s).toContain('viewportWork.isCurrent(epochDeEnvio.current)')
   })
 })
 
