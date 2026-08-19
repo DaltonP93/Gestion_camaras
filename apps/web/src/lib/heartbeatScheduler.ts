@@ -110,6 +110,16 @@ export interface HeartbeatScheduler<T = unknown> {
    * inmediato (revisión de #158).
    */
   cancelInFlight(): void
+  /**
+   * Suspende la cadencia SIN detener el programador: desarma el intervalo y
+   * aborta lo que esté en vuelo. Es lo que necesita el inicio de una
+   * transición de viewport — no basta con invalidar estado si el intervalo
+   * sigue armado y puede vencer un tick mientras se cierran las sesiones
+   * anteriores (revisión de #159).
+   */
+  suspend(): void
+  /** Rearma la cadencia. Idempotente: nunca deja dos intervalos. */
+  arm(): void
 }
 
 const defaultTimers: HeartbeatTimers = {
@@ -242,6 +252,10 @@ export function createHeartbeatScheduler<T = unknown>(
       abortInFlight()
     },
     cancelInFlight() { abortInFlight() },
+    suspend() { disarm(); abortInFlight() },
+    // Referencia explícita a la función externa: `arm() { arm() }` resolvería
+    // igual por alcance léxico, pero se lee como una recursión que no es.
+    arm: () => { arm() },
     isArmed() { return intervalId !== null },
     isInFlight() { return controller !== null },
     runNow() { return run(true) },
