@@ -103,6 +103,13 @@ export interface HeartbeatScheduler<T = unknown> {
    * latiendo con la pestaña oculta.
    */
   runNow(): Promise<HeartbeatOutcome<T>>
+  /**
+   * Aborta la solicitud en vuelo SIN detener el programador ni desarmar el
+   * intervalo. Es lo que necesita un cambio de NVR/página/layout: el trabajo
+   * del viewport anterior se tira, pero el nuevo tiene que poder reconciliar de
+   * inmediato (revisión de #158).
+   */
+  cancelInFlight(): void
 }
 
 const defaultTimers: HeartbeatTimers = {
@@ -234,6 +241,7 @@ export function createHeartbeatScheduler<T = unknown>(
       disarm()
       abortInFlight()
     },
+    cancelInFlight() { abortInFlight() },
     isArmed() { return intervalId !== null },
     isInFlight() { return controller !== null },
     runNow() { return run(true) },

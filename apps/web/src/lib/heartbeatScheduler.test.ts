@@ -506,3 +506,58 @@ describe('(F) runNow comparte cerrojo, guarda y señal con la cadencia', () => {
     expect(s.count()).toBe(0)
   })
 })
+
+// ─── (C) cancelInFlight: el viewport nuevo no hereda el vuelo del anterior ───
+//
+// Revisión de #158: al cambiar de NVR hay que invalidar el trabajo anterior
+// SIN detener el programador, o el viewport nuevo se queda sin cadencia.
+
+describe('(C) cancelInFlight aísla los viewports', () => {
+  it('aborta lo en vuelo pero deja el intervalo armado', () => {
+    const { sched, t, s } = setup(oculta)
+    s.dejarEnVuelo()
+    sched.start()
+
+    sched.cancelInFlight()
+
+    expect(s.abortadas()).toBe(1)
+    expect(sched.isArmed()).toBe(true)      // el programador NO se detuvo
+    expect(t.vivos()).toBe(1)
+  })
+
+  it('el runNow siguiente no se une al vuelo cancelado: hace el suyo', async () => {
+    const { sched, s } = setup(oculta)
+    s.dejarEnVuelo()
+    sched.start()                            // vuelo del viewport A
+    expect(s.count()).toBe(1)
+
+    sched.cancelInFlight()                   // cambio de NVR
+    s.resolver()                             // A resolvería acá
+    const nuevo = sched.runNow()             // viewport B
+
+    expect(s.count()).toBe(2)                // B salió con su propia solicitud
+    await nuevo
+  })
+
+  it('la respuesta del viewport anterior llega como abortada, no como resultado', async () => {
+    const { sched, s } = setup(oculta)
+    s.dejarEnVuelo()
+    const deA = sched.runNow()
+
+    sched.cancelInFlight()
+    s.resolver()
+
+    expect(await deA).toEqual({ status: 'aborted' })
+  })
+
+  it('cancelar sin nada en vuelo no rompe ni desarma', () => {
+    const { sched, t } = setup(oculta)
+    sched.start()
+
+    sched.cancelInFlight()
+    sched.cancelInFlight()
+
+    expect(sched.isArmed()).toBe(true)
+    expect(t.vivos()).toBe(1)
+  })
+})

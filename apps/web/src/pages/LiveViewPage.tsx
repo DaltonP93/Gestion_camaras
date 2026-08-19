@@ -20,6 +20,7 @@ import { clsx } from 'clsx'
 import type { Camera, StreamInfo, GridLayout, StreamHealthStatus, HeartbeatResponse } from '@/types'
 import { createHeartbeatScheduler, type HeartbeatScheduler } from '@/lib/heartbeatScheduler'
 import { reconcileHlsExpiry, decideExpiryRecovery } from '@/lib/hlsExpiryReconcile'
+import { createViewportWork } from '@/lib/viewportWork'
 
 function isHevcCodec(codec?: string): boolean {
   if (!codec) return false
@@ -192,7 +193,6 @@ export function LiveViewPage() {
   // Puente al re-pedido de HD (definido más abajo, tras handleEnterFocus).
   const reacquireHdRef = useRef<((cam: Camera) => Promise<void>) | null>(null)
   // Rate-limit per-camera 401 auto-restarts: timestamp of last restart per cameraId
-  const lastRestartAt  = useRef<Record<string, number>>({})
   // Backoff cuando se recibe STREAM_LIMIT_*: no reintentar esa cámara hasta este
   // timestamp (ms). Evita que el heartbeat golpee el límite en cada ciclo.
   const limitBackoffUntil = useRef<Record<string, number>>({})
@@ -200,18 +200,20 @@ export function LiveViewPage() {
   const filteredCamerasRef = useRef<Camera[]>([])
   // Coalescing queue for HLS_SESSION_EXPIRED: collects simultaneous 401s
   // and flushes them as a single heartbeat after a 2s window
-  const hlsExpiryQueue    = useRef<Set<string>>(new Set())
-  const hlsExpiryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   /**
-   * Expiraciones que NO se pudieron reconciliar todavía: las que llegaron con
-   * la pestaña oculta y las que un heartbeat abortado dejó sin recuperar.
+   * Dueño ÚNICO del trabajo transitorio del viewport: cola de expiraciones,
+   * pendientes, foco pendiente, enfriamiento y temporizadores. Su `invalidate`
+   * los tira todos de una vez y avanza la generación.
    *
-   * hls.js considera fatal el 401 y no vuelve a emitirlo: si se pierde este
-   * conjunto, el player se queda cargando para siempre (revisión de #157).
+   * Antes eran refs sueltas limpiadas sólo en el cleanup del efecto del
+   * programador, que NO corre al cambiar de NVR, página o layout: la vista no
+   * se desmonta (revisión de #158).
    */
-  const pendingExpiry = useRef<Set<string>>(new Set())
-  /** ¿La cámara en foco quedó con su sesión HD expirada y sin recuperar? */
-  const pendingFocusExpiry = useRef<string | null>(null)
+  const viewportWork = useRef(createViewportWork({
+    cancelInFlightHeartbeat: () => heartbeatRef.current?.cancelInFlight(),
+    onInvalidate: ({ epoch, reason }) =>
+      console.info(`[live-ui] viewport_work_invalidated epoch=${epoch} reason=${reason}`),
+  })).current
   // Ref to loadStream so flushHlsExpiry (declared before loadStream) can call it
   // without a forward-reference compile error.
   const loadStreamRef = useRef<((camera: Camera) => Promise<void>) | null>(null)
@@ -481,9 +483,11 @@ export function LiveViewPage() {
   // programaba un `loadStream` aunque la pestaña estuviera oculta: era la única
   // ruta que sobrevivía a la corrección de #156.
   const flushHlsExpiry = useCallback(async () => {
-    hlsExpiryTimerRef.current = null
-    const expiredIds = Array.from(hlsExpiryQueue.current)
-    hlsExpiryQueue.current.clear()
+    viewportWork.clearExpiryTimer()
+    const expiredIds = viewportWork.takeExpiryQueue()
+    // Generación capturada al empezar: si el viewport cambia mientras esto
+    // trabaja, nada de lo que siga puede aplicarse.
+    const epoch = viewportWork.epoch()
     if (expiredIds.length === 0) return
 
     const outcome = await reconcileHlsExpiry<HeartbeatResponse | null>(
@@ -492,7 +496,7 @@ export function LiveViewPage() {
       {
         isHidden: tabIsHidden,
         now: () => Date.now(),
-        lastRestartAt: lastRestartAt.current,
+        lastRestartAt: viewportWork.lastRestartAt,
         // TODA la red pasa por el programador: mismo cerrojo de "uno a la vez",
         // misma guarda de visibilidad y misma señal de cancelación que el
         // latido periódico y el de regreso.
@@ -508,18 +512,26 @@ export function LiveViewPage() {
             if (!cam) return
             bumpPlayerKeys([id])
             const timer = setTimeout(() => {
-              // Última guarda: la pestaña pudo ocultarse durante estos 500 ms y
-              // arrancar un stream ahí resucitaría la sesión.
-              if (tabIsHidden()) return
+              // Últimas guardas: durante estos 500 ms la pestaña pudo ocultarse
+              // —arrancar un stream ahí resucitaría la sesión— o el viewport
+              // pudo cambiar, y entonces la cámara ya no es de esta vista.
+              if (tabIsHidden() || !viewportWork.isCurrent(epoch)) return
               loadStreamRef.current?.(cam)
             }, 500)
-            staggerTimers.current.push(timer)
+            viewportWork.trackTimer(timer)
           })
         },
         startedIdsOf: (r) => r?.startedIds ?? [],
         isAuthError: (e: any) => e?.response?.status === 401,
       },
     )
+
+    // El viewport pudo cambiar mientras la reconciliación viajaba: nada de esto
+    // pertenece ya a lo que el usuario está mirando.
+    if (!viewportWork.isCurrent(epoch)) {
+      console.info(`[live-ui] hls_expiry_flush_discarded reason=viewport_changed epoch=${epoch}`)
+      return
+    }
 
     if (outcome.status === 'reconciled' && outcome.remounted.length > 0) {
       console.info(
@@ -535,7 +547,7 @@ export function LiveViewPage() {
     // Se CONSERVAN: hls.js no volverá a avisar, así que el próximo heartbeat
     // exitoso —el periódico o el de regreso— es quien debe rescatarlas.
     console.info(`[live-ui] hls_expiry_flush outcome=${outcome.status} pending=${outcome.pending.length}`)
-    outcome.pending.forEach(id => pendingExpiry.current.add(id))
+    viewportWork.addPending(outcome.pending)
   }, [bumpPlayerKeys])
 
   // ─── Heartbeat periódico de la vista (30 s) ─────────────────
@@ -546,6 +558,8 @@ export function LiveViewPage() {
   // inmediato y se rearma exactamente uno. Antes el intervalo seguía vivo con
   // una guarda dentro del callback, y esa guarda no cubría las demás rutas.
   const heartbeatRef = useRef<HeartbeatScheduler<HeartbeatResponse | null> | null>(null)
+  /** Generación del viewport con la que salió el heartbeat en vuelo. */
+  const epochDeEnvio = useRef(0)
   // El envío se lee por ref y el efecto no tiene dependencias A PROPÓSITO: si
   // dependiera de `sendHeartbeat`, cada cambio de su identidad destruiría el
   // programador y crearía otro, y como el nuevo late de inmediato eso sería una
@@ -565,11 +579,9 @@ export function LiveViewPage() {
    * necesitan un remonte para renovar la cookie HLS.
    */
   const consumePendingExpiry = useCallback((result: HeartbeatResponse) => {
-    const pendientes = Array.from(pendingExpiry.current)
-    const foco = pendingFocusExpiry.current
+    const pendientes = viewportWork.takePending()
+    const foco = viewportWork.takePendingFocus()
     if (pendientes.length === 0 && !foco) return
-    pendingExpiry.current.clear()
-    pendingFocusExpiry.current = null
 
     const { remount: aRemontar, focus } = decideExpiryRecovery({
       pending: pendientes,
@@ -605,13 +617,23 @@ export function LiveViewPage() {
     const scheduler = createHeartbeatScheduler<HeartbeatResponse | null>({
       intervalMs: 30_000,
       isHidden: tabIsHidden,
-      send: (signal) => sendHeartbeatRef.current(filteredCamerasRef.current.map(c => c.id), signal),
+      send: (signal) => {
+        // Generación del viewport en el momento de salir a la red.
+        epochDeEnvio.current = viewportWork.epoch()
+        return sendHeartbeatRef.current(filteredCamerasRef.current.map(c => c.id), signal)
+      },
       // La cadencia aplica su propio resultado; `runNow` no, para que la
       // reconciliación de sesiones HLS lo aplique una sola vez.
       // Punto ÚNICO de aplicación, sea cual sea la ruta que originó la
       // solicitud (cadencia, regreso o reconciliación que se unió a ella).
       onResult: (result) => {
         if (!result) return
+        // La respuesta puede pertenecer al viewport anterior: el envío capturó
+        // su generación y acá se compara con la vigente.
+        if (!viewportWork.isCurrent(epochDeEnvio.current)) {
+          console.info('[live-ui] heartbeat_result_discarded reason=viewport_changed')
+          return
+        }
         applyHeartbeatRef.current(result)
         consumePendingExpiryRef.current(result)
       },
@@ -624,13 +646,7 @@ export function LiveViewPage() {
       // Nada de la vista anterior sobrevive al desmontaje o al cambio de NVR:
       // recuperar una cámara que ya no se muestra arrancaría un stream sin
       // espectador.
-      if (hlsExpiryTimerRef.current) {
-        clearTimeout(hlsExpiryTimerRef.current)
-        hlsExpiryTimerRef.current = null
-      }
-      hlsExpiryQueue.current.clear()
-      pendingExpiry.current.clear()
-      pendingFocusExpiry.current = null
+      viewportWork.invalidate('unmount')
     }
   }, [])
 
@@ -658,6 +674,11 @@ export function LiveViewPage() {
 
   // ─── Stop ALL current sessions + clear state ────────────────
   const stopAllSessions = useCallback(async (reason?: string) => {
+    // ANTES que nada: se tira el trabajo transitorio del viewport que se está
+    // abandonando y se avanza la generación. Éste es el punto por el que pasan
+    // el cambio de NVR, de página, de layout y la transición de `camera_query`
+    // —ninguno desmonta la vista, así que el cleanup del efecto no corre—.
+    viewportWork.invalidate(reason || 'stop_all')
     clearStaggerTimers()
     const allActive = Array.from(activeSessions.current)
     await stopSessions(allActive, reason || 'stop_all')
@@ -682,6 +703,7 @@ export function LiveViewPage() {
   // El TTL del servidor sigue siendo la garantía final si nada de esto llega.
   useEffect(() => {
     const closeThisView = () => {
+      viewportWork.invalidate('close_view')
       clearStaggerTimers()
       void closeViewSessions(viewId)
     }
@@ -853,14 +875,10 @@ export function LiveViewPage() {
         // Y con él, el vaciado de sesiones HLS: su temporizador pendiente se
         // cancela y la cola se descarta. Al volver, el heartbeat de regreso
         // reconcilia el estado real en una sola pasada.
-        if (hlsExpiryTimerRef.current) {
-          clearTimeout(hlsExpiryTimerRef.current)
-          hlsExpiryTimerRef.current = null
-        }
+        viewportWork.clearExpiryTimer()
         // La cola NO se descarta: se traslada al conjunto pendiente, que el
         // heartbeat de regreso consume una sola vez.
-        hlsExpiryQueue.current.forEach(id => pendingExpiry.current.add(id))
-        hlsExpiryQueue.current.clear()
+        viewportWork.addPending(viewportWork.takeExpiryQueue())
         hiddenSince.current = Date.now()
         console.info('[live-ui] heartbeat_suspended reason=document_hidden')
         return
@@ -1023,7 +1041,7 @@ export function LiveViewPage() {
         // ocultarse, el regreso tiene que rescatarla. Sin esto el foco quedaba
         // con "Reconectando…" para siempre al volver antes del TTL, porque
         // `decideHdReacquire` sólo actúa pasado el TTL (revisión de #157).
-        pendingFocusExpiry.current = cameraId
+        viewportWork.setPendingFocus(cameraId)
         return
       }
       // Con la pestaña oculta no se envía nada ni se programan reintentos, pero
@@ -1031,14 +1049,14 @@ export function LiveViewPage() {
       // emitirlo, así que descartarlo dejaba el player cargando para siempre.
       if (tabIsHidden()) {
         console.info(`[live-ui] hls_expiry_deferred cameraId=${cameraId} reason=document_hidden`)
-        pendingExpiry.current.add(cameraId)
+        viewportWork.addPending([cameraId])
         return
       }
       setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       setLoadingStreams(prev => ({ ...prev, [cameraId]: true }))
-      hlsExpiryQueue.current.add(cameraId)
-      if (!hlsExpiryTimerRef.current) {
-        hlsExpiryTimerRef.current = setTimeout(flushHlsExpiry, 2_000)
+      viewportWork.enqueueExpiry(cameraId)
+      if (!viewportWork.hasExpiryTimer()) {
+        viewportWork.setExpiryTimer(setTimeout(flushHlsExpiry, 2_000))
       }
       return
     }
