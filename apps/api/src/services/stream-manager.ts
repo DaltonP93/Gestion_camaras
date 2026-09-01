@@ -3,12 +3,14 @@
 // Este manager trackea quién está mirando para informar al frontend y aplicar límites.
 import type { FastifyInstance } from 'fastify'
 import type { ChildProcess } from 'child_process'
+import { randomUUID } from 'node:crypto'
 import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, removeTranscodedPath, getStreamStatus, publishTranscodedStream, getTranscodedStreamPath, isTranscodingEnabled, getFfmpegCapabilities, waitForHlsReady, spawnTranscodeProcess, stopTranscodeProcess, isTranscodeProcessAlive, getTranscodeStderr, getStreamDetails, getActiveTranscodesList, getTranscodeRawStderr, getTranscodeRtspMasked } from './stream'
 import type { NVR, Camera } from '@prisma/client'
 import { decryptNvrPassword as decryptPass } from './credentials'
 import { resolveGridProfile } from './transcode-profile'
 import {
-  getSessionTtl, decideSessionExpiry, decideProcessTermination, orphanViewKeys,
+  getSessionTtl, decideSessionExpiry, decideProcessTermination, decideStopTermination,
+  decideAttemptRelease, decideStaleSessionDelete, orphanViewKeys,
   hasFreshClientViewer,
   type SessionTruth, type SessionTtl,
 } from './session-lifecycle'
@@ -84,11 +86,28 @@ const SUPERVISOR_BACKOFFS     = [2_000, 5_000, 10_000] as const
 // Reasons that explicitly allow FFmpeg to be killed when stopping a main_h264 session.
 // Any other reason (e.g. 'retry', 'hls_error') keeps FFmpeg alive so the next startStream
 // call can detect the live process via isTranscodeProcessAlive and reuse it.
-const TRANSCODE_KILL_REASONS = new Set([
+// `stale_response`: la respuesta de start-stream llegó después de que su
+// viewport, su foco o su selección de calidad dejaran de existir. La sesión
+// nació sin dueño y nadie va a reutilizarla, así que su proceso tiene que morir
+// con ella. Es distinta de `viewport_change` —el cierre ordenado de la vista
+// anterior— a propósito: en los logs son dos caminos diferentes.
+//
+// Estas cadenas son un CONTRATO con el frontend (apps/web/src/lib/closeReasons.ts)
+// y las verifica `transcode-kill-reasons.contract.test.ts`. Una letra de más
+// —`viewport_changed` en vez de `viewport_change`— borra la sesión y deja el
+// FFmpeg corriendo sin espectador hasta la poda por inactividad.
+/**
+ * Razón EXACTA de un cierre por respuesta tardía. Contrato con el frontend
+ * (`apps/web/src/lib/closeReasons.ts`), verificado por
+ * `transcode-kill-reasons.contract.test.ts`.
+ */
+export const STALE_RESPONSE_REASON = 'stale_response'
+
+export const TRANSCODE_KILL_REASONS = new Set([
   'exit_focus', 'switch_to_sub', 'cleanup_unmount', 'idle_timeout',
   'force_stop', 'logout', 'session_cleanup', 'viewport_change',
   'layout_change', 'nvr_change', 'page_change', 'stop_all',
-  'exit_fullscreen',
+  'exit_fullscreen', 'stale_response',
 ])
 
 // Desglose de cupos de transcodificación: activos (sesiones main_h264 registradas),
@@ -107,7 +126,7 @@ const TRANSCODE_KILL_REASONS = new Set([
  * a la vez reiniciando no puede ocupar dos cupos.
  */
 export function getTranscodeCounts(): {
-  active: number; starting: number; total: number; max: number
+  active: number; starting: number; retained: number; total: number; max: number
   /** Paths que ya ocupan cupo — permite reutilizarlos con el máximo alcanzado. */
   occupiedPaths: Set<string>
 } {
@@ -119,10 +138,18 @@ export function getTranscodeCounts(): {
     Array.from(transcodeInFlight.entries())
       .filter(([, f]) => f.state === 'starting')
       .map(([path]) => path))
-  const occupiedPaths = new Set([...activePaths, ...startingPaths])
+  // Un proceso RETENIDO (sin sesión) sigue vivo y consume cupo hasta que se
+  // finalice: cuenta capacidad. Sin esto, un FFmpeg huérfano ocupaba un slot
+  // real pero no figuraba en ningún conteo.
+  const retainedPaths = new Set(
+    Array.from(retentions.values())
+      .filter(r => r.streamType === 'main_h264' && isTranscodeProcessAlive(r.streamPath))
+      .map(r => r.streamPath))
+  const occupiedPaths = new Set([...activePaths, ...startingPaths, ...retainedPaths])
   return {
     active: activePaths.size,
     starting: startingPaths.size,
+    retained: retainedPaths.size,
     total: occupiedPaths.size,
     max: MAX_TRANSCODE_SESSIONS,
     occupiedPaths,
@@ -179,6 +206,42 @@ interface StreamSession {
    * proceso vivo ni la actividad de medio la tocan (revisión de #149).
    */
   lastOwnerRequestSeq: number
+  /**
+   * Intento de arranque del CLIENTE que creó esta sesión efectiva.
+   *
+   * La identidad `(userId, viewId, cameraId, streamType)` no distingue dos
+   * solicitudes que aterrizan en la misma ranura, y con la redirección
+   * `main` → `main_h264` eso pasa a diario: A pide `main` y B pide `main_h264`
+   * para la misma cámara y vista. El DELETE tardío de A llega con un ticket
+   * POSTERIOR al de B —lo saca al cerrarse, no al abrirse— así que ni el
+   * watermark ni `lastOwnerRequestSeq` lo frenan, y borraba la sesión de B.
+   *
+   * Con esto, un cierre por respuesta tardía declara a quién cree estar
+   * cerrando y se compara antes de tocar nada.
+   *
+   * ES UN CONJUNTO, NO UN ÚNICO DUEÑO REEMPLAZABLE.
+   *
+   * La versión anterior guardaba un solo intento y lo sustituía por el del
+   * último arranque que llegara, usando `ticket.seq` para decidir cuál era "más
+   * nuevo". Pero el ticket mide el orden de LLEGADA AL SERVIDOR, no el orden
+   * lógico del navegador, y los dos difieren cuando dos POST viajan a la vez:
+   *
+   *   el usuario inicia A y después B;
+   *   B llega primero y crea `main_h264`;
+   *   A llega segundo, con ticket MAYOR, y le arrebataba la propiedad;
+   *   B sigue siendo la operación vigente en el frontend;
+   *   A responde tarde, se descarta, y su `stale_response` coincidía con A…
+   *   …y cerraba la sesión y el FFmpeg que B estaba usando.
+   *
+   * Un arranque aceptado AGREGA su intento y no borra ninguno. Cada intento es
+   * un arrendamiento: la sesión vive mientras quede al menos uno, y un cierre
+   * por respuesta tardía sólo libera el suyo.
+   *
+   * Vacío es legítimo: las sesiones que nacen de la reconciliación del heartbeat
+   * no tienen intento de cliente, y a ésas no las cierra ninguna respuesta
+   * tardía.
+   */
+  startAttemptIds: Set<string>
 }
 
 /**
@@ -200,6 +263,45 @@ type TranscodeRegistrationResult =
  */
 function reaffirmOwnership(session: StreamSession, ticket: RequestTicket): void {
   session.lastOwnerRequestSeq = Math.max(session.lastOwnerRequestSeq, ticket.seq)
+}
+
+/**
+ * KEEPALIVE PURO: renueva el TTL y NADA más.
+ *
+ * Actividad e intención son dos cosas distintas y estaban mezcladas en una sola
+ * operación. `reaffirmOwnership` significa "una petición del cliente afirmó la
+ * PROPIEDAD de esta sesión", y sólo la afirman un arranque o una reutilización.
+ * Un heartbeat de grilla dice otra cosa mucho más débil: "la pestaña sigue
+ * viva". Que además elevara la marca de propiedad producía esta fuga:
+ *
+ *   existe `sub` de grilla y `main_h264` de foco;
+ *   el usuario sale de foco y el DELETE `exit_focus` saca el ticket T;
+ *   un `reconcileView` posterior llega con T+1 y TOCA el `main_h264` co-locado;
+ *   `reaffirmOwnership` sube la marca del HD;
+ *   el cierre llega y `resolveDeletable` contesta `reaffirmed_by_newer_request`.
+ *
+ * Resultado: `ignored`. La sesión HD y su FFmpeg sobrevivían a la salida de foco
+ * por culpa del heartbeat de la GRILLA, que ni siquiera habla del HD.
+ *
+ * El `sub` visible es el caso opuesto y conserva su reafirmación: su heartbeat
+ * SÍ es la grilla diciendo que lo sigue usando, y es la sesión que el propio
+ * heartbeat mantendría viva.
+ */
+function touchActivity(session: StreamSession, now: Date): void {
+  session.lastClientHeartbeat = now
+}
+
+/**
+ * Un arranque aceptado AGREGA su arrendamiento. Nunca reemplaza ni quita otro.
+ *
+ * No recibe el ticket a propósito: el orden de llegada al servidor no dice cuál
+ * intención del navegador es más nueva, y usarlo para decidir la propiedad era
+ * exactamente el defecto. Dos arranques concurrentes son dos espectadores
+ * legítimos de la misma sesión hasta que cada uno suelte el suyo.
+ */
+function addStartAttempt(session: StreamSession, attemptId?: string): void {
+  if (!attemptId) return
+  session.startAttemptIds.add(attemptId)
 }
 
 /**
@@ -245,9 +347,316 @@ function nextGeneration(): number {
   return sessionGenerationCounter
 }
 
+// Identidad OPACA de dueño acuñada por el servidor, para sesiones que nacen sin
+// intento de cliente (reconcile/heartbeat).
+//
+// POR QUÉ EXISTE
+//
+// `reconcileView` crea sesiones sin `startAttemptId` de cliente, así que su
+// conjunto de arrendamientos quedaba vacío. El frontend las anotaba con un id
+// SINTÉTICO local (`hb:<cameraId>`) que el backend nunca registró; al cerrarlas,
+// el DELETE mandaba ese id como `expectedStartAttemptId`, el backend contestaba
+// `attempt_not_registered`, y el cliente lo tomaba por confirmación y las
+// olvidaba — la sesión y su FFmpeg quedaban vivos.
+//
+// Ahora toda sesión que reconcile toca tiene AL MENOS un arrendamiento real: si
+// no tiene ninguno, se acuña uno acá y se devuelve al frontend, que lo guarda y
+// lo usa como identidad de cierre. Es durable (vive en la sesión hasta que se
+// suelta) y específico de esa sesión.
+let serverOwnerCounter = 0
+function nextServerOwnerId(): string {
+  serverOwnerCounter += 1
+  return `srv-${serverOwnerCounter}`
+}
+
+/**
+ * Devuelve un arrendamiento de la sesión, acuñando uno del servidor si no tiene
+ * ninguno. Idempotente: una sesión que ya tiene dueño (de cliente o acuñado
+ * antes) devuelve el mismo, sin sumar otro —acumular un id nuevo por cada
+ * heartbeat sería su propia fuga—.
+ */
+function ensureServerOwnerId(s: StreamSession): string {
+  const existing = s.startAttemptIds.values().next().value as string | undefined
+  if (existing) return existing
+  const id = nextServerOwnerId()
+  s.startAttemptIds.add(id)
+  return id
+}
+
+/**
+ * Devuelve TODOS los arrendamientos vigentes de la sesión, acuñando exactamente
+ * uno del servidor si no tiene ninguno.
+ *
+ * POR QUÉ NO ALCANZA `ensureServerOwnerId` (singular): tomaba el PRIMER elemento
+ * del Set. Si una sesión tiene dos leases —`srv-A` de reconcile y `sa-B` de un
+ * start cuya respuesta HTTP se perdió—, el heartbeat devolvía sólo `srv-A`. El
+ * cliente cerraba `srv-A`, el backend respondía `attempt_released`, y `sa-B`
+ * quedaba vivo sin que el cliente conociera nunca su identidad. Devolver el
+ * conjunto COMPLETO deja que el cliente registre y cierre cada uno.
+ */
+function ensureAllOwnerIds(s: StreamSession): string[] {
+  if (s.startAttemptIds.size === 0) s.startAttemptIds.add(nextServerOwnerId())
+  return Array.from(s.startAttemptIds)
+}
+
 // En memoria — se pierde al reiniciar (intencional: el frontend reconecta)
 // key: `${userId}:${cameraId}:${streamType}` — permite sub y main simultáneos
 const sessions = new Map<string, StreamSession>()
+
+// ─── PROCESOS RETENIDOS: estado explícito del FFmpeg conservado ──────────────
+//
+// Un cierre CONSERVADOR (razón fuera de TRANSCODE_KILL_REASONS: hls_fatal_error,
+// grid_retry, quality_switch, restart_stream) borra la sesión `main_h264` pero
+// CONSERVA el proceso para reutilización. Ese "FFmpeg conservado" deja de ser un
+// hueco implícito: pasa a un estado de lifecycle RASTREADO por INSTANCIA de
+// proceso (no por path, que puede reasignarse a otra instancia posterior).
+//
+//   ACTIVE    → tiene ≥1 propietario (sesión/waiter/arranque válido en vuelo).
+//   RETAINED  → 0 propietarios; conservado durante una gracia para reutilización.
+//   ADOPTED   → un sucesor reclamó la MISMA instancia (transferencia explícita).
+//   TERMINATED→ instancia confirmada muerta.
+//
+// GENERACIÓN OPACA DE PROCESO: cada FFmpeg que se crea recibe un
+// `processInstanceId` monotónico, guardado junto al path. Una retención de la
+// generación A JAMÁS mata una generación B nueva sobre el mismo path.
+let processInstanceCounter = 0
+/** streamPath → id opaco de la INSTANCIA de FFmpeg vigente en ese path. */
+const processInstances = new Map<string, string>()
+function markProcessSpawned(streamPath: string): string {
+  const id = `proc-${++processInstanceCounter}`
+  processInstances.set(streamPath, id)
+  return id
+}
+function currentProcessInstance(streamPath: string): string | undefined {
+  return processInstances.get(streamPath)
+}
+function clearProcessInstance(streamPath: string): void { processInstances.delete(streamPath) }
+
+/** Limpia todo el estado asociado a una instancia main_h264 ya terminada. */
+function clearTerminatedProcessState(streamPath: string, expectedInstanceId?: string): void {
+  if (expectedInstanceId && currentProcessInstance(streamPath) !== expectedInstanceId) return
+  clearProcessInstance(streamPath)
+  transcodeInFlight.delete(streamPath)
+  transcodeRestarts.delete(streamPath)
+  transcodeSourceInfo.delete(streamPath)
+  lastMediaActivity.delete(streamPath)
+  publishedPaths.delete(streamPath)
+  // El borrado de MediaMTX revalida ownership/publicación en el momento de
+  // ejecutarse: una nueva B que aparezca entre medio conserva su path.
+  void removeTranscodedPath(
+    streamPath,
+    () => !pathHasOwner(streamPath) && !publishedPaths.has(streamPath),
+  ).catch(() => false)
+}
+
+interface Retention {
+  token: string
+  streamPath: string
+  processInstanceId: string
+  userId: string; viewId: string; cameraId: string; streamType: string
+  attemptIds: Set<string>
+  createdAt: number
+}
+const retentions = new Map<string, Retention>()   // key: token
+type ResolvedRetentionOutcome = 'terminated' | 'adopted' | 'gone'
+interface ResolvedRetention extends Retention {
+  outcome: ResolvedRetentionOutcome
+  resolvedAt: number
+}
+/**
+ * Resultado idempotente de una retención ya resuelta. Permite que un retry que
+ * perdió la respuesta reciba `retention_adopted/gone` sin reabrir ni matar la
+ * instancia sucesora. Es estado de confirmación, no consume un cupo.
+ */
+const resolvedRetentions = new Map<string, ResolvedRetention>()
+/** Tope de retenciones vivas. Configurable por env; default 100. */
+function getMaxRetentions(): number {
+  const raw = Number(process.env.STREAM_MAX_RETENTIONS)
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 100
+}
+/** TTL de gracia de una retención (ms). Configurable por env; default 30 s. */
+function getRetentionTtlMs(): number {
+  const raw = Number(process.env.STREAM_RETENTION_TTL_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 30_000
+}
+
+interface RetentionCreation { token?: string; killedCurrent: boolean }
+
+function pruneResolvedRetentions(): void {
+  const cutoff = Date.now() - getRetentionTtlMs()
+  for (const [token, r] of resolvedRetentions) {
+    if (r.resolvedAt <= cutoff) resolvedRetentions.delete(token)
+  }
+  const max = Math.max(16, getMaxRetentions() * 2)
+  while (resolvedRetentions.size > max) {
+    const oldest = resolvedRetentions.keys().next().value as string | undefined
+    if (!oldest) break
+    resolvedRetentions.delete(oldest)
+  }
+}
+
+function resolveRetention(r: Retention, outcome: ResolvedRetentionOutcome, reason: string): void {
+  retentions.delete(r.token)
+  resolvedRetentions.set(r.token, { ...r, attemptIds: new Set(r.attemptIds), outcome, resolvedAt: Date.now() })
+  pruneResolvedRetentions()
+  console.info(`[live] retention_${outcome} instance=${r.processInstanceId} path=${r.streamPath} reason=${reason}`)
+}
+
+/** Una sesión registrada adoptó la MISMA generación retenida. */
+function adoptRegisteredRetentions(streamPath: string): void {
+  const instance = currentProcessInstance(streamPath)
+  if (!instance) return
+  for (const r of Array.from(retentions.values())) {
+    if (r.streamPath === streamPath && r.processInstanceId === instance) {
+      resolveRetention(r, 'adopted', 'successor_registered')
+    }
+  }
+}
+
+/** Crea una retención para un proceso conservado huérfano. */
+function crearRetencion(
+  userId: string, viewId: string, cameraId: string, streamType: string,
+  streamPath: string, attemptIds: Set<string>,
+): RetentionCreation {
+  const processInstanceId = currentProcessInstance(streamPath)
+  if (!processInstanceId || !isTranscodeProcessAlive(streamPath)) {
+    return { killedCurrent: false }
+  }
+  let killedCurrent = false
+  if (retentions.size >= getMaxRetentions()) {
+    // Al llegar al máximo NUNCA se borra en silencio: se FINALIZA la más vieja
+    // (mata el huérfano o la marca adoptada), con el mismo camino seguro.
+    const oldest = retentions.keys().next().value
+    const oldestRetention = oldest ? retentions.get(oldest) : undefined
+    const finalized = oldest ? finalizeRetention(oldest, 'retention_cap') : null
+    killedCurrent = finalized?.outcome === 'terminated' &&
+      oldestRetention?.streamPath === streamPath &&
+      oldestRetention.processInstanceId === processInstanceId
+  }
+  // El finalizador del tope pudo terminar precisamente esta instancia. No se
+  // crea una retención fantasma que apunte a un proceso ya muerto/generación
+  // borrada. Si un kill falló, se conserva la retención vieja y se permite
+  // superar temporalmente el tope: perder estado sería peor que excederlo.
+  if (currentProcessInstance(streamPath) !== processInstanceId ||
+      !isTranscodeProcessAlive(streamPath)) {
+    return { killedCurrent }
+  }
+  if (retentions.size >= getMaxRetentions()) {
+    console.warn(`[live] retention_cap_soft_exceeded size=${retentions.size} max=${getMaxRetentions()}`)
+  }
+  // Capability opaca e impredecible. Aun así el uso se valida también contra
+  // usuario+vista+cámara+tipo+intento; el token no reemplaza autorización.
+  const token = `ret-${randomUUID()}`
+  retentions.set(token, {
+    token, streamPath, processInstanceId, userId, viewId, cameraId, streamType,
+    attemptIds: new Set(attemptIds), createdAt: Date.now(),
+  })
+  return { token, killedCurrent }
+}
+
+type RetentionOutcome = 'terminated' | 'adopted' | 'gone' | 'pending'
+/**
+ * FINALIZADOR ÚNICO Y SEGURO de una retención. Nunca mata a una B: comprueba la
+ * generación de proceso y la fuente ÚNICA de ownership (`pathHasOwner`:
+ * sesiones + waiters + arranques válidos en vuelo).
+ *
+ *   · si la instancia ya no es la vigente (nació otra B en el mismo path) → GONE;
+ *   · si el path tiene dueño (una B lo adoptó o está en vuelo) → ADOPTED;
+ *   · si sigue huérfano y vivo → TERMINATED (lo mata de verdad).
+ */
+function finalizeRetention(token: string, reason: string): { outcome: RetentionOutcome; killed: boolean } | null {
+  const r = retentions.get(token)
+  if (!r) return null
+  // La instancia vigente en el path debe ser la MISMA que retuvimos.
+  if (currentProcessInstance(r.streamPath) !== r.processInstanceId) {
+    resolveRetention(r, 'gone', `${reason}_new_process_instance`)
+    return { outcome: 'gone', killed: false }
+  }
+  // Sólo una SESIÓN ya registrada confirma adopción. Un waiter o arranque en
+  // vuelo protege temporalmente el proceso, pero puede fallar: se mantiene la
+  // retención y el cliente reintenta en vez de perder el único handle.
+  if (hasRegisteredPathOwner(r.streamPath)) {
+    resolveRetention(r, 'adopted', reason)
+    return { outcome: 'adopted', killed: false }
+  }
+  if (pathHasOwner(r.streamPath)) {
+    console.info(`[live] retention_pending instance=${r.processInstanceId} path=${r.streamPath} reason=${reason}_provisional_owner`)
+    return { outcome: 'pending', killed: false }
+  }
+  if (isTranscodeProcessAlive(r.streamPath)) {
+    const accepted = stopTranscodeProcess(r.streamPath)
+    const stillAlive = isTranscodeProcessAlive(r.streamPath)
+    if (accepted && !stillAlive) {
+      resolveRetention(r, 'terminated', reason)
+      clearTerminatedProcessState(r.streamPath, r.processInstanceId)
+      return { outcome: 'terminated', killed: true }
+    }
+    if (stillAlive) {
+      // No mentir con `killedFfmpeg=true` ni perder el único handle de retry.
+      console.warn(`[live] retention_pending instance=${r.processInstanceId} path=${r.streamPath} reason=${reason} — kill no confirmado`)
+      return { outcome: 'pending', killed: false }
+    }
+  }
+  resolveRetention(r, 'gone', `${reason}_process_missing`)
+  clearTerminatedProcessState(r.streamPath, r.processInstanceId)
+  return { outcome: 'gone', killed: false }
+}
+
+/** Finaliza (seguro) TODAS las retenciones de una vista. Para cleanupUserSessions. */
+function finalizeRetentionsForView(userId: string, viewId: string, reason: string): number {
+  let killed = 0
+  for (const [token, r] of Array.from(retentions.entries())) {
+    if (r.userId === userId && r.viewId === viewId) {
+      if (finalizeRetention(token, reason)?.killed) killed++
+    }
+  }
+  return killed
+}
+
+/** Barrido de retenciones vencidas (createdAt + TTL). Para el cron idle. */
+function sweepExpiredRetentions(reason: string): number {
+  const cutoff = Date.now() - getRetentionTtlMs()
+  let killed = 0
+  for (const [token, r] of Array.from(retentions.entries())) {
+    if (r.createdAt <= cutoff) {
+      if (finalizeRetention(token, reason)?.killed) killed++
+    }
+  }
+  return killed
+}
+
+export function __resetTombstonesForTest(): void {
+  retentions.clear()
+  resolvedRetentions.clear()
+  processInstances.clear()
+}
+
+/** Sólo tests: retenciones vivas, en forma legible. */
+export function __getRetentionsForTest(): Array<{ token: string; streamPath: string; processInstanceId: string; viewId: string; cameraId: string; streamType: string; attemptIds: string[]; createdAt: number }> {
+  return Array.from(retentions.values()).map(r => ({
+    token: r.token, streamPath: r.streamPath, processInstanceId: r.processInstanceId,
+    viewId: r.viewId, cameraId: r.cameraId, streamType: r.streamType,
+    attemptIds: Array.from(r.attemptIds), createdAt: r.createdAt,
+  }))
+}
+
+/** Sólo tests: la generación de instancia vigente en un path (o undefined). */
+export function __getProcessInstanceForTest(streamPath: string): string | undefined {
+  return currentProcessInstance(streamPath)
+}
+
+/** Sólo tests: fuerza una generación de instancia en un path (simular respawn). */
+export function __setProcessInstanceForTest(streamPath: string): string {
+  return markProcessSpawned(streamPath)
+}
+
+/** Sólo tests: antigüedad artificial de una retención, para probar el TTL. */
+export function __ageRetentionForTest(token: string, ms: number): boolean {
+  const r = retentions.get(token)
+  if (!r) return false
+  r.createdAt = r.createdAt - ms
+  return true
+}
 
 // Per-view tracking: qué cámaras pertenecen a qué view (solo sub streams — main es explícito)
 const viewCameras   = new Map<string, Set<string>>() // key: `${userId}:${viewId}`
@@ -298,6 +707,36 @@ function vKey(userId: string, viewId: string) {
   return `${userId}:${viewId}`
 }
 
+/**
+ * Estado EFECTIVO del arrendamiento de un cliente sobre una sesión, leído del
+ * mapa de sesiones.
+ *
+ * La ruta de arranque devolvía el identificador tal como venía en el cuerpo.
+ * Eso hacía creer al navegador que era dueño de una sesión aunque su arranque se
+ * hubiera cancelado o su registro lo hubiera conservado otra fila; y si más
+ * tarde cerraba por respuesta tardía, el backend lo ignoraba y la anotación
+ * local se borraba igual. Ahora se responde lo que el servidor realmente tiene.
+ */
+export function describeStartAttempt(args: {
+  userId: string
+  viewId?: string
+  cameraId: string
+  streamType: 'sub' | 'main' | 'main_h264'
+  attemptId?: string
+}): { registered: boolean; owners: number } {
+  const key = sessionKey({
+    userId: args.userId,
+    viewId: args.viewId || DEFAULT_VIEW_ID,
+    cameraId: args.cameraId,
+    streamType: args.streamType,
+  })
+  const leases = sessions.get(key)?.startAttemptIds
+  return {
+    registered: !!args.attemptId && !!leases?.has(args.attemptId),
+    owners: leases?.size ?? 0,
+  }
+}
+
 export function getActiveSessions(): StreamSession[] {
   return Array.from(sessions.values())
 }
@@ -313,12 +752,13 @@ export function __seedSessionForTest(s: {
   cameraId: string; userId: string; viewId: string
   streamType: 'sub' | 'main' | 'main_h264'; streamPath: string
   startedAt: Date; lastClientHeartbeat: Date
-  generation?: number; lastOwnerRequestSeq?: number
+  generation?: number; lastOwnerRequestSeq?: number; startAttemptIds?: string[]
 }): void {
   sessions.set(sessionKey({ userId: s.userId, viewId: s.viewId, cameraId: s.cameraId, streamType: s.streamType }), {
     ...s,
     generation: s.generation ?? nextGeneration(),
     lastOwnerRequestSeq: s.lastOwnerRequestSeq ?? 0,
+    startAttemptIds: new Set(s.startAttemptIds ?? []),
   })
   if (s.streamType === 'sub') {
     const vk = vKey(s.userId, s.viewId)
@@ -392,7 +832,8 @@ export function pruneStaleSessions(): number {
     )
   }
 
-  terminateProcesses(termination, 'prune_stale')
+  const applied = terminateProcesses(termination, 'prune_stale')
+  retainUnresolvedTerminations(expired.map(e => e.session), applied)
   pruneOrphanViewIndexes(surviving, nowMs, ttl)
 
   console.info(`[stream-manager] pruned_stale_sessions count=${expired.length}`)
@@ -430,10 +871,16 @@ function registerSessionMonotonic(
   key: string,
   candidate: StreamSession,
   ticket: RequestTicket,
+  /** Arrendamiento del cliente que trae este registro, si lo declaró. */
+  clientStartAttemptId?: string,
 ): StreamSession {
   const current = sessions.get(key)
   if (current && current.lastOwnerRequestSeq > ticket.seq) {
-    // Un arranque POSTERIOR ya reclamó esta clave: no se la pisa.
+    // Un arranque POSTERIOR ya reclamó esta clave: no se la pisa. Pero este
+    // arranque también es un espectador legítimo, así que su arrendamiento se
+    // SUMA al de la sesión que queda; si no, su descarte tardío no encontraría
+    // nada que liberar y su sesión viviría hasta el TTL.
+    addStartAttempt(current, clientStartAttemptId)
     reaffirmOwnership(current, ticket)   // no-op monotónico, deja constancia
     current.lastClientHeartbeat = new Date()
     console.info(
@@ -441,9 +888,11 @@ function registerSessionMonotonic(
       ` streamType=${candidate.streamType} viewId=${candidate.viewId}` +
       ` ownerSeq=${current.lastOwnerRequestSeq} incomingSeq=${ticket.seq}`
     )
+    if (current.streamType === 'main_h264') adoptRegisteredRetentions(current.streamPath)
     return current
   }
   sessions.set(key, candidate)
+  if (candidate.streamType === 'main_h264') adoptRegisteredRetentions(candidate.streamPath)
   return candidate
 }
 
@@ -477,10 +926,21 @@ function viewHeartbeatsAsMs(): Map<string, number> {
  * Aplica la decisión de terminación. Idempotente: `stopTranscodeProcess` tolera
  * un path ya detenido, y los índices se borran con `delete` (no-op si no están).
  */
+interface TerminationApplication {
+  terminated: Set<string>
+  adopted: Set<string>
+  deferred: Set<string>
+  failed: Set<string>
+}
+
 function terminateProcesses(
   decision: { terminate: string[]; keepAlive: Array<{ streamPath: string; remainingViewers: number }> },
   reason: string,
-): void {
+): TerminationApplication {
+  const terminated = new Set<string>()
+  const adopted = new Set<string>()
+  const deferred = new Set<string>()
+  const failed = new Set<string>()
   for (const { streamPath, remainingViewers } of decision.keepAlive) {
     console.info(
       `[stream-manager] transcode_keepalive path=${streamPath}` +
@@ -488,12 +948,50 @@ function terminateProcesses(
     )
   }
   for (const streamPath of decision.terminate) {
-    stopTranscodeProcess(streamPath)
-    transcodeInFlight.delete(streamPath)
-    transcodeRestarts.delete(streamPath)
-    transcodeSourceInfo.delete(streamPath)
-    lastMediaActivity.delete(streamPath)
-    console.info(`[stream-manager] transcode_killed path=${streamPath} reason=${reason}_refcount_zero`)
+    // La decisión pura conoce sesiones; la revalidación runtime incluye además
+    // waiters y arranques válidos en vuelo. Es la misma fuente de ownership que
+    // usa el finalizador de retenciones.
+    if (hasRegisteredPathOwner(streamPath)) {
+      adopted.add(streamPath)
+      console.info(`[stream-manager] transcode_keepalive path=${streamPath} reason=${reason}_runtime_owner`)
+      continue
+    }
+    if (pathHasOwner(streamPath)) {
+      deferred.add(streamPath)
+      console.info(`[stream-manager] transcode_keepalive path=${streamPath} reason=${reason}_provisional_owner`)
+      continue
+    }
+    const accepted = stopTranscodeProcess(streamPath)
+    if (accepted && !isTranscodeProcessAlive(streamPath)) {
+      clearTerminatedProcessState(streamPath)
+      terminated.add(streamPath)
+      console.info(`[stream-manager] transcode_killed path=${streamPath} reason=${reason}_refcount_zero`)
+    } else if (!isTranscodeProcessAlive(streamPath)) {
+      // Murió por su cuenta: se limpia el estado, pero no se atribuye el kill.
+      clearTerminatedProcessState(streamPath)
+      console.info(`[stream-manager] transcode_gone path=${streamPath} reason=${reason}_refcount_zero`)
+    } else {
+      failed.add(streamPath)
+      console.warn(`[stream-manager] transcode_kill_pending path=${streamPath} reason=${reason}_refcount_zero`)
+    }
+  }
+  return { terminated, adopted, deferred, failed }
+}
+
+/** Un kill fallido nunca deja un proceso sin estado rastreado. */
+function retainUnresolvedTerminations(
+  sources: readonly SessionTruth[], result: TerminationApplication,
+): void {
+  const seen = new Set<string>()
+  for (const s of sources) {
+    if (s.streamType !== 'main_h264' ||
+        (!result.failed.has(s.streamPath) && !result.deferred.has(s.streamPath))) continue
+    const key = `${s.userId}:${s.viewId}:${s.cameraId}:${s.streamPath}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    crearRetencion(
+      s.userId, s.viewId, s.cameraId, s.streamType, s.streamPath, new Set(),
+    )
   }
 }
 
@@ -670,6 +1168,8 @@ interface InFlightStart {
   ticket: RequestTicket
   /** Clave de sesión a la que aspira este intento (informativa). */
   sessionKey: string
+  /** Lease opaco declarado por el cliente, si lo hubo. */
+  clientStartAttemptId?: string
 }
 // path → (clave de sesión → arranque). Es un MAPA por path, no una entrada
 // única: dos pestañas pueden estar arrancando el MISMO path a la vez y la
@@ -800,10 +1300,15 @@ function pathHasOwner(streamPath: string, excludeAttemptId?: string): boolean {
     isTranscodeProcessAlive(streamPath) &&
     transcodeInFlight.get(streamPath)?.state !== 'failed'
   return (
-    toSessionTruths().some(s => s.streamPath === streamPath) ||
+    hasRegisteredPathOwner(streamPath) ||
     waiterAdoptable ||
     hasValidInFlightOwner(streamPath, excludeAttemptId)
   )
+}
+
+function hasRegisteredPathOwner(streamPath: string): boolean {
+  for (const s of sessions.values()) if (s.streamPath === streamPath) return true
+  return false
 }
 
 /**
@@ -862,6 +1367,9 @@ async function releaseUnownedStream(
   /** Intento que se está descartando: no debe contarse como propietario. */
   excludeAttemptId?: string,
 ): Promise<boolean> {
+  const abandonedStart = excludeAttemptId
+    ? inFlightStarts.get(streamPath)?.get(excludeAttemptId)
+    : undefined
   // ¿Es un path de transcodificación? Se decide ANTES de borrar el estado que
   // lo delata, porque más abajo se limpia todo.
   const isTranscodePath =
@@ -894,8 +1402,27 @@ async function releaseUnownedStream(
   transcodeInFlight.delete(streamPath)
 
   if (isTranscodeProcessAlive(streamPath)) {
-    stopTranscodeProcess(streamPath)
-    console.info(`[stream-manager] transcode_killed path=${streamPath} reason=${reason}`)
+    const accepted = stopTranscodeProcess(streamPath)
+    if (accepted && !isTranscodeProcessAlive(streamPath)) {
+      clearProcessInstance(streamPath)
+      console.info(`[stream-manager] transcode_killed path=${streamPath} reason=${reason}`)
+    } else if (isTranscodeProcessAlive(streamPath)) {
+      // Un aborto de start también puede dejar un FFmpeg sin sesión. Si el SO
+      // rechaza el kill, conservar el handle como retención de la vista; nunca
+      // limpiar la generación y fingir que desapareció.
+      if (abandonedStart) {
+        crearRetencion(
+          abandonedStart.userId,
+          abandonedStart.viewId,
+          abandonedStart.cameraId,
+          'main_h264',
+          streamPath,
+          new Set(abandonedStart.clientStartAttemptId ? [abandonedStart.clientStartAttemptId] : []),
+        )
+      }
+      console.warn(`[stream-manager] transcode_kill_pending path=${streamPath} reason=${reason}`)
+      return false
+    }
   }
   // El estado POR PATH se limpia siempre que el path quedó sin dueño, esté el
   // proceso vivo o ya caído. Hacerlo sólo al matarlo dejaba a un FFmpeg que se
@@ -1238,10 +1765,12 @@ export function touchSession(
     return
   }
   // Hora del SERVIDOR, nunca un timestamp enviado por el navegador.
-  s.lastClientHeartbeat = new Date()
-  // Un heartbeat válido REAFIRMA la propiedad: protege la sesión de un cierre
-  // anterior que todavía esté en vuelo.
-  reaffirmOwnership(s, ticket)
+  touchActivity(s, new Date())
+  // Un heartbeat del `sub` visible REAFIRMA la propiedad: protege la sesión de
+  // un cierre anterior que todavía esté en vuelo. Para `main`/`main_h264` no:
+  // el heartbeat es actividad, no intención de arranque, y bloqueaba la salida
+  // de foco y el cambio a baja calidad.
+  if (streamType === 'sub') reaffirmOwnership(s, ticket)
 }
 
 // Tocar todas las sesiones de un view de una vez — toca sub, main y main_h264
@@ -1259,7 +1788,12 @@ export function touchView(userId: string, viewId: string, ticket: RequestTicket 
   for (const cameraId of vCams) {
     for (const st of ['sub', 'main', 'main_h264'] as const) {
       const s = sessions.get(sessionKey({ userId, viewId, cameraId, streamType: st }))
-      if (s) { s.lastClientHeartbeat = now; reaffirmOwnership(s, ticket) }
+      if (!s) continue
+      touchActivity(s, now)
+      // Sólo el `sub` visible reafirma propiedad: es la sesión que la grilla
+      // está usando y de la que este heartbeat habla. El HD se mantiene vivo
+      // por TTL, pero su cierre deliberado no puede quedar bloqueado por acá.
+      if (st === 'sub') reaffirmOwnership(s, ticket)
     }
   }
 }
@@ -1283,8 +1817,14 @@ function attachTranscodeSupervisor(
   streamPath: string,
   proc: ChildProcess,
   sourceRef: TranscodeSourceRef,
+  processInstanceId: string,
 ): void {
   proc.once('exit', (code, signal) => {
+    // El exit tardío de A no gobierna una B que ya ocupó el mismo path.
+    if (currentProcessInstance(streamPath) !== processInstanceId) {
+      console.info(`[supervisor] stale_exit_skipped path=${streamPath} instance=${processInstanceId}`)
+      return
+    }
     const stderr     = getTranscodeRawStderr(streamPath)
     const isEof      = stderr.includes('End of file') || stderr.includes('Failed reading RTSP data')
     const exitReason = isEof ? 'RTSP_INPUT_EOF'
@@ -1390,6 +1930,7 @@ async function runTranscodeSupervisor(
   }
 
   const proc = spawnTranscodeProcess(sourceRef.nvr, sourceRef.camera, streamPath)
+  const processInstanceId = proc ? markProcessSpawned(streamPath) : undefined
   if (!proc) {
     console.error(`[supervisor] restart_spawn_failed path=${streamPath} attempt=${info.count}`)
     dropSessionsByStreamPath(streamPath, 'supervisor_spawn_failed')
@@ -1407,7 +1948,7 @@ async function runTranscodeSupervisor(
     transcodeInFlight.set(streamPath, { state: 'ready', promise: Promise.resolve(true), resolve: () => {} })
   }
 
-  attachTranscodeSupervisor(streamPath, proc, sourceRef)
+  attachTranscodeSupervisor(streamPath, proc, sourceRef, processInstanceId!)
 }
 
 // Iniciar stream para un usuario
@@ -1450,9 +1991,15 @@ export async function startStream(
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
   ticket?: RequestTicket,
+  /**
+   * Intento de arranque declarado por el CLIENTE. Queda como propietario de la
+   * sesión efectiva y es lo único que permite a un cierre por respuesta tardía
+   * demostrar que la sesión que quiere cerrar es la suya.
+   */
+  clientStartAttemptId?: string,
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
   try {
-    const result = await startStreamCore(server, userId, cameraId, viewId, streamType, ticket)
+    const result = await startStreamCore(server, userId, cameraId, viewId, streamType, ticket, clientStartAttemptId)
     recordStartResult(userId, result.error)
     return result
   } catch (err) {
@@ -1468,6 +2015,8 @@ async function startStreamCore(
   viewId?: string,
   streamType: 'sub' | 'main' | 'main_h264' = 'sub',
   ticket: RequestTicket = beginRequest(),
+  /** Intento declarado por el cliente; propietario de la sesión efectiva. */
+  clientStartAttemptId?: string,
 ): Promise<{ hlsUrl: string; webrtcUrl: string; streamPath: string; transcoded?: boolean; error?: StreamError; warning?: StreamError }> {
   const effectiveViewId = viewId || DEFAULT_VIEW_ID
 
@@ -1647,7 +2196,10 @@ async function startStreamCore(
         generation: nextGeneration(),
         // La propiedad nace con el ticket de la petición que la creó.
         lastOwnerRequestSeq: ticket.seq,
-      }, ticket)
+        // …y con el arrendamiento del cliente, que es lo que distingue esta
+        // solicitud de otra que aterrice en la MISMA ranura tras una redirección.
+        startAttemptIds: new Set(clientStartAttemptId ? [clientStartAttemptId] : []),
+      }, ticket, clientStartAttemptId)
 
       const localPathDiscarded = owned.streamPath !== streamPath
       if (localPathDiscarded) {
@@ -1785,6 +2337,7 @@ async function startStreamCore(
     const existingSession = sessions.get(transcodeKey)
     if (existingSession) {
       existingSession.lastClientHeartbeat = new Date()
+      addStartAttempt(existingSession, clientStartAttemptId)
       reaffirmOwnership(existingSession, ticket)
       // Ya NO se reescribe `viewId`: la clave lo contiene, así que reasignarlo
       // desincronizaría la fila de su clave. Era el resto de cuando una segunda
@@ -1911,7 +2464,8 @@ async function startStreamCore(
     // El arranque queda registrado con su dueño: si la pestaña se cierra, el
     // supervisor sabrá que este in-flight ya no autoriza ningún reinicio.
     addInFlightStart(streamPath, startAttemptId, {
-      userId, viewId: effectiveViewId, cameraId, streamType, ticket, sessionKey: transcodeKey,
+      userId, viewId: effectiveViewId, cameraId, streamType, ticket,
+      sessionKey: transcodeKey, clientStartAttemptId,
     })
 
     /**
@@ -1946,21 +2500,17 @@ async function startStreamCore(
       resolveInFlight(false)
       // 3. Limpieza ESPERADA, excluyendo este intento al comprobar propiedad.
       //    Si apareció otro dueño real, `releaseUnownedStream` conserva todo.
-      const kept = await releaseUnownedStream(
+      await releaseUnownedStream(
         server, cameraId, streamPath, reason, startAttemptId,
       )
-      // 4. Si el path quedó sin dueño y este intento llegó a spawnear, se
-      //    recoge el proceso aunque ya hubiera salido solo: `stopTranscodeProcess`
-      //    es idempotente y libera el handle y su stderr.
-      if (!kept && spawnedByThisAttempt) stopTranscodeProcess(streamPath)
+      // `releaseUnownedStream` es el único finalizador: si el kill falla deja
+      // una retención rastreada. Un segundo stop directo perdería ese contrato.
     }
     /** Igual que arriba, pero devolviendo el error TAL CUAL lo define el llamador. */
     const failTranscodeStart = async (o: { reason: string; error: StreamError }) => {
       await cleanupFailedStart(o.reason)
       return { hlsUrl: '', webrtcUrl: '', streamPath: '', error: o.error }
     }
-    let spawnedByThisAttempt = false
-
     try {
       // Register passive RTSP receiver path in MediaMTX (no runOnDemand)
       const published = await publishTranscodedStream(nvr as any, camera as any)
@@ -1976,6 +2526,7 @@ async function startStreamCore(
       // spawnTranscodeProcess returns null if password is empty or RTSP URL is invalid.
       // The spawn_abort log in stream.ts explains the reason; show it in the error detail too.
       const proc = spawnTranscodeProcess(nvr as any, camera as any, streamPath)
+      const processInstanceId = proc ? markProcessSpawned(streamPath) : undefined
       if (!proc) {
         console.error(`[transcode] spawn_null cameraId=${cameraId} ch=${ch} path=${streamPath} — spawnTranscodeProcess returned null (see spawn_abort log above)`)
         return await failTranscodeStart({
@@ -1985,13 +2536,12 @@ async function startStreamCore(
             details: `path=${streamPath} — ver logs [transcode] spawn_abort para causa exacta` },
         })
       }
-      spawnedByThisAttempt = true
       console.info(`[transcode] spawn_ok cameraId=${cameraId} ch=${ch} path=${streamPath} pid=${proc.pid ?? 'pending'}`)
 
       // Store source info for supervisor restarts and attach the supervisor
       const sourceRef: TranscodeSourceRef = { nvr: nvr as any, camera: camera as any, userId, cameraId }
       transcodeSourceInfo.set(streamPath, sourceRef)
-      attachTranscodeSupervisor(streamPath, proc, sourceRef)
+      attachTranscodeSupervisor(streamPath, proc, sourceRef, processInstanceId!)
 
       // Poll HLS manifest — abort early if FFmpeg exits before producing segments.
       // manifestVisible=true means status=200+#EXTM3U was seen; FFmpeg is alive
@@ -2092,7 +2642,9 @@ async function startStreamCore(
     existingSession.lastClientHeartbeat = new Date()
     // Reutilizar una sesión REAFIRMA su propiedad. Sin esto, un `stop` anterior
     // que resucita más tarde pasaba `resolveDeletable` y borraba la sesión que
-    // este arranque acababa de reclamar (revisión de #151).
+    // este arranque acababa de reclamar (revisión de #151). Y AGREGA su
+    // arrendamiento: quien reutiliza es un espectador más, no el dueño único.
+    addStartAttempt(existingSession, clientStartAttemptId)
     reaffirmOwnership(existingSession, ticket)
     // Ya NO se reescribe `viewId`: la clave lo contiene y reasignarlo
     // desincronizaría la fila de su clave.
@@ -2126,7 +2678,8 @@ async function startStreamCore(
   )
   if (cancelled()) return abortResult('before_publish')
   addInFlightStart(streamPath, startAttemptId, {
-    userId, viewId: effectiveViewId, cameraId, streamType, ticket, sessionKey: key,
+    userId, viewId: effectiveViewId, cameraId, streamType, ticket,
+    sessionKey: key, clientStartAttemptId,
   })
   let published: boolean
   try {
@@ -2160,7 +2713,8 @@ async function startStreamCore(
     streamPath, startedAt: new Date(), lastClientHeartbeat: new Date(),
     generation: nextGeneration(),
     lastOwnerRequestSeq: ticket.seq,
-  }, ticket)
+    startAttemptIds: new Set(clientStartAttemptId ? [clientStartAttemptId] : []),
+  }, ticket, clientStartAttemptId)
   if (effectiveType === 'sub') {
     const vk = vKey(userId, effectiveViewId)
     if (!viewCameras.has(vk)) viewCameras.set(vk, new Set())
@@ -2182,6 +2736,93 @@ async function startStreamCore(
   return { hlsUrl: getHlsUrl(owned.streamPath), webrtcUrl: getWebRtcUrl(owned.streamPath), streamPath: owned.streamPath }
 }
 
+/**
+ * Desenlace EXPLÍCITO de un cierre. El llamador —y, a través de la ruta HTTP, el
+ * navegador— tiene que poder distinguir "no hice nada" de "solté tu
+ * arrendamiento" y de "cerré la sesión".
+ *
+ * Sin esto, el cliente daba por confirmado cualquier cierre que hubiera podido
+ * EMITIR, y borraba su anotación local aunque el backend lo hubiera ignorado:
+ * la sesión seguía viva y ya nadie sabía que existía.
+ */
+export type StopStreamOutcome = 'ignored' | 'attempt_released' | 'session_closed'
+
+export interface StopStreamResult {
+  outcome: StopStreamOutcome
+  /** Arrendamiento procesado, cuando lo hubo. */
+  attemptId?: string
+  /** Arrendamientos que siguen sosteniendo la sesión tras soltar el de arriba. */
+  remainingAttempts?: number
+  /** Sólo informativo: si además se terminó el proceso. Sólo `true` si esa
+   *  instancia se terminó DE VERDAD. */
+  killedFfmpeg?: boolean
+  /** Por qué se ignoró. */
+  reason?: string
+  /** Token de retención del proceso conservado, para escalarlo después. */
+  retentionToken?: string
+}
+
+/**
+ * ESCALADA de un cierre TERMINANTE sobre una identidad cuya sesión `main_h264`
+ * ya borró un cierre conservador que CONSERVÓ el FFmpeg (ahora una retención).
+ * Encuentra la retención por su token o por identidad y la FINALIZA de forma
+ * segura: nunca mata una B (comprueba generación de proceso + `pathHasOwner`).
+ */
+function escalarRetencion(
+  userId: string, viewId: string | undefined, cameraId: string,
+  streamType: string, reason: string | undefined, expected: string | undefined,
+  retentionToken: string | undefined,
+): StopStreamResult | null {
+  if (!viewId || streamType !== 'main_h264') return null
+  if (!reason || !TRANSCODE_KILL_REASONS.has(reason)) return null
+  const coincide = (r: Retention | ResolvedRetention) =>
+    r.userId === userId && r.viewId === viewId && r.cameraId === cameraId &&
+    r.streamType === streamType && (!expected || r.attemptIds.has(expected))
+  // Buscar la retención: por token exacto, o por identidad (vista+cam+tipo, con
+  // el attempt entre sus dueños). Un terminante sin id igual escala su cam/tipo.
+  // El token es una capability, pero NUNCA saltea la autorización contextual:
+  // un token de otra vista/usuario/intento no puede matar su proceso.
+  const porToken = retentionToken ? retentions.get(retentionToken) : undefined
+  let token = porToken && coincide(porToken) ? porToken.token : undefined
+  if (!token) {
+    for (const [tk, r] of retentions) {
+      if (coincide(r)) {
+        token = tk; break
+      }
+    }
+  }
+  if (!token) {
+    const resolvedByToken = retentionToken ? resolvedRetentions.get(retentionToken) : undefined
+    let resolved = resolvedByToken && coincide(resolvedByToken) ? resolvedByToken : undefined
+    if (!resolved) {
+      for (const r of resolvedRetentions.values()) {
+        if (coincide(r)) { resolved = r; break }
+      }
+    }
+    if (!resolved) return null
+    return {
+      outcome: 'ignored',
+      reason: resolved.outcome === 'adopted' ? 'retention_adopted' : 'retention_gone',
+      attemptId: expected,
+      killedFfmpeg: false,
+    }
+  }
+  const res = finalizeRetention(token, reason)
+  if (!res) return null
+  if (res.outcome === 'terminated') {
+    return { outcome: 'session_closed', attemptId: expected, killedFfmpeg: true }
+  }
+  if (res.outcome === 'pending') {
+    return {
+      outcome: 'ignored', reason: 'retention_pending', attemptId: expected,
+      killedFfmpeg: false, retentionToken: token,
+    }
+  }
+  // Adoptada (una B la reutiliza) o ya inexistente: no se mató nada, pero el
+  // cliente ya puede dejar de reintentar —desenlace INEQUÍVOCO, no ambiguo—.
+  return { outcome: 'ignored', reason: res.outcome === 'adopted' ? 'retention_adopted' : 'retention_gone', attemptId: expected }
+}
+
 // Detener stream para un usuario
 export async function stopStream(
   server: FastifyInstance,
@@ -2192,7 +2833,15 @@ export async function stopStream(
   viewId?: string,
   /** Ticket de la petición de cierre; lo estampa el hook `onRequest`. */
   ticket: RequestTicket = beginRequest(),
-): Promise<void> {
+  /**
+   * Arrendamiento que el cliente afirma sostener. Obligatorio para
+   * `reason=stale_response`: sin él —o si no está registrado en la sesión— el
+   * cierre es un no-op TOTAL.
+   */
+  expectedStartAttemptId?: string,
+  /** Token de retención que el cliente conserva de un cierre conservador previo. */
+  retentionToken?: string,
+): Promise<StopStreamResult> {
   // Una pestaña no puede cerrar la sesión de otra pestaña del mismo usuario:
   // sin viewId sólo se resuelve si la pertenencia es inequívoca.
   const { key, ambiguous } = resolveOwnedSessionKey(userId, viewId, cameraId, streamType)
@@ -2201,16 +2850,80 @@ export async function stopStream(
       `[live] stop_ignored_ambiguous cameraId=${cameraId} streamType=${streamType}` +
       ` reason=multiple_views_without_viewId`
     )
-    return
+    return { outcome: 'ignored', reason: 'ambiguous_view' }
   }
   const session = key ? sessions.get(key) : undefined
-  // Marcar el cierre ANTES de mirar si la sesión existe. Si el arranque de esta
-  // cámara sigue en vuelo todavía no hay fila que borrar, y sin esta marca el
-  // arranque terminaría después registrando una sesión que el usuario ya cerró
-  // — el mismo hueco que se tapó en `cleanupUserSessions`, aquí a nivel cámara.
-  if (key) markTargetClosed(key, ticket)
+
+  // ESCALADA DE RETENCIÓN: sin sesión (un cierre conservador ya la borró
+  // conservando el FFmpeg) pero con una razón TERMINANTE, se finaliza la
+  // retención del proceso huérfano de esta identidad. Va antes de
+  // `decideAttemptRelease`, que sin sesión sólo devolvería `ignored/no_session`.
+  if (!session && reason && TRANSCODE_KILL_REASONS.has(reason)) {
+    const esc = escalarRetencion(userId, viewId, cameraId, streamType, reason, expectedStartAttemptId, retentionToken)
+    if (esc) return esc
+  }
+
+  // PRIMERA decisión, y va antes que CUALQUIER efecto: antes de marcar el
+  // cierre, de tocar watermarks, de borrar la fila y de mirar procesos.
+  //
+  // Un cierre por respuesta tardía tiene que demostrar que sostiene un
+  // arrendamiento de esta sesión. Con la redirección `main` → `main_h264` dos
+  // solicitudes distintas caen en la misma clave, y el DELETE del intento viejo
+  // —que saca su ticket al cerrarse, por lo tanto POSTERIOR— pasaba todas las
+  // defensas por orden.
+  const veredicto = decideAttemptRelease({
+    reason,
+    staleReason: STALE_RESPONSE_REASON,
+    expectedStartAttemptId,
+    session,
+  })
+
+  if (veredicto.action === 'ignored') {
+    console.info(
+      `[live] stale_close_ignored cameraId=${cameraId} streamType=${streamType}` +
+      ` viewId=${viewId ?? 'n/a'} expectedAttempt=${expectedStartAttemptId ?? 'none'}` +
+      ` leases=[${Array.from(session?.startAttemptIds ?? []).join(',')}]` +
+      ` reason=${veredicto.reason}`
+    )
+    return { outcome: 'ignored', reason: veredicto.reason }
+  }
+
+  if (veredicto.action === 'release_attempt') {
+    // Quedan otros espectadores lógicos sobre la MISMA sesión: se suelta sólo
+    // este arrendamiento. Ni marca de cierre, ni borrado, ni proceso.
+    session!.startAttemptIds.delete(veredicto.attemptId)
+    console.info(
+      `[live] stale_attempt_released cameraId=${cameraId} streamType=${streamType}` +
+      ` viewId=${viewId ?? 'n/a'} attempt=${veredicto.attemptId}` +
+      ` remaining=${veredicto.remaining}`
+    )
+    return {
+      outcome: 'attempt_released',
+      attemptId: veredicto.attemptId,
+      remainingAttempts: veredicto.remaining,
+    }
+  }
+
+  // `close_session` (era el último arrendamiento) y `full_close` (cierre
+  // deliberado) siguen por el camino de cierre completo.
+  const attemptCerrado = veredicto.action === 'close_session' ? veredicto.attemptId : undefined
+
   let killedFfmpeg = false
   let clearedInFlight = false
+  let terminationPending = false
+  /** Token de la retención creada (cierre conservador que conservó el FFmpeg). */
+  let nuevaRetencion: string | undefined
+  /**
+   * La marca de cierre se aplica UNA sola vez y sólo cuando el cierre va a
+   * surtir efecto.
+   *
+   * Antes se estampaba antes de la relectura, así que un desenlace `ignored`
+   * dejaba igual el watermark movido: un arranque anterior en vuelo se
+   * cancelaba solo por un cierre que no cerró nada. Hoy no hay ningún `await`
+   * entre la relectura y esta llamada, pero el orden correcto es el que evita
+   * que el día que aparezca uno el efecto quede a medias.
+   */
+  const marcarCierre = () => { if (key) markTargetClosed(key, ticket) }
 
   if (session && key) {
     const generation = session.generation
@@ -2223,14 +2936,41 @@ export async function stopStream(
     //   stop 1 continúa               → 2 > 1 ⇒ preservar
     //
     // Decidir con el objeto capturado borraba la sesión nueva (revisión #149).
-    const verdict = resolveDeletable(key, generation, ticket)
+    //
+    // PERO el cierre por respuesta tardía NO puede decidirse por ticket. Esa
+    // protección no distingue un arranque nuevo de un heartbeat de grilla, y
+    // ambos elevan `lastOwnerRequestSeq`. Con un único arrendamiento A, un
+    // `reconcileView` que sólo tocaba la sesión bastaba para que el cierre de A
+    // devolviera `reaffirmed_by_newer_request`: A quedaba retenido, la sesión
+    // viva y su FFmpeg corriendo sin espectador.
+    //
+    // Para esa rama la señal correcta es el propio conjunto de arrendamientos:
+    // un arranque nuevo SIEMPRE suma el suyo y una sesión reabierta trae otra
+    // generación; un heartbeat no hace ninguna de las dos cosas.
+    const verdict = attemptCerrado
+      ? (() => {
+          const v = decideStaleSessionDelete({
+            attemptId: attemptCerrado,
+            expectedGeneration: generation,
+            current: sessions.get(key),
+          })
+          return v.deletable
+            ? { deletable: true as const, session: sessions.get(key)! }
+            : { deletable: false as const, reason: v.reason }
+        })()
+      : resolveDeletable(key, generation, ticket)
     if (!verdict.deletable) {
+      // Ni watermark ni nada: un cierre que no cierra no puede dejar rastro.
       console.info(
         `[live] stop_ignored_newer cameraId=${cameraId} streamType=${streamType}` +
-        ` viewId=${session.viewId} closeSeq=${ticket.seq} reason=${verdict.reason}`
+        ` viewId=${session.viewId} closeSeq=${ticket.seq} attempt=${attemptCerrado ?? 'none'}` +
+        ` reason=${verdict.reason}`
       )
-      return
+      return { outcome: 'ignored', reason: verdict.reason }
     }
+    // El cierre PROCEDE: recién ahora se estampa la marca, que es lo que impide
+    // que un arranque todavía en vuelo registre una sesión ya cerrada.
+    marcarCierre()
     if (streamType === 'sub') {
       const vk = vKey(userId, session.viewId)
       viewCameras.get(vk)?.delete(cameraId)
@@ -2245,26 +2985,63 @@ export async function stopStream(
       // Only kill FFmpeg when the reason explicitly permits it.
       // Non-kill reasons (retry, hls_error, etc.) keep FFmpeg alive so the next
       // startStream call can detect the live process and reuse it without re-spawning.
-      const shouldKill = !reason || TRANSCODE_KILL_REASONS.has(reason)
-      // Refcount compartido: aunque toque matar, no se mata mientras otro
-      // espectador siga usando EXACTAMENTE el mismo proceso/perfil.
-      const decision = decideProcessTermination(
-        [sessionTruthOf(key, session)],
-        toSessionTruths(),
-      )
-      if (shouldKill && decision.terminate.length > 0) {
-        terminateProcesses(decision, reason || 'stop_stream')
-        killedFfmpeg = true
+      // Autorización por razón Y refcount compartido, en una sola decisión pura:
+      // aunque la razón permita matar, no se mata mientras otro espectador siga
+      // usando EXACTAMENTE el mismo proceso/perfil.
+      const veredicto = decideStopTermination({
+        streamType,
+        reason,
+        killReasons: TRANSCODE_KILL_REASONS,
+        expired: [sessionTruthOf(key, session)],
+        surviving: toSessionTruths(),
+      })
+      const shouldKill = veredicto.shouldKill
+      const decision = veredicto.processes
+      if (veredicto.terminate.length > 0) {
+        const applied = terminateProcesses(decision, reason || 'stop_stream')
+        killedFfmpeg = applied.terminated.has(session.streamPath)
+        // Un propietario nuevo (sesión, waiter o start válido en vuelo) adoptó
+        // la instancia: el cierre de A termina sin matar ni retener a B.
+        const adopted = applied.adopted.has(session.streamPath)
+        const unresolved = applied.failed.has(session.streamPath) ||
+          applied.deferred.has(session.streamPath)
+        if (!killedFfmpeg && !adopted && unresolved) {
+          const retainedAfterFailure = crearRetencion(
+            userId, session.viewId, cameraId, streamType,
+            session.streamPath, session.startAttemptIds,
+          )
+          nuevaRetencion = retainedAfterFailure.token
+          killedFfmpeg = retainedAfterFailure.killedCurrent
+          terminationPending = !killedFfmpeg && !!nuevaRetencion
+        }
       } else if (shouldKill) {
         terminateProcesses({ terminate: [], keepAlive: decision.keepAlive }, reason || 'stop_stream')
       } else {
         console.info(`[live] stop_stream_keep_ffmpeg path=${session.streamPath} reason=${reason}`)
+        // La sesión se borró pero el proceso quedó vivo (razón conservadora). Si
+        // NADIE lo reutiliza (fuente ÚNICA de ownership: sesiones+waiters+en
+        // vuelo), queda huérfano: se RETIENE explícitamente, con su generación de
+        // instancia, para que un cierre TERMINANTE posterior lo escale y mate.
+        if (isTranscodeProcessAlive(session.streamPath) && !pathHasOwner(session.streamPath)) {
+          const creation = crearRetencion(
+            userId, session.viewId, cameraId, streamType,
+            session.streamPath, session.startAttemptIds,
+          )
+          nuevaRetencion = creation.token
+          killedFfmpeg = creation.killedCurrent
+        }
       }
       // Always clear inFlight — next startStream will re-register via isTranscodeProcessAlive check
       transcodeInFlight.delete(session.streamPath)
       clearedInFlight = true
     }
   } else {
+    // No hay fila que borrar, pero el arranque de esta cámara puede seguir EN
+    // VUELO: sin la marca terminaría registrando una sesión que el usuario ya
+    // cerró — el hueco que se tapó en `cleanupUserSessions`, aquí a nivel
+    // cámara. Un cierre por respuesta tardía nunca llega hasta acá: sin sesión
+    // su veredicto ya fue `ignored`, y no debe mover ningún watermark.
+    marcarCierre()
     // Idempotencia: cerrar dos veces (pagehide + desmontaje + cambio de layout
     // concurrentes) no es un error y no debe producir efectos adicionales.
     console.info(`[live] stop_ignored_stale cameraId=${cameraId} streamType=${streamType} reason=${reason || 'unspecified'}`)
@@ -2281,6 +3058,17 @@ export async function stopStream(
   if (!othersWatching) {
     server.log.info(`[stream-manager] Todos los viewers salieron de cámara ${cameraId}`)
   }
+
+  // Sin fila que borrar no hubo cierre: el cliente no puede tomarlo por
+  // confirmación y olvidar su anotación.
+  if (!session || !key) return { outcome: 'ignored', reason: 'no_session' }
+  if (terminationPending) {
+    return {
+      outcome: 'ignored', reason: 'retention_pending', attemptId: attemptCerrado,
+      killedFfmpeg: false, retentionToken: nuevaRetencion,
+    }
+  }
+  return { outcome: 'session_closed', attemptId: attemptCerrado, killedFfmpeg, retentionToken: nuevaRetencion }
 }
 
 // ─── Heartbeat de viewport: reconciliar cámaras visibles ────
@@ -2290,7 +3078,7 @@ export async function stopStream(
 // - Toca todas las sesiones existentes (keepalive)
 // - Devuelve URLs para todas las cámaras visibles
 export interface ReconcileResult {
-  streams: Record<string, { hls: string; webrtc: string; streamPath: string; channel?: number; nvrName?: string; warning?: { code: string; message: string } }>
+  streams: Record<string, { hls: string; webrtc: string; streamPath: string; channel?: number; nvrName?: string; warning?: { code: string; message: string }; startAttemptId?: string; startAttemptIds?: string[] }>
   errors: Record<string, { code: string; message: string }>
   startedIds: string[]  // cámaras que se iniciaron ahora (necesitan nuevo player)
   stoppedIds: string[]  // cámaras que se detuvieron
@@ -2360,8 +3148,11 @@ export async function reconcileView(
       for (const st of ['main', 'main_h264'] as const) {
         const sOther = sessions.get(sessionKey({ userId, viewId, cameraId, streamType: st }))
         if (sOther) {
-          sOther.lastClientHeartbeat = now2
-          reaffirmOwnership(sOther, ticket)
+          // KEEPALIVE, no propiedad: renueva el TTL del HD para que la poda no
+          // lo mate mientras el usuario lo mira, pero NO puede bloquear un
+          // cierre de foco en vuelo. Este heartbeat es de la grilla y no dice
+          // nada sobre la intención del usuario respecto del HD.
+          touchActivity(sOther, now2)
           if (st === 'main_h264') lastMediaActivity.set(sOther.streamPath, Date.now())
           console.info(`[reconcileView] touch ${st} cameraId=${cameraId} path=${sOther.streamPath}`)
         }
@@ -2370,6 +3161,16 @@ export async function reconcileView(
         hls: getHlsUrl(existing.streamPath),
         webrtc: getWebRtcUrl(existing.streamPath),
         streamPath: existing.streamPath,
+        // Identidad DURABLE de la sesión: la que ya tiene, o una acuñada por el
+        // servidor si nació sin dueño. El frontend la guarda y la usa para
+        // cerrar; nunca un `hb:*` local que el backend no conoce.
+        //
+        // Se devuelve el CONJUNTO COMPLETO de arrendamientos (`startAttemptIds`):
+        // una sesión puede tener varios —`srv-*` de reconcile + un `sa-*` de un
+        // start cuya respuesta se perdió—, y el cliente debe cerrarlos todos. El
+        // singular `startAttemptId` queda por compatibilidad (primer elemento).
+        startAttemptIds: ensureAllOwnerIds(existing),
+        startAttemptId: existing.startAttemptIds.values().next().value,
       }
     } else if (suppressSet.has(cameraId)) {
       // Backoff de límite activo en el frontend: mantener visible pero NO iniciar
@@ -2390,6 +3191,16 @@ export async function reconcileView(
           where: { id: cameraId },
           select: { channel: true, nvr: { select: { name: true } } },
         })
+        // La sesión recién creada por reconcile no tiene intento de cliente:
+        // se le acuña una identidad de servidor y se devuelve, para que el
+        // frontend pueda cerrarla más tarde por identidad real.
+        //
+        // El backend pudo redirigir el `sub` a `main`/`main_h264`, así que la
+        // sesión NO está bajo la clave 'sub': se la busca por el `streamPath`
+        // efectivo que devolvió el arranque.
+        const creada = Array.from(sessions.values()).find(s =>
+          s.userId === userId && s.viewId === viewId &&
+          s.cameraId === cameraId && s.streamPath === result.streamPath)
         streams[cameraId] = {
           hls: result.hlsUrl,
           webrtc: result.webrtcUrl,
@@ -2397,6 +3208,8 @@ export async function reconcileView(
           channel: cam?.channel,
           nvrName: cam?.nvr?.name,
           warning: result.warning,
+          startAttemptIds: creada ? ensureAllOwnerIds(creada) : undefined,
+          startAttemptId: creada ? creada.startAttemptIds.values().next().value : undefined,
         }
         startedIds.push(cameraId)
       }
@@ -2547,7 +3360,11 @@ export async function cleanupUserSessions(
     }
   }
 
-  terminateProcesses(finalTermination, viewId ? 'cleanup_view' : 'cleanup_stale')
+  const appliedTermination = terminateProcesses(
+    finalTermination,
+    viewId ? 'cleanup_view' : 'cleanup_stale',
+  )
+  retainUnresolvedTerminations(deleted, appliedTermination)
 
   // Clean view maps
   if (viewId) {
@@ -2571,6 +3388,18 @@ export async function cleanupUserSessions(
     // `view_heartbeat_missing` y el TTL de HD configurado no serviría de nada
     // (revisión de #147). Se poda con la misma decisión de supervivencia.
     pruneOrphanViewIndexes(toSessionTruths(), Date.now(), getSessionTtl())
+  }
+
+  // FINALIZAR LAS RETENCIONES de esta vista (garantía de C18/C19): `disposeView`
+  // cierra el view, pero un FFmpeg conservado por un cierre conservador previo
+  // seguiría vivo sin sesión. Se finaliza cada retención de la vista de forma
+  // SEGURA: mata el huérfano, o —si una B lo adoptó— la resuelve sin matar.
+  if (viewId) {
+    const killed = finalizeRetentionsForView(userId, viewId, 'cleanup_view')
+    if (killed > 0) console.info(`[live] cleanup_view_retentions_killed userId=${userId} viewId=${viewId} count=${killed}`)
+  } else {
+    // Limpieza global/idle: barre también retenciones vencidas.
+    sweepExpiredRetentions('cleanup_stale')
   }
 
   return removed
@@ -2605,6 +3434,12 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
     nowMs,
     ttl,
   })
+  // El barrido de retenciones vencidas corre SIEMPRE, aun sin sesiones que
+  // vencer: una retención es un FFmpeg conservado SIN sesión —si el barrido
+  // dependiera de que hubiera sesiones expiradas, un huérfano retenido no lo
+  // recogería nunca este cron (defecto P0-4 de C19)—. El finalizador respeta
+  // la generación de proceso y el ownership: nunca mata a una B.
+  sweepExpiredRetentions('idle_cleanup')
   if (expired.length === 0) return 0
 
   // Decidir la terminación ANTES de borrar: qué procesos quedan sin espectador
@@ -2638,7 +3473,8 @@ export async function cleanupIdleSessions(server: FastifyInstance): Promise<numb
     )
   }
 
-  terminateProcesses(termination, 'idle_cleanup')
+  const applied = terminateProcesses(termination, 'idle_cleanup')
+  retainUnresolvedTerminations(expired.map(e => e.session), applied)
   pruneOrphanViewIndexes(surviving, nowMs, ttl)
 
   return expired.length
@@ -2746,12 +3582,15 @@ export interface TranscodeSlot {
   viewerCount:   number
   /** Propietarios del proceso. Sin tokens ni datos sensibles. */
   viewers:       Array<{ userId: string; viewId: string }>
+  /** Proceso sin sesión, conservado explícitamente para una posible reutilización. */
+  retained:      boolean
 }
 
 export function getTranscodeSlots(): {
   maxTranscodes:      number
   activeProcessCount: number
   startingCount:      number
+  retainedCount:      number
   slots:              TranscodeSlot[]
 } {
   const counts = getTranscodeCounts()
@@ -2800,13 +3639,45 @@ export function getTranscodeSlots(): {
       viewerCount:   viewersByPath.get(streamPath) ?? owners.length,
       // Sin tokens ni datos sensibles: sólo qué pestañas de qué usuarios lo usan.
       viewers:       owners.map(o => ({ userId: o.userId, viewId: o.viewId })),
+      retained:      false,
     }
   })
 
+  // Una retención huérfana consume un proceso/cupo aunque no tenga sesión. Se
+  // agrega como slot diagnóstico (sin exponer su capability/token). Si el path
+  // ya tiene una sesión, esa fila activa lo representa y no se duplica.
+  const represented = new Set(slots.map(s => s.streamPath))
+  const retainedByPath = new Map<string, Retention>()
+  for (const r of retentions.values()) {
+    if (represented.has(r.streamPath) || !isTranscodeProcessAlive(r.streamPath)) continue
+    const prev = retainedByPath.get(r.streamPath)
+    if (!prev || r.createdAt < prev.createdAt) retainedByPath.set(r.streamPath, r)
+  }
+  for (const [streamPath, r] of retainedByPath) {
+    const proc = procByPath.get(streamPath)
+    const at = new Date(r.createdAt)
+    slots.push({
+      cameraId: r.cameraId,
+      userId: r.userId,
+      viewId: r.viewId,
+      streamPath,
+      pid: proc?.pid,
+      processAlive: proc?.alive ?? isTranscodeProcessAlive(streamPath),
+      startedAt: at,
+      lastHeartbeat: at,
+      profile,
+      reason: 'proceso FFmpeg retenido sin sesión; pendiente de adopción o finalización',
+      viewerCount: 0,
+      viewers: [],
+      retained: true,
+    })
+  }
+
   return {
     maxTranscodes:      counts.max,
-    activeProcessCount: counts.active,
+    activeProcessCount: slots.length,
     startingCount:      counts.starting,
+    retainedCount:      counts.retained,
     slots,
   }
 }

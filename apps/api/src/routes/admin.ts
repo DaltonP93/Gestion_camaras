@@ -162,6 +162,7 @@ export const adminRoutes: FastifyPluginAsync = async (server) => {
       maxTranscodes:      diag.maxTranscodes,
       activeProcessCount: diag.activeProcessCount,
       startingCount:      diag.startingCount,
+      retainedCount:      diag.retainedCount,
       slots: diag.slots.map(s => ({
         cameraId:      s.cameraId,
         cameraName:    nameById.get(s.cameraId)?.cameraName ?? null,
@@ -177,6 +178,7 @@ export const adminRoutes: FastifyPluginAsync = async (server) => {
         idleSeconds:   Math.round((now - s.lastHeartbeat.getTime()) / 1000),
         profile:       s.profile,
         reason:        s.reason,
+        retained:      s.retained,
       })),
     })
   })

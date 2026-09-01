@@ -4,6 +4,8 @@ import { z } from 'zod'
 import { publishStream, removeStream, getStreamPath, getHlsUrl, getWebRtcUrl, getStreamStatus, getStreamDetails } from '../services/stream'
 import { resolveGridProfile, deriveOutputResolution } from '../services/transcode-profile'
 import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary, recordStreamOutcome } from '../services/stream-manager'
+import { readStartAttemptId } from '../services/start-attempt'
+import { describeStartAttempt } from '../services/stream-manager'
 import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
@@ -373,6 +375,11 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       body?.streamType === 'main'      ? 'main'      :
       body?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+    // Intento de arranque del cliente: propietario de la sesión efectiva. Un
+    // valor mal formado se ignora —la sesión queda sin intento— en vez de
+    // rechazar la petición: el arranque es legítimo y el único efecto de no
+    // tenerlo es que ningún cierre por respuesta tardía podrá cerrarla.
+    const startAttemptId = readStartAttemptId(body?.startAttemptId)
 
     if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
       // Registrar rechazo por permiso ANTES de startStream — es la única rama
@@ -384,7 +391,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
 
     server.log.info(`[live] start_stream_requested cameraId=${id} streamType=${streamType} userId=${user.sub}`)
 
-    const result = await startStream(server, user.sub, id, viewId, streamType, ticket)
+    const result = await startStream(server, user.sub, id, viewId, streamType, ticket, startAttemptId)
     if (result.error) {
       if (result.error.code === 'TRANSCODE_LIMIT_REACHED') {
         server.log.warn(`[live] start_stream_failed cameraId=${id} code=TRANSCODE_LIMIT_REACHED streamType=${streamType}`)
@@ -494,6 +501,15 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       nvrName:    camera?.nvr?.name ?? '',
       // Metadatos reales para la insignia de calidad (PR B).
       streamType: effectiveType,
+      // Estado EFECTIVO del arrendamiento, leído del mapa de sesiones. No es el
+      // eco del identificador enviado: que el cliente lo haya mandado no prueba
+      // que haya quedado registrado —el arranque pudo cancelarse, o el registro
+      // pudo conservar otra fila— y devolver el crudo hacía creer al cliente que
+      // era dueño de algo que no lo era.
+      startAttempt: describeStartAttempt({
+        userId: user.sub, viewId, cameraId: id,
+        streamType: effectiveType, attemptId: startAttemptId,
+      }),
       transcoded,
       codec,
       resolution,
@@ -532,11 +548,21 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     // viewId identifica la PESTAÑA dueña: una pestaña no puede cerrar la sesión
     // de otra pestaña del mismo usuario.
     const viewId = typeof body?.viewId === 'string' && body.viewId.length > 0 ? body.viewId : undefined
+    // Identidad esperada del intento dueño. Con `reason=stale_response` es
+    // obligatoria: sin ella el cierre no puede probar que la sesión de esa
+    // ranura es la que él creó, y se rechaza entero.
+    const expectedStartAttemptId = readStartAttemptId(body?.expectedStartAttemptId)
     // El cierre se sella con el ticket de SU propia petición, no con el
     // contador global: si este cierre se demoró en autenticarse y mientras
     // tanto llegó una reapertura legítima, sellar con el global la rechazaría.
-    await stopStream(server, user.sub, id, streamType, reason, viewId, request.requestTicket)
-    return reply.send({ ok: true })
+    const resultado = await stopStream(
+      server, user.sub, id, streamType, reason, viewId, request.requestTicket,
+      expectedStartAttemptId,
+    )
+    // El desenlace va en la respuesta: el cliente NO puede tomar un 200 por
+    // confirmación de cierre. Un `ignored` significa que su anotación local
+    // sigue describiendo una sesión viva.
+    return reply.send({ ok: true, ...resultado })
   })
 
   // ─── Cierre de sesiones con `fetch(..., { keepalive: true })` ──────────────
@@ -560,14 +586,32 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
   server.delete('/:id/stream', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const q = request.query as any
+    const body = request.body as any
     const user = request.user
     const streamType: 'sub' | 'main' | 'main_h264' =
       q?.streamType === 'main'      ? 'main'      :
       q?.streamType === 'main_h264' ? 'main_h264' : 'sub'
     const reason = typeof q?.reason === 'string' ? q.reason : undefined
     const viewId = typeof q?.viewId === 'string' && q.viewId.length > 0 ? q.viewId : undefined
-    await stopStream(server, user.sub, id, streamType, reason, viewId, request.requestTicket)
-    return reply.send({ ok: true })
+    const expectedStartAttemptId = readStartAttemptId(q?.expectedStartAttemptId)
+    // Token de retención que el cliente conserva de un cierre conservador previo,
+    // para escalar (matar) el FFmpeg huérfano de esa identidad exacta.
+    // Capability opaca: el cliente actual la envía en el cuerpo para que no
+    // aparezca en access logs. Se acepta query sólo como compatibilidad con un
+    // cliente C19 ya desplegado; ambos caminos tienen límite estricto.
+    const rawRetentionToken = body?.retentionToken ?? q?.retentionToken
+    const retentionToken = typeof rawRetentionToken === 'string' &&
+      rawRetentionToken.length > 0 && rawRetentionToken.length <= 128
+      ? rawRetentionToken
+      : undefined
+    const resultado = await stopStream(
+      server, user.sub, id, streamType, reason, viewId, request.requestTicket,
+      expectedStartAttemptId, retentionToken,
+    )
+    // El desenlace va en la respuesta: el cliente NO puede tomar un 200 por
+    // confirmación de cierre. Un `ignored` significa que su anotación local
+    // sigue describiendo una sesión viva.
+    return reply.send({ ok: true, ...resultado })
   })
 
   // DELETE /api/cameras/my-sessions?viewId=

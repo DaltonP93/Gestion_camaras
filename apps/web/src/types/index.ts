@@ -290,6 +290,11 @@ export interface StreamInfo {
   nvrName: string
   // Metadatos reales del stream servido (PR B) — para el badge de calidad.
   streamType?: 'sub' | 'main' | 'main_h264'
+  /**
+   * Estado EFECTIVO del arrendamiento declarado en el POST, leído por el
+   * servidor de su mapa de sesiones. No es el eco del identificador enviado.
+   */
+  startAttempt?: { registered: boolean; owners: number }
   transcoded?: boolean
   codec?: string | null
   resolution?: string | null
@@ -299,7 +304,15 @@ export interface StreamInfo {
 }
 
 export interface HeartbeatResponse {
-  streams: Record<string, { hls: string; webrtc: string; streamPath: string; channel?: number; nvrName?: string; warning?: { code: string; message: string } }>
+  // `startAttemptId`: identidad DURABLE que el servidor acuña para la sesión de
+  // reconcile (que nace sin intento de cliente). El frontend la guarda y la usa
+  // para cerrar por identidad real; reemplaza al `hb:*` sintético que el backend
+  // nunca reconocía.
+  // `startAttemptIds`: TODOS los arrendamientos vigentes de la sesión. El
+  // frontend registra cada uno por su identidad real (una sesión puede tener el
+  // `srv-*` de reconcile más un `sa-*` de un start cuya respuesta se perdió). El
+  // singular `startAttemptId` queda por compatibilidad (primer elemento).
+  streams: Record<string, { hls: string; webrtc: string; streamPath: string; channel?: number; nvrName?: string; warning?: { code: string; message: string }; startAttemptId?: string; startAttemptIds?: string[] }>
   errors: Record<string, { code: string; message: string; details?: string }>
   startedIds: string[]   // cámaras iniciadas en este heartbeat (necesitan nuevo player key)
   stoppedIds: string[]   // cámaras detenidas (ya no visibles en el view)

@@ -278,6 +278,41 @@ describe('ocultarse durante la transición', () => {
     expect(b.latidos).toEqual([])
   })
 
+  it('tampoco deja el intervalo armado: sin espectador no hay cadencia', async () => {
+    b.scheduler.start(); await flush(); b.latidos.length = 0
+
+    const corriendo = b.transition.run('nvr_change', { nvr: 'B', ids: ['b1'] })
+    await flush()
+    b.oculta.valor = true
+    b.cierres[0].d.resolver(); await flush(); b.publicaciones[0].resolver()
+    await corriendo
+
+    // Armar acá dejaría un tick vivo con la pestaña oculta hasta el próximo
+    // `visibilitychange`: exactamente la sesión zombi que se persigue.
+    expect(b.scheduler.isArmed()).toBe(false)
+    expect(b.intervalosVivos()).toBe(0)
+    expect(b.latidos).toEqual([])
+    expect(b.transition.isTransitioning()).toBe(false)
+  })
+
+  it('al volver a visible: exactamente un heartbeat y un solo intervalo', async () => {
+    b.scheduler.start(); await flush(); b.latidos.length = 0
+
+    const corriendo = b.transition.run('nvr_change', { nvr: 'B', ids: ['b1'] })
+    await flush()
+    b.oculta.valor = true
+    b.cierres[0].d.resolver(); await flush(); b.publicaciones[0].resolver()
+    expect(await corriendo).toBe('hidden_no_beat')
+
+    b.oculta.valor = false
+    b.scheduler.handleVisibilityChange()
+    await flush()
+
+    expect(b.latidos).toEqual([['b1']])       // uno solo, y con los IDs nuevos
+    expect(b.intervalosVivos()).toBe(1)       // un solo intervalo, no dos
+    expect(b.scheduler.isArmed()).toBe(true)
+  })
+
   it('el viewport igual queda publicado, para que el regreso reconcilie', async () => {
     const corriendo = b.transition.run('nvr_change', { nvr: 'B', ids: ['b1'] })
     await flush()
