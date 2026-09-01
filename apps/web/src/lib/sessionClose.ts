@@ -29,25 +29,86 @@ function readAccessToken(): string | null {
 }
 
 /**
+ * Desenlace del cierre TAL COMO LO DECLARA EL SERVIDOR.
+ *
+ * `emitted` sólo dice que la petición salió. Es lo único que se sabía antes, y
+ * tratarlo como confirmación era un error: un 401, un 500 o un `ignored` del
+ * backend salen igual de "emitidos", y el cliente borraba su anotación local de
+ * una sesión que seguía viva. `outcome` es lo que de verdad pasó.
+ */
+export type CloseOutcome = 'ignored' | 'attempt_released' | 'session_closed'
+
+export interface CloseResult {
+  /** La petición se pudo emitir (hubo token y `fetch` no lanzó). */
+  emitted: boolean
+  /** Código HTTP, si llegó respuesta. */
+  status?: number
+  /** Desenlace declarado por el servidor. `undefined` = no se pudo leer. */
+  outcome?: CloseOutcome
+  /**
+   * Por qué se ignoró. Distingue "no había nada que cerrar" —y entonces no hay
+   * nada que reintentar— de "el servidor lo rechazó", que sí exige reintento.
+   */
+  reason?: string
+  /** Arrendamiento que el servidor dice haber procesado. */
+  attemptId?: string
+  /** Arrendamientos que siguen sosteniendo la sesión. */
+  remainingAttempts?: number
+  /** Si además se terminó el FFmpeg (sólo `true` si la instancia murió de verdad). */
+  killedFfmpeg?: boolean
+  /** Token de retención del proceso conservado, para escalarlo (matarlo) después. */
+  retentionToken?: string
+}
+
+/**
  * `fetch` con `keepalive` que nunca lanza: un cierre no puede romper el
  * desmontaje de un componente ni el handler de `pagehide`.
  *
- * Devuelve true si la petición se pudo emitir. No espera la respuesta cuando la
- * página se está descargando — el servidor la procesa igual.
+ * NO interpreta el resultado. Devuelve lo que el servidor declaró cuando se
+ * pudo leer, y nada cuando no —descarga de la página, red caída, cuerpo
+ * ilegible—. Quien decide qué hacer con eso es el llamador: para un cierre
+ * deliberado alcanza con haberlo emitido; para un descarte por respuesta tardía
+ * hace falta la confirmación explícita.
  */
-export async function closeWithKeepalive(path: string): Promise<boolean> {
+export async function closeWithKeepalive(
+  path: string,
+  body?: Record<string, unknown>,
+): Promise<CloseResult> {
   const token = readAccessToken()
-  if (!token) return false
+  if (!token) return { emitted: false }
   try {
-    await fetch(`${BASE_URL}/api${path}`, {
+    const headers: Record<string, string> = { Authorization: `Bearer ${token}` }
+    if (body) headers['Content-Type'] = 'application/json'
+    const res = await fetch(`${BASE_URL}/api${path}`, {
       method: 'DELETE',
       keepalive: true,
-      headers: { Authorization: `Bearer ${token}` },
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
     })
-    return true
+    // 401, 403, 5xx: la petición salió, pero NO hubo cierre. Se informa el
+    // estado y ningún desenlace, que es lo que impide darlo por confirmado.
+    if (!res.ok) return { emitted: true, status: res.status }
+    try {
+      const body: any = await res.json()
+      const outcome: CloseOutcome | undefined =
+        body?.outcome === 'ignored' || body?.outcome === 'attempt_released' ||
+        body?.outcome === 'session_closed' ? body.outcome : undefined
+      return {
+        emitted: true, status: res.status, outcome,
+        reason: typeof body?.reason === 'string' ? body.reason : undefined,
+        attemptId: typeof body?.attemptId === 'string' ? body.attemptId : undefined,
+        remainingAttempts: typeof body?.remainingAttempts === 'number' ? body.remainingAttempts : undefined,
+        killedFfmpeg: typeof body?.killedFfmpeg === 'boolean' ? body.killedFfmpeg : undefined,
+        retentionToken: typeof body?.retentionToken === 'string' ? body.retentionToken : undefined,
+      }
+    } catch {
+      // Cuerpo ilegible (la página se está descargando, respuesta vacía…).
+      // Emitido, sin confirmación.
+      return { emitted: true, status: res.status }
+    }
   } catch {
     // Sin reintento: si falló durante la descarga, el TTL del servidor cierra.
-    return false
+    return { emitted: false }
   }
 }
 
@@ -67,14 +128,32 @@ export function closeStreamSession(
   streamType: StreamKind,
   reason: string,
   viewId: string,
-): Promise<boolean> {
+  /**
+   * Intento de arranque que creó la sesión que se quiere cerrar. Obligatorio en
+   * la práctica para `reason=stale_response`: sin él el backend rechaza el
+   * cierre, porque una respuesta tardía no puede pedir que se borre "la sesión
+   * que haya" en esa ranura — puede ser la de otra solicitud vigente.
+   */
+  expectedStartAttemptId?: string,
+  /**
+   * Token de retención de un cierre conservador previo: acompaña a un cierre
+   * TERMINANTE para escalar (matar) el FFmpeg huérfano de esa identidad exacta.
+   */
+  retentionToken?: string,
+): Promise<CloseResult> {
   const qs = new URLSearchParams({ streamType, reason })
   if (viewId) qs.set('viewId', viewId)
-  return closeWithKeepalive(`/cameras/${encodeURIComponent(cameraId)}/stream?${qs}`)
+  if (expectedStartAttemptId) qs.set('expectedStartAttemptId', expectedStartAttemptId)
+  // El token es una capability: nunca va en la URL (access logs/historial).
+  // Un cuerpo JSON pequeño es compatible con fetch keepalive.
+  return closeWithKeepalive(
+    `/cameras/${encodeURIComponent(cameraId)}/stream?${qs}`,
+    retentionToken ? { retentionToken } : undefined,
+  )
 }
 
 /** Cierra TODAS las sesiones de un view (pestaña). Idempotente. */
-export function closeViewSessions(viewId: string): Promise<boolean> {
+export function closeViewSessions(viewId: string): Promise<CloseResult> {
   const qs = new URLSearchParams({ viewId })
   return closeWithKeepalive(`/cameras/my-sessions?${qs}`)
 }

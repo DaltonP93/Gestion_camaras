@@ -25,45 +25,15 @@ const read = (rel: string): string => {
   return src
 }
 
-/**
- * Extrae las llamadas a `start-stream` con el argumento de cuerpo que las
- * acompaña. El `(?<!re)` evita capturar `restart-stream`, que es otro endpoint
- * (reinicio administrativo del path en MediaMTX) y no crea ninguna sesión.
- *
- * El cuerpo puede ser un literal `{ … }` o una variable ya construida; se
- * devuelve tal cual y el llamador decide cómo verificarlo.
- */
-function startStreamCalls(source: string): string[] {
-  const re = /(?<!re)start-stream`\s*,\s*(\{[^}]*\}|[A-Za-z_$][\w$]*)/g
-  const out: string[] = []
-  let m: RegExpExecArray | null
-  while ((m = re.exec(source)) !== null) out.push(m[1])
-  return out
-}
-
-describe('(1) ViewPlayerPage declara su viewId en todos los arranques', () => {
+describe('(1) ViewPlayerPage identifica su pestaña vía el controlador', () => {
   const source = read('./ViewPlayerPage.tsx')
 
-  it('encuentra los cuatro caminos de arranque de esta página', () => {
-    // Fullscreen HD, reintento tras HLS_SESSION_EXPIRED (grilla), reintento HD y
-    // carga de página (que cubre también el slideshow, porque avanza `currentPage`).
-    // Si el número baja, es que alguno dejó de matchear y el test estaría
-    // validando menos de lo que cree.
-    expect(startStreamCalls(source)).toHaveLength(4)
+  it('crea el controlador con el viewId ESTABLE de la instancia', () => {
+    expect(source).toContain('const viewIdRef = useRef')
+    expect(source).toContain('useViewportSessionLifecycle(viewIdRef.current)')
   })
 
-  it('TODAS las llamadas a start-stream envían viewId', () => {
-    const sinViewId = startStreamCalls(source).filter(body => !body.includes('viewId'))
-    expect(sinViewId).toEqual([])
-  })
-
-  it('el viewId es el mismo ref estable de la instancia, no uno improvisado', () => {
-    for (const body of startStreamCalls(source)) {
-      expect(body).toContain('viewIdRef.current')
-    }
-  })
-
-  it('el heartbeat usa ese mismo ref', () => {
+  it('el heartbeat usa ese mismo viewId', () => {
     expect(source).toMatch(/viewId:\s*viewIdRef\.current/)
   })
 
@@ -72,34 +42,85 @@ describe('(1) ViewPlayerPage declara su viewId en todos los arranques', () => {
     expect(declaraciones).toHaveLength(1)
   })
 
-  it('el cierre de la vista también identifica la pestaña', () => {
-    expect(source).toContain('closeViewSessions(viewIdRef.current)')
-    expect(source).toMatch(/closeStreamSession\([^)]*viewIdRef\.current\)/)
+  it('el cierre de la vista pasa por el controlador, no un `closeViewSessions` suelto', () => {
+    expect(source).toContain('ctrl.disposeView()')
+    expect(source).not.toMatch(/closeViewSessions\(/)
   })
 })
 
-describe('(1b) LiveViewPage tampoco arranca sin declarar su pestaña', () => {
+describe('(1c) la carga de vista tiene ALCANCE propio', () => {
+  const source = read('./ViewPlayerPage.tsx')
+
+  it('la carga pasa por `runScopedViewLoad`, no por un `.then` suelto', () => {
+    // El defecto: `apiGet(`/views/${id}`).then(v => { setView(v); … setSlots })`
+    // sin comprobar vigencia. Una respuesta A tardía pisaba la vista B.
+    expect(source).toContain("import { runScopedViewLoad } from '@/lib/scopedViewLoad'")
+    expect(source).toContain('void runScopedViewLoad<CameraView, Camera, StreamInfo>({')
+    // Ya no hay un `.then` directo del GET de la vista que aplique estado.
+    expect(source).not.toMatch(/apiGet<CameraView>\(`\/views\/\$\{id\}`\)\s*\n\s*\.then/)
+  })
+
+  it('el scope de vista se PUBLICA en el commit (useLayoutEffect), no en cleanup pasivo', () => {
+    // El defecto del correctivo 12: la invalidación vivía sólo en el cleanup de
+    // un `useEffect` (fase pasiva). Entre el commit de B y ese cleanup corría la
+    // continuación de A y aún pasaba `isCurrent()`. Ahora el scope se publica
+    // síncronamente en el commit, invalidando el anterior en el acto.
+    expect(source).toContain("import { createScopeGuard } from '@/lib/scopeGuard'")
+    expect(source).toContain('const viewScope = useRef(createScopeGuard()).current')
+    // La publicación es un layout effect atado a [id], no un useEffect pasivo.
+    expect(source).toMatch(/useLayoutEffect\(\(\) => \{\s*const scope = viewScope\.publish\(\)\s*return \(\) => viewScope\.invalidate\(scope\)\s*\}, \[id\]\)/)
+  })
+
+  it('la corrida captura el scope vigente y NO confía en el `id` del closure', () => {
+    const i = source.indexOf('// ─── Load view + cameras + streams')
+    expect(i).toBeGreaterThan(-1)
+    const fin = source.indexOf('}, [id])', i)
+    expect(fin).toBeGreaterThan(i)
+    const cuerpo = source.slice(i, fin)
+    // Se captura el scope que publicó el layout effect; la vigencia compara su
+    // identidad EXACTA contra la vigente, no el `id` capturado.
+    expect(cuerpo).toContain('const scope = viewScope.current()')
+    expect(cuerpo).toContain('const vigente = () => viewScope.isCurrent(scope)')
+    // `setView`/`setSlots` sólo entran como callbacks del camino con alcance.
+    expect(cuerpo).toMatch(/isCurrent: vigente/)
+    // SNAPSHOT ATÓMICO: `view` NO se aplica en `onView` (dejaba view=B, slots=A);
+    // se aplican view+slots+loadedId JUNTOS en `onSlots`.
+    expect(cuerpo).toMatch(/onView: \(\) => \{\}/)
+    expect(cuerpo).toContain('setLoadedId(rutaId)')
+    // Y la carga ya NO se invalida en un cleanup pasivo propio: eso era el gap.
+    expect(cuerpo).not.toContain('viewLoadTokenRef')
+  })
+
+  it('el page-loader y el heartbeat sólo trabajan con el snapshot aplicado (loadedId === id)', () => {
+    // El gate atómico va en AMBOS efectos —page-loader y heartbeat—: mientras B
+    // carga o falla, no sale trabajo de A por ninguno.
+    const gates = source.match(/if \(!view \|\| loadedId !== id/g) ?? []
+    expect(gates.length).toBe(2)
+    // El reset de página es SÍNCRONO en el commit del cambio de id, no pasivo.
+    expect(source).toMatch(/useLayoutEffect\(\(\) => \{\s*setCurrentPage\(0\)\s*\}, \[id\]\)/)
+  })
+})
+
+describe('(1b) LiveViewPage también identifica su pestaña vía el controlador', () => {
   const source = read('./LiveViewPage.tsx')
 
-  it('los cuerpos literales de start-stream envían viewId', () => {
-    const literales = startStreamCalls(source).filter(b => b.startsWith('{'))
-    expect(literales.length).toBeGreaterThan(0)
-    expect(literales.filter(b => !b.includes('viewId'))).toEqual([])
+  it('crea el controlador con su viewId estable', () => {
+    expect(source).toContain('const [viewId] = useState<string>(makeViewId)')
+    expect(source).toContain('useViewportSessionLifecycle(viewId)')
   })
 
-  it('el cuerpo construido en variable de la grilla también lo incluye', () => {
-    // loadStream arma `body` según haya override de tipo; ambas ramas deben
-    // llevar viewId.
-    const m = source.match(/const body = overrideType[^\n]*\n?[^\n]*/)
-    expect(m).not.toBeNull()
-    const asignacion = m![0]
-    expect(asignacion).toContain('viewId')
-    // Las DOS ramas del ternario, no sólo una.
-    expect(asignacion.match(/viewId/g) ?? []).toHaveLength(2)
+  it('el arranque NO lleva viewId ni startAttemptId «a mano»: los agrega el controlador', () => {
+    // Los cuerpos de `startRaw` ya no cargan viewId/startAttemptId; el hook +
+    // controlador los agregan. Ni la grilla ni el foco/calidad los declaran.
+    expect(source).not.toMatch(/streamType: overrideType, viewId/)
+    expect(source).not.toMatch(/streamType: 'main', viewId/)
+    expect(source).not.toMatch(/streamType: quality, viewId/)
   })
 
-  it('restart-stream NO se cuenta: es otro endpoint y no crea sesión', () => {
+  it('el arranque pasa por `ctrl.startRaw`, no por un `apiPost(start-stream)` directo', () => {
+    expect(source).toMatch(/ctrl\.startRaw\(/)
+    expect(source).not.toMatch(/apiPost(?:<[^>]*>)?\(\s*`\/cameras\/\$\{[^}]+\}\/(?<!re)start-stream`/)
+    // `restart-stream` es otro endpoint (reinicio administrativo) y sí puede quedar.
     expect(source).toContain('restart-stream')
-    expect(startStreamCalls(source).some(b => b === '{}')).toBe(false)
   })
 })

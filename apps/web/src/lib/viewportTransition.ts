@@ -107,14 +107,17 @@ export function createViewportTransition<V>(
     if (t.id !== token.id) { emit(`superseded_after_publish:${t.id}`); return 'superseded' }
 
     transitioning = false
-    deps.armScheduler()
 
     if (deps.isHidden()) {
-      // Ocultarse durante la transición no puede iniciar ni revivir nada; el
-      // latido de regreso reconciliará.
+      // Ocultarse durante la transición no puede iniciar ni revivir nada, y eso
+      // incluye la cadencia: armar el intervalo acá dejaría un tick vivo con la
+      // pestaña oculta hasta el próximo `visibilitychange`, que es justo la
+      // sesión zombi que se persigue desde el principio. El intervalo queda
+      // desarmado y es el regreso a visible el que late una vez y arma uno solo.
       emit(`commit_hidden:${t.id}`)
       return 'hidden_no_beat'
     }
+    deps.armScheduler()
     emit(`commit:${t.id}`)
     await deps.runHeartbeatNow()
     return 'committed'

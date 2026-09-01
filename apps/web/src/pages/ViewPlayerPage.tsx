@@ -1,5 +1,5 @@
 // src/pages/ViewPlayerPage.tsx
-import { useEffect, useState, useRef, useCallback, type MutableRefObject } from 'react'
+import { useEffect, useLayoutEffect, useState, useRef, useCallback, type MutableRefObject } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, LayoutGrid, ChevronLeft, ChevronRight,
@@ -8,8 +8,12 @@ import {
   Loader2,
 } from 'lucide-react'
 import { apiGet, apiPost } from '@/lib/api'
-import { createHeartbeatScheduler } from '@/lib/heartbeatScheduler'
-import { closeStreamSession, closeViewSessions } from '@/lib/sessionClose'
+import { runScopedViewLoad } from '@/lib/scopedViewLoad'
+import { registerHeartbeatIdentities } from '@/lib/heartbeatIdentities'
+import { createScopeGuard } from '@/lib/scopeGuard'
+import { EXIT_FULLSCREEN } from '@/lib/closeReasons'
+import { useViewportSessionLifecycle } from '@/lib/useViewportSessionLifecycle'
+import { pageShowAction } from '@/lib/bfcachePolicy'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
 import type { CameraPlaybackError } from '@/components/cameras/VideoPlayer'
 import { clsx } from 'clsx'
@@ -162,6 +166,10 @@ export function ViewPlayerPage() {
 
   const [view, setView] = useState<CameraView | null>(null)
   const [slots, setSlots] = useState<SlotWithCamera[]>([])
+  // Id de la vista cuyo SNAPSHOT (view + slots) está aplicado. El page-loader y
+  // el heartbeat sólo trabajan cuando `loadedId === id`: mientras B carga (o
+  // falla), no puede salir trabajo de A aunque `view` intermedio sea de otra.
+  const [loadedId, setLoadedId] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [objectFit, setObjectFit] = useState<ObjectFitMode>('contain')
@@ -186,6 +194,14 @@ export function ViewPlayerPage() {
   // de una cámara que el usuario estaba mirando.
   const viewIdRef = useRef<string>(`vp_${Math.random().toString(36).slice(2)}`)
 
+  // CONTROLADOR ÚNICO del ciclo de vida de sesiones. Es el dueño del registro,
+  // la cola de pendientes, los timers HLS, el heartbeat, el scope de sesión y de
+  // todo arranque/cierre/descarte/retry. La página no llama `apiPost(start-stream)`,
+  // `closeStreamSession` ni `closeViewSessions` directo: todo pasa por acá (guarda
+  // AST). Antes cada handler manejaba su propio start/stop/timer/registro y cada
+  // uno podía reabrir la clase entera de fugas; ahora hay un solo dueño.
+  const ctrl = useViewportSessionLifecycle(viewIdRef.current)
+
   // ─── Fullscreen state machine ─────────────────────────────────────────────
   const [fsState, setFsState] = useState<FsState>(FS_IDLE)
   // Ref mirror for fsState.cameraId — readable inside event listeners without stale closures
@@ -193,11 +209,27 @@ export function ViewPlayerPage() {
   // DOM refs for each tile — set by CameraCell ref callback
   const tileRefs = useRef<Map<string, HTMLDivElement>>(new Map())
 
+  // TRANSICIÓN ATÓMICA de sesión, SÍNCRONA en el commit (useLayoutEffect corre
+  // en el mismo task del commit, antes de que se despache la continuación de un
+  // start-stream de la página vieja). En A→B —cambio de página o de vista—:
+  // publica el scope B (invalida A en el acto), cancela los timers de A, DETIENE
+  // su heartbeat y cierra las identidades EXACTAS de A por su scope abandonado
+  // (nunca una B). Los start-stream ya emitidos de A no se abortan: responden y
+  // se auto-descartan por identidad. No se usa `closeView` acá: conserva el
+  // viewId y podría bloquear a B.
+  useLayoutEffect(() => {
+    ctrl.beginTransition('page_change')
+  }, [currentPage, id, ctrl])
+
   // ─── Stop active HD stream ────────────────────────────────────────────────
+  // CIERRE POR IDENTIDAD vía el controlador: cierra los tipos HD (`main`,
+  // `main_h264`) de la cámara declarando su `startAttemptId`, así el backend
+  // suelta sólo ese arrendamiento y nunca el de otra pestaña. Cancela además el
+  // re-arranque de HD pendiente (clave `__fs__`), que si no recrearía la sesión.
   const stopHdStream = useCallback((cameraId: string) => {
-    void closeStreamSession(cameraId, 'main',      'exit_fullscreen', viewIdRef.current)
-    void closeStreamSession(cameraId, 'main_h264', 'exit_fullscreen', viewIdRef.current)
-  }, [])
+    ctrl.cancelTimers('__fs__')
+    void ctrl.closeHd(cameraId, EXIT_FULLSCREEN)
+  }, [ctrl])
 
   // ─── Enter fullscreen (must be called inside user gesture) ───────────────
   const enterFullscreen = useCallback((cameraId: string) => {
@@ -232,14 +264,21 @@ export function ViewPlayerPage() {
       }
     }
 
-    // Start HD stream
-    apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType, viewId: viewIdRef.current })
-      .then((info) => {
-        // Verify this camera is still the active fullscreen
-        if (fsCamIdRef.current !== cameraId) return
+    // Start HD stream por el controlador: registra por identidad al confirmarse y
+    // descarta por identidad si el scope dejó de ser vigente (cambio de página).
+    const scope = ctrl.currentScope()
+    void ctrl.start({ source: 'fullscreen', cameraId, requested: hdStreamType, scope, body: { streamType: hdStreamType } })
+      .then((r) => {
+        if (!r) return   // descartada por scope (cambio de página/vista)
+        // El foco pudo cambiar de cámara mientras el HD arrancaba: la sesión ya
+        // quedó registrada (scope vigente), así que se cierra por identidad.
+        if (fsCamIdRef.current !== cameraId) {
+          void ctrl.close({ cameraId, streamType: r.effectiveType, reason: EXIT_FULLSCREEN })
+          return
+        }
         setFsState(prev =>
           prev.cameraId === cameraId
-            ? { ...prev, phase: 'fullscreen_hd', hdStream: info, hdStreamType }
+            ? { ...prev, phase: 'fullscreen_hd', hdStream: r.info as StreamInfo, hdStreamType }
             : prev
         )
       })
@@ -253,7 +292,7 @@ export function ViewPlayerPage() {
             : prev
         )
       })
-  }, [fsState, slots, stopHdStream])
+  }, [fsState, slots, stopHdStream, ctrl])
 
   // ─── Exit fullscreen ──────────────────────────────────────────────────────
   const exitFullscreen = useCallback(() => {
@@ -289,78 +328,136 @@ export function ViewPlayerPage() {
   // con `keepalive`, que sobrevive a la descarga de la página, y de forma
   // idempotente (pagehide + desmontaje pueden dispararse a la vez).
   useEffect(() => {
-    const closeThisView = () => {
-      const cam = fsCamIdRef.current
-      if (cam) stopHdStream(cam)
-      void closeViewSessions(viewIdRef.current)
+    // Descarga o desmontaje REAL sin sucesor: el controlador aborta requests,
+    // cancela todos los timers, detiene el heartbeat y cierra TODA la vista con
+    // keepalive (que sobrevive a la descarga). Idempotente (pagehide + desmontaje
+    // pueden dispararse a la vez).
+    // bfcache: cualquier `pagehide` ABANDONA el lifecycle por completo
+    // (disposeView: detiene también la maquinaria adoptada e invalida el scope);
+    // al volver, `pageshow.persisted` fuerza una recarga limpia si fue abandonado.
+    const onPageHide = () => { ctrl.disposeView() }
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (pageShowAction(e.persisted) === 'reload' && ctrl.isAbandoned()) window.location.reload()
     }
-    window.addEventListener('pagehide', closeThisView)
+    window.addEventListener('pagehide', onPageHide)
+    window.addEventListener('pageshow', onPageShow)
     return () => {
-      window.removeEventListener('pagehide', closeThisView)
-      closeThisView()
+      window.removeEventListener('pagehide', onPageHide)
+      window.removeEventListener('pageshow', onPageShow)
+      ctrl.disposeView()   // desmontaje REAL de React
     }
-  }, [stopHdStream])
+  }, [ctrl])
 
   // ─── Stream error handlers ────────────────────────────────────────────────
+  // El re-arranque va detrás de un `setTimeout` REGISTRADO: salir, cambiar de
+  // cámara o desmontar lo cancela. Sin ese registro, el timer disparaba 2 s
+  // después y creaba una sesión que ya nadie miraba. Y la respuesta se anota por
+  // identidad, igual que cualquier otro arranque de la página.
   const handleStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
     if (err.code !== 'HLS_SESSION_EXPIRED') return
-    setTimeout(() => {
-      apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { viewId: viewIdRef.current })
-        .then((info) => setSlots((prev) => prev.map((s) => s.cameraId === cameraId ? { ...s, stream: info } : s)))
+    // Re-arranque de grilla vía el controlador: timer REGISTRADO y atado al scope
+    // (un cambio de página lo invalida), y `start` que descarta por identidad si
+    // el scope cambió. La clave del timer es la cámara: re-errores la reemplazan.
+    const scope = ctrl.currentScope()
+    ctrl.scheduleHlsRestart(cameraId, scope, 2000, () => {
+      void ctrl.start({ source: 'grid_hls_restart', cameraId, requested: 'sub', scope })
+        .then((r) => {
+          if (r) setSlots((prev) => prev.map((s) => s.cameraId === cameraId ? { ...s, stream: r.info as StreamInfo } : s))
+        })
         .catch(() => {})
-    }, 2000)
-  }, [])
+    })
+  }, [ctrl])
 
   const handleFsStreamError = useCallback((cameraId: string, err: CameraPlaybackError) => {
     if (err.code !== 'HLS_SESSION_EXPIRED') return
     const cam = slots.find((s) => s.cameraId === cameraId)?.camera
     const hdStreamType = pickHdStreamType(cam)
-    setTimeout(() => {
-      apiPost<StreamInfo>(`/cameras/${cameraId}/start-stream`, { streamType: hdStreamType, viewId: viewIdRef.current })
-        .then((info) => {
-          setFsState(prev =>
-            prev.cameraId === cameraId ? { ...prev, hdStream: info } : prev
-          )
+    // Un solo timer de re-arranque de HD (clave `__fs__`), atado al scope.
+    const scope = ctrl.currentScope()
+    ctrl.scheduleHlsRestart('__fs__', scope, 2000, () => {
+      void ctrl.start({ source: 'fullscreen_hls', cameraId, requested: hdStreamType, scope, body: { streamType: hdStreamType } })
+        .then((r) => {
+          if (!r) return
+          if (fsCamIdRef.current !== cameraId) {
+            void ctrl.close({ cameraId, streamType: r.effectiveType, reason: EXIT_FULLSCREEN })
+            return
+          }
+          setFsState(prev => prev.cameraId === cameraId ? { ...prev, hdStream: r.info as StreamInfo } : prev)
         })
         .catch(() => {})
-    }, 2000)
-  }, [slots])
+    })
+  }, [slots, ctrl])
+
+  // SCOPE de carga de VISTA. Es INDEPENDIENTE del de grilla: aquél protege los
+  // arranques de stream por página; éste, la carga del `CameraView` y sus
+  // cámaras/streams. La ruta `views/:id` conserva el mismo ViewPlayerPage
+  // montado, así que una navegación A → B —con B respondiendo primero y A
+  // después— dejaba que la respuesta de A sobrescribiera `view` y `slots`
+  // mientras la URL seguía en B; el cargador de grilla tomaba entonces la vista A
+  // y abría sus streams, y el heartbeat los conservaba. Cada corrida captura su
+  // identidad de scope y la compara contra la vigente —no contra el `id` del
+  // closure— después de CADA await y antes de CADA cambio de estado.
+  const viewScope = useRef(createScopeGuard()).current
+  // PUBLICADO EN EL COMMIT (useLayoutEffect), no en el cleanup pasivo. Entre el
+  // commit de B y el cleanup pasivo de A puede correr una continuación de Promise
+  // de A; publicar el scope de B síncronamente en el commit invalida el de A en
+  // el acto, antes de que esa continuación se despache.
+  useLayoutEffect(() => {
+    const scope = viewScope.publish()
+    return () => viewScope.invalidate(scope)
+  }, [id])
 
   // ─── Load view + cameras + streams ───────────────────────────────────────
   useEffect(() => {
     if (!id) return
+    // El scope que publicó el layout effect de ESTA corrida. Cualquier corrida
+    // posterior publica otro y `vigente()` lo delata.
+    const scope = viewScope.current()
+    const vigente = () => viewScope.isCurrent(scope)
+    const rutaId = id
     setIsLoading(true)
     setError(null)
 
-    apiGet<CameraView>(`/views/${id}`)
-      .then(async (v) => {
+    void runScopedViewLoad<CameraView, Camera, StreamInfo>({
+      id,
+      isCurrent: vigente,
+      fetchView: (vid) => apiGet<CameraView>(`/views/${vid}`),
+      assignedIds: (v) => v.cameraSlots.filter((s) => s.cameraId).map((s) => s.cameraId!),
+      fetchCamera: (cid) => apiGet<Camera>(`/cameras/${cid}`),
+      fetchStream: (cid) => apiGet<StreamInfo>(`/cameras/${cid}/stream`),
+      // NO se aplica `view` acá: hacerlo dejaba un render con view=B y slots=A,
+      // y sus efectos podían mandar cámaras A bajo el scope B.
+      onView: () => {},
+      // SNAPSHOT ATÓMICO: view + slots + loadedId juntos, sólo cuando la carga
+      // completa y vigente terminó. Recién ahí `loadedId === id` habilita el
+      // page-loader y el heartbeat de B.
+      onSlots: (v, cameraMap, streamMap) => {
         setView(v)
-        const assignedIds = v.cameraSlots.filter((s) => s.cameraId).map((s) => s.cameraId!)
-
-        const [camerasData, streamData] = await Promise.all([
-          Promise.allSettled(assignedIds.map((cid) => apiGet<Camera>(`/cameras/${cid}`))),
-          Promise.allSettled(assignedIds.map((cid) => apiGet<StreamInfo>(`/cameras/${cid}/stream`))),
-        ])
-
-        const cameraMap = new Map<string, Camera>()
-        camerasData.forEach((r, i) => { if (r.status === 'fulfilled') cameraMap.set(assignedIds[i], r.value) })
-
-        const streamMap = new Map<string, StreamInfo>()
-        streamData.forEach((r, i) => { if (r.status === 'fulfilled') streamMap.set(assignedIds[i], r.value) })
-
         setSlots(v.cameraSlots.map((s) => ({
           ...s,
           camera: s.cameraId ? cameraMap.get(s.cameraId) : undefined,
           stream: s.cameraId ? streamMap.get(s.cameraId) : undefined,
         })))
-      })
-      .catch((e) => setError(e?.message ?? 'No se pudo cargar la vista'))
-      .finally(() => setIsLoading(false))
+        setLoadedId(rutaId)
+      },
+      onError: (msg) => setError(msg),
+      onSettled: () => setIsLoading(false),
+      errorMessage: (e: any) => e?.message ?? 'No se pudo cargar la vista',
+    })
+  }, [id])
+
+  // Reset de paginación de B SÍNCRONO en el commit del cambio de `id` (parte de
+  // la transición fuerte), no en un efecto pasivo: así no hay un commit
+  // intermedio con la página de A que pudiera arrancar trabajo A.
+  useLayoutEffect(() => {
+    setCurrentPage(0)
   }, [id])
 
   // Load streams for new pages
   useEffect(() => {
-    if (!view) return
+    // GATE atómico: sólo se arranca trabajo cuando el snapshot de ESTA ruta está
+    // aplicado. Mientras B carga o falla, el gate `loadedId` bloquea todo.
+    if (!view || loadedId !== id) return
     const perPage = getSlotsPerPage(view.layout)
     const pageIds = filledSlots
       .slice(currentPage * perPage, (currentPage + 1) * perPage)
@@ -368,15 +465,25 @@ export function ViewPlayerPage() {
       .filter((cid) => !slots.find((s) => s.cameraId === cid)?.stream)
     if (pageIds.length === 0) return
 
-    Promise.allSettled(pageIds.map((cid) => apiPost<StreamInfo>(`/cameras/${cid}/start-stream`, { viewId: viewIdRef.current })))
+    // Scope de grilla vigente al PROGRAMAR este lote. El controlador descarta por
+    // identidad toda respuesta cuyo scope dejó de ser vigente (start devuelve
+    // null); acá sólo se aplican las aceptadas, y sólo si el scope sigue vigente.
+    const scope = ctrl.currentScope()
+
+    Promise.allSettled(pageIds.map((cid) =>
+      ctrl.start({ source: 'grid', cameraId: cid, requested: 'sub', scope }),
+    ))
       .then((results) => {
+        if (!ctrl.isCurrent(scope)) return
         const loaded = new Map<string, StreamInfo>()
-        results.forEach((r, i) => { if (r.status === 'fulfilled') loaded.set(pageIds[i], r.value) })
+        results.forEach((r, i) => {
+          if (r.status === 'fulfilled' && r.value) loaded.set(pageIds[i], r.value.info as StreamInfo)
+        })
         if (loaded.size > 0) {
           setSlots((prev) => prev.map((s) => (s.cameraId && loaded.has(s.cameraId) ? { ...s, stream: loaded.get(s.cameraId) } : s)))
         }
       })
-  }, [currentPage, view]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [currentPage, view, loadedId, id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Slideshow ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -397,50 +504,53 @@ export function ViewPlayerPage() {
   const prevPage = useCallback(() => setCurrentPage((p) => (p - 1 + totalPages) % totalPages), [totalPages])
   const nextPage = useCallback(() => setCurrentPage((p) => (p + 1) % totalPages), [totalPages])
 
-  // ─── Heartbeat — mantiene vivas las sesiones (TTL de 90 s) ───────────────
+  // ─── Heartbeat — lo posee el CONTROLADOR ─────────────────────────────────
   //
-  // Este intervalo NO tenía guarda de visibilidad: con la pestaña oculta seguía
-  // latiendo cada 30 s, el servidor veía un espectador y nunca expiraba las
-  // sesiones ni liberaba FFmpeg (validación A1). Ahora el intervalo lo posee
-  // `heartbeatScheduler`: se cancela al ocultarse y se rearma —uno solo, con un
-  // latido inmediato— al volver.
+  // El controlador ata el heartbeat a `heartbeatScheduler` (visible-only) y, en
+  // cada resultado, reintenta los cierres pendientes SÓLO-CIERRE. La página sólo
+  // provee el envío (cámaras visibles de la página) y aplica los streams del
+  // resultado. El reintento de cierres ya no vive acá: es del controlador.
   useEffect(() => {
-    if (!view || filledSlots.length === 0) return
+    // GATE atómico: el heartbeat de B se liga SÓLO cuando su snapshot está
+    // aplicado (`loadedId === id`). Nunca late con cámaras de A mientras B carga.
+    if (!view || loadedId !== id || filledSlots.length === 0) return
     const perPage     = getSlotsPerPage(view.layout)
     const pageSlots   = filledSlots.slice(currentPage * perPage, (currentPage + 1) * perPage)
     const visibleIds  = pageSlots.map((s) => s.cameraId!).filter(Boolean)
     if (visibleIds.length === 0) return
 
-    const sendBeat = (signal: AbortSignal) =>
-      apiPost('/live-view/heartbeat', {
+    ctrl.bindHeartbeat({
+      intervalMs: 30_000,
+      isHidden: tabIsHidden,
+      // El heartbeat pertenece al scope B vigente: si hay una transición, no
+      // envía ni aplica (el controlador lo verifica antes de ambas cosas).
+      scope: ctrl.currentScope(),
+      send: (signal) => apiPost('/live-view/heartbeat', {
         viewId:           viewIdRef.current,
         visibleCameraIds: visibleIds,
         layout:           perPage,
         page:             currentPage,
-      }, undefined, signal).then((result: any) => {
+      }, undefined, signal),
+      onResult: (result: any) => {
         if (!result?.streams) return
-        // La pestaña pudo ocultarse mientras la solicitud viajaba.
         if (tabIsHidden()) return
+        // El backend pudo ACEPTAR un start cuya respuesta HTTP se perdió: el
+        // heartbeat trae su identidad REAL (`streams[cam].startAttemptId`). Se
+        // registra por el controlador —con el tipo efectivo que resuelve el
+        // `streamPath`— para que una transición posterior pueda cerrarla EXACTO.
+        // Se registra CADA arrendamiento vigente (`startAttemptIds`) por el mismo
+        // helper compartido que LiveView; nunca un id sintético.
+        registerHeartbeatIdentities(result.streams, (cid, tipo, aid) => ctrl.registerReconciled(cid, tipo, aid))
         setSlots((prev) => prev.map((s) => {
           if (!s.cameraId) return s
           const info = result.streams[s.cameraId]
           return info ? { ...s, stream: info } : s
         }))
-      }).catch(() => {})
-
-    const scheduler = createHeartbeatScheduler({
-      intervalMs: 30_000,
-      isHidden: tabIsHidden,
-      send: sendBeat,
+      },
     })
-    const onVisibility = () => scheduler.handleVisibilityChange()
-    document.addEventListener('visibilitychange', onVisibility)
-    scheduler.start()
-    return () => {
-      document.removeEventListener('visibilitychange', onVisibility)
-      scheduler.stop()
-    }
-  }, [view, currentPage, filledSlots.map((s) => s.cameraId).join(',')]) // eslint-disable-line react-hooks/exhaustive-deps
+    ctrl.startHeartbeat()
+    return () => { ctrl.stopHeartbeat() }
+  }, [view, currentPage, loadedId, id, filledSlots.map((s) => s.cameraId).join(','), ctrl]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Loading / error UI ───────────────────────────────────────────────────
   if (isLoading) {

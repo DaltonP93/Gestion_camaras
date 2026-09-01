@@ -12,7 +12,10 @@ import { CameraDiagnosticModal } from '@/components/cameras/CameraDiagnosticModa
 import { useAuthStore } from '@/stores/authStore'
 import { apiGet, apiPost } from '@/lib/api'
 import { parseStreamError, parseRetryAfterMs } from '@/lib/streamErrors'
-import { closeViewSessions, closeStreamSession } from '@/lib/sessionClose'
+import { useViewportSessionLifecycle } from '@/lib/useViewportSessionLifecycle'
+import { pageShowAction } from '@/lib/bfcachePolicy'
+import { registerHeartbeatIdentities } from '@/lib/heartbeatIdentities'
+import { STALE_RESPONSE, VIEWPORT_CHANGE } from '@/lib/closeReasons'
 import { resolveHdSessionTtlMs } from '@/lib/hdSessionTtl'
 import { decideHdReacquire, finishHdReacquire, initialHdReacquireState, decideHdFallback } from '@/lib/hdReacquire'
 import { createQualitySwitchController } from '@/components/cameras/qualitySwitchController'
@@ -24,6 +27,12 @@ import { createViewportWork } from '@/lib/viewportWork'
 import { createViewportTransition, type TransitionToken } from '@/lib/viewportTransition'
 import { runViewportRequest } from '@/lib/viewportRequest'
 import { scheduleDeferredStart } from '@/lib/deferredStart'
+import { beginOperation } from '@/lib/guardedOperation'
+import { resolveCreatedType, type StreamKind } from '@/lib/streamTypes'
+import {
+  restartStreamFlow, exitFocusFlow, hdReacquireFlow, limitHitFlow,
+  type EnterFocusOutcome,
+} from '@/lib/liveViewFlows'
 
 function isHevcCodec(codec?: string): boolean {
   if (!codec) return false
@@ -159,11 +168,22 @@ export function LiveViewPage() {
   // Stable ID for this browser tab — used by backend to track sessions per view
   const [viewId] = useState<string>(makeViewId)
 
+  // CONTROLADOR compartido del ciclo de vida de sesiones. Es el dueño de los
+  // PRIMITIVOS —registro, cola de pendientes, POST de arranque, cierres por
+  // identidad y timers HLS—: la página no llama `apiPost(start-stream)`,
+  // `closeStreamSession` ni `closeViewSessions` directo (guarda AST). La
+  // orquestación de transición/foco/calidad —ya probada— se conserva y usa estos
+  // primitivos. Es la MISMA abstracción que usa `ViewPlayerPage`.
+  const ctrl = useViewportSessionLifecycle(viewId)
+
   // Resultado de entrar en foco. Discriminado a propósito: el llamador decide
   // el fallback con ESTE valor, nunca leyendo estado de React recién fijado.
-  type EnterFocusResult =
-    | { ok: true; info: StreamInfo; actualType: 'sub' | 'main' | 'main_h264' }
-    | { ok: false; error: CameraPlaybackError }
+  //
+  // Tres desenlaces, no dos. "Superado" no es un fallo: mientras se devolvía
+  // como un error sintético `UNKNOWN/viewport_changed`, la readquisición de HD
+  // lo tomaba por un fallo real y aplicaba su repliegue —tipo de stream, overlay
+  // y remonte— sobre un viewport que ya no era el suyo.
+  type EnterFocusResult = EnterFocusOutcome<StreamInfo, CameraPlaybackError>
 
   // Error codes that belong exclusively to focus/main_h264 streams.
   // Grid tiles show sub streams — showing these errors on a tile is always stale/misleading.
@@ -172,7 +192,36 @@ export function LiveViewPage() {
   ])
 
   // Track which cameraIds have active sessions in the backend
-  const activeSessions = useRef<Set<string>>(new Set())
+  // Sesiones EFECTIVAS de esta pestaña, por cámara y por tipo real. Antes era
+  // un `Set<cameraId>` y todo se cerraba como 'sub': con el backend
+  // redirigiendo sub→main/main_h264, ese cierre no cerraba nada.
+  // El registro y la cola los POSEE el controlador; la página los lee/actualiza
+  // a través de su API (nunca muta el registro/cola «a mano»).
+  const activeSessions = ctrl.registry()
+
+  /**
+   * Anota una sesión recién creada y contrasta lo anotado con lo que el
+   * servidor dice tener.
+   *
+   * La entrada se guarda SIEMPRE (por identidad) a través del controlador:
+   * aunque el arrendamiento no haya quedado registrado, la sesión puede existir
+   * y hay que poder cerrarla deliberadamente. Lo que no puede es pasar
+   * inadvertido, porque un arrendamiento ausente significa que ningún descarte
+   * por respuesta tardía podrá soltarla y sólo el TTL la recogerá.
+   */
+  const registrarSesion = useCallback((
+    entry: { cameraId: string; streamType: StreamKind; startAttemptId: string },
+    info: StreamInfo,
+  ) => {
+    ctrl.registerStarted(entry.cameraId, entry.streamType, entry.startAttemptId)
+    if (info.startAttempt && !info.startAttempt.registered) {
+      console.warn(
+        `[live-ui] start_attempt_not_registered cameraId=${entry.cameraId}` +
+        ` streamType=${entry.streamType} attempt=${entry.startAttemptId}` +
+        ` owners=${info.startAttempt.owners} — sólo un cierre deliberado o el TTL la recogerán`
+      )
+    }
+  }, [ctrl])
   // Track pending start-stream requests to avoid double-firing
   const pendingStarts  = useRef<Set<string>>(new Set())
   // Controlador single-flight del cambio de calidad (mutex + secuencia por cámara).
@@ -212,11 +261,13 @@ export function LiveViewPage() {
    * programador, que NO corre al cambiar de NVR, página o layout: la vista no
    * se desmonta (revisión de #158).
    */
-  const viewportWork = useRef(createViewportWork({
+  // OWNERSHIP en el controlador: la página ya no guarda su propio lifecycle. El
+  // controlador crea y retiene `viewportWork` (una sola vez); la página lo usa.
+  const viewportWork = ctrl.adopt('viewportWork', () => createViewportWork({
     cancelInFlightHeartbeat: () => heartbeatRef.current?.cancelInFlight(),
     onInvalidate: ({ epoch, reason }) =>
       console.info(`[live-ui] viewport_work_invalidated epoch=${epoch} reason=${reason}`),
-  })).current
+  }))
   // Ref to loadStream so flushHlsExpiry (declared before loadStream) can call it
   // without a forward-reference compile error.
   const loadStreamRef = useRef<((camera: Camera) => Promise<void>) | null>(null)
@@ -341,6 +392,20 @@ export function LiveViewPage() {
     // but these cameras are intentionally running main_h264; overwriting would cause
     // VideoPlayer to load the broken sub URL and restart the fallback loop.
     if (Object.keys(result.streams).length > 0) {
+      // PASO 1 · RECONCILIACIÓN DE IDENTIDAD, separada de la mutación visual y
+      // ANTES de decidir la URL. Se registran TODOS los arrendamientos vigentes
+      // de CADA cámara —incluidas las que están en fallback (`gridStreamOverride`)—:
+      // el override sólo debe impedir pisar la URL, NUNCA impedir recuperar el
+      // ownership. Antes el `continue` del override saltaba también este registro,
+      // y una cámara en fallback nunca anotaba su `startAttemptId`: su sesión
+      // quedaba sin identidad y ninguna transición podía cerrarla.
+      //
+      // La IDENTIDAD es la que ACUÑÓ EL SERVIDOR; sin id real no se anota (jamás
+      // un `hb:*`). El helper compartido NO conoce el override: por construcción
+      // no puede saltarse el registro de una cámara en fallback.
+      registerHeartbeatIdentities(result.streams, (cid, tipo, aid) => ctrl.registerReconciled(cid, tipo, aid))
+      // PASO 2 · MUTACIÓN VISUAL. El override sólo evita pisar la URL de fallback;
+      // no tiene efectos laterales sobre el registro (que ya se hizo arriba).
       setStreams(prev => {
         const next = { ...prev }
         for (const [cameraId, info] of Object.entries(result.streams)) {
@@ -354,7 +419,6 @@ export function LiveViewPage() {
             nvrName: info.nvrName ?? '',
             warning: info.warning,
           }
-          activeSessions.current.add(cameraId)
         }
         return next
       })
@@ -384,7 +448,12 @@ export function LiveViewPage() {
     }
     // Cameras the backend stopped
     if (result.stoppedIds.length > 0) {
-      result.stoppedIds.forEach(id => activeSessions.current.delete(id))
+      // `reconcileView` sólo detiene sesiones `sub`: la fila `viewCameras` que
+      // recorre se alimenta únicamente de arranques de ese tipo. Olvidar la
+      // cámara entera borraba de la vista la anotación de un `main`/`main_h264`
+      // concurrente —el del foco— que seguía vivo en el backend, y nadie volvía
+      // a cerrarlo.
+      ctrl.forgetStoppedSubs(result.stoppedIds)
     }
     // Map backend errors to frontend error format
     for (const [cameraId, err] of Object.entries(result.errors)) {
@@ -480,7 +549,7 @@ export function LiveViewPage() {
       // se salte el backoff del frontend y golpee el límite en cada heartbeat).
       const now = Date.now()
       const suppressStartCameraIds = filteredIds.filter(id =>
-        (limitBackoffUntil.current[id] ?? 0) > now && !activeSessions.current.has(id))
+        (limitBackoffUntil.current[id] ?? 0) > now && !activeSessions.has(id))
       const result = await apiPost<HeartbeatResponse>('/live-view/heartbeat', {
         viewId,
         visibleCameraIds: filteredIds,
@@ -594,7 +663,9 @@ export function LiveViewPage() {
   /** `stopAllSessions` se define más abajo; el coordinador la lee por ref. */
   const stopAllSessionsRef = useRef<(reason?: string) => Promise<void>>(async () => {})
   const publishedResolvers = useRef<Array<() => void>>([])
-  const transition = useRef(createViewportTransition<() => void>({
+  // OWNERSHIP en el controlador: la transición de viewport la retiene el
+  // controlador, no un `useRef` propio de la página.
+  const transition = ctrl.adopt('transition', () => createViewportTransition<() => void>({
     suspendScheduler: () => heartbeatRef.current?.suspend(),
     armScheduler: () => heartbeatRef.current?.arm(),
     runHeartbeatNow: () => heartbeatRef.current?.runNow() ?? Promise.resolve(null),
@@ -604,7 +675,7 @@ export function LiveViewPage() {
     awaitPublished: () => new Promise<void>(r => { publishedResolvers.current.push(r) }),
     isHidden: tabIsHidden,
     onEvent: (e) => console.info(`[live-ui] viewport_transition ${e}`),
-  })).current
+  }))
   // El envío se lee por ref y el efecto no tiene dependencias A PROPÓSITO: si
   // dependiera de `sendHeartbeat`, cada cambio de su identidad destruiría el
   // programador y crearía otro, y como el nuevo late de inmediato eso sería una
@@ -658,6 +729,16 @@ export function LiveViewPage() {
   }, [bumpPlayerKeys])
   const consumePendingExpiryRef = useRef(consumePendingExpiry)
   consumePendingExpiryRef.current = consumePendingExpiry
+
+  /** Reintento de los cierres sin confirmar, enganchado a la cadencia. */
+  const reintentarCierres = useCallback(async () => {
+    const r = await ctrl.retryCloses()
+    if (r.siguenPendientes > 0) {
+      console.warn(`[live-ui] close_still_pending count=${r.siguenPendientes}`)
+    }
+  }, [ctrl])
+  const retryPendingClosesRef = useRef(reintentarCierres)
+  retryPendingClosesRef.current = reintentarCierres
   useEffect(() => {
     const scheduler = createHeartbeatScheduler<HeartbeatResponse | null>({
       intervalMs: 30_000,
@@ -688,6 +769,12 @@ export function LiveViewPage() {
         }
         applyHeartbeatRef.current(result)
         consumePendingExpiryRef.current(result)
+        // Y se reintenta lo que quedó sin cerrar. La cadencia del heartbeat es
+        // el único reloj que la vista ya tiene y que sólo late con la pestaña
+        // visible: no genera tráfico con el usuario ausente, y es exactamente
+        // cuando el heartbeat de grilla está renovando el TTL del HD que quedó
+        // huérfano —o sea, cuando más falta hace insistir—.
+        void retryPendingClosesRef.current()
       },
     })
     heartbeatRef.current = scheduler
@@ -704,19 +791,49 @@ export function LiveViewPage() {
 
   // ─── Stop sessions for a set of cameraIds ───────────────────
   const stopSessions = useCallback(async (cameraIds: string[], reason?: string) => {
-    const toStop = cameraIds.filter(id => activeSessions.current.has(id))
-    if (toStop.length === 0) return
-    console.info(`[LiveView] stopSessions reason=${reason || 'unspecified'} count=${toStop.length} ids=[${toStop.join(',')}]`)
-    // keepalive: un cambio de layout/cámara puede coincidir con una navegación;
-    // sin él la petición se aborta y la sesión queda viva hasta el TTL.
-    await Promise.allSettled(
-      toStop.map(id => closeStreamSession(id, 'sub', reason || 'stop_sessions', viewId))
+    // Cada cámara se cierra con SUS tipos reales —pueden ser dos a la vez, el
+    // `sub` de la grilla y el `main`/`main_h264` del foco—. Cerrar todo como
+    // 'sub', que es lo que hacía, no cerraba nada cuando el backend había
+    // redirigido, y la sesión seguía viva con su FFmpeg.
+    const cerradas = await ctrl.closeTracked(
+      cameraIds,
+      reason || VIEWPORT_CHANGE,
+      ({ cameraId }) => { pendingStarts.current.delete(cameraId) },
     )
-    toStop.forEach(id => {
-      activeSessions.current.delete(id)
-      pendingStarts.current.delete(id)
+    if (cerradas.length > 0) {
+      const detalle = cerradas.map(c => `${c.cameraId}:${c.confirmadas.join('+') || '-'}`).join(',')
+      const sinConfirmar = cerradas.filter(c => c.pendientes.length > 0)
+      console.info(
+        `[LiveView] stopSessions reason=${reason || VIEWPORT_CHANGE}` +
+        ` count=${cerradas.length} confirmadas=[${detalle}]` +
+        ` pendientes=${sinConfirmar.length}`
+      )
+      if (sinConfirmar.length > 0) {
+        // No es un detalle cosmético: cada una es una sesión que sigue viva.
+        console.warn(
+          `[live-ui] close_unconfirmed count=${sinConfirmar.length}` +
+          ` sessions=[${sinConfirmar.map(c => `${c.cameraId}:${c.pendientes.join('+')}`).join(',')}]` +
+          ' — quedan en cola de reintento'
+        )
+      }
+    }
+  }, [ctrl])
+
+  // Cierre deliberado por IDENTIDAD de UNA ranura, vía el controlador (dueño del
+  // cierre). Sólo se olvida la anotación confirmada; lo no confirmado queda en la
+  // cola y se reintenta. Es el único camino de cierre puntual de la página.
+  const cerrarSesion = useCallback((cameraId: string, streamType: StreamKind, reason: string) => {
+    void ctrl.close({
+      cameraId, streamType, reason,
+      onUnconfirmed: (startAttemptId, outcome, status) => {
+        console.warn(
+          `[live-ui] close_unconfirmed cameraId=${cameraId} streamType=${streamType}` +
+          ` attempt=${startAttemptId} reason=${reason}` +
+          ` outcome=${outcome ?? 'unknown'} status=${status ?? 'n/a'}`
+        )
+      },
     })
-  }, [viewId])
+  }, [ctrl])
 
   // ─── Clear stagger timers ────────────────────────────────────
   const clearStaggerTimers = useCallback(() => {
@@ -731,7 +848,7 @@ export function LiveViewPage() {
     // trabajo transitorio antes de llamar acá). Invalidar de nuevo desde dentro
     // avanzaría la generación a mitad de la transacción y anularía su token.
     clearStaggerTimers()
-    const allActive = Array.from(activeSessions.current)
+    const allActive = activeSessions.cameras()
     await stopSessions(allActive, reason || 'stop_all')
     setStreams({})
     setStreamErrors({})
@@ -747,14 +864,20 @@ export function LiveViewPage() {
    * Único punto para programar un arranque diferido (restart, retry grid,
    * fallback a main_h264, stagger).
    *
-   * Captura el token de la transición vigente, registra el temporizador para
-   * que la invalidación pueda cancelarlo, y al dispararse comprueba token y
-   * visibilidad. Antes cada sitio hacía su propio `setTimeout` suelto: ninguno
-   * se cancelaba al cambiar de viewport y todos podían arrancar una cámara que
-   * ya no estaba en pantalla (revisión de #159).
+   * El token es un parámetro OBLIGATORIO, no algo que esta función capture por
+   * su cuenta. Capturarlo acá funcionaba mientras quien llamaba lo hiciera de
+   * inmediato, pero el reinicio manual llama DESPUÉS de esperar su POST: para
+   * entonces `transition.current()` ya podía ser el del NVR nuevo, y la cámara
+   * del anterior se programaba como si perteneciera a la vista nueva. Con el
+   * token explícito, cada llamada declara a qué viewport pertenece.
+   *
+   * Registra el temporizador para que la invalidación pueda cancelarlo, y al
+   * dispararse comprueba token y visibilidad: cancelar no alcanza para un
+   * callback ya encolado, y comprobar no alcanza para no acumular basura.
    */
-  const scheduleStart = useCallback((cam: Camera, delayMs: number, reason: string) => {
-    const token = transition.current()
+  const scheduleStart = useCallback((
+    cam: Camera, delayMs: number, reason: string, token: TransitionToken,
+  ) => {
     scheduleDeferredStart({
       cameraId: cam.id,
       reason,
@@ -780,25 +903,46 @@ export function LiveViewPage() {
   // así que `pagehide` + desmontaje simultáneos no son un problema.
   //
   // El TTL del servidor sigue siendo la garantía final si nada de esto llega.
+  // El dispose de la maquinaria adoptada lo GOBIERNA el controlador: la página
+  // sólo le entrega un callback (invalidar viewportWork + detener su heartbeat).
+  // Así `disposeView` —lo llame pagehide o el desmontaje— detiene TODO el
+  // lifecycle, incluido el heartbeat propio de LiveView, sin depender del cleanup
+  // de React (que en `pagehide` no corre).
   useEffect(() => {
-    const closeThisView = () => {
+    ctrl.onDispose(() => {
       viewportWork.invalidate('close_view')
-      clearStaggerTimers()
-      void closeViewSessions(viewId)
+      heartbeatRef.current?.stop()
+    })
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    // bfcache: cualquier `pagehide` ABANDONA el lifecycle por completo
+    // (`disposeView` ejecuta los hooks de dispose → detiene el heartbeat propio de
+    // LiveView e invalida su `viewportWork`, e invalida el scope). Al volver del
+    // bfcache, `pageshow.persisted` fuerza una recarga limpia si fue abandonado.
+    const onPageHide = () => { clearStaggerTimers(); ctrl.disposeView() }
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (pageShowAction(e.persisted) === 'reload' && ctrl.isAbandoned()) window.location.reload()
     }
-    // `pagehide` cubre cierre de pestaña, navegación y bfcache en iOS/Safari,
-    // donde `beforeunload` no es fiable.
-    window.addEventListener('pagehide', closeThisView)
+    window.addEventListener('pagehide', onPageHide)
+    window.addEventListener('pageshow', onPageShow)
     return () => {
-      window.removeEventListener('pagehide', closeThisView)
-      closeThisView()
+      window.removeEventListener('pagehide', onPageHide)
+      window.removeEventListener('pageshow', onPageShow)
+      clearStaggerTimers()
+      ctrl.disposeView()   // desmontaje REAL de React
     }
-  }, [clearStaggerTimers, viewId])
+  }, [clearStaggerTimers, ctrl])
 
   // ─── Load a single stream ────────────────────────────────────
   // NOTE: intentionally does NOT depend on `streams` state — using it would create
   // a stale closure bug. pendingStarts guards against concurrent duplicate calls.
-  const loadStream = useCallback(async (camera: Camera): Promise<void> => {
+  // `heredado` es el token de una operación que ya venía en curso —hoy, el
+  // reintento tras el límite de streams—. Sin él, el reintento capturaba la
+  // vigencia DESPUÉS del cierre de sesiones y adoptaba el viewport nuevo.
+  const loadStream = useCallback(async (
+    camera: Camera, heredado?: TransitionToken,
+  ): Promise<void> => {
     if (pendingStarts.current.has(camera.id)) return
 
     // Backoff activo por límite de streams: no reintentar hasta que expire.
@@ -820,25 +964,48 @@ export function LiveViewPage() {
 
     // TOKEN LOCAL del arranque. Si el viewport cambia mientras la solicitud
     // viaja, la respuesta no puede tocar el estado del viewport nuevo.
-    const token = transition.current()
+    const token = heredado ?? transition.current()
 
     const overrideType = gridStreamOverride.current[camera.id]
-    // El viewId va SIEMPRE: sin él la sesión se registra bajo 'default' y su
-    // heartbeat de view nunca coincide con el de esta pestaña.
-    const body = overrideType ? { streamType: overrideType, viewId } : { viewId }
+    // El POST lo emite el CONTROLADOR (dueño de `apiPost start-stream`); genera y
+    // devuelve el intento REAL de esta operación (que sobrevive al reintento del
+    // interceptor tras renovar el JWT, porque el cuerpo queda fijo). Se captura
+    // acá para que discard/apply hablen de la misma solicitud.
+    let startAttemptId = ''
+    const body = overrideType ? { streamType: overrideType } : {}
 
     const outcome = await runViewportRequest<StreamInfo>({
       isCurrent: () => transition.isCurrent(token),
-      request: () => apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, body),
-      discard: () => {
+      request: () => ctrl.startRaw(camera.id, body).then(r => {
+        startAttemptId = r.startAttemptId
+        return r.info as StreamInfo
+      }),
+      discard: (info) => {
         // El backend YA creó la sesión: dejarla viva sería un FFmpeg sin
-        // espectador hasta el TTL. Se cierra en el acto y no se toca nada del
-        // viewport nuevo —ni activeSessions, ni streams, ni loading, ni errores—.
-        console.info(`[live-ui] start_discarded cameraId=${camera.id} reason=viewport_changed`)
-        void closeStreamSession(camera.id, overrideType ?? 'sub', 'viewport_changed', viewId)
+        // espectador hasta el TTL. Se cierra en el acto por IDENTIDAD y no se
+        // toca nada del viewport nuevo. El tipo se resuelve sobre la RESPUESTA
+        // (pedir `sub` no garantiza `sub`); la razón `stale_response` autoriza
+        // terminar el FFmpeg. Lo no confirmado queda en la cola del controlador.
+        void ctrl.closeStale({
+          cameraId: camera.id,
+          info,
+          requested: (overrideType as StreamKind | undefined) ?? 'sub',
+          startAttemptId,
+          onClose: ({ created, confirmed, outcome, status }) => {
+            console.info(
+              `[live-ui] start_discarded cameraId=${camera.id} created=${created}` +
+              ` attempt=${startAttemptId} confirmed=${confirmed}` +
+              ` outcome=${outcome ?? 'unknown'} status=${status ?? 'n/a'} reason=${STALE_RESPONSE}`
+            )
+          },
+        })
       },
       apply: (info) => {
-        activeSessions.current.add(camera.id)
+        registrarSesion({
+          cameraId: camera.id,
+          streamType: resolveCreatedType(info, (overrideType as StreamKind | undefined) ?? 'sub'),
+          startAttemptId,
+        }, info)
         if (info.hls) currentStreamUrls.current[camera.id] = info.hls
         setStreams(prev => ({ ...prev, [camera.id]: info }))
         setStreamErrors(prev => {
@@ -859,7 +1026,9 @@ export function LiveViewPage() {
         const rawMsg: string = body.message || body.code || body.error || ''
 
         if (code === 'STREAM_LIMIT_REACHED' || code === 'STREAM_LIMIT_GLOBAL') {
-          await handleLimitHit(camera, body.current as number | undefined, body.max as number | undefined)
+          // Se propaga el token: el manejo del límite es la continuación de
+          // ESTE arranque, no una operación nueva.
+          await handleLimitHit(camera, token, body.current as number | undefined, body.max as number | undefined)
           return
         }
 
@@ -908,40 +1077,58 @@ export function LiveViewPage() {
   loadStreamRef.current = loadStream  // keep ref current for flushHlsExpiry
 
   // ─── Handle stream limit: cleanup non-visible then retry ────
-  const handleLimitHit = useCallback(async (camera: Camera, current?: number, max?: number) => {
-    const visibleIds = new Set(filteredCameras.map(c => c.id))
-    const nonVisible = Array.from(activeSessions.current).filter(id => !visibleIds.has(id))
+  // El token llega del `loadStream` que chocó con el límite: esta operación es
+  // la continuación de aquélla, no una nueva. Volver a capturar la vigencia
+  // después del cierre —que es lo que hacía— era la forma en que un arranque del
+  // NVR anterior renacía dentro del nuevo y reintentaba una cámara invisible.
+  const handleLimitHit = useCallback(async (
+    camera: Camera, token: TransitionToken, current?: number, max?: number,
+  ) => {
+    const limitMsg = current !== undefined && max !== undefined
+      ? `Límite de streams alcanzado (${current}/${max} activos)`
+      : `Límite de streams alcanzado`
 
-    if (nonVisible.length > 0) {
-      // Liberar sesiones no visibles resuelve el límite — limpiar backoff y reintentar
-      await stopSessions(nonVisible)
-      setStreams(prev => {
-        const next = { ...prev }
-        nonVisible.forEach(id => delete next[id])
-        return next
-      })
-      delete limitBackoffUntil.current[camera.id]
-      pendingStarts.current.delete(camera.id)
-      await loadStream(camera)
-    } else {
+    await limitHitFlow({
+      op: beginOperation(() => transition.isCurrent(token)),
+      nonVisible: () => {
+        const visibleIds = new Set(filteredCameras.map(c => c.id))
+        return activeSessions.cameras().filter(id => !visibleIds.has(id))
+      },
+      stopSessions: (ids) => stopSessions(ids),
+      forgetStreams: (ids) => {
+        setStreams(prev => {
+          const next = { ...prev }
+          ids.forEach(id => delete next[id])
+          return next
+        })
+      },
+      clearBackoff: () => { delete limitBackoffUntil.current[camera.id] },
+      clearPendingStart: () => { pendingStarts.current.delete(camera.id) },
+      // Reintento con la MISMA vigencia: `loadStream` no la vuelve a capturar.
+      retry: () => loadStream(camera, token),
       // Nada que liberar: mostrar un error claro (no "desconocido") y aplicar
       // backoff para no reintentar en cada heartbeat mientras persista el límite.
-      const limitMsg = current !== undefined && max !== undefined
-        ? `Límite de streams alcanzado (${current}/${max} activos)`
-        : `Límite de streams alcanzado`
-      limitBackoffUntil.current[camera.id] = Date.now() + 15_000
-      setStreamErrors(prev => ({
-        ...prev,
-        [camera.id]: { code: 'STREAM_LIMIT_REACHED', message: limitMsg },
-      }))
-      setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
-    }
+      applyBackoff: () => { limitBackoffUntil.current[camera.id] = Date.now() + 15_000 },
+      showLimitError: () => {
+        setStreamErrors(prev => ({
+          ...prev,
+          [camera.id]: { code: 'STREAM_LIMIT_REACHED', message: limitMsg },
+        }))
+        setLoadingStreams(prev => ({ ...prev, [camera.id]: false }))
+      },
+      onDiscard: () => {
+        console.info(`[live-ui] limit_hit_discarded cameraId=${camera.id} reason=viewport_changed`)
+      },
+    })
   }, [filteredCameras, stopSessions, loadStream])
 
   // ─── Start visible streams with stagger ─────────────────────
   // Blocked cameras (offline / known bad health) are loaded immediately without stagger
   // so their error overlay appears right away without a spinner delay.
-  const startVisibleStreams = useCallback((cams: Camera[]) => {
+  // El token también es obligatorio acá: los dos llamadores arrancan la grilla
+  // DESPUÉS de esperar algo (el cierre de las cámaras que se van, o las esperas
+  // de la salida de foco), y el escalonado que programa vive todavía más tarde.
+  const startVisibleStreams = useCallback((cams: Camera[], token: TransitionToken) => {
     const delay = STAGGER_MS[gridLayout] ?? 500
     let staggerIdx = 0
     cams.forEach((cam) => {
@@ -949,7 +1136,7 @@ export function LiveViewPage() {
         // Immediate — no timer needed, loadStream returns synchronously for blocked cameras
         loadStream(cam)
       } else {
-        scheduleStart(cam, staggerIdx * delay, 'stagger')
+        scheduleStart(cam, staggerIdx * delay, 'stagger', token)
         staggerIdx++
       }
     })
@@ -1053,7 +1240,15 @@ export function LiveViewPage() {
 
     clearStaggerTimers()
 
+    // Vigencia capturada ANTES del cierre: lo que sigue corre después de un
+    // await y no puede adoptar el viewport que llegue mientras tanto.
+    const token = transition.current()
     stopSessions(leaving, 'viewport_change').then(() => {
+      if (!transition.isCurrent(token)) {
+        console.info('[live-ui] viewport_diff_discarded reason=viewport_changed')
+        isTransitioning.current = false
+        return
+      }
       if (leaving.length > 0) {
         setStreams(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
         setStreamErrors(prev => { const n = { ...prev }; leaving.forEach(id => delete n[id]); return n })
@@ -1068,7 +1263,7 @@ export function LiveViewPage() {
           return n
         })
       }
-      startVisibleStreams(arriving)
+      startVisibleStreams(arriving, token)
       isTransitioning.current = false
     })
   }, [filteredCameras.map(c => c.id).join(',')])
@@ -1109,26 +1304,57 @@ export function LiveViewPage() {
   }, [cameras])
 
   const handleRestartStream = useCallback(async (cameraId: string) => {
-    activeSessions.current.delete(cameraId)
-    pendingStarts.current.delete(cameraId)
-    setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
-    setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
-    bumpPlayerKeys([cameraId])
-    await apiPost(`/cameras/${cameraId}/restart-stream`, {}).catch(() => {})
-    const cam = cameras.find(c => c.id === cameraId)
-    if (cam) scheduleStart(cam, 3000, 'restart_stream')
+    // Token capturado al ABRIR la operación, no después del POST: el reinicio
+    // tarda, y programar con el token de entonces adoptaba el viewport nuevo.
+    const token = transition.current()
+    await restartStreamFlow({
+      op: beginOperation(() => transition.isCurrent(token)),
+      resetLocal: () => {
+        // Antes se olvidaba la cámara entera del registro —un `forget` a ciegas—
+        // ANTES de cualquier cierre confirmado. Un 500, un `ignored` o una red
+        // caída dejaban el arrendamiento vivo y sin nadie que lo recordara; para
+        // el HD el TTL tampoco lo recoge, porque el heartbeat de grilla lo
+        // renueva. Ahora se cierra por IDENTIDAD (tipo real por tipo real) y
+        // sólo se olvida lo que el servidor confirmó; lo demás queda en la cola
+        // para reintentarse. `restart_stream` conserva el FFmpeg: el propio
+        // `/restart-stream` lo reinicia y matarlo acá sería una carrera.
+        for (const streamType of activeSessions.typesOf(cameraId)) {
+          cerrarSesion(cameraId, streamType, 'restart_stream')
+        }
+        pendingStarts.current.delete(cameraId)
+        setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+        setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
+        bumpPlayerKeys([cameraId])
+      },
+      restart: () => apiPost(`/cameras/${cameraId}/restart-stream`, {}).then(() => {}).catch(() => {}),
+      scheduleStart: () => {
+        const cam = cameras.find(c => c.id === cameraId)
+        if (cam) scheduleStart(cam, 3000, 'restart_stream', token)
+      },
+      onDiscard: () => {
+        console.info(`[live-ui] restart_discarded cameraId=${cameraId} reason=viewport_changed`)
+      },
+    })
   }, [cameras, loadStream, bumpPlayerKeys])
 
   // ─── Retry a single grid camera (full stream restart) ───────
   const handleGridCameraRetry = useCallback((cameraId: string) => {
-    apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: 'sub', reason: 'grid_retry', viewId }).catch(() => {})
-    activeSessions.current.delete(cameraId)
+    // Camino COMPARTIDO: identidad + confirmación + cola. Se itera el TIPO real
+    // de cada sesión —si el backend redirigió sub→main, cerrar 'sub' no cierra
+    // nada— y `closeOneSession` resuelve por dentro los arrendamientos y sólo
+    // quita el que el servidor confirmó (nunca `forget` amplio ni el objeto
+    // `SessionEntry` como streamType). `grid_retry` conserva el FFmpeg a
+    // propósito: no está en TRANSCODE_KILL_REASONS y el re-arranque lo reutiliza.
+    for (const streamType of activeSessions.typesOf(cameraId)) {
+      cerrarSesion(cameraId, streamType, 'grid_retry')
+    }
     setStreamErrors(prev => { const n = { ...prev }; delete n[cameraId]; return n })
     setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
     pendingStarts.current.delete(cameraId)
     bumpPlayerKeys([cameraId])
     const cam = cameras.find(c => c.id === cameraId)
-    if (cam) scheduleStart(cam, 300, 'grid_retry')
+    // Sin await de por medio: el token vigente ES el de esta operación.
+    if (cam) scheduleStart(cam, 300, 'grid_retry', transition.current())
   }, [cameras, loadStream, bumpPlayerKeys])
 
   // ─── HLS fatal error from VideoPlayer ───────────────────────
@@ -1181,17 +1407,26 @@ export function LiveViewPage() {
     }
 
     // For all other fatal errors, stop the backend stream using the correct type.
-    // Focus camera non-transcode: use focusStreamType. Grid camera: always sub.
-    // Pass reason=hls_fatal_error so backend does NOT kill FFmpeg (transient error).
+    // El tipo sale del REGISTRO de sesiones efectivas, no de una suposición:
+    // `gridStreamOverride ?? 'sub'` fallaba en toda cámara redirigida por el
+    // backend (sub HEVC → main, o USING_MAIN_STREAM → main).
+    //
+    // Una cámara puede tener dos sesiones a la vez. Si la que falló es la del
+    // foco, se cierra sólo ésa y la de la grilla sobrevive; si es una celda de
+    // la grilla, esa cámara no está en foco y todo lo registrado es suyo.
+    // `hls_fatal_error` conserva el FFmpeg: el error es transitorio.
     const isGridCamera = cameraId !== focusCameraRef.current
-    const currentStreamType = isGridCamera
-      ? (gridStreamOverride.current[cameraId] ?? 'sub')
-      : (cameraId === focusCamera ? focusStreamType : 'sub')
-    if (activeSessions.current.has(cameraId)) {
-      console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${currentStreamType} reason=hls_fatal_error code=${err.code}`)
-      apiPost(`/cameras/${cameraId}/stop-stream`, { streamType: currentStreamType, reason: 'hls_fatal_error', viewId }).catch(() => {})
-      activeSessions.current.delete(cameraId)
-    }
+    const tiposACerrar: StreamKind[] = isGridCamera
+      ? activeSessions.typesOf(cameraId)
+      : activeSessions.hasType(cameraId, focusStreamTypeRef.current as StreamKind)
+        ? [focusStreamTypeRef.current as StreamKind]
+        : activeSessions.typesOf(cameraId)
+    tiposACerrar.forEach(streamType => {
+      console.info(`[LiveView] stop-stream cameraId=${cameraId} streamType=${streamType} reason=hls_fatal_error code=${err.code}`)
+      // Camino COMPARTIDO por el controlador: por identidad, con confirmación y
+      // cola. `hls_fatal_error` conserva el FFmpeg (error transitorio).
+      cerrarSesion(cameraId, streamType, 'hls_fatal_error')
+    })
     // HLS manifest 404 on a grid (sub) camera = RTSP source returned 404 from NVR.
     // Reclassify to RTSP_CHANNEL_NOT_FOUND so the tile shows a meaningful message.
     let displayErr = err
@@ -1226,7 +1461,7 @@ export function LiveViewPage() {
       setStreams(prev => { const n = { ...prev }; delete n[cameraId]; return n })
       bumpPlayerKeys([cameraId])
       const cam = filteredCamerasRef.current.find(c => c.id === cameraId)
-      if (cam) scheduleStart(cam, 300, 'grid_fallback_to_main_h264')
+      if (cam) scheduleStart(cam, 300, 'grid_fallback_to_main_h264', transition.current())
       return
     }
 
@@ -1261,7 +1496,7 @@ export function LiveViewPage() {
         technicalDetail: `Codec: ${camera.mainCodec}${camera.mainResolution ? `, Resolución: ${camera.mainResolution}` : ''}`,
       })
       return {
-        ok: false,
+        status: 'error',
         error: {
           code: 'CODEC_UNSUPPORTED',
           message: 'El flujo principal está en H.265/HEVC. Los navegadores no pueden reproducir H.265.',
@@ -1271,35 +1506,47 @@ export function LiveViewPage() {
 
     // La resolución la fija la ruta que gane: el mismo ciclo de vida que usa el
     // arranque de grid, para que foco y HD no puedan divergir de él.
-    let resultado: EnterFocusResult = {
-      ok: false, error: { code: 'UNKNOWN', message: 'viewport_changed' },
-    }
+    // Por defecto, "superado": si ninguna rama lo cambia es porque la respuesta
+    // pertenecía a otro viewport, y eso NO es un fallo del que reponerse.
+    let resultado: EnterFocusResult = { status: 'superseded' }
+    let startAttemptId = ''
     const desenlace = await runViewportRequest<StreamInfo>({
       isCurrent: () => transition.isCurrent(token),
-      request: () => apiPost<StreamInfo>(`/cameras/${camera.id}/start-stream`, { streamType: 'main', viewId }),
+      request: () => ctrl.startRaw(camera.id, { streamType: 'main' }).then(r => {
+        startAttemptId = r.startAttemptId
+        return r.info as StreamInfo
+      }),
       discard: (info) => {
         // El viewport cambió mientras se pedía el HD: la sesión ya existe en el
-        // backend, así que se cierra en el acto y no se toca el estado nuevo.
-        const creado: 'main' | 'main_h264' =
-          (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264') ? 'main_h264' : 'main'
-        console.info(`[live-ui] focus_discarded cameraId=${camera.id} reason=viewport_changed`)
-        void closeStreamSession(camera.id, creado, 'viewport_changed', viewId)
+        // backend, así que se cierra en el acto por identidad y no se toca el
+        // estado nuevo. Se cierra el tipo CREADO, no el pedido: si el backend
+        // redirigió a main_h264, cerrar `main` no cierra nada.
+        void ctrl.closeStale({
+          cameraId: camera.id, info, requested: 'main', startAttemptId,
+          onClose: ({ created, confirmed, outcome, status }) => {
+            console.info(
+              `[live-ui] focus_discarded cameraId=${camera.id} created=${created}` +
+              ` attempt=${startAttemptId} confirmed=${confirmed}` +
+              ` outcome=${outcome ?? 'unknown'} status=${status ?? 'n/a'} reason=${STALE_RESPONSE}`
+            )
+          },
+        })
       },
       apply: (info) => {
         // Backend may auto-redirect main→main_h264 (HEVC camera + transcoding enabled).
         // Detect the actual stream type from the response so stop-stream/quality-switch
         // use the correct type key.
-        const actualType: 'sub' | 'main' | 'main_h264' =
-          (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
-            ? 'main_h264'
-            : 'main'
+        const actualType = resolveCreatedType(info, 'main')
         if (actualType !== focusStreamType) {
           console.info(`[LiveView] enterFocus redirect cameraId=${camera.id} requested=main actual=${actualType}`)
           setFocusStreamType(actualType)
         }
         setFocusStreamInfo(info)
         bumpPlayerKeys([camera.id])
-        resultado = { ok: true, info, actualType }
+        // La sesión de foco convive con la de la grilla: se registra aparte,
+        // por su tipo real y su intento, para que cada flujo cierre la suya.
+        registrarSesion({ cameraId: camera.id, streamType: actualType, startAttemptId }, info)
+        resultado = { status: 'ok', info, actualType }
       },
       onError: (err: any) => {
         // Contrato unificado: lee body.code ?? body.error (antes leía body.error y un 429
@@ -1319,7 +1566,7 @@ export function LiveViewPage() {
           technicalDetail: parsed.technicalDetail,
         }
         setFocusStreamError(failure)
-        resultado = { ok: false, error: failure }
+        resultado = { status: 'error', error: failure }
       },
     })
     if (desenlace === 'error_discarded') {
@@ -1336,28 +1583,33 @@ export function LiveViewPage() {
   useEffect(() => {
     reacquireHdRef.current = async (camera: Camera) => {
       const before = focusStreamTypeRef.current
-      let result: EnterFocusResult
-      try {
-        result = await handleEnterFocus(camera)
-      } catch (e: any) {
-        result = { ok: false, error: { code: 'UNKNOWN', message: String(e?.message ?? e) } }
-      }
-      // El plan se decide con el RESULTADO devuelto, no con focusStreamError:
-      // el estado de React puede seguir sin renderizar en este punto.
-      const plan = decideHdFallback({
-        ok: result.ok,
-        errorCode: result.ok ? undefined : result.error.code,
+      await hdReacquireFlow<StreamInfo, CameraPlaybackError>({
+        enterFocus: () => handleEnterFocus(camera).catch(
+          (e: any): EnterFocusResult => ({
+            status: 'error',
+            error: { code: 'UNKNOWN', message: String(e?.message ?? e) },
+          }),
+        ),
+        // El plan se decide con el RESULTADO devuelto, no con focusStreamError:
+        // el estado de React puede seguir sin renderizar en este punto.
+        planFallback: (errorCode) => decideHdFallback({ ok: false, errorCode }),
+        errorCodeOf: (error) => error.code,
+        clearFocusError: () => setFocusStreamError(null),
+        clearFocusInfo: () => setFocusStreamInfo(null),
+        setFocusType: (t) => setFocusStreamType(t),
+        remountPlayer: () => bumpPlayerKeys([camera.id]),
+        onSuperseded: () => {
+          // Ni repliegue, ni overlay, ni tipo, ni remonte: este intento
+          // pertenecía a un foco que ya no existe.
+          console.info(`[live-ui] hd_reacquire_superseded cameraId=${camera.id} reason=viewport_changed`)
+        },
+        onFailure: (code) => {
+          console.info(
+            `[live-ui] hd_reacquire_failed cameraId=${camera.id} code=${code}` +
+            ` prevType=${before} — se restaura baja calidad, sin pantalla negra`
+          )
+        },
       })
-      if (result.ok) return
-
-      console.info(
-        `[live-ui] hd_reacquire_failed cameraId=${camera.id} code=${result.error.code}` +
-        ` prevType=${before} — se restaura baja calidad, sin pantalla negra`
-      )
-      if (!plan.showErrorOverlay) setFocusStreamError(null)
-      if (plan.clearStreamInfo) setFocusStreamInfo(null)
-      setFocusStreamType(plan.streamType)
-      if (plan.remountPlayer) bumpPlayerKeys([camera.id])
     }
   }, [handleEnterFocus, bumpPlayerKeys])
 
@@ -1417,8 +1669,13 @@ export function LiveViewPage() {
         // Explicitly switching back to sub — stop both main streams so FFmpeg is killed.
         console.info(`[LiveView] qualitySwitch cameraId=${cam} from=${focusStreamType} to=sub reason=switch_to_sub`)
         console.info(`[live-ui] fallback_to_substream cameraId=${cam} reason=user_selected_low_quality prevType=${focusStreamType}`)
-        void closeStreamSession(cam, 'main',      'switch_to_sub', viewId)
-        void closeStreamSession(cam, 'main_h264', 'switch_to_sub', viewId)
+        // Se cierran las sesiones HD registradas —`main` y/o `main_h264`—; el
+        // `sub` de la grilla no se toca, que es justo lo que el usuario quiere.
+        // La anotación se quita SÓLO con confirmación del servidor; lo que no
+        // se confirme queda en la cola y se reintenta.
+        for (const tipoHd of ['main', 'main_h264'] as const) {
+          cerrarSesion(cam, tipoHd, 'switch_to_sub')
+        }
         setFocusStreamInfo(null)
         setFocusStreamError(null)
         setFocusStreamType('sub')
@@ -1444,40 +1701,62 @@ export function LiveViewPage() {
       // a) On HEVC cameras, 'main' redirects to 'main_h264' anyway (same FFmpeg).
       // b) Stopping main_h264 kills FFmpeg, then start-stream immediately re-spawns it
       //    causing the "closing existing publisher" duplicate in MediaMTX.
+      //
+      // El cierre va por el camino COMPARTIDO con IDENTIDAD: antes era un POST
+      // suelto que detenía `main` SIN declarar `expectedStartAttemptId`, y un
+      // DELETE así —llegando sobre una ranura que otra solicitud ocupó después—
+      // cerraba la sesión ajena. `closeOneSession`
+      // suelta sólo el arrendamiento `main` que esta vista registró; si el
+      // backend había redirigido a `main_h264`, no hay entrada `main` y es un
+      // no-op, igual que antes. `quality_switch` conserva el FFmpeg.
       if (prevType === 'main') {
-        apiPost(`/cameras/${cam}/stop-stream`, { streamType: 'main', reason: 'quality_switch', viewId }).catch(() => {})
+        cerrarSesion(cam, 'main', 'quality_switch')
       }
 
       setFocusStreamInfo(null)
       setFocusStreamError(null)
       setFocusStreamType(quality)
 
+      let startAttemptId = ''
       await runViewportRequest<StreamInfo>({
-        isCurrent: () => transition.isCurrent(token),
-        request: () => apiPost<StreamInfo>(`/cameras/${cam}/start-stream`, { streamType: quality, viewId }),
-        discard: () => {
-          console.info(`[live-ui] quality_switch_discarded cameraId=${cam} reason=viewport_changed`)
-          void closeStreamSession(cam, quality, 'viewport_changed', viewId)
+        // La vigencia es DOBLE y va entera acá: el viewport (token) y la
+        // selección de calidad (secuencia). Comprobar la secuencia dentro de
+        // `apply` con un `return` silencioso dejaba viva la sesión que la
+        // selección superada acababa de crear — un FFmpeg de más por cada clic
+        // rápido. Ahora una selección superada entra por `discard` y se cierra.
+        isCurrent: () => transition.isCurrent(token) && qualityCtl.current.isCurrent(cam, seq),
+        request: () => ctrl.startRaw(cam, { streamType: quality }).then(r => {
+          startAttemptId = r.startAttemptId
+          return r.info as StreamInfo
+        }),
+        discard: (info) => {
+          // El tipo que hay que cerrar es el CREADO, no el pedido: si se pidió
+          // `main` y el backend redirigió a `main_h264`, cerrar `main` no cierra
+          // nada.
+          const causa = transition.isCurrent(token) ? 'superseded_selection' : 'viewport_changed'
+          void ctrl.closeStale({
+            cameraId: cam, info, requested: quality, startAttemptId,
+            onClose: ({ created, confirmed, outcome, status }) => {
+              console.info(
+                `[live-ui] quality_switch_discarded cameraId=${cam} seq=${seq} created=${created}` +
+                ` attempt=${startAttemptId} confirmed=${confirmed}` +
+                ` outcome=${outcome ?? 'unknown'} status=${status ?? 'n/a'}` +
+                ` cause=${causa} reason=${STALE_RESPONSE}`
+              )
+            },
+          })
         },
         apply: (info) => {
-          // Descarta respuestas tardías de una selección anterior (llegadas fuera de orden).
-          if (!qualityCtl.current.isCurrent(cam, seq)) {
-            console.info(`[live-ui] quality_switch_stale_response cameraId=${cam} seq=${seq} quality=${quality} — descartada`)
-            return
-          }
-          const actualType: 'sub' | 'main' | 'main_h264' =
-            (info as any).transcoded === true || info.streamPath?.endsWith('_main_h264')
-              ? 'main_h264' : quality
+          const actualType = resolveCreatedType(info, quality)
           if (actualType !== quality) {
             console.info(`[LiveView] qualitySwitch redirect cameraId=${cam} requested=${quality} actual=${actualType}`)
             setFocusStreamType(actualType)
           }
           setFocusStreamInfo(info)
           bumpPlayerKeys([cam])
+          registrarSesion({ cameraId: cam, streamType: actualType, startAttemptId }, info)
         },
         onError: (err: any) => {
-          // Un error tardío de una selección superada tampoco debe pisar la vigente.
-          if (!qualityCtl.current.isCurrent(cam, seq)) return
           const parsed = parseStreamError(
             err?.response?.data || {},
             err?.response?.status,
@@ -1506,27 +1785,39 @@ export function LiveViewPage() {
   // We do NOT restart cameras that weren't affected by the fullscreen.
   const handleExitFocus = useCallback(async () => {
     const prevFocusId = focusCamera
-    setFocusCamera(null)
-    setFocusStreamInfo(null)
-    setFocusStreamError(null)
-    setFocusStreamType('sub')
-
-    // Stop main/main_h264 streams — sub stream stays alive for the grid
-    if (prevFocusId) {
-      void closeStreamSession(prevFocusId, 'main',      'exit_focus', viewId)
-      void closeStreamSession(prevFocusId, 'main_h264', 'exit_focus', viewId)
-    }
-
-    // Reconcile the grid cameras after returning from fullscreen.
-    // Small delay for state to settle before starting streams.
-    await new Promise(r => setTimeout(r, 100))
-    const ids = filteredCamerasRef.current.map(c => c.id)
-
-    // Bump keys for grid cameras so stale HLS instances are destroyed
-    bumpPlayerKeys(ids)
-    await new Promise(r => setTimeout(r, 300))
-    startVisibleStreams(filteredCamerasRef.current)
-  }, [focusCamera, bumpPlayerKeys, startVisibleStreams])
+    // Las dos esperas de esta secuencia eran `new Promise(r => setTimeout(...))`
+    // sueltas: sobrevivían a un cambio de NVR y remontaban y arrancaban la
+    // grilla del viewport nuevo con la intención del viejo. Ahora la operación
+    // lleva la vigencia capturada al entrar y abandona en cuanto deja de valer.
+    const token = transition.current()
+    await exitFocusFlow({
+      op: beginOperation(() => transition.isCurrent(token)),
+      settleMs: 100,
+      remountMs: 300,
+      clearFocus: () => {
+        setFocusCamera(null)
+        setFocusStreamInfo(null)
+        setFocusStreamError(null)
+        setFocusStreamType('sub')
+      },
+      // Stop main/main_h264 streams — sub stream stays alive for the grid
+      closeFocusSessions: () => {
+        if (!prevFocusId) return
+        // El `sub` de la grilla sobrevive: es el que va a reproducir la celda.
+        // El HD se cierra con confirmación; sin ella queda en la cola, porque la
+        // interfaz ya salió de foco y nadie más se va a acordar.
+        for (const tipoHd of ['main', 'main_h264'] as const) {
+          cerrarSesion(prevFocusId, tipoHd, 'exit_focus')
+        }
+      },
+      // Bump keys for grid cameras so stale HLS instances are destroyed
+      bumpPlayerKeys: () => bumpPlayerKeys(filteredCamerasRef.current.map(c => c.id)),
+      startVisibleStreams: () => startVisibleStreams(filteredCamerasRef.current, token),
+      onDiscard: (stage) => {
+        console.info(`[live-ui] exit_focus_discarded stage=${stage} reason=viewport_changed`)
+      },
+    })
+  }, [focusCamera, bumpPlayerKeys, startVisibleStreams, viewId])
 
   const currentGrid    = GRID_OPTIONS.find(g => g.value === gridLayout) || GRID_OPTIONS[2]
   const totalForFilter = allFiltered.length

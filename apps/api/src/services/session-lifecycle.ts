@@ -264,6 +264,197 @@ export function decideProcessTermination(
   return { terminate, keepAlive }
 }
 
+/**
+ * PURA. ¿Puede este cierre actuar sobre la sesión que encontró?
+ *
+ * Es la primera decisión de `stopStream`, ANTES de marcar el cierre, de tocar
+ * watermarks, de borrar la fila y de matar procesos.
+ *
+ * EL PROBLEMA QUE RESUELVE
+ *
+ * La identidad de una sesión es `(userId, viewId, cameraId, streamType)`, y esa
+ * cuádrupla NO distingue dos solicitudes de arranque cuando el backend
+ * redirige:
+ *
+ *   A pide `main`      → el backend crea `main_h264`
+ *   B pide `main_h264` → misma cámara y vista; queda vigente y responde primero
+ *   A responde tarde   → su descarte cierra `…:main_h264`, que ahora es de B
+ *
+ * Las defensas por orden no sirven acá: el DELETE de A saca su ticket al
+ * CERRARSE, no al abrirse, así que es POSTERIOR al de B y pasa tanto el
+ * watermark como `lastOwnerRequestSeq`. Lo único que separa a A de B es el
+ * intento de arranque que cada una declaró.
+ *
+ * Sólo se exige para `stale_response`. Un cierre deliberado —transición, salida
+ * de foco, desmontaje, TTL— cierra lo que haya en la ranura, que es justo lo
+ * que se le pide, y conserva su comportamiento anterior.
+ */
+export type AttemptReleaseVerdict =
+  /** Cierre deliberado: cierra la ranura entera, como siempre. */
+  | { action: 'full_close' }
+  /** No hay nada que hacer, y NADA puede tocarse. */
+  | { action: 'ignored'; reason: 'missing_expected_id' | 'no_session' | 'attempt_not_registered' }
+  /** El intento existía, pero quedan otros: se suelta sólo el suyo. */
+  | { action: 'release_attempt'; attemptId: string; remaining: number }
+  /** Era el último arrendamiento: se cierra la sesión y se evalúa el proceso. */
+  | { action: 'close_session'; attemptId: string }
+
+/**
+ * PURA. Qué puede hacer un cierre por respuesta tardía.
+ *
+ * POR QUÉ ES UN CONJUNTO Y NO UN DUEÑO ÚNICO
+ *
+ * La versión anterior comparaba contra UN propietario que se reemplazaba con
+ * cada arranque, decidiendo cuál era "más nuevo" por `ticket.seq`. Ese ticket
+ * mide el orden de llegada al SERVIDOR, y no coincide con el orden lógico del
+ * navegador cuando dos POST viajan a la vez:
+ *
+ *   el usuario inicia A y luego B;
+ *   B llega primero y crea la sesión;
+ *   A llega segundo, con ticket mayor, y le arrebataba la propiedad;
+ *   A se descarta en el navegador y su `stale_response` coincidía…
+ *   …y mataba la sesión y el FFmpeg que B seguía usando.
+ *
+ * Con arrendamientos no hay nada que arrebatar: cada arranque aceptado suma el
+ * suyo, cada descarte suelta el suyo, y la sesión sólo cae cuando se suelta el
+ * último. El ticket sigue sirviendo para los watermarks —orden de llegada, que
+ * es lo que mide— pero no decide identidad lógica.
+ */
+export function decideAttemptRelease(args: {
+  reason?: string
+  staleReason: string
+  expectedStartAttemptId?: string
+  session?: { startAttemptIds?: ReadonlySet<string> } | null
+}): AttemptReleaseVerdict {
+  const isStale = args.reason === args.staleReason
+
+  // La IDENTIDAD, no la razón, decide el modo. Un cierre que declara un
+  // `expectedStartAttemptId` —sea una respuesta tardía o un retry deliberado de
+  // `exit_focus`/`switch_to_sub`— sólo puede soltar ESE arrendamiento. Ésa es la
+  // guarda que impide que el retry de A cierre una sesión B abierta después
+  // sobre la misma cámara/tipo: no alcanzaba con proteger `stale_response`.
+  if (!args.expectedStartAttemptId) {
+    // Sin identidad: una respuesta tardía no puede probar pertenencia y se
+    // rechaza; un cierre deliberado a granel (transición, desmontaje) que no
+    // rastrea intentos cierra la ranura entera, como siempre.
+    return isStale
+      ? { action: 'ignored', reason: 'missing_expected_id' }
+      : { action: 'full_close' }
+  }
+
+  if (!args.session) return { action: 'ignored', reason: 'no_session' }
+
+  const leases = args.session.startAttemptIds
+  if (!leases || !leases.has(args.expectedStartAttemptId)) {
+    return { action: 'ignored', reason: 'attempt_not_registered' }
+  }
+  const attemptId = args.expectedStartAttemptId
+  const remaining = leases.size - 1
+  return remaining > 0
+    ? { action: 'release_attempt', attemptId, remaining }
+    : { action: 'close_session', attemptId }
+}
+
+/**
+ * PURA. ¿Puede un cierre por respuesta tardía BORRAR la sesión?
+ *
+ * Es la segunda mitad de `decideAttemptRelease`, y existe porque la protección
+ * general por ticket —`resolveDeletable`— no sabe distinguir dos cosas muy
+ * distintas que ambas elevan `lastOwnerRequestSeq`:
+ *
+ *   · un arranque NUEVO, que es una intención lógica nueva del navegador;
+ *   · un heartbeat de grilla, que sólo dice "sigo mirando".
+ *
+ * Con esa confusión aparecía la fuga: existía `main_h264` con un único
+ * arrendamiento A; el DELETE de A sacaba su ticket y se demoraba; un
+ * `reconcileView` posterior tocaba la sesión y subía la marca; al reanudarse, el
+ * cierre encontraba `reaffirmed_by_newer_request` y devolvía `ignored`. A seguía
+ * en la lista, la sesión viva y su FFmpeg corriendo — sin nadie mirándola.
+ *
+ * La señal correcta no es el ticket sino el propio conjunto de arrendamientos:
+ * un arranque nuevo SIEMPRE agrega el suyo, y una sesión reabierta llega con
+ * otra generación. Un heartbeat no hace ninguna de las dos cosas. Así que basta
+ * releer la fila y comprobar que sigue siendo la misma sesión y que A sigue
+ * siendo su único arrendamiento.
+ */
+export type StaleDeleteVerdict =
+  | { deletable: true }
+  | {
+      deletable: false
+      reason: 'already_gone' | 'replaced_by_newer_generation' | 'attempt_gone' | 'other_leases'
+      /** Arrendamientos que quedaron, cuando los hay. */
+      remaining?: number
+    }
+
+export function decideStaleSessionDelete(args: {
+  /** Arrendamiento que pide el cierre. */
+  attemptId: string
+  /** Generación de la sesión sobre la que se decidió el veredicto. */
+  expectedGeneration: number
+  /** Fila RELEÍDA del mapa, justo antes de borrar. */
+  current?: { generation: number; startAttemptIds: ReadonlySet<string> } | null
+}): StaleDeleteVerdict {
+  if (!args.current) return { deletable: false, reason: 'already_gone' }
+
+  // Otra sesión ocupa la ranura: eso sí es algo genuinamente nuevo.
+  if (args.current.generation !== args.expectedGeneration) {
+    return { deletable: false, reason: 'replaced_by_newer_generation' }
+  }
+
+  const leases = args.current.startAttemptIds
+  // El arrendamiento se soltó por otro camino mientras tanto.
+  if (!leases.has(args.attemptId)) return { deletable: false, reason: 'attempt_gone' }
+
+  // Apareció otro espectador lógico: se suelta el propio, no se cierra la
+  // sesión. Un heartbeat no puede producir esta rama.
+  if (leases.size > 1) {
+    return { deletable: false, reason: 'other_leases', remaining: leases.size - 1 }
+  }
+  return { deletable: true }
+}
+
+export interface StopTerminationDecision {
+  /** ¿La razón del cierre autoriza terminar el proceso? */
+  shouldKill: boolean
+  /** Refcount: qué paths quedan sin dueño y cuáles siguen usándose. */
+  processes: ProcessTerminationDecision
+  /** Lo que realmente hay que matar: autorización Y ausencia de dueños. */
+  terminate: string[]
+}
+
+/**
+ * PURA. Decisión completa de un cierre explícito: ¿se termina el FFmpeg?
+ *
+ * Combina las DOS condiciones que estaban escritas sueltas en `stopStream`:
+ *
+ *   · la razón del cierre autoriza matar (un fallo transitorio no lo hace: el
+ *     próximo arranque reutiliza el proceso vivo), y
+ *   · no queda ningún otro espectador sobre el mismo `streamPath`.
+ *
+ * Vive acá para poder ejecutarla: el contrato de razones con el frontend es
+ * exactamente lo que falló —`viewport_changed` no estaba en el conjunto y la
+ * sesión se borraba dejando el proceso corriendo— y una condición que no se
+ * puede ejecutar en una prueba es una condición que nadie verifica.
+ */
+export function decideStopTermination(args: {
+  streamType: StreamType
+  reason?: string
+  killReasons: ReadonlySet<string>
+  /** La sesión que se está cerrando. */
+  expired: SessionTruth[]
+  /** Todas las demás sesiones vivas. */
+  surviving: SessionTruth[]
+}): StopTerminationDecision {
+  // Sin razón declarada se mata: es el cierre por defecto (desmontaje, TTL).
+  const shouldKill = !args.reason || args.killReasons.has(args.reason)
+  const processes = decideProcessTermination(args.expired, args.surviving)
+  return {
+    shouldKill,
+    processes,
+    terminate: shouldKill ? processes.terminate : [],
+  }
+}
+
 // ─── Autorización de reinicio del supervisor ─────────────────────────────────
 
 /**

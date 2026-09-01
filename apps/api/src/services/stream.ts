@@ -223,6 +223,10 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   })
 
   proc.stderr?.on('data', (data: Buffer) => {
+    // Un proceso A puede emitir sus últimos bytes después de que una instancia
+    // B ya ocupó el mismo path. Sus callbacks no pueden contaminar el buffer de
+    // B ni borrar su estado.
+    if (transcodeProcesses.get(streamPath) !== proc) return
     const chunk = data.toString()
     // Save first ~1KB for startup/error diagnosis (codec errors, file-not-found, etc.)
     const startBuf = transcodeStderrStart.get(streamPath) || ''
@@ -236,6 +240,13 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   })
 
   proc.on('exit', (code, signal) => {
+    // `spawnTranscodeProcess` detiene la instancia anterior antes de registrar
+    // la nueva. El `exit` de A llega de forma asíncrona; si B ya ocupa el path,
+    // este callback es obsoleto y no puede borrar a B del mapa por path.
+    if (transcodeProcesses.get(streamPath) !== proc) {
+      console.info(`[transcode] ffmpeg_exit_stale path=${streamPath} pid=${proc.pid ?? 'n/a'}`)
+      return
+    }
     // Sanitize before any logging — FFmpeg echoes the input URL (with credentials) in stderr
     const fullStderr  = sanitizeRtsp(transcodeStderr.get(streamPath) || '')
     const startBuf    = sanitizeRtsp(transcodeStderrStart.get(streamPath) || '')
@@ -275,6 +286,7 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   })
 
   proc.on('error', (err: NodeJS.ErrnoException) => {
+    if (transcodeProcesses.get(streamPath) !== proc) return
     // 'error' event fires when spawn itself fails (ENOENT=binary not found, EACCES=no exec permission)
     console.error(`[transcode] ffmpeg_spawn_error path=${streamPath} err=${err.message} code=${err.code ?? 'n/a'}`)
     if (err.code === 'ENOENT') {
@@ -287,13 +299,34 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   return proc
 }
 
-export function stopTranscodeProcess(streamPath: string): void {
+/**
+ * Solicita la terminación de la instancia ACTUAL del path.
+ * Devuelve `true` sólo cuando había una instancia y el SO aceptó la señal.
+ * El mapa se limpia únicamente para esa instancia exacta; el `exit` tardío de
+ * una A anterior nunca puede borrar una B posterior.
+ */
+export function stopTranscodeProcess(streamPath: string): boolean {
   const proc = transcodeProcesses.get(streamPath)
-  if (!proc) return
-  try { proc.kill('SIGTERM') } catch {}
-  transcodeProcesses.delete(streamPath)
+  if (!proc) return false
+  let accepted = false
+  try {
+    // Algunos dobles de prueba antiguos no retornan el booleano de Node; sólo
+    // un `false` explícito significa rechazo.
+    accepted = proc.kill('SIGTERM') !== false
+  } catch {
+    accepted = false
+  }
+  if (!accepted) {
+    console.warn(`[transcode] ffmpeg_kill_failed path=${streamPath} pid=${proc.pid ?? 'n/a'}`)
+    return false
+  }
+  if (transcodeProcesses.get(streamPath) === proc) transcodeProcesses.delete(streamPath)
+  transcodeStderr.delete(streamPath)
+  transcodeStderrStart.delete(streamPath)
+  transcodeSpawnTime.delete(streamPath)
   transcodeRtspMasked.delete(streamPath)
   console.info(`[transcode] ffmpeg_killed path=${streamPath}`)
+  return true
 }
 
 // ─── Spawn FFmpeg transcode from an explicit RTSP URL ────────
@@ -383,6 +416,7 @@ export function spawnTranscodeFromRtsp(
   })
 
   proc.stderr?.on('data', (data: Buffer) => {
+    if (transcodeProcesses.get(streamPath) !== proc) return
     const chunk   = data.toString()
     const startBuf = transcodeStderrStart.get(streamPath) || ''
     if (startBuf.length < 1200) {
@@ -394,6 +428,10 @@ export function spawnTranscodeFromRtsp(
   })
 
   proc.on('exit', (code, signal) => {
+    if (transcodeProcesses.get(streamPath) !== proc) {
+      console.info(`[transcode] ffmpeg_exit_stale path=${streamPath} pid=${proc.pid ?? 'n/a'}`)
+      return
+    }
     const fullStderr  = sanitizeRtsp(transcodeStderr.get(streamPath) || '')
     const startBuf    = sanitizeRtsp(transcodeStderrStart.get(streamPath) || '')
     const spawnedAt   = transcodeSpawnTime.get(streamPath) ?? Date.now()
@@ -433,6 +471,7 @@ export function spawnTranscodeFromRtsp(
   })
 
   proc.on('error', (err: NodeJS.ErrnoException) => {
+    if (transcodeProcesses.get(streamPath) !== proc) return
     console.error(`[transcode] ffmpeg_spawn_error path=${streamPath} err=${err.message}`)
     if (err.code === 'ENOENT') console.error('[transcode] ffmpeg_not_found — check Dockerfile')
     transcodeProcesses.delete(streamPath)
