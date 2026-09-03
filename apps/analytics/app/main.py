@@ -35,6 +35,8 @@ STATE: dict = {
     "bootStartedAt": None,
     "lastBootAt": None,
     "manager": None,
+    "frigateIngestor": None,        # FrigateIngestor si FRIGATE_ENABLED
+    "frigateError": None,
 }
 
 
@@ -90,6 +92,26 @@ def _boot() -> None:
 
     manager = PipelineManager()
     STATE["manager"] = manager
+
+    # Ingestor de Frigate (fuente externa de detección). Arranca SOLO si
+    # FRIGATE_ENABLED; con la flag off el comportamiento es idéntico. Cualquier
+    # fallo se registra y NO tumba el servicio (misma regla de oro que el resto).
+    if getattr(settings, "frigate_enabled", False):
+        try:
+            from .frigate import FrigateIngestor
+            ingestor = FrigateIngestor()
+            # Exclusión mutua por cámara: las cámaras mapeadas a Frigate no corren
+            # worker YOLOX nativo (evita eventos duplicados).
+            manager.excluded_camera_ids = ingestor.mapped_camera_ids()
+            ingestor.start()
+            STATE["frigateIngestor"] = ingestor
+            log.info("frigate_ingestor_boot mode=%s excluded_cams=%d",
+                     getattr(settings, "frigate_ingest_mode", "http"),
+                     len(manager.excluded_camera_ids))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("frigate_ingestor_boot_failed")
+            STATE["frigateError"] = str(exc)
+
     manager.start()  # internamente maneja fallo de modelo con reintentos
     STATE["serviceStatus"] = "running"
     STATE["lastBootAt"] = _now_iso()
@@ -150,6 +172,18 @@ def status():
     merged["workersError"] = sum(
         1 for w in workers if w.get("status") in ("rtsp_down", "disabled_due_errors")
     )
+    ing = STATE.get("frigateIngestor")
+    if ing is not None:
+        merged["frigate"] = {
+            "status": getattr(ing, "status", None),
+            "eventsSeen": getattr(ing, "events_seen", 0),
+            "eventsPosted": getattr(ing, "events_posted", 0),
+            "lastPollAt": getattr(ing, "last_poll_at", None),
+            "lastError": getattr(ing, "last_error", None),
+            "excludedCameras": len(manager.excluded_camera_ids),
+        }
+    elif STATE.get("frigateError"):
+        merged["frigate"] = {"status": "error", "lastError": STATE["frigateError"]}
     return merged
 
 

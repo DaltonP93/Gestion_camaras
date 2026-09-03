@@ -454,6 +454,10 @@ class PipelineManager:
         self.lock = threading.Lock()
         self.last_refresh: float | None = None
         self.last_refresh_error: str | None = None
+        # cameraIds gestionados por el ingestor de Frigate: NO se les levanta worker
+        # YOLOX nativo (exclusión mutua → sin eventos duplicados). Se llena desde
+        # main._boot cuando FRIGATE_ENABLED está activo y hay mapa de cámaras.
+        self.excluded_camera_ids: set[str] = set()
 
     # compat: el resto del código consultaba manager.detector para saber si el
     # modelo está cargado; exponemos un alias de solo lectura.
@@ -502,6 +506,12 @@ class PipelineManager:
         assert self.provider is not None
         with self.lock:
             desired = {c["cameraId"]: c for c in cams}
+            # Exclusión mutua con Frigate: una cámara ingestada por Frigate no
+            # corre worker YOLOX nativo (evita eventos duplicados del mismo objeto).
+            if self.excluded_camera_ids:
+                for cam_id in list(desired):
+                    if cam_id in self.excluded_camera_ids:
+                        del desired[cam_id]
             # límite de workers para proteger CPU/memoria
             if len(desired) > settings.max_workers:
                 allowed = dict(list(desired.items())[: settings.max_workers])

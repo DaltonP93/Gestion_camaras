@@ -54,6 +54,24 @@ class Settings(BaseSettings):
     alpr_enabled: bool = Field(
         default=False, validation_alias=AliasChoices("ANALYTICS_ALPR_ENABLED", "ALPR_ENABLED"))
 
+    # ── Ingestor de Frigate (fuente externa de detección) ────────────────────
+    # Con FRIGATE_ENABLED=false el ingestor NO arranca ⇒ comportamiento idéntico.
+    # Frigate SUSTITUYE la detección nativa por cámara; una cámara mapeada a
+    # Frigate NO debe correr también su worker YOLOX (exclusión mutua → sin
+    # eventos duplicados). Ver docs/frigate/INTEGRATION_DESIGN.md.
+    frigate_enabled: bool = False
+    frigate_url: str = "http://frigate:5000"          # API HTTP de Frigate
+    frigate_ingest_mode: str = "http"                 # http | mqtt
+    frigate_poll_interval_sec: int = 5                # solo http
+    frigate_mqtt_host: str = ""                       # solo mqtt (requiere paho-mqtt aparte)
+    frigate_mqtt_port: int = 1883
+    frigate_mqtt_topic: str = "frigate/events"
+    # JSON opcional {"frigate_cam": "<cameraId>"}; vacío → match directo por nombre.
+    frigate_camera_map: str = ""
+    frigate_fetch_snapshots: bool = True
+    frigate_min_confidence: float = 0.6
+    frigate_supported_classes: str = "person,car,truck,bus,motorcycle,bicycle"
+
     class Config:
         env_prefix = ""  # variables planas: API_BASE_URL, ANALYTICS_SECRET, MODEL_PATH...
 
