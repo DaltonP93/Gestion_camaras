@@ -39,7 +39,7 @@ import { diagnosticsRoutes } from './routes/diagnostics'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
-import { publishStream } from './services/stream'
+import { publishStream, getActiveTranscodesList, stopTranscodeProcess } from './services/stream'
 import { decryptNvrPasswordOrNull as decryptPass } from './services/credentials'
 
 const server = Fastify({
@@ -267,6 +267,15 @@ async function main() {
   startHealthWorker(server)
   startSyncWorker(server)
 
+  // Apagado elegante (A2): terminar los FFmpeg de transcode en vivo por su vía
+  // terminal ya existente cuando el servidor cierra. Los FFmpeg de preview/VOD
+  // se cierran en su propio hook onClose (routes/recordings.ts).
+  server.addHook('onClose', async () => {
+    for (const t of getActiveTranscodesList()) {
+      try { stopTranscodeProcess(t.streamPath) } catch { /* noop */ }
+    }
+  })
+
   // N1 — Lifecycle de fuente MediaMTX → registro de instancia del plano de medios.
   // SÓLO con NATIVE_SOURCE_LIFECYCLE_ENABLED activa: con la flag apagada no se
   // arranca, ningún path se registra ⇒ `issue` sigue negándose (NO_MEDIA_INSTANCE)
@@ -291,6 +300,37 @@ async function main() {
 
   await server.listen({ host, port })
   server.log.info(`VisionCore API v1.0.0 commit=${COMMIT_SHA} corriendo en http://${host}:${port}`)
+
+  // ─── Apagado elegante (A2) ────────────────────────────────
+  // dumb-init reenvía SIGTERM a Node; sin este manejador el proceso salía de
+  // inmediato sin drenar Fastify ni disparar los hooks onClose (srcPoller,
+  // terminación de FFmpeg de transcode/preview/VOD), dejando hijos huérfanos en
+  // cada deploy/restart (invariante 5). server.close() ejecuta esos onClose.
+  // Idempotente: una segunda señal durante el cierre se ignora.
+  let shuttingDown = false
+  const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 15_000
+  const gracefulShutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return
+    shuttingDown = true
+    server.log.info(`[shutdown] señal ${signal} recibida — cerrando el servidor`)
+    const forceTimer = setTimeout(() => {
+      server.log.error(`[shutdown] timeout de ${SHUTDOWN_TIMEOUT_MS}ms — forzando salida`)
+      process.exit(1)
+    }, SHUTDOWN_TIMEOUT_MS)
+    forceTimer.unref?.()
+    try {
+      await server.close()
+      clearTimeout(forceTimer)
+      server.log.info('[shutdown] cierre completo')
+      process.exit(0)
+    } catch (err) {
+      clearTimeout(forceTimer)
+      server.log.error(`[shutdown] error durante el cierre: ${err instanceof Error ? err.message : String(err)}`)
+      process.exit(1)
+    }
+  }
+  process.once('SIGTERM', () => { void gracefulShutdown('SIGTERM') })
+  process.once('SIGINT', () => { void gracefulShutdown('SIGINT') })
   // TASK 1 — config efectiva del preview de grabaciones (commit + presupuesto real
   // + detección de override viejo). Confirma qué código/presupuesto corren.
   logPreviewStartupConfig((m) => server.log.info(m), COMMIT_SHA)

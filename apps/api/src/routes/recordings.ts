@@ -1352,6 +1352,25 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     server.log.info('[recordings] download_token_store backend=memory')
   }
 
+  // ─── Apagado elegante (A2) ──────────────────────────────────────────────────
+  // Al cerrar el servidor (SIGTERM/SIGINT → server.close()), terminar TODOS los
+  // FFmpeg de preview y VOD por su vía terminal ya existente para no dejar hijos
+  // huérfanos (invariante 5). `terminatePreviewSession` es idempotente y contempla
+  // explícitamente el motivo "shutdown"; iterar sobre una copia porque termina y
+  // borra de `previewSessions` durante el recorrido.
+  server.addHook('onClose', async () => {
+    const log = (m: string) => server.log.info(m)
+    for (const [sid, session] of [...previewSessions.entries()]) {
+      try { terminatePreviewSession(sid, session, 'shutdown', log) } catch { /* noop */ }
+    }
+    for (const [sid, session] of [...recordingSessions.entries()]) {
+      recordingSessions.delete(sid)
+      if (session.vodProcess) {
+        try { session.vodProcess.kill('SIGTERM') } catch { /* noop */ }
+      }
+    }
+  })
+
   // ─── Política de audio a nivel SYSTEM (singleton) ───────────────────────────
   // GET /api/recordings/settings/audio — modo de audio predeterminado del sistema.
   server.get('/settings/audio', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR', 'AUDITOR'])] }, async (_request, reply) => {
