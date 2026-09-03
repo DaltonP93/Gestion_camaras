@@ -37,6 +37,7 @@ import { analyticsRoutes } from './routes/analytics'
 import { aiDemoRoutes } from './routes/aiDemo'
 import { diagnosticsRoutes } from './routes/diagnostics'
 import { onvifRoutes } from './routes/onvif'
+import { hikConnectRoutes } from './routes/hikConnect'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
@@ -220,6 +221,12 @@ async function main() {
   // registran ⇒ 404 y ningún I/O ONVIF posible (comportamiento idéntico).
   if (process.env.ONVIF_ENABLED === 'true') {
     await server.register(onvifRoutes, { prefix: '/api/onvif' })
+  }
+  // Hik-Connect (P1): provider de conectividad remota (fallback vía nube). Las
+  // rutas existen SÓLO con la flag activa; con la flag apagada no se registran ⇒
+  // 404 y ningún I/O Hik-Connect posible (comportamiento idéntico).
+  if (process.env.HIK_CONNECT_ENABLED === 'true') {
+    await server.register(hikConnectRoutes, { prefix: '/api/hik-connect' })
   }
   await server.register(metricsRoutes)  // /metrics (Prometheus), sin prefijo /api
   await server.register(wsHandler, { prefix: '/ws' })
