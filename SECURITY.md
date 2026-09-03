@@ -157,10 +157,21 @@ CORS_ORIGINS=
 
 ## MediaMTX — Acceso a streams
 
-MediaMTX está configurado sin autenticación propia (`authInternalUsers: any`). El control de acceso real se realiza en la capa del API de VisionCore:
+MediaMTX está configurado sin autenticación propia (`authInternalUsers: any`).
+El API controla quién puede crear una sesión y a quién entrega el `streamPath`,
+pero la petición HLS posterior no vuelve a validar el JWT. Por eso la red y el
+firewall siguen siendo parte de la frontera de seguridad; un path no debe
+tratarse como una credencial fuerte:
 
 - El frontend obtiene las URLs HLS/WebRTC **solo tras autenticarse** con JWT válido
 - Las URLs expuestas al frontend contienen el `streamPath` pero **no las credenciales del NVR**
 - nginx expone `/hls/` al exterior pero no la API de administración de MediaMTX (puerto 9997)
 
 > En producción, no exponer el puerto 9997 de MediaMTX en el firewall del servidor.
+
+Los puertos de medios 8554/8888/8889 tampoco constituyen una API pública para
+clientes nativos mientras MediaMTX acepte `user: any`. Deben quedar limitados a
+la red confiable/firewall. El futuro cliente Windows/Android/iOS sólo podrá usar
+HEVC directo después de incorporar autorización por path y grants efímeros; no
+recibirá credenciales ni URLs RTSP del NVR. Ver
+`docs/native/LIVE_CLIENT_ARCHITECTURE.md`.

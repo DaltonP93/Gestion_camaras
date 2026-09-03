@@ -1,0 +1,305 @@
+// apps/api/src/services/media/grant-store.ts
+//
+// Almacén de grants con TRANSICIÓN ATÓMICA ÚNICA (C22.2). Corrige las carreras
+// TOCTOU de C22.1: consume ya no hace get→validate→claim como pasos separados.
+//
+//   - `validateAndClaim`: relee grant + epoch de usuario + instancia de fuente +
+//     estado de uso y, en la MISMA operación linealizable, valida y marca el uso.
+//     Memoria: método síncrono (atómico en el event loop de un solo hilo). Redis:
+//     script Lua vía EVAL (una sola operación linealizable en el servidor).
+//   - Revocación durable por EPOCH de autorización por usuario (logout/permisos
+//     lo incrementan). Un grant con epoch viejo no valida aunque su índice se
+//     haya escrito tarde. `bumpUserEpoch` FALLA si el backend está caído (no se
+//     traga una revocación de seguridad).
+//   - Registro de INSTANCIA de fuente real por path (sub/main/main_h264):
+//     `registerSource`/`retireSource` la crean/rotan/eliminan junto al lifecycle
+//     de MediaMTX. `issue` NO inventa una instancia: si no hay fuente vigente,
+//     se niega. Recrear la fuente rota la generación e invalida grants viejos.
+//
+// El backend Redis se ejecuta contra Redis real en producción (Lua). En este
+// entorno no hay Redis, pero la LÓGICA del script Lua real (LUA_VALIDATE_AND_CLAIM)
+// SÍ está validada: grant-store.lua.test.ts lo ejecuta en una VM Lua (wasmoon) y
+// cruza su resultado contra validateAndClaimReducer para cada motivo. Lo que sigue
+// NO VALIDADO en vivo es la ATOMICIDAD/linealizabilidad de EVAL en un Redis real
+// (garantía de Redis, no de nuestro código) — requiere un servidor Redis.
+
+import type { StoredMediaGrant, GrantRejectReason, GrantScopeQuery } from './contracts'
+
+export type IndexKind = 'user' | 'view' | 'session'
+
+export interface ClaimResult {
+  ok: boolean
+  reason?: GrantRejectReason
+  grant?: StoredMediaGrant
+}
+
+export interface ValidateAndClaimInput {
+  grantId: string
+  presentedSecretHash: string
+  scope: GrantScopeQuery
+  nowMs: number
+}
+
+// ─── reducer PURO de la transición (misma lógica en memoria y en Lua) ──
+export interface ClaimState {
+  grant: StoredMediaGrant | null
+  userEpoch: number
+  currentInstance: string | null
+  alreadyClaimed: boolean
+}
+
+/** Decisión atómica pura. `claim=true` ⇒ el llamador debe marcar el uso. */
+export function validateAndClaimReducer(state: ClaimState, input: ValidateAndClaimInput): { result: ClaimResult; claim: boolean } {
+  const g = state.grant
+  if (!g) return { result: { ok: false, reason: 'NOT_FOUND' }, claim: false }
+  if (g.revokedAt !== null) return { result: { ok: false, reason: 'REVOKED' }, claim: false }
+  if (input.nowMs >= g.expiresAt) return { result: { ok: false, reason: 'EXPIRED' }, claim: false }
+  const s = input.scope
+  if (g.userId !== s.userId || g.cameraId !== s.cameraId || g.streamPath !== s.streamPath || g.transport !== s.transport || g.action !== s.action) {
+    return { result: { ok: false, reason: 'SCOPE_MISMATCH' }, claim: false }
+  }
+  if (g.authorizationEpoch !== state.userEpoch) return { result: { ok: false, reason: 'EPOCH_MISMATCH' }, claim: false }
+  if (state.currentInstance === null || state.currentInstance === undefined) return { result: { ok: false, reason: 'INSTANCE_REQUIRED' }, claim: false }
+  if (g.mediaInstanceId !== state.currentInstance) return { result: { ok: false, reason: 'INSTANCE_MISMATCH' }, claim: false }
+  if (g.secretHash !== input.presentedSecretHash) return { result: { ok: false, reason: 'SECRET_MISMATCH' }, claim: false }
+  if (state.alreadyClaimed) return { result: { ok: false, reason: 'REPLAYED' }, claim: false }
+  return { result: { ok: true, grant: g }, claim: true }
+}
+
+export interface IssueIndices { viewId: string; sessionId?: string }
+
+export interface GrantStore {
+  /** true si el backend es atómico ENTRE PROCESOS (Redis). Memoria = false. */
+  readonly crossProcessAtomic: boolean
+  /** ¿El backend está operativo? (para readiness / fail-closed). */
+  healthy(): Promise<boolean>
+
+  /** Emite grant + índices de forma atómica. */
+  issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<void>
+  getGrant(grantId: string): Promise<StoredMediaGrant | null>
+
+  /** Transición atómica única: valida y reclama el uso. */
+  validateAndClaim(input: ValidateAndClaimInput): Promise<ClaimResult>
+
+  /** Epoch de autorización por usuario (revocación durable). `bump` lanza si falla. */
+  getUserEpoch(userId: string): Promise<number>
+  bumpUserEpoch(userId: string): Promise<number>
+
+  /** Revocación best-effort por índice (vista/sesión/grant). No es el epoch. */
+  listIndex(kind: IndexKind, key: string): Promise<string[]>
+  markRevoked(grantId: string, at: number, ttlMs: number): Promise<void>
+
+  /** Instancia de fuente real por path. `issue` sólo la LEE (no mintea). */
+  currentInstance(streamPath: string): Promise<string | null>
+  /** El lifecycle real (MediaMTX source add) la crea/rota. Devuelve la nueva. */
+  registerSource(streamPath: string, ttlMs: number): Promise<string>
+  /**
+   * Extiende el TTL de la instancia SIN rotarla (keepalive del reconcile). Rotar
+   * en cada tick invalidaría grants vivos (INSTANCE_MISMATCH); `refresh` sólo
+   * prolonga la vigencia de la MISMA instancia.
+   */
+  refreshSource(streamPath: string, ttlMs: number): Promise<void>
+  /** El lifecycle real (source remove) la elimina. */
+  retireSource(streamPath: string): Promise<void>
+}
+
+// ─── memoria (atómica dentro de un proceso) ─────────────────────────
+export class MemoryGrantStore implements GrantStore {
+  readonly crossProcessAtomic = false
+  private grants = new Map<string, { g: StoredMediaGrant; exp: number }>()
+  private claims = new Set<string>()
+  private idx: Record<IndexKind, Map<string, Set<string>>> = { user: new Map(), view: new Map(), session: new Map() }
+  private userEpochs = new Map<string, number>()
+  private instances = new Map<string, string>()
+  private instanceCounter = 0
+  private up = true
+
+  constructor(private readonly clock: () => number = () => Date.now()) {}
+
+  /** Para pruebas: simular backend caído. */
+  setHealthy(v: boolean): void { this.up = v }
+  async healthy(): Promise<boolean> { return this.up }
+
+  private live(grantId: string): StoredMediaGrant | null {
+    const e = this.grants.get(grantId)
+    if (!e) return null
+    if (this.clock() > e.exp) { this.grants.delete(grantId); return null }
+    return e.g
+  }
+
+  async issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<void> {
+    if (!this.up) throw new Error('grant store unavailable')
+    // Atómico: sin await entre estas escrituras.
+    this.grants.set(grant.grantId, { g: grant, exp: this.clock() + ttlMs })
+    this.addIdx('user', grant.userId, grant.grantId)
+    this.addIdx('view', indices.viewId, grant.grantId)
+    if (indices.sessionId) this.addIdx('session', indices.sessionId, grant.grantId)
+  }
+  private addIdx(kind: IndexKind, key: string, grantId: string): void {
+    let s = this.idx[kind].get(key)
+    if (!s) { s = new Set(); this.idx[kind].set(key, s) }
+    s.add(grantId)
+  }
+
+  async getGrant(grantId: string): Promise<StoredMediaGrant | null> { return this.live(grantId) }
+
+  // Atómico: lee estado y marca el uso sin await intermedio.
+  async validateAndClaim(input: ValidateAndClaimInput): Promise<ClaimResult> {
+    if (!this.up) return { ok: false, reason: 'BACKEND_UNAVAILABLE' }
+    const grant = this.live(input.grantId)
+    const state: ClaimState = {
+      grant,
+      userEpoch: grant ? (this.userEpochs.get(grant.userId) ?? 0) : 0,
+      currentInstance: grant ? (this.instances.get(grant.streamPath) ?? null) : null,
+      alreadyClaimed: this.claims.has(input.grantId),
+    }
+    const { result, claim } = validateAndClaimReducer(state, input)
+    if (claim) this.claims.add(input.grantId)
+    return result
+  }
+
+  async getUserEpoch(userId: string): Promise<number> {
+    if (!this.up) throw new Error('grant store unavailable')
+    return this.userEpochs.get(userId) ?? 0
+  }
+  async bumpUserEpoch(userId: string): Promise<number> {
+    if (!this.up) throw new Error('grant store unavailable')
+    const next = (this.userEpochs.get(userId) ?? 0) + 1
+    this.userEpochs.set(userId, next)
+    return next
+  }
+
+  async listIndex(kind: IndexKind, key: string): Promise<string[]> { return [...(this.idx[kind].get(key) ?? [])] }
+  async markRevoked(grantId: string, at: number, ttlMs: number): Promise<void> {
+    const g = this.live(grantId)
+    if (g) this.grants.set(grantId, { g: { ...g, revokedAt: at }, exp: this.clock() + ttlMs })
+  }
+
+  async currentInstance(streamPath: string): Promise<string | null> { return this.instances.get(streamPath) ?? null }
+  async registerSource(streamPath: string): Promise<string> {
+    if (!this.up) throw new Error('grant store unavailable')
+    const token = `mi-${++this.instanceCounter}`
+    this.instances.set(streamPath, token)
+    return token
+  }
+  // Memoria: el Map no tiene TTL, así que refrescar es un no-op (la instancia
+  // persiste hasta retireSource/rotación). No rota el token: eso es lo esencial.
+  async refreshSource(): Promise<void> { /* no-op: sin expiración en memoria */ }
+  async retireSource(streamPath: string): Promise<void> { this.instances.delete(streamPath) }
+}
+
+// ─── Redis (atómico entre procesos, vía Lua) ────────────────────────
+export interface RedisGrantClient {
+  get(key: string): Promise<string | null>
+  set(key: string, value: string, mode: 'PX', ttl: number, nx?: 'NX'): Promise<unknown>
+  del(key: string): Promise<unknown>
+  sadd(key: string, member: string): Promise<unknown>
+  srem(key: string, member: string): Promise<unknown>
+  smembers(key: string): Promise<string[]>
+  pexpire(key: string, ttlMs: number): Promise<unknown>
+  incr(key: string): Promise<number>
+  ping(): Promise<unknown>
+  /** EVAL de un script Lua. En producción es ioredis real; en tests, un fake equivalente. */
+  eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>
+}
+
+const P = 'vc:mg:'
+export const gk = (id: string) => `${P}grant:${id}`
+export const ck = (id: string) => `${P}claim:${id}`
+export const ik = (kind: IndexKind, key: string) => `${P}idx:${kind}:${key}`
+export const ekk = (userId: string) => `${P}epoch:user:${userId}`
+export const instk = (path: string) => `${P}inst:${path}`
+const INSTANCE_COUNTER = `${P}instctr`
+
+// Script Lua de validateAndClaim (linealizable en el servidor Redis). Relee el
+// grant, el epoch del usuario, la instancia de la fuente y el estado de uso, y
+// marca el uso en la misma operación. Marcado con VALIDATE_AND_CLAIM para el fake.
+export const LUA_VALIDATE_AND_CLAIM = `-- VALIDATE_AND_CLAIM
+local g = redis.call('GET', KEYS[1])
+if not g then return cjson.encode({ok=false, reason='NOT_FOUND'}) end
+local grant = cjson.decode(g)
+local now = tonumber(ARGV[7])
+if grant.revokedAt ~= nil and grant.revokedAt ~= cjson.null then return cjson.encode({ok=false, reason='REVOKED'}) end
+if now >= grant.expiresAt then return cjson.encode({ok=false, reason='EXPIRED'}) end
+if grant.userId ~= ARGV[1] or grant.cameraId ~= ARGV[2] or grant.streamPath ~= ARGV[3] or grant.transport ~= ARGV[4] or grant.action ~= ARGV[5] then return cjson.encode({ok=false, reason='SCOPE_MISMATCH'}) end
+local epoch = tonumber(redis.call('GET', KEYS[2]) or '0')
+if grant.authorizationEpoch ~= epoch then return cjson.encode({ok=false, reason='EPOCH_MISMATCH'}) end
+local inst = redis.call('GET', KEYS[3])
+if not inst then return cjson.encode({ok=false, reason='INSTANCE_REQUIRED'}) end
+if grant.mediaInstanceId ~= inst then return cjson.encode({ok=false, reason='INSTANCE_MISMATCH'}) end
+if grant.secretHash ~= ARGV[6] then return cjson.encode({ok=false, reason='SECRET_MISMATCH'}) end
+if redis.call('EXISTS', KEYS[4]) == 1 then return cjson.encode({ok=false, reason='REPLAYED'}) end
+redis.call('SET', KEYS[4], '1', 'PX', tonumber(ARGV[8]))
+return cjson.encode({ok=true})`
+
+export class RedisGrantStore implements GrantStore {
+  readonly crossProcessAtomic = true
+  constructor(private readonly redis: RedisGrantClient) {}
+
+  async healthy(): Promise<boolean> {
+    try { await this.redis.ping(); return true } catch { return false }
+  }
+
+  async issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<void> {
+    // Un pipeline agrupa las escrituras; el epoch ya fue capturado en el grant.
+    await this.redis.set(gk(grant.grantId), JSON.stringify(grant), 'PX', Math.max(1, ttlMs))
+    await this.redis.sadd(ik('user', grant.userId), grant.grantId)
+    await this.redis.sadd(ik('view', indices.viewId), grant.grantId)
+    if (indices.sessionId) await this.redis.sadd(ik('session', indices.sessionId), grant.grantId)
+    await this.redis.pexpire(ik('user', grant.userId), Math.max(ttlMs, 60_000))
+  }
+
+  async getGrant(grantId: string): Promise<StoredMediaGrant | null> {
+    const raw = await this.redis.get(gk(grantId))
+    return raw ? (JSON.parse(raw) as StoredMediaGrant) : null
+  }
+
+  async validateAndClaim(input: ValidateAndClaimInput): Promise<ClaimResult> {
+    try {
+      const grant = await this.getGrant(input.grantId)
+      const epochKey = grant ? ekk(grant.userId) : ekk('_')
+      const instKey = grant ? instk(grant.streamPath) : instk('_')
+      const raw = await this.redis.eval(
+        LUA_VALIDATE_AND_CLAIM, 4,
+        gk(input.grantId), epochKey, instKey, ck(input.grantId),
+        input.scope.userId, input.scope.cameraId, input.scope.streamPath, input.scope.transport, input.scope.action,
+        input.presentedSecretHash, String(input.nowMs), String(Math.max(1, grant ? grant.expiresAt - input.nowMs : 1000)),
+      )
+      const parsed = JSON.parse(String(raw)) as { ok: boolean; reason?: GrantRejectReason }
+      return parsed.ok ? { ok: true, grant: grant! } : { ok: false, reason: parsed.reason }
+    } catch {
+      return { ok: false, reason: 'BACKEND_UNAVAILABLE' }
+    }
+  }
+
+  async getUserEpoch(userId: string): Promise<number> {
+    const v = await this.redis.get(ekk(userId))
+    return v ? parseInt(v, 10) : 0
+  }
+  async bumpUserEpoch(userId: string): Promise<number> {
+    // INCR es atómico y durable; si Redis está caído, LANZA (no se traga).
+    return this.redis.incr(ekk(userId))
+  }
+
+  async listIndex(kind: IndexKind, key: string): Promise<string[]> { return (await this.redis.smembers(ik(kind, key))) ?? [] }
+  async markRevoked(grantId: string, at: number, ttlMs: number): Promise<void> {
+    const g = await this.getGrant(grantId)
+    if (g) await this.redis.set(gk(grantId), JSON.stringify({ ...g, revokedAt: at }), 'PX', Math.max(1, ttlMs))
+  }
+
+  async currentInstance(streamPath: string): Promise<string | null> { return this.redis.get(instk(streamPath)) }
+  async registerSource(streamPath: string, ttlMs: number): Promise<string> {
+    const token = `mi-${await this.redis.incr(INSTANCE_COUNTER)}`
+    await this.redis.set(instk(streamPath), token, 'PX', Math.max(ttlMs, 60_000))
+    return token
+  }
+  // PEXPIRE extiende el TTL de la MISMA instancia (no cambia el token). Si el
+  // path ya no existe (vencido/retirado), PEXPIRE es no-op — el reconcile lo
+  // re-registrará en la próxima pasada.
+  async refreshSource(streamPath: string, ttlMs: number): Promise<void> { await this.redis.pexpire(instk(streamPath), Math.max(ttlMs, 60_000)) }
+  async retireSource(streamPath: string): Promise<void> { await this.redis.del(instk(streamPath)) }
+}
+
+export function createGrantStore(redis: RedisGrantClient | null | undefined): GrantStore {
+  return redis ? new RedisGrantStore(redis) : new MemoryGrantStore()
+}

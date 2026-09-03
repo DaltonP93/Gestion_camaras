@@ -1,0 +1,29 @@
+# apps/native/src-tauri/Cargo.toml
+# Skeleton del backend nativo (Tauri 2). NO se compila en este entorno: no hay
+# cargo/rustc ni SDK de plataforma. Ver README para el estado de validación.
+[package]
+name = "visioncore-native"
+version = "0.0.0"
+edition = "2021"
+description = "VisionCore cliente nativo — backend de decodificación por plataforma"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+# Dependencias específicas de plataforma (se resuelven por target al compilar en
+# el entorno correspondiente; aquí sólo se declaran como referencia):
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Media_MediaFoundation"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# El decoder Android usa MediaCodec vía JNI (ndk / jni). Se integra en N3.
+
+[target.'cfg(target_os = "ios")'.dependencies]
+# El decoder iOS usa VideoToolbox/AVFoundation vía objc2. Se integra en N3.

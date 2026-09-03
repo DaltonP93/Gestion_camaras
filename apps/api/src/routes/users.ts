@@ -3,6 +3,7 @@ import type { FastifyPluginAsync } from 'fastify'
 import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
+import { revokeUserMediaGrants } from '../services/media/grant-service'
 import { checkPasswordPolicy, addToPasswordHistory, resolveFeaturePermissions } from '../services/totp'
 import { getSecuritySettings } from '../services/security-settings'
 
@@ -353,6 +354,10 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
 
     await Promise.all(ops)
 
+    // C22.1 (P0-1/P0-2): un cambio de permisos revoca los grants de medios vivos
+    // del usuario afectado, para no seguir autorizando lo ya retirado.
+    await revokeUserMediaGrants(server, id)
+
     await AuditAction(server.prisma, request.user.sub, 'PERMISSIONS_UPDATED', id, request, {
       nvrCount:    body.nvrPermissions?.length ?? 0,
       cameraCount: body.cameraPermissions?.length ?? 0,
@@ -437,6 +442,9 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
         canHighQuality: p.canHighQuality,
       })),
     })
+
+    // C22.1 (P0-1/P0-2): revoca grants de medios vivos del usuario afectado.
+    await revokeUserMediaGrants(server, id)
 
     await AuditAction(server.prisma, request.user.sub, 'PERMISSIONS_UPDATED', id, request, {
       permissionsCount: created.count,

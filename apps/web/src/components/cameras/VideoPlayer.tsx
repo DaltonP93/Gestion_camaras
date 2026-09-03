@@ -119,6 +119,8 @@ interface Props {
   streamBitrate?: string | null   // bitrate real (transcodificado) — se muestra en el badge si existe
   transcodingAvailable?: boolean
   qualitySwitchBusy?: boolean  // deshabilita Baja/Alta/Trans mientras hay un cambio en vuelo
+  /** Estado externo (p. ej. el sub sigue visible mientras se prepara HD). */
+  preparingMessage?: string | null
   objectFit?: 'cover' | 'contain'  // default: 'contain'
 }
 
@@ -145,6 +147,7 @@ export function VideoPlayer({
   streamBitrate,
   transcodingAvailable,
   qualitySwitchBusy,
+  preparingMessage,
   objectFit = 'contain',
 }: Props) {
   // Whether the current stream is the transcoded (HEVC→H.264) variant
@@ -421,6 +424,20 @@ export function VideoPlayer({
               {transcodeStartMsg}
             </p>
           )}
+        </div>
+      )}
+
+      {/* El stream actual puede seguir reproduciéndose mientras el padre abre
+          HD. Mostrarlo como preparación evita que esos 5–7 s parezcan un cupo
+          que todavía no se liberó o una pantalla congelada. */}
+      {preparingMessage && !activeError && (
+        <div
+          className="absolute left-1/2 bottom-3 -translate-x-1/2 z-20 flex items-center gap-1.5 max-w-[90%] rounded-full bg-black/75 border border-purple-500/30 px-3 py-1.5 shadow-lg"
+          role="status"
+          aria-live="polite"
+        >
+          <Loader2 size={11} className="animate-spin text-purple-300" />
+          <span className="text-[10px] text-purple-200 text-center leading-snug">{preparingMessage}</span>
         </div>
       )}
 

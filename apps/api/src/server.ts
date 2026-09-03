@@ -27,10 +27,14 @@ import appearancePlugin from './routes/appearance'
 import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
+import { mediaGrantsRoutes } from './routes/mediaGrants'
+import { getMediaGrantManager } from './services/media/grant-service'
+import { SourceLifecycleController, startSourceLifecyclePoller, createMediaMtxPathLister } from './services/media/source-lifecycle'
 import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
 import { adminRoutes } from './routes/admin'
 import { analyticsRoutes } from './routes/analytics'
+import { aiDemoRoutes } from './routes/aiDemo'
 import { diagnosticsRoutes } from './routes/diagnostics'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
@@ -193,10 +197,19 @@ async function main() {
   await server.register(profileRoutes, { prefix: '/api/profile' })
   await server.register(alertSettingsRoutes, { prefix: '/api/alerts' })
   await server.register(liveViewRoutes, { prefix: '/api/live-view' })
+  // C22.1 (P1): las rutas del plano de medios existen SÓLO con la flag activa.
+  // Con la flag apagada no se registran ⇒ 404 (comportamiento idéntico a C21).
+  if (process.env.NATIVE_PLAYBACK_ENABLED === 'true') {
+    await server.register(mediaGrantsRoutes, { prefix: '/api/live-view' })
+  }
   await server.register(searchRoutes, { prefix: '/api/search' })
   await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
   await server.register(adminRoutes, { prefix: '/api/admin' })
   await server.register(analyticsRoutes, { prefix: '/api/analytics' })
+  // C22.1 (P1): la ruta demo de IA existe SÓLO con la flag activa (si no, 404).
+  if (process.env.AI_EVENTS_ENABLED === 'true') {
+    await server.register(aiDemoRoutes, { prefix: '/api/ai' })
+  }
   await server.register(diagnosticsRoutes, { prefix: '/api/diagnostics' })
   await server.register(metricsRoutes)  // /metrics (Prometheus), sin prefijo /api
   await server.register(wsHandler, { prefix: '/ws' })
@@ -253,6 +266,24 @@ async function main() {
   // ─── Jobs en background ───────────────────────────────────
   startHealthWorker(server)
   startSyncWorker(server)
+
+  // N1 — Lifecycle de fuente MediaMTX → registro de instancia del plano de medios.
+  // SÓLO con NATIVE_SOURCE_LIFECYCLE_ENABLED activa: con la flag apagada no se
+  // arranca, ningún path se registra ⇒ `issue` sigue negándose (NO_MEDIA_INSTANCE)
+  // ⇒ comportamiento idéntico a C22.2. Sólo lee la API de MediaMTX (no la altera).
+  if (process.env.NATIVE_SOURCE_LIFECYCLE_ENABLED === 'true') {
+    const srcController = new SourceLifecycleController(getMediaGrantManager(server), {
+      log: (m) => server.log.info(`media_source ${m}`),
+    })
+    const srcPoller = startSourceLifecyclePoller(
+      srcController,
+      createMediaMtxPathLister(),
+      Number(process.env.NATIVE_SOURCE_LIFECYCLE_INTERVAL_MS) || 30_000,
+      (m) => server.log.warn(`media_source ${m}`),
+    )
+    server.addHook('onClose', async () => srcPoller.stop())
+    server.log.info('[startup] N1 source-lifecycle poller activo (NATIVE_SOURCE_LIFECYCLE_ENABLED=true)')
+  }
 
   // ─── Iniciar servidor ─────────────────────────────────────
   const host = process.env.API_HOST || '0.0.0.0'

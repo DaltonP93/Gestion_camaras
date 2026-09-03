@@ -15,6 +15,7 @@ import { parseStreamError, parseRetryAfterMs } from '@/lib/streamErrors'
 import { useViewportSessionLifecycle } from '@/lib/useViewportSessionLifecycle'
 import { pageShowAction } from '@/lib/bfcachePolicy'
 import { registerHeartbeatIdentities } from '@/lib/heartbeatIdentities'
+import { hdStartupMessage } from '@/lib/hdStartupMessage'
 import { STALE_RESPONSE, VIEWPORT_CHANGE } from '@/lib/closeReasons'
 import { resolveHdSessionTtlMs } from '@/lib/hdSessionTtl'
 import { decideHdReacquire, finishHdReacquire, initialHdReacquireState, decideHdFallback } from '@/lib/hdReacquire'
@@ -1921,6 +1922,13 @@ export function LiveViewPage() {
               const focusBitrate = info?.bitrate ?? null
               const canTryMainStream = focusStreamType === 'sub' && !focusStreamError
               const transcodingAvailable = !!(streamCapabilities?.ffmpegAvailable && streamCapabilities?.transcodingEnabled)
+              const preparingHd = !focusStreamInfo && !focusStreamError && focusStreamType !== 'sub'
+                ? hdStartupMessage({
+                    mainCodec: cam.mainCodec,
+                    transcodingAvailable,
+                    requestedType: focusStreamType,
+                  })
+                : null
               return (
                 <div className="h-full flex flex-col gap-0 relative">
                   <VideoPlayer
@@ -1949,6 +1957,7 @@ export function LiveViewPage() {
                     streamBitrate={focusBitrate}
                     transcodingAvailable={transcodingAvailable}
                     qualitySwitchBusy={qualitySwitchBusy}
+                    preparingMessage={preparingHd}
                   />
                   {/* Intentar alta calidad — visible button when watching sub in focus */}
                   {canTryMainStream && (
