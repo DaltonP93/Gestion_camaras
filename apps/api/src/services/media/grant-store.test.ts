@@ -63,6 +63,42 @@ describe.each([
   })
 })
 
+describe('B2 · issueGrant atómico (EVAL agrupa grant + índices)', () => {
+  it('escribe grant e índices user/view/session en la misma operación', async () => {
+    const redis = new FakeRedis()
+    const s = new RedisGrantStore(redis)
+    await s.registerSource('nvr_c_sub', 60_000)
+    const inst = await s.currentInstance('nvr_c_sub')
+    await s.issueGrant(grant({ mediaInstanceId: inst!, secretHash: 'sh' }), { viewId: 'view-1', sessionId: 'sess-1' }, 30_000)
+    // El grant y TODOS sus índices quedan presentes (no hay grant sin índice).
+    expect(await s.getGrant('g1')).not.toBeNull()
+    expect(await s.listIndex('user', 'u')).toContain('g1')
+    expect(await s.listIndex('view', 'view-1')).toContain('g1')
+    expect(await s.listIndex('session', 'sess-1')).toContain('g1')
+  })
+
+  it('sin sessionId no crea el índice de sesión', async () => {
+    const redis = new FakeRedis()
+    const s = new RedisGrantStore(redis)
+    await s.registerSource('nvr_c_sub', 60_000)
+    const inst = await s.currentInstance('nvr_c_sub')
+    await s.issueGrant(grant({ mediaInstanceId: inst!, secretHash: 'sh' }), { viewId: 'view-1' }, 30_000)
+    expect(await s.listIndex('view', 'view-1')).toContain('g1')
+    expect(await s.listIndex('session', '_')).toEqual([])
+  })
+
+  it('backend caído durante el issue ⇒ lanza (nada a medias)', async () => {
+    const redis = new FakeRedis()
+    const s = new RedisGrantStore(redis)
+    redis.down = true
+    await expect(s.issueGrant(grant({ secretHash: 'sh' }), { viewId: 'v' }, 30_000)).rejects.toThrow()
+    // El outbox de Redis quedó intacto: ni grant ni índice.
+    redis.down = false
+    expect(await s.getGrant('g1')).toBeNull()
+    expect(await s.listIndex('user', 'u')).toEqual([])
+  })
+})
+
 describe('cross-process (dos RedisGrantStore sobre el mismo Redis)', () => {
   it('T3 · validateAndClaim concurrente ⇒ exactamente uno gana', async () => {
     const redis = new FakeRedis()

@@ -232,6 +232,22 @@ if redis.call('EXISTS', KEYS[4]) == 1 then return cjson.encode({ok=false, reason
 redis.call('SET', KEYS[4], '1', 'PX', tonumber(ARGV[8]))
 return cjson.encode({ok=true})`
 
+// B2 — Script Lua de emisión ATÓMICA (linealizable en el servidor Redis). Antes
+// eran `await` secuenciales: un crash entre el SET del grant y los SADD de índices
+// dejaba un grant sin índice (o un índice sin grant), y la revocación por-índice
+// (revokeByView/revokeBySession) podía no encontrarlo. EVAL agrupa todas las
+// escrituras en una sola operación indivisible. Marcado ISSUE_GRANT para el fake.
+//   KEYS[1]=grant  KEYS[2]=idx:user  KEYS[3]=idx:view  KEYS[4]=idx:session
+//   ARGV[1]=grantJSON ARGV[2]=grantTtlMs ARGV[3]=grantId(member)
+//   ARGV[4]=hasSession('1'|'') ARGV[5]=userIdxExpireMs
+export const LUA_ISSUE_GRANT = `-- ISSUE_GRANT
+redis.call('SET', KEYS[1], ARGV[1], 'PX', tonumber(ARGV[2]))
+redis.call('SADD', KEYS[2], ARGV[3])
+redis.call('SADD', KEYS[3], ARGV[3])
+if ARGV[4] ~= '' then redis.call('SADD', KEYS[4], ARGV[3]) end
+redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[5]))
+return 1`
+
 export class RedisGrantStore implements GrantStore {
   readonly crossProcessAtomic = true
   constructor(private readonly redis: RedisGrantClient) {}
@@ -241,12 +257,15 @@ export class RedisGrantStore implements GrantStore {
   }
 
   async issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<void> {
-    // Un pipeline agrupa las escrituras; el epoch ya fue capturado en el grant.
-    await this.redis.set(gk(grant.grantId), JSON.stringify(grant), 'PX', Math.max(1, ttlMs))
-    await this.redis.sadd(ik('user', grant.userId), grant.grantId)
-    await this.redis.sadd(ik('view', indices.viewId), grant.grantId)
-    if (indices.sessionId) await this.redis.sadd(ik('session', indices.sessionId), grant.grantId)
-    await this.redis.pexpire(ik('user', grant.userId), Math.max(ttlMs, 60_000))
+    // Escrituras AGRUPADAS en una sola operación linealizable (EVAL): un crash no
+    // puede dejar un grant sin índice. El epoch ya fue capturado en el grant.
+    const px = Math.max(1, ttlMs)
+    const userExpire = Math.max(ttlMs, 60_000)
+    await this.redis.eval(
+      LUA_ISSUE_GRANT, 4,
+      gk(grant.grantId), ik('user', grant.userId), ik('view', indices.viewId), ik('session', indices.sessionId ?? '_'),
+      JSON.stringify(grant), String(px), grant.grantId, indices.sessionId ? '1' : '', String(userExpire),
+    )
   }
 
   async getGrant(grantId: string): Promise<StoredMediaGrant | null> {

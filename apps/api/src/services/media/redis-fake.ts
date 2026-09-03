@@ -41,9 +41,23 @@ export class FakeRedis implements RedisGrantClient {
   async pexpire(): Promise<unknown> { this.guard(); return 1 }
   async incr(k: string): Promise<number> { this.guard(); const e = this.live(k); const n = (e ? parseInt(e.v, 10) : 0) + 1; this.kv.set(k, { v: String(n), exp: null }); return n }
 
-  // EVAL del script VALIDATE_AND_CLAIM (atómico: lee estado y marca el uso sin await).
+  // EVAL de los scripts del plano de grants (atómicos: leen/escriben sin await).
   async eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown> {
     this.guard()
+    // B2 — emisión atómica del grant + índices (ISSUE_GRANT).
+    if (script.includes('ISSUE_GRANT')) {
+      const keys = args.slice(0, numKeys).map(String)
+      const argv = args.slice(numKeys).map(String)
+      const [grantKey, userIdx, viewIdx, sessionIdx] = keys
+      const [grantJson, pxStr, member, hasSession] = argv
+      this.kv.set(grantKey, { v: grantJson, exp: Date.now() + Number(pxStr) })
+      const addSet = (k: string, m: string): void => { let s = this.sets.get(k); if (!s) { s = new Set(); this.sets.set(k, s) } s.add(m) }
+      addSet(userIdx, member)
+      addSet(viewIdx, member)
+      if (hasSession !== '') addSet(sessionIdx, member)
+      // PEXPIRE sobre el índice de usuario: los sets del fake no tienen TTL ⇒ no-op.
+      return 1
+    }
     if (!script.includes('VALIDATE_AND_CLAIM')) throw new Error('unknown script')
     const keys = args.slice(0, numKeys).map(String)
     const argv = args.slice(numKeys).map(String)
