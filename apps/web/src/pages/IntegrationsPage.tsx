@@ -15,14 +15,16 @@ import { useEffect, useState } from 'react'
 import {
   Globe, Radar, Info, Film, Link2, Move, Aperture, RefreshCw,
   Copy, Check, AlertTriangle, Loader2, Eye, EyeOff,
+  Cloud, KeyRound, PlayCircle, Terminal,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
-import { integrationsApi, onvifApi } from '@/lib/api'
-import { deriveOnvifPanelState, integrationErrorMessage } from '@/lib/integrations'
+import { integrationsApi, onvifApi, hikConnectApi } from '@/lib/api'
+import { deriveOnvifPanelState, deriveHikConnectPanelState, integrationErrorMessage } from '@/lib/integrations'
 import type {
   IntegrationsStatus, OnvifCredentials, OnvifDiscoveredDevice, OnvifDeviceInformation,
   OnvifProfile, OnvifPtzConfiguration, OnvifImagingSettings, OnvifIrCutFilterMode,
+  HikConnectTokenStatus, HikConnectHlsResponse, HikConnectIsapiMethod,
 } from '@/types'
 
 function Section({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
@@ -60,6 +62,19 @@ export function IntegrationsPage() {
   const [irCut, setIrCut] = useState<OnvifIrCutFilterMode>('AUTO')
 
   const panel = deriveOnvifPanelState(status)
+  const hikPanel = deriveHikConnectPanelState(status)
+
+  // ── Estado Hik-Connect (todo transitorio; nada se persiste ni loguea) ──
+  const [busyHik, setBusyHik] = useState<string | null>(null)
+  const [hikToken, setHikToken] = useState<HikConnectTokenStatus | null>(null)
+  const [hikSerial, setHikSerial] = useState('')
+  const [hikChannel, setHikChannel] = useState('1')
+  const [hikHls, setHikHls] = useState<HikConnectHlsResponse | null>(null)
+  const [hikHlsCopied, setHikHlsCopied] = useState(false)
+  const [isapiMethod, setIsapiMethod] = useState<HikConnectIsapiMethod>('GET')
+  const [isapiPath, setIsapiPath] = useState('')
+  const [isapiBody, setIsapiBody] = useState('')
+  const [isapiResult, setIsapiResult] = useState<string | null>(null)
 
   useEffect(() => {
     let alive = true
@@ -97,6 +112,30 @@ export function IntegrationsPage() {
       await navigator.clipboard.writeText(streamUri)
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
+    } catch {
+      toast.error('No se pudo copiar')
+    }
+  }
+
+  // Guard Hik-Connect: nunca llamar a /api/hik-connect/* si el panel está off.
+  async function runHik<T>(key: string, fn: () => Promise<T>, onOk: (r: T) => void) {
+    if (hikPanel.actionsDisabled) return
+    setBusyHik(key)
+    try {
+      onOk(await fn())
+    } catch (e) {
+      toast.error(integrationErrorMessage(e))
+    } finally {
+      setBusyHik(null)
+    }
+  }
+
+  async function copyHikHls() {
+    if (!hikHls) return
+    try {
+      await navigator.clipboard.writeText(hikHls.url)
+      setHikHlsCopied(true)
+      setTimeout(() => setHikHlsCopied(false), 1500)
     } catch {
       toast.error('No se pudo copiar')
     }
@@ -391,6 +430,197 @@ export function IntegrationsPage() {
               <p className="text-xs text-surface-400">
                 IR-Cut actual: <span className="text-surface-200 font-mono">{imaging.irCutFilter ?? '—'}</span>
               </p>
+            )}
+          </Section>
+        </fieldset>
+      </div>
+
+      {/* ── Panel Hik-Connect ───────────────────────────────── */}
+      <div className="card p-4 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2 text-surface-100 font-semibold">
+            <Cloud size={18} className="text-brand-400" />
+            Hik-Connect
+          </div>
+          {loadingStatus ? (
+            <span className="text-xs text-surface-400 flex items-center gap-1">
+              <Loader2 size={12} className="animate-spin" /> Comprobando…
+            </span>
+          ) : hikPanel.enabled ? (
+            <span className="badge-online">Habilitado</span>
+          ) : (
+            <span className="badge-offline">Deshabilitado</span>
+          )}
+        </div>
+
+        <p className="text-xs text-surface-500">
+          Proveedor cloud de Hikvision. El AppKey/SecretKey se configuran SÓLO en el servidor (variables de
+          entorno) y nunca se piden ni muestran acá. Hik-Connect entrega H.264 (sin HEVC/transcode).
+        </p>
+
+        {!loadingStatus && hikPanel.actionsDisabled && (
+          <div className="flex items-start gap-2 rounded-lg bg-amber-900/20 border border-amber-800/40 p-3 text-sm text-amber-300">
+            <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
+            <span>{hikPanel.notice}</span>
+          </div>
+        )}
+
+        <fieldset disabled={hikPanel.actionsDisabled} className={clsx('space-y-4', hikPanel.actionsDisabled && 'opacity-50')}>
+          {/* Probar token (sólo metadatos, NUNCA el accessToken) */}
+          <Section icon={<KeyRound size={15} />} title="Probar token (metadatos)">
+            <button
+              className="btn-secondary text-xs"
+              disabled={busyHik === 'token'}
+              onClick={() => runHik('token', () => hikConnectApi.tokenStatus(), setHikToken)}
+            >
+              {busyHik === 'token' ? <Loader2 size={13} className="animate-spin" /> : <KeyRound size={13} />}
+              Probar token
+            </button>
+            {hikToken && (
+              <dl className="text-xs space-y-1">
+                <div className="flex justify-between gap-3">
+                  <dt className="text-surface-400">areaDomain</dt>
+                  <dd className="text-surface-200 font-mono truncate">{hikToken.areaDomain}</dd>
+                </div>
+                <div className="flex justify-between gap-3">
+                  <dt className="text-surface-400">Expira</dt>
+                  <dd className="text-surface-200 font-mono">
+                    {hikToken.expireTimeMs ? new Date(hikToken.expireTimeMs).toLocaleString() : '—'}
+                  </dd>
+                </div>
+                <div className="flex justify-between gap-3">
+                  <dt className="text-surface-400">Activo</dt>
+                  <dd className="text-surface-200 font-mono">{hikToken.active ? 'sí' : 'no'}</dd>
+                </div>
+              </dl>
+            )}
+            <p className="text-xs text-surface-500">
+              Sólo se muestran metadatos del token; el accessToken nunca sale del servidor.
+            </p>
+          </Section>
+
+          {/* HLS temporal (URL transitoria) */}
+          <Section icon={<PlayCircle size={15} />} title="HLS temporal">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="md:col-span-2">
+                <label className="label">Device serial</label>
+                <input
+                  className="input font-mono"
+                  placeholder="p.ej. DS-XXXXXXXXX"
+                  value={hikSerial}
+                  onChange={(e) => { setHikSerial(e.target.value); setHikHls(null); setHikHlsCopied(false) }}
+                  autoComplete="off"
+                />
+              </div>
+              <div>
+                <label className="label">Canal</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={1}
+                  max={999}
+                  value={hikChannel}
+                  onChange={(e) => { setHikChannel(e.target.value); setHikHls(null); setHikHlsCopied(false) }}
+                />
+              </div>
+            </div>
+            <button
+              className="btn-secondary text-xs"
+              disabled={hikSerial.trim() === '' || busyHik === 'hls'}
+              onClick={() => runHik(
+                'hls',
+                () => hikConnectApi.getHls({
+                  deviceSerial: hikSerial.trim(),
+                  ...(hikChannel.trim() !== '' ? { channelNo: Number(hikChannel) } : {}),
+                }),
+                setHikHls,
+              )}
+            >
+              {busyHik === 'hls' ? <Loader2 size={13} className="animate-spin" /> : <PlayCircle size={13} />}
+              Obtener URL HLS
+            </button>
+            {hikHls && (
+              <>
+                <div className="flex items-center gap-2 rounded-lg bg-surface-900 border border-surface-600 p-2">
+                  <code className="flex-1 text-xs text-surface-200 break-all font-mono">{hikHls.url}</code>
+                  <button className="btn-ghost p-1.5" onClick={copyHikHls} title="Copiar">
+                    {hikHlsCopied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+                  </button>
+                </div>
+                <p className="text-xs text-surface-500">
+                  URL efímera (TTL {hikHls.ttlSec}s). Se muestra sólo para copiarla; no se almacena. Se limpia al
+                  cambiar de serial o canal.
+                </p>
+              </>
+            )}
+          </Section>
+
+          {/* Tester ISAPI-proxy avanzado */}
+          <Section icon={<Terminal size={15} />} title="ISAPI-proxy (avanzado)">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div>
+                <label className="label">Método</label>
+                <select
+                  className="input text-xs"
+                  value={isapiMethod}
+                  onChange={(e) => setIsapiMethod(e.target.value as HikConnectIsapiMethod)}
+                >
+                  {(['GET', 'POST', 'PUT', 'DELETE'] as const).map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="md:col-span-3">
+                <label className="label">isapiPath</label>
+                <input
+                  className="input font-mono"
+                  placeholder="/ISAPI/System/deviceInfo"
+                  value={isapiPath}
+                  onChange={(e) => { setIsapiPath(e.target.value); setIsapiResult(null) }}
+                  autoComplete="off"
+                />
+              </div>
+            </div>
+            <div>
+              <label className="label">Body (opcional)</label>
+              <textarea
+                className="input font-mono text-xs min-h-[72px]"
+                placeholder="Cuerpo crudo (XML/JSON) para POST/PUT"
+                value={isapiBody}
+                onChange={(e) => setIsapiBody(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+            <button
+              className="btn-secondary text-xs"
+              disabled={hikSerial.trim() === '' || isapiPath.trim() === '' || busyHik === 'isapi'}
+              onClick={() => runHik(
+                'isapi',
+                () => hikConnectApi.proxyIsapi({
+                  deviceSerial: hikSerial.trim(),
+                  method: isapiMethod,
+                  isapiPath: isapiPath.trim(),
+                  ...(isapiBody.trim() !== '' ? { body: isapiBody } : {}),
+                }),
+                (r) => setIsapiResult(
+                  typeof r.result === 'string' ? r.result : JSON.stringify(r.result, null, 2),
+                ),
+              )}
+            >
+              {busyHik === 'isapi' ? <Loader2 size={13} className="animate-spin" /> : <Terminal size={13} />}
+              Enviar
+            </button>
+            <p className="text-xs text-surface-500">
+              El path debe comenzar por <code className="font-mono text-surface-300">/ISAPI/</code>. Usa el serial
+              del bloque HLS. El destino se fija al areaDomain validado en el servidor (anti-SSRF).
+            </p>
+            {isapiResult !== null && (
+              <>
+                <pre className="rounded-lg bg-surface-900 border border-surface-600 p-2 text-xs text-surface-200 overflow-x-auto max-h-64 whitespace-pre-wrap break-all">
+                  {isapiResult}
+                </pre>
+                <p className="text-xs text-surface-500">Respuesta transitoria; no se almacena ni loguea.</p>
+              </>
             )}
           </Section>
         </fieldset>

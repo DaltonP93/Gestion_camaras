@@ -30,6 +30,33 @@ export function deriveOnvifPanelState(status: IntegrationsStatus | null): OnvifP
   }
 }
 
+export interface HikConnectPanelState {
+  /** true ⇒ HIK_CONNECT_ENABLED=true en el servidor: se permiten acciones. */
+  enabled: boolean
+  /** true ⇒ deshabilitar todos los controles y NO llamar a /api/hik-connect/*. */
+  actionsDisabled: boolean
+  /** Aviso a mostrar cuando está deshabilitado (null si está habilitado). */
+  notice: string | null
+}
+
+const HIK_DISABLED_NOTICE =
+  'Deshabilitado — definí HIK_CONNECT_ENABLED=true (y HIK_CONNECT_APP_KEY/SECRET_KEY) en el servidor'
+
+/**
+ * Deriva el estado del panel Hik-Connect a partir del status de integraciones.
+ * Igual criterio fail-safe que ONVIF: mientras el status no cargó (null) se trata
+ * como deshabilitado, de modo que no se dispara ningún I/O a /api/hik-connect/*
+ * hasta confirmar que la flag está activa.
+ */
+export function deriveHikConnectPanelState(status: IntegrationsStatus | null): HikConnectPanelState {
+  const enabled = status?.hikConnect.enabled === true
+  return {
+    enabled,
+    actionsDisabled: !enabled,
+    notice: enabled ? null : HIK_DISABLED_NOTICE,
+  }
+}
+
 /** Extrae un mensaje de error legible de un error de axios/fetch, sin filtrar cuerpos. */
 export function integrationErrorMessage(err: unknown, fallback = 'Error al comunicarse con el dispositivo'): string {
   const anyErr = err as { response?: { data?: { message?: string; code?: string } }; message?: string }

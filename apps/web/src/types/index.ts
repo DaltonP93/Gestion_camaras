@@ -641,3 +641,43 @@ export interface OnvifPtzVector {
   y?:    number
   zoom?: number
 }
+
+// ─── Hik-Connect (proveedor cloud) ────────────────────────────
+// Metadatos del token que devuelve POST /api/hik-connect/token. NUNCA incluye el
+// accessToken crudo: sólo el areaDomain (base URL validada anti-SSRF) y su
+// expiración. `active` indica que hay un token vigente cacheado en el servidor.
+export interface HikConnectTokenStatus {
+  areaDomain:   string
+  expireTimeMs: number | null
+  active:       boolean
+}
+
+// Petición de URL HLS temporal (POST /api/hik-connect/hls).
+export interface HikConnectHlsRequest {
+  deviceSerial: string
+  channelNo?:   number
+}
+
+// Respuesta HLS: URL EFÍMERA (TTL ≤ 600s). Es transitoria: la UI la muestra para
+// copiarla, nunca la persiste ni la loguea.
+export interface HikConnectHlsResponse {
+  url:    string
+  ttlSec: number
+}
+
+export type HikConnectIsapiMethod = 'GET' | 'POST' | 'PUT' | 'DELETE'
+
+// Petición del ISAPI-proxy (POST /api/hik-connect/isapi). El `isapiPath` se valida
+// estrictamente en el servidor (anti-SSRF/inyección); debe empezar por /ISAPI/.
+export interface HikConnectIsapiRequest {
+  deviceSerial: string
+  method:       HikConnectIsapiMethod
+  isapiPath:    string
+  body?:        string
+}
+
+// Respuesta cruda del ISAPI-proxy. `result` es el cuerpo devuelto por el NVR; se
+// muestra transitoriamente en la UI admin, nunca se persiste ni loguea.
+export interface HikConnectIsapiResponse {
+  result: unknown
+}

@@ -1,7 +1,7 @@
 // Verifica que los métodos del cliente arman bien las requests (URL + body),
 // espiando la instancia axios `api` (no se toca la red real).
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { api, integrationsApi, onvifApi } from './api'
+import { api, integrationsApi, onvifApi, hikConnectApi } from './api'
 
 const creds = { username: 'u', password: 'p' }
 
@@ -85,5 +85,50 @@ describe('onvifApi arma las requests correctamente', () => {
     expect(post.mock.calls[0][1]).toEqual({
       deviceUrl: 'http://dev/onvif', creds, videoSourceToken: 'VideoSource_1', settings: { irCutFilter: 'AUTO' },
     })
+  })
+})
+
+describe('hikConnectApi arma las requests correctamente', () => {
+  it('tokenStatus → POST /hik-connect/token sin body', async () => {
+    const post = stubPost({ areaDomain: 'https://x.hik-connect.com', expireTimeMs: null, active: true })
+    const res = await hikConnectApi.tokenStatus()
+    expect(post.mock.calls[0][0]).toBe('/hik-connect/token')
+    expect(post.mock.calls[0][1]).toBeUndefined()
+    expect(res).toEqual({ areaDomain: 'https://x.hik-connect.com', expireTimeMs: null, active: true })
+  })
+
+  it('getHls con canal → body { deviceSerial, channelNo }', async () => {
+    const post = stubPost({ url: 'https://x/hls.m3u8', ttlSec: 600 })
+    const res = await hikConnectApi.getHls({ deviceSerial: 'DS-1', channelNo: 2 })
+    expect(post.mock.calls[0][0]).toBe('/hik-connect/hls')
+    expect(post.mock.calls[0][1]).toEqual({ deviceSerial: 'DS-1', channelNo: 2 })
+    expect(res).toEqual({ url: 'https://x/hls.m3u8', ttlSec: 600 })
+  })
+
+  it('getHls sin canal → body sólo { deviceSerial } (no envía channelNo undefined)', async () => {
+    const post = stubPost({ url: 'https://x/hls.m3u8', ttlSec: 600 })
+    await hikConnectApi.getHls({ deviceSerial: 'DS-1' })
+    expect(post.mock.calls[0][1]).toEqual({ deviceSerial: 'DS-1' })
+    expect(post.mock.calls[0][1]).not.toHaveProperty('channelNo')
+  })
+
+  it('proxyIsapi con body → body { deviceSerial, method, isapiPath, body }', async () => {
+    const post = stubPost({ result: '<xml/>' })
+    await hikConnectApi.proxyIsapi({
+      deviceSerial: 'DS-1', method: 'POST', isapiPath: '/ISAPI/System/deviceInfo', body: '<x/>',
+    })
+    expect(post.mock.calls[0][0]).toBe('/hik-connect/isapi')
+    expect(post.mock.calls[0][1]).toEqual({
+      deviceSerial: 'DS-1', method: 'POST', isapiPath: '/ISAPI/System/deviceInfo', body: '<x/>',
+    })
+  })
+
+  it('proxyIsapi sin body → no envía body undefined', async () => {
+    const post = stubPost({ result: {} })
+    await hikConnectApi.proxyIsapi({ deviceSerial: 'DS-1', method: 'GET', isapiPath: '/ISAPI/System/deviceInfo' })
+    expect(post.mock.calls[0][1]).toEqual({
+      deviceSerial: 'DS-1', method: 'GET', isapiPath: '/ISAPI/System/deviceInfo',
+    })
+    expect(post.mock.calls[0][1]).not.toHaveProperty('body')
   })
 })

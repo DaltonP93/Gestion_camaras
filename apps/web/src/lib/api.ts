@@ -201,6 +201,11 @@ import type {
   OnvifImagingSettings,
   OnvifImagingInput,
   OnvifPtzVector,
+  HikConnectTokenStatus,
+  HikConnectHlsRequest,
+  HikConnectHlsResponse,
+  HikConnectIsapiRequest,
+  HikConnectIsapiResponse,
 } from '@/types'
 
 export const integrationsApi = {
@@ -237,4 +242,27 @@ export const onvifApi = {
 
   imagingSet: (deviceUrl: string, creds: OnvifCredentials, videoSourceToken: string, settings: OnvifImagingInput) =>
     apiPost<{ ok: true }>('/onvif/imaging/set', { deviceUrl, creds, videoSourceToken, settings }),
+}
+
+// ─── Hik-Connect (ADMIN-only; rutas existen sólo con HIK_CONNECT_ENABLED) ────
+// AppKey/SecretKey viven SÓLO en el servidor (env): jamás se piden ni viajan
+// desde el cliente. `tokenStatus` devuelve METADATOS (areaDomain + expiración),
+// nunca el accessToken crudo. La URL HLS y la respuesta ISAPI son transitorias:
+// el cliente no las persiste ni loguea.
+export const hikConnectApi = {
+  tokenStatus: () => apiPost<HikConnectTokenStatus>('/hik-connect/token'),
+
+  getHls: ({ deviceSerial, channelNo }: HikConnectHlsRequest) =>
+    apiPost<HikConnectHlsResponse>('/hik-connect/hls', {
+      deviceSerial,
+      ...(channelNo !== undefined ? { channelNo } : {}),
+    }),
+
+  proxyIsapi: ({ deviceSerial, method, isapiPath, body }: HikConnectIsapiRequest) =>
+    apiPost<HikConnectIsapiResponse>('/hik-connect/isapi', {
+      deviceSerial,
+      method,
+      isapiPath,
+      ...(body !== undefined ? { body } : {}),
+    }),
 }
