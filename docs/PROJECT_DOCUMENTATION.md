@@ -810,8 +810,12 @@ NO-GO (`NATIVE_MEDIA_RELAY_ENABLED=false`).
 prod — hecho; (4) diseñar A1 sin habilitar — hecho.
 
 ### Todavía no realizado (siguiente desarrollo)
-- **ONVIF** ✅ y **Hik-Connect** ✅ implementados (flags OFF, con tests); falta
-  validación con hardware/cuenta reales y el cableado a la UI de cámaras/NVR.
+- **ONVIF** ✅ y **Hik-Connect** ✅ implementados (flags OFF, con tests) **y
+  cableados a la UI**: página admin **Integraciones** (`apps/web/src/pages/IntegrationsPage.tsx`,
+  ruta `/integrations` ADMIN-only) con paneles ONVIF (descubrir/perfiles/stream-URI/
+  PTZ/imaging) y Hik-Connect (token/HLS temporal/ISAPI-proxy), alimentados por
+  `GET /api/integrations/status` (siempre disponible; muestra "deshabilitado"
+  cuando la flag está OFF). Falta validación con hardware/cuenta reales.
 - **Despliegue de Frigate**: agregar el servicio a docker-compose + config.yml +
   hardware de detección (requiere autorización); conexión y validación end-to-end.
 - **A1 Fase F0** (código del auth-hook + session-grant, flag OFF) si se autoriza.
