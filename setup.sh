@@ -45,15 +45,33 @@ if [ ! -f ".env" ]; then
   log "Creando archivo .env desde .env.example..."
   cp .env.example .env
 
-  # Generar secrets aleatorios
+  # Generar secrets aleatorios. Reemplazo por línea (^VAR=) para no depender de
+  # un texto de placeholder concreto; se usa | como delimitador de sed.
   if command -v openssl &>/dev/null; then
     JWT_SECRET=$(openssl rand -hex 32)
     JWT_REFRESH=$(openssl rand -hex 32)
-    sed -i "s/cambiar_este_secreto_por_uno_muy_largo_y_aleatorio/$JWT_SECRET/" .env
-    sed -i "s/cambiar_este_refresh_secreto_tambien/$JWT_REFRESH/" .env
-    log "Secrets JWT generados aleatoriamente ✓"
+    NVR_KEY=$(openssl rand -hex 32)
+
+    sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$JWT_SECRET|" .env
+    # JWT_REFRESH_SECRET: reemplazar si existe la línea, si no, añadirla.
+    if grep -q "^JWT_REFRESH_SECRET=" .env; then
+      sed -i "s|^JWT_REFRESH_SECRET=.*|JWT_REFRESH_SECRET=$JWT_REFRESH|" .env
+    else
+      echo "JWT_REFRESH_SECRET=$JWT_REFRESH" >> .env
+    fi
+    # NVR_CREDENTIAL_KEY: rellenar solo si el placeholder existe y está vacío.
+    if grep -q "^NVR_CREDENTIAL_KEY=$" .env; then
+      sed -i "s|^NVR_CREDENTIAL_KEY=$|NVR_CREDENTIAL_KEY=$NVR_KEY|" .env
+    fi
+
+    # Verificar que el reemplazo de JWT_SECRET tuvo efecto.
+    if grep -q "^JWT_SECRET=$JWT_SECRET$" .env; then
+      log "Secrets generados aleatoriamente (JWT_SECRET, JWT_REFRESH_SECRET, NVR_CREDENTIAL_KEY) ✓"
+    else
+      warn "No se pudo escribir JWT_SECRET en .env — revísalo manualmente"
+    fi
   else
-    warn "openssl no disponible — cambia JWT_SECRET manualmente en .env"
+    warn "openssl no disponible — cambia JWT_SECRET y NVR_CREDENTIAL_KEY manualmente en .env"
   fi
 
   echo ""
