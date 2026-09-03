@@ -60,10 +60,10 @@ export async function syncNvrCameraMetadata(
 
     let decPass: string
     try {
-      const CryptoJS = (await import('crypto-js')).default
-      const key = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-      decPass = CryptoJS.AES.decrypt(nvr.password, key).toString(CryptoJS.enc.Utf8)
-      if (!decPass) throw new Error('empty')
+      const { decryptNvrPasswordOrNull } = await import('./credentials')
+      const dec = decryptNvrPasswordOrNull(nvr.password)
+      if (!dec) throw new Error('empty')
+      decPass = dec
     } catch {
       syncLocks.delete(nvrId)
       return { nvrId, total: 0, synced: 0, ipUpdated: 0, nameUpdated: 0, statusUpdated: 0, sourceUsed: 'none', isapIStatus: 'unknown', syncedAt: new Date().toISOString(), skipped: false }
