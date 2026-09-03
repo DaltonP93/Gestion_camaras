@@ -772,22 +772,55 @@ De `docs/audits/_SHARED_BRIEF.md`:
   subir el límite) y el playback de grabaciones.
 - Mantener siempre los invariantes de negocio y las restricciones duras.
 
-### Lo realizado en esta sesión
+### Lo realizado en esta sesión (equipo multi-agente, rama `claude/multi-agent-project-audit-hf14wq`, PR #162)
+
+**Base y auditoría (Ciclo 1):**
 - Se **importó el estado c22** (≈ `9fbb01f`) sobre `main` (`620c893`) como commit
-  local `0b3c2f8` en la rama `claude/multi-agent-project-audit-hf14wq`
-  (`chore(c22): importar trabajo local c22 …`). `main` no fue tocado.
-- Se preparó el **brief compartido** del equipo (`docs/audits/_SHARED_BRIEF.md`)
-  con arquitectura, estado c22, restricciones duras, invariantes, prioridades y
-  formato de hallazgos.
-- Se **lanzó el equipo de auditoría** (solo lectura de código) para producir
-  hallazgos con severidad P0–P3, área, evidencia (archivo:línea) y recomendación.
-- Se generó **esta documentación técnica integral** como fuente única de verdad.
+  `0b3c2f8`. `main` no fue tocado.
+- Se ejecutó la **escuadra de auditoría** (4 agentes solo-lectura): reportes en
+  `docs/audits/AUDIT_DEV_ARCH.md`, `AUDIT_DEVOPS.md`, `AUDIT_SECURITY.md`, y la
+  **síntesis del líder** en `docs/audits/LEADERSHIP_SYNTHESIS.md` (backlog P0–P3).
+- Se generó **esta documentación integral** como fuente única de verdad.
+
+**Desarrollo verificado (compuerta tsc + vitest + mutaciones / compileall + unittest):**
+- **Dev 1 — seguridad/robustez:** bump de dependencias a **0 hallazgos npm audit**;
+  **apagado elegante SIGTERM/SIGINT** con cierre de FFmpeg; **redacción de IPs
+  internas** en la doc versionada (invariante #6).
+- **Dev 2 — plano de grants:** recuperación de **revocación durable** cableada a
+  reconexión Redis (P1); **`issueGrant` atómico** vía EVAL Lua; **paginación de
+  `/v3/paths/list`** (lista truncada no autoritativa); **verificación de scope**
+  no tautológica. `vitest 1002/1002`, `mutaciones 19/19`.
+- **Dev 3 — integración Frigate:** ingestor en `apps/analytics/app/frigate/`
+  (normalize/camera_map/derive/client/mqtt_consumer/ingestor) que alimenta el
+  dashboard vía el ya-existente `POST /api/analytics/internal/events`, detrás de
+  `FRIGATE_ENABLED=false`. HTTP polling funcional, MQTT scaffold. Cero cambios en
+  API/DB/web. Diseño en `docs/frigate/INTEGRATION_DESIGN.md`. `unittest 79/79`.
+- **Dev 4 — endurecimiento aprobado:** credenciales NVR migradas a **AES-256-GCM**
+  (`node:crypto` + scrypt) con **descifrado legacy retrocompatible** y clave
+  **obligatoria en prod** (fail-fast) / warning en dev; puertos MediaMTX
+  **atados a 127.0.0.1**; bugfixes de `deploy.sh` (backup DB) y `setup.sh`
+  (generación de secretos). `vitest 1008`.
+
+**Diseño (sin habilitar):** plan del **relay A1 autenticado** vía hooks HTTP de
+MediaMTX contra el plano de grants, en `docs/native/A1_RELAY_DESIGN.md`. A1 sigue
+NO-GO (`NATIVE_MEDIA_RELAY_ENABLED=false`).
+
+**Decisiones tomadas por el humano:** (1) deuda antes que ONVIF/Hik-Connect;
+(2) atar MediaMTX a 127.0.0.1 — hecho; (3) `NVR_CREDENTIAL_KEY` obligatoria en
+prod — hecho; (4) diseñar A1 sin habilitar — hecho.
 
 ### Todavía no realizado (siguiente desarrollo)
-- Implementación del servicio ONVIF y del provider Hik-Connect.
-- Cableado real de N1 (relay + auth por path en MediaMTX + atomicidad Redis).
-- Adopción de `waitForCapacity` por un flujo real; forma durable de N2d.
-- MVP del cliente nativo (Windows/Media Foundation) con toolchain Rust.
+- **ONVIF** y **Hik-Connect** (prioridad #1 del usuario, tras cerrar la deuda).
+- **Despliegue de Frigate**: agregar el servicio a docker-compose + config.yml +
+  hardware de detección (requiere autorización); conexión y validación end-to-end.
+- **A1 Fase F0** (código del auth-hook + session-grant, flag OFF) si se autoriza.
+- Cliente nativo (Tauri/Rust) por plataforma; adopción real de `waitForCapacity`.
+
+> ⚠️ **Nota de migración (producción):** con este cambio, el arranque del API
+> **falla si `NVR_CREDENTIAL_KEY` no está definida** en producción. Antes de
+> desplegar, definirla (`openssl rand -hex 32`). Si la instalación previa cifró
+> con `JWT_SECRET` o el default, mantener ese valor disponible (la ruta legacy lo
+> usa para descifrar) o re-guardar cada credencial (se re-cifra a GCM).
 
 ---
 
@@ -802,13 +835,14 @@ De `docs/audits/_SHARED_BRIEF.md`:
 - [ ] **Hik-Connect (nuevo):** provider (`services/providers/hik-connect*`), flag,
   manejo de token cloud, HLS temporal, ISAPI-proxy, protección de secretos y
   SSRF, tests. _(Pendiente.)_
-- [ ] **N1 relay autenticado:** auth por path en MediaMTX, atomicidad Redis de
-  grants, pruebas de revocación/aislamiento en vivo, condiciones para
-  `NATIVE_MEDIA_RELAY_ENABLED=true`. _(Diseño listo; sin implementar.)_
+- [x] **N1/A1 relay autenticado:** diseño completo en `docs/native/A1_RELAY_DESIGN.md`
+  (hooks HTTP de MediaMTX + session-grant + revoke→kick). _Sin implementar/habilitar._
 - [ ] **Cliente nativo:** resultados de compilación Tauri/Rust, adaptadores por
   plataforma, benchmarks 1/4/9 cámaras HEVC. _(Skeleton.)_
-- [ ] **Hallazgos de auditoría:** enlazar el informe consolidado del equipo
-  multi-agente (P0–P3) cuando esté disponible en `docs/audits/`.
+- [x] **Hallazgos de auditoría:** consolidados en `docs/audits/LEADERSHIP_SYNTHESIS.md`
+  + reportes por área (`AUDIT_DEV_ARCH.md`, `AUDIT_DEVOPS.md`, `AUDIT_SECURITY.md`).
+- [x] **Frigate (nuevo):** ingestor en `apps/analytics/app/frigate/`, flag
+  `FRIGATE_ENABLED`, diseño en `docs/frigate/INTEGRATION_DESIGN.md`. _Falta despliegue._
 - [ ] **Playback de grabaciones:** métricas reales de robustez del preview;
   decisión sobre Opción A (SDK) si aparece `RTSP_AUTH_OR_TRACK_DENIED` persistente.
 - [ ] **Validaciones en vivo:** `docker compose config`, Redis/Lua real, analytics
