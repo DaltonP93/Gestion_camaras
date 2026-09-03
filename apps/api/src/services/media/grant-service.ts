@@ -75,16 +75,51 @@ export async function revokeUserMediaGrants(server: FastifyInstance, userId: str
 
 /** Reintenta las revocaciones pendientes (llamar al recuperar Redis). */
 export async function retryPendingUserRevokes(server: FastifyInstance): Promise<number> {
+  // Inerte si no hay nada pendiente: no construye el singleton ni toca Redis (con
+  // las flags OFF y sin outage previo, el barrido/reconexión no hace nada).
+  if (pendingUserRevokes.size === 0) return 0
   const mgr = getMediaGrantManager(server)
   let ok = 0
   for (const uid of [...pendingUserRevokes]) {
-    const o = await mgr.revokeAllForUser(uid)
-    if (o.status === 'applied') { pendingUserRevokes.delete(uid); ok++ }
+    try {
+      const o = await mgr.revokeAllForUser(uid)
+      if (o.status === 'applied') { pendingUserRevokes.delete(uid); ok++ }
+    } catch { /* backend aún caído: sigue pendiente, se reintenta en el próximo barrido */ }
   }
   return ok
 }
 
 export function __pendingUserRevokeCount(): number { return pendingUserRevokes.size }
+
+export interface RevokeRecovery { stop(): void }
+
+/**
+ * B1 — Cablea la RECUPERACIÓN de la revocación durable a dos disparadores:
+ *   1) `redis.on('ready')`: al (re)conectar Redis, drena el outbox de inmediato
+ *      (cierra el hueco del outage: los grants viejos no pueden re-validar porque
+ *      el epoch se incrementa en cuanto vuelve el backend).
+ *   2) barrido periódico (unref'd): red de seguridad si el evento 'ready' se pierde
+ *      o si la revocación falla en el primer intento. Inerte cuando no hay pendientes.
+ * Idempotente y seguro con las flags OFF: sin revocaciones pendientes es un no-op.
+ */
+export function startRevokeRecovery(server: FastifyInstance, sweepIntervalMs = 60_000): RevokeRecovery {
+  const redis = (server as any).redis as { on?: (e: string, cb: () => void) => void; off?: (e: string, cb: () => void) => void } | null
+  const drain = (trigger: string): void => {
+    void retryPendingUserRevokes(server)
+      .then((n) => { if (n > 0) server.log.info(`media_grant revoke_drained trigger=${trigger} n=${n}`) })
+      .catch(() => { /* se reintenta en el próximo disparo */ })
+  }
+  const onReady = (): void => drain('redis_ready')
+  if (redis && typeof redis.on === 'function') redis.on('ready', onReady)
+  const timer = setInterval(() => drain('sweep'), Math.max(1000, sweepIntervalMs))
+  if (typeof (timer as { unref?: () => void }).unref === 'function') (timer as { unref: () => void }).unref()
+  return {
+    stop() {
+      clearInterval(timer)
+      if (redis && typeof redis.off === 'function') redis.off('ready', onReady)
+    },
+  }
+}
 
 /** Sólo para pruebas: reconstruye singletons y limpia el outbox. */
 export function __resetMediaGrantManagerForTest(): void {

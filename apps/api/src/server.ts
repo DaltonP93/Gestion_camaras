@@ -28,7 +28,7 @@ import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
 import { mediaGrantsRoutes } from './routes/mediaGrants'
-import { getMediaGrantManager } from './services/media/grant-service'
+import { getMediaGrantManager, startRevokeRecovery } from './services/media/grant-service'
 import { SourceLifecycleController, startSourceLifecyclePoller, createMediaMtxPathLister } from './services/media/source-lifecycle'
 import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
@@ -266,6 +266,14 @@ async function main() {
   // ─── Jobs en background ───────────────────────────────────
   startHealthWorker(server)
   startSyncWorker(server)
+
+  // B1 — Recuperación de la revocación durable de medios. Si Redis cae durante un
+  // logout / cambio de permisos, `revokeUserMediaGrants` encola el usuario y el
+  // plano falla cerrado; aquí se drena ese outbox al reconectar Redis y en un
+  // barrido periódico, para que ningún grant viejo re-valide tras el outage.
+  // Inerte con las flags OFF y sin outage previo (no toca Redis si no hay pendientes).
+  const revokeRecovery = startRevokeRecovery(server)
+  server.addHook('onClose', async () => revokeRecovery.stop())
 
   // Apagado elegante (A2): terminar los FFmpeg de transcode en vivo por su vía
   // terminal ya existente cuando el servidor cierra. Los FFmpeg de preview/VOD

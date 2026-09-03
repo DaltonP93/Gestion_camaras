@@ -682,8 +682,10 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       where: { refreshToken: hashToken(refreshToken) },
     })
     // C22.1 (P0-1): el logout revoca los grants de medios vivos del usuario.
-    await revokeUserMediaGrants(server, request.user.sub)
-    await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request)
+    // B1: no se descarta el estado — 'pending' queda encolado (el plano falla
+    // cerrado) y se drena al recuperar Redis; se deja constancia en la auditoría.
+    const mediaRevoke = await revokeUserMediaGrants(server, request.user.sub)
+    await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request, { mediaRevoke })
     return reply.send({ message: 'Sesión cerrada' })
   })
 
