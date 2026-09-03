@@ -810,7 +810,8 @@ NO-GO (`NATIVE_MEDIA_RELAY_ENABLED=false`).
 prod — hecho; (4) diseñar A1 sin habilitar — hecho.
 
 ### Todavía no realizado (siguiente desarrollo)
-- **ONVIF** y **Hik-Connect** (prioridad #1 del usuario, tras cerrar la deuda).
+- **ONVIF** ✅ y **Hik-Connect** ✅ implementados (flags OFF, con tests); falta
+  validación con hardware/cuenta reales y el cableado a la UI de cámaras/NVR.
 - **Despliegue de Frigate**: agregar el servicio a docker-compose + config.yml +
   hardware de detección (requiere autorización); conexión y validación end-to-end.
 - **A1 Fase F0** (código del auth-hook + session-grant, flag OFF) si se autoriza.
@@ -829,12 +830,18 @@ prod — hecho; (4) diseñar A1 sin habilitar — hecho.
 > Estas secciones se completan a medida que avance el desarrollo. Mantener este
 > documento como fuente única de verdad y actualizar la fecha del encabezado.
 
-- [ ] **ONVIF (nuevo):** ubicación del servicio (`services/onvif/*`), flag
-  (`ONVIF_ENABLED`), endpoints, WS-Discovery, GetStreamUri, PTZ, imaging, tests,
-  mitigación SSRF. _(Pendiente de implementación.)_
-- [ ] **Hik-Connect (nuevo):** provider (`services/providers/hik-connect*`), flag,
-  manejo de token cloud, HLS temporal, ISAPI-proxy, protección de secretos y
-  SSRF, tests. _(Pendiente.)_
+- [x] **ONVIF (nuevo):** implementado en `apps/api/src/services/onvif/*`, flag
+  `ONVIF_ENABLED=false`. Núcleo puro (SOAP builders, WS-Security digest, parsers,
+  WS-Discovery) + I/O inyectable (SOAP HTTP, UDP multicast). SSRF LAN-only +
+  bloqueo de metadatos cloud; XXE-safe; credenciales nunca logueadas. Ruta ADMIN
+  guardada por flag. 80 tests. _Falta validación con cámaras reales._
+- [x] **Hik-Connect (nuevo):** implementado en
+  `apps/api/src/services/providers/hik-connect/*`, flag `HIK_CONNECT_ENABLED=false`.
+  Token cloud (appKey/secretKey→accessToken+areaDomain), HLS temporal (TTL≤600),
+  ISAPI-proxy con validación estricta de path (anti-SSRF) + validación de
+  areaDomain; AppKey/SecretKey/accessToken tratados como secretos. Ruta ADMIN
+  guardada por flag. 73 tests. Limitación: H.264, sin HEVC/transcode. _Falta
+  validación con cuenta Technology Partner real._
 - [x] **N1/A1 relay autenticado:** diseño completo en `docs/native/A1_RELAY_DESIGN.md`
   (hooks HTTP de MediaMTX + session-grant + revoke→kick). _Sin implementar/habilitar._
 - [ ] **Cliente nativo:** resultados de compilación Tauri/Rust, adaptadores por
