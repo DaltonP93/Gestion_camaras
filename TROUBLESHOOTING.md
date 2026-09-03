@@ -6,9 +6,9 @@
 
 **Diagnóstico:**
 ```bash
-bash scripts/probe-camera.sh 192.168.1.10 <canal> admin <contraseña>
+bash scripts/probe-camera.sh <ip_nvr> <canal> <usuario> <contraseña>
 # Verificar directamente vía ISAPI:
-curl --digest -u admin:pass http://192.168.1.10/ISAPI/ContentMgmt/InputProxy/channels
+curl --digest -u <usuario>:<contraseña> http://<ip_nvr>/ISAPI/ContentMgmt/InputProxy/channels
 ```
 
 **Causas comunes:**
@@ -26,7 +26,7 @@ curl --digest -u admin:pass http://192.168.1.10/ISAPI/ContentMgmt/InputProxy/cha
 ```bash
 bash scripts/probe-camera.sh <ip_nvr> <canal> <usuario> <contraseña>
 # Prueba directa con curl:
-curl -v --digest -u admin:password http://192.168.1.10/ISAPI/System/deviceInfo
+curl -v --digest -u <usuario>:<contraseña> http://<ip_nvr>/ISAPI/System/deviceInfo
 ```
 
 **Causas:**
@@ -48,7 +48,7 @@ curl -v --digest -u admin:password http://192.168.1.10/ISAPI/System/deviceInfo
 - En la interfaz web del NVR: Configuración de codificación → Substream → cambiar a H.264
 - Verificar codec actual:
 ```bash
-bash scripts/probe-camera.sh 192.168.1.10 1 admin password
+bash scripts/probe-camera.sh <ip_nvr> 1 <usuario> <contraseña>
 # La línea "Stream secundario" debe mostrar: Codec: h264
 ```
 
@@ -73,7 +73,7 @@ curl http://localhost:9997/v3/paths/list | python3 -m json.tool | grep name
   ```
 - El contenedor `mediamtx` no alcanza la IP del NVR (verificar `extra_hosts` en compose):
   ```bash
-  docker compose exec mediamtx sh -c "nc -zv 192.168.1.10 554"
+  docker compose exec mediamtx sh -c "nc -zv <ip_nvr> 554"
   ```
 - El bloque `~.*` en `mediamtx.yml` tiene `source: publisher` y captura paths `nvr_*` antes del bloque correcto
 

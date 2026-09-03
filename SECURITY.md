@@ -53,7 +53,7 @@ Las URLs RTSP contienen usuario y contraseña del NVR. VisionCore garantiza que 
 
 ```
 # Salida enmascarada en probe-camera.sh y logs:
-rtsp://admin:***@192.168.1.10:554/Streaming/Channels/101
+rtsp://<usuario>:***@<ip_nvr>:554/Streaming/Channels/101
 ```
 
 ---

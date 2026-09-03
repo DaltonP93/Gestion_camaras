@@ -11,7 +11,7 @@ El interceptor de Axios maneja esto automáticamente en cada llamada. No se requ
 
 ```bash
 # Prueba manual desde terminal
-curl -v --digest -u admin:Password http://192.168.1.10/ISAPI/System/deviceInfo
+curl -v --digest -u <usuario>:<contraseña> http://<ip_nvr>/ISAPI/System/deviceInfo
 ```
 
 ---
@@ -123,10 +123,10 @@ Los números de canal son base-1. Canal 3 → `301` (main), `302` (sub). Canal 1
 
 | IP | Canales | Notas |
 |---|---|---|
-| 192.168.1.10 | 62 | NVR principal |
-| 192.168.1.110 | 16 | NVR secundario A |
-| 192.168.1.111 | 32 | NVR secundario B |
-| 192.168.1.112 | 31 | NVR secundario C |
+| <ip_nvr_1> | <n> | NVR principal |
+| <ip_nvr_2> | <n> | NVR secundario A |
+| <ip_nvr_3> | <n> | NVR secundario B |
+| <ip_nvr_4> | <n> | NVR secundario C |
 
 Puerto HTTP ISAPI: 80 (default). Puerto RTSP: 554. Puerto SDK: 8000.
 
@@ -151,10 +151,10 @@ Puerto HTTP ISAPI: 80 (default). Puerto RTSP: 554. Puerto SDK: 8000.
 bash scripts/check-nvrs.sh
 
 # Probar RTSP de una cámara específica (main + sub)
-bash scripts/probe-camera.sh 192.168.1.10 1 admin MiClave
+bash scripts/probe-camera.sh <ip_nvr> 1 <usuario> <contraseña>
 
 # Llamadas ISAPI manuales
-curl --digest -u admin:Pass http://192.168.1.10/ISAPI/System/deviceInfo
-curl --digest -u admin:Pass http://192.168.1.10/ISAPI/ContentMgmt/InputProxy/channels
-curl --digest -u admin:Pass http://192.168.1.10/ISAPI/ContentMgmt/Storage
+curl --digest -u <usuario>:<contraseña> http://<ip_nvr>/ISAPI/System/deviceInfo
+curl --digest -u <usuario>:<contraseña> http://<ip_nvr>/ISAPI/ContentMgmt/InputProxy/channels
+curl --digest -u <usuario>:<contraseña> http://<ip_nvr>/ISAPI/ContentMgmt/Storage
 ```
