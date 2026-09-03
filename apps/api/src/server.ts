@@ -36,6 +36,7 @@ import { adminRoutes } from './routes/admin'
 import { analyticsRoutes } from './routes/analytics'
 import { aiDemoRoutes } from './routes/aiDemo'
 import { diagnosticsRoutes } from './routes/diagnostics'
+import { integrationsRoutes } from './routes/integrations'
 import { onvifRoutes } from './routes/onvif'
 import { hikConnectRoutes } from './routes/hikConnect'
 import { metricsRoutes } from './routes/metrics'
@@ -217,6 +218,10 @@ async function main() {
     await server.register(aiDemoRoutes, { prefix: '/api/ai' })
   }
   await server.register(diagnosticsRoutes, { prefix: '/api/diagnostics' })
+  // Estado de integraciones (P1): SIEMPRE registrado (no condicional a flags), para
+  // que la UI muestre "habilitado/deshabilitado" sin depender de un 404. Sólo reporta
+  // el estado de las flags; nunca secretos ni configuración sensible.
+  await server.register(integrationsRoutes, { prefix: '/api/integrations' })
   // ONVIF (P1): rutas existen SÓLO con la flag activa. Con la flag apagada no se
   // registran ⇒ 404 y ningún I/O ONVIF posible (comportamiento idéntico).
   if (process.env.ONVIF_ENABLED === 'true') {

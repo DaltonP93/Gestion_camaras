@@ -4,7 +4,7 @@ import { useRef, useState, useEffect } from 'react'
 import {
   LayoutDashboard, Video, Clock, Bell, Server, Users,
   Activity, Shield, Settings, LayoutGrid, Palette,
-  LogOut, UserCircle, ChevronUp, ChevronRight, Menu, X, Radar,
+  LogOut, UserCircle, ChevronUp, ChevronRight, Menu, X, Radar, Globe,
 } from 'lucide-react'
 import { useAuthStore } from '@/stores/authStore'
 import { useAlertStore } from '@/stores/alertStore'
@@ -200,6 +200,7 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
             {navItem('/users', <Users size={14} />, 'Usuarios', undefined, ['ADMIN'])}
             {navItem('/activity', <Activity size={14} />, 'Actividad', undefined, ['ADMIN'])}
             {navItem('/appearance', <Palette size={14} />, 'Apariencia', undefined, ['ADMIN'])}
+            {navItem('/integrations', <Globe size={14} />, 'Integraciones', undefined, ['ADMIN'])}
             {navItem('/settings', <Settings size={14} />, 'Configuración', undefined, ['ADMIN'])}
           </>
         )}

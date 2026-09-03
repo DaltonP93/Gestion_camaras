@@ -565,3 +565,79 @@ export interface AppearanceSettings {
   analyticsColor?: string | null
 }
 
+
+// ─── Integraciones (ONVIF / Hik-Connect) ──────────────────────
+// Estado que reporta GET /api/integrations/status. Sólo booleans de flags; el
+// backend NUNCA envía secretos ni configuración sensible por acá.
+export interface IntegrationsStatus {
+  onvif:      { enabled: boolean }
+  hikConnect: { enabled: boolean }
+}
+
+// Credenciales del dispositivo ONVIF. Viajan SÓLO en el body de las peticiones
+// ADMIN a /api/onvif/*; NUNCA se persisten (localStorage/sessionStorage) ni se
+// loguean en el cliente.
+export interface OnvifCredentials {
+  username: string
+  password: string
+}
+
+// Dispositivo descubierto por WS-Discovery. remoteAddress es la IP en la LAN.
+export interface OnvifDiscoveredDevice {
+  endpoint:      string | null
+  xaddrs:        string[]
+  types:         string | null
+  scopes:        string[]
+  remoteAddress: string
+}
+
+export interface OnvifDeviceInformation {
+  manufacturer:    string | null
+  model:           string | null
+  firmwareVersion: string | null
+  serialNumber:    string | null
+  hardwareId:      string | null
+}
+
+export interface OnvifProfile {
+  token:            string
+  name:             string | null
+  videoSourceToken: string | null
+  encoding:         string | null
+  width:            number | null
+  height:           number | null
+}
+
+export interface OnvifPtzConfiguration {
+  token:     string
+  name:      string | null
+  nodeToken: string | null
+}
+
+export type OnvifIrCutFilterMode = 'ON' | 'OFF' | 'AUTO'
+
+export interface OnvifImagingSettings {
+  brightness:      number | null
+  contrast:        number | null
+  colorSaturation: number | null
+  sharpness:       number | null
+  irCutFilter:     string | null
+  focus:           { autoFocusMode: string | null; defaultSpeed: number | null } | null
+}
+
+// Entrada para setImaging (todos opcionales). irCutFilter acotado a ON/OFF/AUTO.
+export interface OnvifImagingInput {
+  brightness?:      number
+  contrast?:        number
+  colorSaturation?: number
+  sharpness?:       number
+  irCutFilter?:     OnvifIrCutFilterMode
+  focus?:           { autoFocusMode?: 'AUTO' | 'MANUAL'; defaultSpeed?: number }
+}
+
+// Vector PTZ (pan/tilt/zoom), cada componente en [-1, 1].
+export interface OnvifPtzVector {
+  x?:    number
+  y?:    number
+  zoom?: number
+}
