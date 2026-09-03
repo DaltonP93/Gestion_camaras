@@ -32,6 +32,10 @@ const validateSchema = z.object({
   secret:     z.string().min(1).max(256),
   streamPath: z.string().min(1).max(200),
   transport:  z.enum(['rtsps', 'whep']),
+  // B4: cameraId ESPERADO por el relay. Cuando se presenta se compara contra el
+  // grant (SCOPE_MISMATCH real). Opcional por compatibilidad; si falta, no puede
+  // verificarse en esta frontera (ver comentario en scope).
+  cameraId:   z.string().min(1).max(200).optional(),
 })
 function codecOf(raw: string | null | undefined): 'h264' | 'hevc' {
   return /hevc|h\.?265|hvc1/i.test(raw ?? '') ? 'hevc' : 'h264'
@@ -111,8 +115,15 @@ export const mediaGrantsRoutes: FastifyPluginAsync = async (server) => {
     const stored = await manager.peek(body.grantId)
     if (!stored) return reply.status(403).send({ ok: false, reason: 'NOT_FOUND' })
 
+    // B4: el scope se compara contra los valores PRESENTADOS por el relay, no
+    // contra el propio grant (antes userId/cameraId se copiaban del grant peekeado
+    // ⇒ SCOPE_MISMATCH tautológico, nunca disparaba). streamPath/transport siempre
+    // los presenta el relay; cameraId cuando lo envía (SCOPE_MISMATCH real). userId
+    // NO es presentable aquí: el relay se autentica por secreto compartido, no como
+    // usuario, así que ese campo sólo puede tomarse del grant.
     const scope: GrantScopeQuery = {
-      userId: stored.userId, cameraId: stored.cameraId,
+      userId: stored.userId,
+      cameraId: body.cameraId ?? stored.cameraId,
       streamPath: body.streamPath, transport: body.transport as MediaTransport, action: 'read',
     }
     const result = await manager.consume({ grantId: body.grantId, secret: body.secret }, scope)

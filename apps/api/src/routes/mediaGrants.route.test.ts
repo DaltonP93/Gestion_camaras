@@ -99,6 +99,37 @@ describe('POST /media-grant (inject)', () => {
   })
 })
 
+describe('B4 · verificación de scope no tautológica (cameraId presentado por el relay)', () => {
+  const relayHdr = { 'x-media-relay-secret': 'relaysecret' }
+
+  it('cameraId presentado que NO coincide con el grant ⇒ 403 SCOPE_MISMATCH', async () => {
+    const redis = new FakeRedis()
+    const app = await buildApp({ user: { sub: 'userA', role: 'ADMIN' }, camera: CAM_HEVC, redis })
+    await getMgr(app).registerSource(path(CAM_HEVC, 'main'))
+    const g = (await app.inject({ method: 'POST', url: '/api/live-view/media-grant', payload: { viewId: 'v1', cameraId: 'cam-1', transport: 'rtsps', device: 'win' } })).json()
+
+    const res = await app.inject({
+      method: 'POST', url: '/api/live-view/internal/media-grant/validate', headers: relayHdr,
+      payload: { grantId: g.grantId, secret: g.secret, streamPath: g.streamPath, transport: 'rtsps', cameraId: 'cam-OTRA' },
+    })
+    expect(res.statusCode).toBe(403); expect(res.json().reason).toBe('SCOPE_MISMATCH')
+    await app.close()
+  })
+
+  it('cameraId presentado correcto ⇒ 200 (el grant no se consumió por el mismatch previo)', async () => {
+    const redis = new FakeRedis()
+    const app = await buildApp({ user: { sub: 'userA', role: 'ADMIN' }, camera: CAM_HEVC, redis })
+    await getMgr(app).registerSource(path(CAM_HEVC, 'main'))
+    const g = (await app.inject({ method: 'POST', url: '/api/live-view/media-grant', payload: { viewId: 'v1', cameraId: 'cam-1', transport: 'rtsps', device: 'win' } })).json()
+
+    // mismatch (no consume, claim=false), luego el correcto (200).
+    await app.inject({ method: 'POST', url: '/api/live-view/internal/media-grant/validate', headers: relayHdr, payload: { grantId: g.grantId, secret: g.secret, streamPath: g.streamPath, transport: 'rtsps', cameraId: 'cam-OTRA' } })
+    const ok = await app.inject({ method: 'POST', url: '/api/live-view/internal/media-grant/validate', headers: relayHdr, payload: { grantId: g.grantId, secret: g.secret, streamPath: g.streamPath, transport: 'rtsps', cameraId: 'cam-1' } })
+    expect(ok.statusCode).toBe(200); expect(ok.json().ok).toBe(true); expect(ok.json().cameraId).toBe('cam-1')
+    await app.close()
+  })
+})
+
 describe('validate + flags OFF', () => {
   it('secreto de relay inválido ⇒ 401', async () => {
     const redis = new FakeRedis()
