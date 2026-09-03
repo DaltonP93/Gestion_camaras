@@ -51,9 +51,12 @@ services:
     volumes:
       - ./infra/mediamtx/mediamtx.yml:/mediamtx.yml:ro
     ports:
-      - "8554:8554"   # RTSP
-      - "8888:8888"   # HLS
-      - "8889:8889"   # WebRTC
+      # Puertos de medios atados a loopback: Nginx los alcanza por la red interna
+      # de docker; no deben quedar expuestos a todas las interfaces (MediaMTX corre
+      # con user: any). Ver AUDIT_DEVOPS / AUDIT_SECURITY (P1 superficie de medios).
+      - "127.0.0.1:8554:8554"   # RTSP
+      - "127.0.0.1:8888:8888"   # HLS
+      - "127.0.0.1:8889:8889"   # WebRTC
       # API REST de MediaMTX: interna (la usa el API vía red docker) — sólo localhost.
       - "127.0.0.1:9997:9997"
     networks:
