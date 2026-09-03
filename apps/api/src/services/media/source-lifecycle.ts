@@ -139,25 +139,56 @@ export function startSourceLifecyclePoller(
   return { stop() { stopped = true; clearInterval(timer) } }
 }
 
+/** Tamaño de página al recorrer `/v3/paths/list`. */
+const LIST_ITEMS_PER_PAGE = 1000
+/** Cota dura de páginas para no colgarse si el servidor devuelve pageCount absurdo. */
+const LIST_MAX_PAGES = 1000
+
 /**
- * Lister real contra la API de MediaMTX (sólo lectura). Devuelve los nombres de
- * paths con `ready=true`. null si la API no responde 200. Mismas env vars que
- * services/stream.ts. NOTA (honestidad): no pagina `/v3/paths/list` (paridad con
- * `listRegisteredConfigPaths`); con muchos paths podría truncar — a revisar si el
- * despliegue supera una página. NO VALIDADO en vivo en este entorno (sin MediaMTX).
+ * B3 — Lister real contra la API de MediaMTX (sólo lectura). Devuelve los nombres
+ * de paths con `ready=true`. Mismas env vars que services/stream.ts.
+ *
+ * AUTORIDAD DE LA LISTA (invariante clave de N1): `reconcile` RETIRA las fuentes
+ * ausentes de esta lista. Por eso una lista TRUNCADA jamás puede devolverse como
+ * verdad: retiraría fuentes VIVAS con espectadores → INSTANCE_MISMATCH y caída de
+ * la reproducción nativa. Por eso:
+ *   - Se PAGINA `/v3/paths/list` (`page`/`itemsPerPage`) usando `pageCount`.
+ *   - Ante cualquier duda (no-200, error, o página LLENA sin `pageCount` fiable que
+ *     confirme que es la última) se devuelve `null` ⇒ NO-autoritativa ⇒ reconcile
+ *     no retira nada.
+ * NO VALIDADO en vivo en este entorno (sin MediaMTX); la lógica de paginación/
+ * truncado sí está cubierta por tests con un cliente HTTP falso.
  */
 export function createMediaMtxPathLister(baseUrl = process.env.MEDIAMTX_URL || 'http://mediamtx:9997'): MediaMtxPathLister {
   const api = axios.create({ baseURL: baseUrl, timeout: 5000 })
   return {
     async listReadyPaths(): Promise<string[] | null> {
       try {
-        const res = await api.get('/v3/paths/list', { validateStatus: () => true })
-        if (res.status !== 200) return null
-        const items: unknown[] = Array.isArray(res.data?.items) ? res.data.items : []
-        return items
-          .filter((p): p is { name: string; ready: boolean } =>
-            !!p && typeof (p as any).name === 'string' && (p as any).ready === true)
-          .map((p) => p.name)
+        const collected: string[] = []
+        for (let page = 0; page < LIST_MAX_PAGES; page++) {
+          const res = await api.get('/v3/paths/list', {
+            params: { page, itemsPerPage: LIST_ITEMS_PER_PAGE },
+            validateStatus: () => true,
+          })
+          if (res.status !== 200) return null
+          const data = (res.data ?? {}) as { items?: unknown; pageCount?: unknown }
+          const items: unknown[] = Array.isArray(data.items) ? data.items : []
+          for (const p of items) {
+            if (!!p && typeof (p as any).name === 'string' && (p as any).ready === true) collected.push((p as any).name)
+          }
+          const pageCount = Number(data.pageCount)
+          if (Number.isFinite(pageCount) && pageCount >= 1) {
+            // Metadatos fiables: recorremos hasta la última página.
+            if (page + 1 >= pageCount) return collected
+            continue
+          }
+          // Sin `pageCount` fiable: si la página vino INCOMPLETA, es la última
+          // (lista completa). Si vino LLENA, podría estar truncada ⇒ NO-autoritativa.
+          if (items.length < LIST_ITEMS_PER_PAGE) return collected
+          return null
+        }
+        // Se agotó la cota de páginas sin cerrar: no podemos garantizar completitud.
+        return null
       } catch { return null }
     },
   }
