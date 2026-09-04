@@ -309,6 +309,13 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    # A3 — Recarga periódica para tomar los certs que renueva el contenedor certbot.
+    # certbot escribe los certs en el volumen compartido certbot_conf pero NO recarga
+    # nginx; sin esto nginx sirve el cert viejo hasta un reload manual (outage ~90d).
+    # Patrón estándar cross-container: nginx se recarga a sí mismo cada 6h (no usa
+    # `docker exec` ni señalización externa). El $${!} se escapa ($$→$) para que lo
+    # interprete el shell del contenedor, no la interpolación de compose.
+    command: ["/bin/sh", "-c", "while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g 'daemon off;'"]
     depends_on:
       # Esperar a que el API esté SANO (no sólo iniciado) para no producir 502
       # transitorios mientras corren migraciones / arranque. web también se espera
