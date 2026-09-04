@@ -4,7 +4,7 @@ import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
-import { revokeUserMediaGrants } from '../services/media/grant-service'
+import { revokeUserMediaGrants, getSessionPolicy } from '../services/media/grant-service'
 import {
   generateTotpSecret, verifyTotpToken, getTotpQrCodeUri,
   generateBackupCodes, hashBackupCodes, verifyBackupCode,
@@ -685,6 +685,10 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     // B1: no se descarta el estado — 'pending' queda encolado (el plano falla
     // cerrado) y se drena al recuperar Redis; se deja constancia en la auditoría.
     const mediaRevoke = await revokeUserMediaGrants(server, request.user.sub)
+    // N2d (#9): limpiar el mapa en-proceso usuario→sesión de medios para no
+    // dejarlo colgado tras el logout. Con SINGLE_ACTIVE_MEDIA_SESSION OFF es
+    // no-op (el mapa nunca se pobló) ⇒ comportamiento idéntico.
+    getSessionPolicy(server).forgetUser(request.user.sub)
     await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request, { mediaRevoke })
     return reply.send({ message: 'Sesión cerrada' })
   })
