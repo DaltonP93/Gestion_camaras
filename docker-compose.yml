@@ -10,7 +10,12 @@ services:
     environment:
       POSTGRES_DB: visioncore_db
       POSTGRES_USER: visioncore
-      POSTGRES_PASSWORD: visioncore_pass
+      # Sin default hardcodeado. Debe venir de .env / entorno (ver .env.example).
+      # Se usa la forma ${VAR:-} (vacío si falta) a propósito: `docker compose config`
+      # sigue validando sin .env (CI), y `docker compose up` falla claro porque
+      # postgres rechaza una contraseña vacía = fail-fast deseado. NO usar la forma
+      # ${VAR:?...} porque rompe `docker compose config` sin .env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -86,7 +91,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://visioncore:visioncore_pass@postgres:5432/visioncore_db
+      DATABASE_URL: postgresql://visioncore:${POSTGRES_PASSWORD:-}@postgres:5432/visioncore_db
       REDIS_URL: redis://redis:6379
       MEDIAMTX_URL: http://mediamtx:9997
       # Claves — generar con: openssl rand -hex 64 / openssl rand -hex 32

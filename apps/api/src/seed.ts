@@ -2,6 +2,7 @@
 // Poblado inicial de la base de datos con los 4 NVRs y usuario admin
 import { PrismaClient } from '@prisma/client'
 import bcrypt from 'bcryptjs'
+import crypto from 'crypto'
 // Usa la MISMA clave que el resto del sistema (antes omitía NVR_CREDENTIAL_KEY:
 // con esa env definida, los NVRs sembrados quedaban cifrados con otra clave y
 // eran indescifrables en runtime)
@@ -67,21 +68,41 @@ const NVR_CONFIGS = [
 async function main() {
   console.log('🌱 Iniciando seed de VisionCore...')
 
-  // Crear usuario admin por defecto
-  const adminHash = await bcrypt.hash('Admin123!', 12)
+  // ─── Usuario admin ─────────────────────────────────────────
+  // Seguridad: NO se hornea una contraseña conocida. La contraseña del admin
+  // viene de SEED_ADMIN_PASSWORD; si no se define, se genera una aleatoria fuerte
+  // y se muestra UNA sola vez en este log (nunca se persiste en claro ni se
+  // versiona). El email/usuario pueden ajustarse por env (no son secretos).
+  // Esto no rompe el flujo del seed: el admin siempre se crea.
+  const adminUsername = process.env.SEED_ADMIN_USERNAME || 'admin'
+  const adminEmail = process.env.SEED_ADMIN_EMAIL || 'admin@visioncore.local'
+  const providedAdminPassword = process.env.SEED_ADMIN_PASSWORD
+  // 24 chars base64url = 18 bytes de entropía. Suficientemente fuerte y sin
+  // caracteres problemáticos para copiar/pegar.
+  const adminPassword = providedAdminPassword || crypto.randomBytes(18).toString('base64url')
+  const adminPasswordGenerated = !providedAdminPassword
+
+  const adminHash = await bcrypt.hash(adminPassword, 12)
   const admin = await prisma.user.upsert({
-    where: { username: 'admin' },
+    where: { username: adminUsername },
     update: {},
     create: {
-      username: 'admin',
-      email: 'admin@visioncore.local',
+      username: adminUsername,
+      email: adminEmail,
       passwordHash: adminHash,
       fullName: 'Administrador del Sistema',
       role: 'ADMIN',
       active: true,
     },
   })
-  console.log(`✅ Usuario admin creado: admin / Admin123!`)
+  if (adminPasswordGenerated) {
+    console.log('⚠️  SEED_ADMIN_PASSWORD no definido — se generó una contraseña aleatoria.')
+    console.log('    Guardala ahora (se muestra UNA sola vez) y cambiala tras el primer login:')
+    console.log(`      usuario:     ${adminUsername}`)
+    console.log(`      contraseña:  ${adminPassword}`)
+  } else {
+    console.log(`✅ Usuario admin creado: ${adminUsername} (contraseña definida por SEED_ADMIN_PASSWORD)`)
+  }
 
   // Crear usuarios de prueba
   const supervisorHash = await bcrypt.hash('Super123!', 12)
@@ -165,7 +186,11 @@ async function main() {
 
   console.log('\n🎉 Seed completado exitosamente!')
   console.log('\n📋 Credenciales de acceso:')
-  console.log('  admin      / Admin123!  (Administrador)')
+  if (adminPasswordGenerated) {
+    console.log(`  ${adminUsername}      / (ver contraseña generada arriba)  (Administrador)`)
+  } else {
+    console.log(`  ${adminUsername}      / (SEED_ADMIN_PASSWORD)  (Administrador)`)
+  }
   console.log('  supervisor / Super123!  (Supervisor)')
   console.log('  operador1  / Oper123!   (Operador)')
   console.log('  auditor    / Audit123!  (Auditor)')
