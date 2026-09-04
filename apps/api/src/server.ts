@@ -39,6 +39,7 @@ import { diagnosticsRoutes } from './routes/diagnostics'
 import { integrationsRoutes } from './routes/integrations'
 import { onvifRoutes } from './routes/onvif'
 import { hikConnectRoutes } from './routes/hikConnect'
+import { mediamtxAuthRoutes } from './routes/mediamtxAuth'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
@@ -232,6 +233,12 @@ async function main() {
   // 404 y ningún I/O Hik-Connect posible (comportamiento idéntico).
   if (process.env.HIK_CONNECT_ENABLED === 'true') {
     await server.register(hikConnectRoutes, { prefix: '/api/hik-connect' })
+  }
+  // A1 · F0 — auth-hook de MediaMTX: rutas existen SÓLO con la flag activa. Con la
+  // flag apagada NO se registran ⇒ 404, ningún grant relay_session ni kick posible
+  // (comportamiento idéntico a hoy). A1 sigue NO-GO: esto es sólo código.
+  if (process.env.NATIVE_MEDIA_RELAY_ENABLED === 'true') {
+    await server.register(mediamtxAuthRoutes, { prefix: '/internal/mediamtx' })
   }
   await server.register(metricsRoutes)  // /metrics (Prometheus), sin prefijo /api
   await server.register(wsHandler, { prefix: '/ws' })
