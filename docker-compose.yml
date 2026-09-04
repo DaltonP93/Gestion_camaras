@@ -1,13 +1,21 @@
 services:
   # ─── Base de datos PostgreSQL ───────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    # Minor pin (antes 16-alpine, que flota por minor). 16.4 fija la minor y deja
+    # flotar sólo la patch dentro de una línea estable de larga vida. NO cambiar la
+    # major (16) sin migración planificada del volumen de datos.
+    image: postgres:16.4-alpine
     container_name: visioncore_postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: visioncore_db
       POSTGRES_USER: visioncore
-      POSTGRES_PASSWORD: visioncore_pass
+      # Sin default hardcodeado. Debe venir de .env / entorno (ver .env.example).
+      # Se usa la forma ${VAR:-} (vacío si falta) a propósito: `docker compose config`
+      # sigue validando sin .env (CI), y `docker compose up` falla claro porque
+      # postgres rechaza una contraseña vacía = fail-fast deseado. NO usar la forma
+      # ${VAR:?...} porque rompe `docker compose config` sin .env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -24,7 +32,8 @@ services:
 
   # ─── Redis (sesiones y caché) ───────────────────────────────
   redis:
-    image: redis:7-alpine
+    # Minor pin (antes 7-alpine). 7.4 fija la minor, patch flotante en línea estable.
+    image: redis:7.4-alpine
     container_name: visioncore_redis
     restart: unless-stopped
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -43,7 +52,10 @@ services:
 
   # ─── MediaMTX (proxy RTSP → HLS/WebRTC) ────────────────────
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    # Pin fijo (antes :latest). 1.9.3 es una release estable conocida de la línea
+    # 1.9.x; evita que un `pull` futuro cambie el comportamiento del componente
+    # crítico de streaming. Actualizar deliberadamente, no por deriva del tag.
+    image: bluenviron/mediamtx:1.9.3
     container_name: visioncore_mediamtx
     restart: unless-stopped
     environment:
@@ -79,7 +91,7 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgresql://visioncore:visioncore_pass@postgres:5432/visioncore_db
+      DATABASE_URL: postgresql://visioncore:${POSTGRES_PASSWORD:-}@postgres:5432/visioncore_db
       REDIS_URL: redis://redis:6379
       MEDIAMTX_URL: http://mediamtx:9997
       # Claves — generar con: openssl rand -hex 64 / openssl rand -hex 32
@@ -184,6 +196,15 @@ services:
       - api
     networks:
       - visioncore_net
+    # Healthcheck: la imagen es nginx:alpine (busybox). Se usa el wget de busybox
+    # (no hay curl) para pedir la raíz del estático servido en :80. 127.0.0.1
+    # explícito para no depender de la resolución IPv6 de 'localhost'.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   # ─── Analítica de video (Supervision + YOLOX/ONNX) ─────────
   # CPU por defecto. Para GPU NVIDIA ver apps/analytics/README.md.
@@ -224,6 +245,16 @@ services:
     dns:
       - 8.8.8.8
       - 1.1.1.1
+    # Healthcheck: la imagen trae curl. GET /health responde 200 mientras FastAPI
+    # viva (a propósito no refleja el estado del modelo — eso se ve en /status — para
+    # no reiniciar el contenedor por un modelo caído). start_period amplio porque el
+    # modelo ONNX se descarga en el primer arranque.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8500/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   # ─── Frigate (NVR con detección de objetos — fuente de analítica) ──
   # OPT-IN: sólo arranca con `docker compose --profile frigate up -d frigate`.
@@ -234,7 +265,9 @@ services:
   # El config real (con IPs/credenciales) es infra/frigate/config.yml (gitignored);
   # copiar de infra/frigate/config.example.yml. Nunca versionar credenciales/IPs.
   frigate:
-    image: ghcr.io/blakeblackshear/frigate:stable
+    # Pin fijo (antes :stable, que flota). 0.14.1 es la última patch estable de la
+    # línea 0.14.x. Frigate es opt-in (profile) y no arranca en el stack por defecto.
+    image: ghcr.io/blakeblackshear/frigate:0.14.1
     container_name: visioncore_frigate
     profiles: ["frigate"]
     restart: unless-stopped
@@ -257,10 +290,21 @@ services:
       - visioncore_net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Healthcheck: la imagen de Frigate (Debian) trae curl. GET /api/version en la
+    # API interna (5000). Servicio opt-in (profile "frigate"): no arranca en el stack
+    # por defecto y ningún otro servicio depende de él, así que este check no afecta
+    # el arranque normal. start_period amplio (Frigate tarda en levantar detectores).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/api/version || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
 
   # ─── Nginx (reverse proxy + SSL) ───────────────────────────
   nginx:
-    image: nginx:alpine
+    # Minor pin (antes nginx:alpine). 1.27 fija la minor estable, patch flotante.
+    image: nginx:1.27-alpine
     container_name: visioncore_nginx
     restart: unless-stopped
     volumes:
@@ -270,14 +314,23 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    # A3 — Recarga periódica para tomar los certs que renueva el contenedor certbot.
+    # certbot escribe los certs en el volumen compartido certbot_conf pero NO recarga
+    # nginx; sin esto nginx sirve el cert viejo hasta un reload manual (outage ~90d).
+    # Patrón estándar cross-container: nginx se recarga a sí mismo cada 6h (no usa
+    # `docker exec` ni señalización externa). El $${!} se escapa ($$→$) para que lo
+    # interprete el shell del contenedor, no la interpolación de compose.
+    command: ["/bin/sh", "-c", "while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g 'daemon off;'"]
     depends_on:
       # Esperar a que el API esté SANO (no sólo iniciado) para no producir 502
-      # transitorios mientras corren migraciones / arranque. web y mediamtx sólo
-      # necesitan estar iniciados.
+      # transitorios mientras corren migraciones / arranque. web también se espera
+      # SANO (ya tiene healthcheck). mediamtx corre desde una imagen `scratch` (sin
+      # shell ni cliente HTTP) por lo que no admite un healthcheck interno estándar
+      # → se mantiene service_started.
       api:
         condition: service_healthy
       web:
-        condition: service_started
+        condition: service_healthy
       mediamtx:
         condition: service_started
     networks:
@@ -285,7 +338,9 @@ services:
 
   # ─── Certbot (renovación automática SSL) ────────────────────
   certbot:
-    image: certbot/certbot:latest
+    # Pin fijo (antes :latest). v3.0.1 es una release estable conocida; evita que
+    # una renovación futura traiga un certbot con flags/comportamiento distinto.
+    image: certbot/certbot:v3.0.1
     container_name: visioncore_certbot
     restart: unless-stopped
     volumes:

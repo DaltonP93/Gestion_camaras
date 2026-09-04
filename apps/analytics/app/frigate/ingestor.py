@@ -206,7 +206,10 @@ class FrigateIngestor(threading.Thread):
     def _ensure_client(self) -> Any:
         if self._client is None:
             from .client import FrigateHttpClient
-            self._client = FrigateHttpClient(getattr(self._settings, "frigate_url", ""))
+            self._client = FrigateHttpClient(
+                getattr(self._settings, "frigate_url", ""),
+                max_snapshot_bytes=getattr(self._settings, "frigate_max_snapshot_bytes", 5 * 1024 * 1024),
+            )
         return self._client
 
     def _default_poster(self, payload: dict) -> bool:

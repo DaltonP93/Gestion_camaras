@@ -63,6 +63,7 @@ async function withPathLock<T>(streamPath: string, fn: () => Promise<T>): Promis
 // consumidores por path/tipo con leases TTL; removeStream lo consulta y no
 // borra un path que aún tenga consumidores vigentes.
 import { getStreamConsumerRegistry } from './stream-consumer-registry'
+import { maskIp } from '../lib/log-redact'
 
 // Un solo consumidor analytics por path → id estable derivado del path.
 const analyticsConsumerId = (streamPath: string) => `analytics:${streamPath}`
@@ -912,7 +913,7 @@ export async function publishStream(nvr: NVR, camera: Camera, streamType: 'sub' 
   // Bloquear publicación si la contraseña está vacía (credencial no descifrada o no configurada)
   const pass: string = (nvr as any).password ?? ''
   if (!pass) {
-    console.error(`[stream] PASSWORD_EMPTY — omitiendo path ${streamPath} (nvr=${nvr.id} ip=${nvr.ipAddress}). Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales.`)
+    console.error(`[stream] PASSWORD_EMPTY — omitiendo path ${streamPath} (nvr=${nvr.id} ip=${maskIp(nvr.ipAddress)}). Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales.`)
     return false
   }
 

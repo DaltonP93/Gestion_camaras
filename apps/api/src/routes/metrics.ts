@@ -12,6 +12,7 @@ import {
 import { getStreamConsumerRegistry } from '../services/stream-consumer-registry'
 import { getRecordingsMetrics } from './recordings'
 import { getTranscodeSlots } from '../services/stream-manager'
+import { timingSafeEqualHex, sha256Hex } from '../services/media/media-grants'
 
 const METRICS_TOKEN = process.env.METRICS_TOKEN || ''
 const ANALYTICS_URL = process.env.ANALYTICS_URL || 'http://analytics:8500'
@@ -100,7 +101,10 @@ export const metricsRoutes: FastifyPluginAsync = async (server) => {
       const auth = request.headers.authorization || ''
       const q = (request.query as { token?: string })?.token || ''
       const provided = auth.startsWith('Bearer ') ? auth.slice(7) : q
-      if (provided !== METRICS_TOKEN) {
+      // Comparación timing-safe con longitudes normalizadas (sha256 hex de 64
+      // chars): evita el canal lateral de tiempo de `!==`. Comportamiento
+      // idéntico: token vacío ⇒ no se entra aquí (red interna); match ⇒ pasa.
+      if (!timingSafeEqualHex(sha256Hex(provided), sha256Hex(METRICS_TOKEN))) {
         return reply.status(401).type('text/plain').send('unauthorized')
       }
     }

@@ -52,6 +52,42 @@ describe('SingleActiveSessionPolicy', () => {
     expect(p.activeSession('u1')).toBeNull()
   })
 
+  it('forget: no-op cuando está deshabilitada (mapa siempre vacío)', async () => {
+    const r = revoker()
+    const p = new SingleActiveSessionPolicy(r, false)
+    // register es no-op con la flag OFF ⇒ nada que olvidar; no debe lanzar.
+    p.forget('u1', 's1')
+    expect(p.activeSession('u1')).toBeNull()
+  })
+
+  it('forgetUser: limpia CUALQUIER sesión activa del usuario (logout)', async () => {
+    const r = revoker()
+    const p = new SingleActiveSessionPolicy(r, true)
+    await p.register('u1', 's1')
+    expect(p.activeSession('u1')).toBe('s1')
+    expect(p.forgetUser('u1')).toBe(true)         // había mapeo ⇒ true
+    expect(p.activeSession('u1')).toBeNull()
+    expect(p.forgetUser('u1')).toBe(false)        // ya limpio ⇒ false
+    expect(r.calls).toEqual([])                   // forgetUser NO revoca grants
+  })
+
+  it('forgetUser: no cruza usuarios', async () => {
+    const r = revoker()
+    const p = new SingleActiveSessionPolicy(r, true)
+    await p.register('u1', 's1')
+    await p.register('u2', 's2')
+    p.forgetUser('u1')
+    expect(p.activeSession('u1')).toBeNull()
+    expect(p.activeSession('u2')).toBe('s2')      // u2 intacto
+  })
+
+  it('forgetUser: no-op (false) cuando está deshabilitada', async () => {
+    const r = revoker()
+    const p = new SingleActiveSessionPolicy(r, false)
+    await p.register('u1', 's1')                  // no-op con flag OFF
+    expect(p.forgetUser('u1')).toBe(false)
+  })
+
   it('usuarios independientes', async () => {
     const r = revoker()
     const p = new SingleActiveSessionPolicy(r, true)

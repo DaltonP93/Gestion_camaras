@@ -47,6 +47,20 @@ export class SingleActiveSessionPolicy {
 
   /** Olvida la sesión (logout de ese dispositivo) si es la activa. */
   forget(userId: string, sessionId: string): void {
+    if (!this.enabled) return
     if (this.active.get(userId) === sessionId) this.active.delete(userId)
+  }
+
+  /**
+   * Olvida CUALQUIER sesión activa del usuario. Se usa en el logout, que revoca
+   * TODOS los grants de medios del usuario (por usuario, no por sesión) y por
+   * tanto debe dejar el mapa usuario→sesión limpio, sin depender de conocer el
+   * `sessionId` de medios (que no viaja en el JWT ni en el body del logout).
+   * Devuelve true si había una sesión mapeada. No-op si está deshabilitada
+   * (con la flag OFF `register` nunca puebla el mapa ⇒ comportamiento idéntico).
+   */
+  forgetUser(userId: string): boolean {
+    if (!this.enabled) return false
+    return this.active.delete(userId)
   }
 }

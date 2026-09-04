@@ -10,6 +10,7 @@ import multipart from '@fastify/multipart'
 import path from 'path'
 import fs from 'fs'
 import { redactUrlSecrets } from './lib/log-redact'
+import { resolveCorsOptions } from './lib/cors-config'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -44,6 +45,7 @@ import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
 import { publishStream, getActiveTranscodesList, stopTranscodeProcess } from './services/stream'
+import { reRegisterStreams } from './services/stream-reregister'
 import { decryptNvrPasswordOrNull as decryptPass, validateNvrCredentialKey } from './services/credentials'
 
 const server = Fastify({
@@ -123,14 +125,11 @@ async function main() {
   })
 
   // CORS: lista blanca por env var (CORS_ORIGINS=https://camaras.example.com,https://otro.com)
-  // Si no está definida, refleja el origin (compatibilidad con dev / detrás de nginx)
-  const corsOrigins = process.env.CORS_ORIGINS
-    ? process.env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
-    : null
-  await server.register(cors, {
-    origin: corsOrigins ?? true,
-    credentials: true,
-  })
+  // Con CORS_ORIGINS definido → comportamiento idéntico al histórico (allowlist +
+  // credenciales). Sin CORS_ORIGINS → NO se refleja cualquier origin con
+  // credenciales: sólo se permite localhost/127.0.0.1/[::1] (dev usable); el resto
+  // de orígenes cruzados quedan sin cabeceras CORS. Ver lib/cors-config.ts.
+  await server.register(cors, resolveCorsOptions(process.env.CORS_ORIGINS))
 
   await server.register(rateLimit, {
     max: 600,
@@ -380,22 +379,17 @@ async function main() {
         where: { active: true },
         include: { cameras: { where: { active: true } } },
       })
-      let count = 0
-      let skipped = 0
-      for (const nvr of nvrs) {
-        const plainPass = decryptPass(nvr.password)
-        if (!plainPass) {
-          server.log.error(`[startup] DECRYPT_ERROR para NVR ${nvr.name} (${nvr.id}) — streams omitidos. Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales del NVR.`)
-          skipped++
-          continue
-        }
-        const nvrDecrypted = { ...nvr, password: plainPass }
-        for (const camera of nvr.cameras) {
-          await publishStream(nvrDecrypted as any, camera)
-          count++
-        }
-      }
-      server.log.info(`[startup] ${count} paths on-demand registrados en MediaMTX (RTSP inactivo hasta primer viewer — sourceOnDemand=true)${skipped > 0 ? ` | ${skipped} NVR(s) omitidos por DECRYPT_ERROR` : ''}`)
+      // Aislamiento por cámara: un fallo puntual de publishStream no aborta el
+      // re-registro del resto del lote (ver services/stream-reregister.ts).
+      await reRegisterStreams(nvrs as any, {
+        decryptPass,
+        publishStream: (nvr, camera) => publishStream(nvr as any, camera as any),
+        log: {
+          info: (m) => server.log.info(m),
+          warn: (m) => server.log.warn(m),
+          error: (m) => server.log.error(m),
+        },
+      })
     } catch (err) {
       server.log.warn(`[startup] Error registrando streams en MediaMTX: ${err}`)
     }
