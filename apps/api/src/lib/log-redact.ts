@@ -22,3 +22,25 @@ export function redactUrlUserinfo(url: string): string {
   if (!url) return url
   return url.replace(/(\/\/[^/@:]+:)[^/@]*@/g, '$1***@')
 }
+
+// Invariante #6: nunca registrar IPs internas reales (NVR ni sub-cámaras) en
+// logs. Estos helpers enmascaran el host de una IPv4 conservando sólo los dos
+// primeros octetos como contexto de subred; cualquier otra cosa (hostname,
+// IPv6, vacío) se colapsa. No cambian la lógica, sólo lo que llega al log.
+
+const IPV4_RE = /(\b\d{1,3}\.\d{1,3})\.\d{1,3}\.\d{1,3}\b/g
+
+/** Enmascara una IPv4 individual → `a.b.x.x`. Vacío/no-IPv4 → '' o '***'. */
+export function maskIp(ip?: string | null): string {
+  if (!ip) return ''
+  const s = String(ip).trim()
+  const m = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(s)
+  if (m) return `${m[1]}.${m[2]}.x.x`
+  return '***'
+}
+
+/** Enmascara todas las IPv4 embebidas en un texto (p.ej. snippets XML). */
+export function redactIps(text: string): string {
+  if (!text) return text
+  return text.replace(IPV4_RE, '$1.x.x')
+}
