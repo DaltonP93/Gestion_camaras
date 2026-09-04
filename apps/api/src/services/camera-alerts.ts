@@ -4,7 +4,7 @@
 // Nunca registra contraseñas, URLs RTSP completas ni JWT.
 
 import type { FastifyInstance } from 'fastify'
-import { broadcastAlert } from '../routes/websocket'
+import { broadcastAlertScoped } from '../routes/websocket'
 import { sendAlertNotification } from './notification.service'
 
 export type CameraAlertSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
@@ -48,7 +48,7 @@ export async function raiseCameraAlert(server: FastifyInstance, opts: {
     `[camera-health] camera_alert_created cameraId=${opts.camera.id} nvrId=${opts.nvr.id}` +
     ` channel=${opts.camera.channel} type=${opts.type} severity=${severity} alertId=${alert.id}`
   )
-  broadcastAlert({
+  await broadcastAlertScoped(server.prisma, opts.camera.id, {
     type: 'alert',
     alert: {
       id: alert.id, type: alert.type, severity: alert.severity, message: alert.message,
@@ -90,8 +90,8 @@ export async function recoverCameraAlert(server: FastifyInstance, opts: {
     `[camera-health] camera_alert_resolved cameraId=${opts.camera.id} channel=${opts.camera.channel}` +
     ` type=${opts.offlineType} count=${active.length}`
   )
-  // Bajar el contador de la campana en vivo (sin recargar).
-  for (const a of active) broadcastAlert({ type: 'alert_resolved', alertId: a.id })
+  // Bajar el contador de la campana en vivo (sin recargar) — sólo a quien podía verla.
+  for (const a of active) await broadcastAlertScoped(server.prisma, opts.camera.id, { type: 'alert_resolved', alertId: a.id })
 
   // Registro separado de recuperación (resolved+read: no afecta la campana).
   const rec = await server.prisma.alert.create({
@@ -101,7 +101,7 @@ export async function recoverCameraAlert(server: FastifyInstance, opts: {
       resolved: true, resolvedAt: now, readAt: now,
     },
   })
-  broadcastAlert({
+  await broadcastAlertScoped(server.prisma, opts.camera.id, {
     type: 'alert',
     alert: {
       id: rec.id, type: rec.type, severity: rec.severity, message: rec.message,
@@ -135,7 +135,7 @@ export async function resolveCameraAlertQuiet(
     where: { cameraId, type: type as any, resolved: false },
     data: { resolved: true, resolvedAt: new Date() },
   })
-  for (const a of active) broadcastAlert({ type: 'alert_resolved', alertId: a.id })
+  for (const a of active) await broadcastAlertScoped(server.prisma, cameraId, { type: 'alert_resolved', alertId: a.id })
   server.log.info(`[camera-health] camera_alert_resolved cameraId=${cameraId} type=${type} count=${active.length} quiet=true`)
   return active.length
 }

@@ -12,6 +12,7 @@ import { validateAndUpdateCameraHealth } from '../services/stream-validator'
 import { resolveCameraStatus } from '../services/camera-status-truth'
 import { AuditAction } from '../services/audit'
 import { decryptNvrPassword as decryptPass } from '../services/credentials'
+import { getViewableCameraIds } from '../services/camera-scope'
 
 const sanitizeRtsp = (s: string | null | undefined): string | null => {
   if (!s) return s ?? null
@@ -59,11 +60,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         orderBy: [{ nvrId: 'asc' }, { channel: 'asc' }],
       })
     } else {
-      const perms = await server.prisma.userPermission.findMany({
-        where: { userId: user.sub, cameraId: { not: null }, canView: true },
-        select: { cameraId: true },
-      })
-      const cameraIds = perms.map((p: any) => p.cameraId!).filter(Boolean)
+      const cameraIds = await getViewableCameraIds(server.prisma, user.sub)
       cameras = await server.prisma.camera.findMany({
         where: { id: { in: cameraIds }, ...(nvrId ? { nvrId } : {}) },
         include: { nvr: { select: { id: true, name: true, ipAddress: true } } },

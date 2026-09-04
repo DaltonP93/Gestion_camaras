@@ -55,3 +55,25 @@ export function alertWhere(status: AlertStatusFilter, severity: AlertSeverityFil
   if (severity !== 'all') (where as Prisma.AlertWhereInput).severity = severity
   return where
 }
+
+// Scope de VISIBILIDAD por cámara para alertas (RBAC / DEV14):
+//   ADMIN          → sin restricción ({}).
+//   resto de roles → sólo alertas de sus cámaras `canView`, MÁS las alertas sin
+//                    cameraId (sistema/NVR, no específicas de cámara) que siguen
+//                    visibles para todos. Filtro: cameraId IN (allowed) OR cameraId IS NULL.
+// `allowedCameraIds` proviene de getViewableCameraIds (camera-scope.ts).
+export function alertCameraScopeWhere(isAdmin: boolean, allowedCameraIds: string[]): Prisma.AlertWhereInput {
+  if (isAdmin) return {}
+  return { OR: [{ cameraId: { in: allowedCameraIds } }, { cameraId: null }] }
+}
+
+// Combina un `where` de estado/severidad con el scope de cámara sin que uno pise al
+// otro (el scope usa OR; usar AND evita clobber si el where tuviera su propio OR).
+// scope vacío (ADMIN) ⇒ devuelve el where sin tocar.
+export function withAlertScope(
+  where: Prisma.AlertWhereInput,
+  scope: Prisma.AlertWhereInput,
+): Prisma.AlertWhereInput {
+  if (!scope || Object.keys(scope).length === 0) return where
+  return { AND: [where, scope] }
+}
