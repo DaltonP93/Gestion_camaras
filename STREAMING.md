@@ -6,10 +6,12 @@
 NVR Hikvision (RTSP puerto 554)
   └─ MediaMTX — pull on-demand (sourceOnDemand: true)
        ├─ HLS  (puerto 8888) → nginx /hls/ → Navegador (hls.js)   ~6s latencia
-       └─ WebRTC (puerto 8889) → nginx /webrtc/ → Navegador       ~500ms latencia
+       └─ WebRTC (puerto 8889) → red confiable / futuro relay     ~500ms latencia
 ```
 
-MediaMTX se conecta al NVR solo cuando hay un viewer activo y corta la conexión RTSP tras 30 segundos sin viewers (`sourceOnDemandCloseAfter: 30s`).
+MediaMTX se conecta al NVR sólo cuando hay un lector. VisionCore cierra la
+sesión explícitamente al salir o cambiar de vista; `sourceOnDemandCloseAfter:
+10m` es únicamente el GC de respaldo para una limpieza que no haya llegado.
 
 ---
 
@@ -17,10 +19,10 @@ MediaMTX se conecta al NVR solo cuando hay un viewer activo y corta la conexión
 
 | IP | Canales | Descripción |
 |---|---|---|
-| 192.168.1.10 | 62 | NVR principal |
-| 192.168.1.110 | 16 | NVR secundario A |
-| 192.168.1.111 | 32 | NVR secundario B |
-| 192.168.1.112 | 31 | NVR secundario C |
+| <ip_nvr_1> | <n> | NVR principal |
+| <ip_nvr_2> | <n> | NVR secundario A |
+| <ip_nvr_3> | <n> | NVR secundario B |
+| <ip_nvr_4> | <n> | NVR secundario C |
 
 ---
 
@@ -34,10 +36,10 @@ rtsp://<usuario>:<contraseña>@<ip_nvr>:554/Streaming/Channels/<canal>01
 rtsp://<usuario>:<contraseña>@<ip_nvr>:554/Streaming/Channels/<canal>02
 ```
 
-**Ejemplo — Canal 3 del NVR 192.168.1.10:**
+**Ejemplo — Canal 3 del NVR `<ip_nvr>`:**
 ```
-rtsp://admin:Password@192.168.1.10:554/Streaming/Channels/301   # main
-rtsp://admin:Password@192.168.1.10:554/Streaming/Channels/302   # sub
+rtsp://<usuario>:<contraseña>@<ip_nvr>:554/Streaming/Channels/301   # main
+rtsp://<usuario>:<contraseña>@<ip_nvr>:554/Streaming/Channels/302   # sub
 ```
 
 > VisionCore usa el substream (`sub`) por defecto para cada cámara. Se puede cambiar individualmente en la UI.
@@ -63,7 +65,8 @@ El bloque `~^nvr_.*` en `mediamtx.yml` aplica la configuración on-demand a todo
 2. La API descifra la contraseña AES del NVR y llama a `POST /v3/config/paths/add/nvr_<id>` en MediaMTX con la URL RTSP
 3. MediaMTX registra el path con `sourceOnDemand: true` pero aún no conecta al NVR
 4. El frontend carga `index.m3u8` → MediaMTX conecta al NVR por RTSP y comienza a generar segmentos HLS
-5. Sin viewers por 30s → MediaMTX corta la conexión RTSP automáticamente
+5. Al salir/cambiar, el API retira la sesión; el cierre on-demand de 10 min es
+   sólo una red de seguridad de MediaMTX
 
 ---
 
@@ -170,21 +173,36 @@ completo de sesiones, no una por una.
 
 ---
 
+## Evidencia C21: liberación frente a preparación
+
+La validación real del 2026-09-01, con `MAX_TRANSCODE_SESSIONS=2`, separó los
+dos tiempos que la interfaz antes hacía parecer uno solo:
+
+- `exit_focus` terminó FFmpeg y el conteo bajó en el mismo segundo;
+- una nueva solicitud ocupó el cupo en aproximadamente 0,1–0,2 s;
+- `waitForHlsReady` tardó aproximadamente 5,1–6,8 s en producir HLS usable;
+- al terminar la prueba el conteo quedó en cero.
+
+Por tanto, reducir `STREAM_HD_IDLE_TIMEOUT` no acelera un cierre normal: sólo
+debilitaría la red de seguridad ante pestañas o redes interrumpidas. C21 expone
+por separado los gauges de capacidad y el histograma
+`visioncore_live_transcode_hls_ready_seconds`.
+
 ## Configuración MediaMTX relevante
 
 ```yaml
 # infra/mediamtx/mediamtx.yml
-hlsVariant: mpegts          # Compatibilidad máxima con hls.js
-hlsSegmentCount: 3          # Buffer de 3 segmentos
+hlsVariant: fmp4            # Tolera B-frames/DTS reordenado del origen
+hlsSegmentCount: 7          # Ventana de segmentos disponible
 hlsSegmentDuration: 2s      # Latencia total ~6s
-hlsCookies: no              # Sin cookie auth en HLS (nginx controla acceso)
-hlsAlwaysRemux: yes         # Genera HLS aunque no haya viewers activos
+hlsMuxerCloseAfter: 10m
+hlsAlwaysRemux: no          # Se genera bajo demanda
 hlsAllowOrigin: "*"         # CORS abierto (el acceso real lo gestiona la API)
 
 paths:
   ~^nvr_.*:
     sourceOnDemandStartTimeout: 15s   # Tiempo máx. para que el NVR responda
-    sourceOnDemandCloseAfter: 30s     # Cierra RTSP tras 30s sin viewers
+    sourceOnDemandCloseAfter: 10m     # GC de respaldo; el API cierra antes
 ```
 
 ---
@@ -203,7 +221,7 @@ curl http://localhost:9997/v3/paths/get/nvr_<cameraId>
 # Registrar stream on-demand manualmente
 curl -X POST http://localhost:9997/v3/config/paths/add/nvr_test \
   -H "Content-Type: application/json" \
-  -d '{"source":"rtsp://admin:pass@192.168.1.10:554/Streaming/Channels/101","sourceOnDemand":true}'
+  -d '{"source":"rtsp://<usuario>:<contraseña>@<ip_nvr>:554/Streaming/Channels/101","sourceOnDemand":true}'
 
 # Eliminar un stream
 curl -X DELETE http://localhost:9997/v3/config/paths/delete/nvr_test
@@ -218,12 +236,12 @@ curl -X DELETE http://localhost:9997/v3/config/paths/delete/nvr_test
 bash scripts/probe-camera.sh <ip_nvr> <canal> <usuario> <contraseña>
 
 # Ejemplo: canal 5 del NVR principal
-bash scripts/probe-camera.sh 192.168.1.10 5 admin MiClave123
+bash scripts/probe-camera.sh <ip_nvr> 5 <usuario> <contraseña>
 
 # Prueba manual directa
 ffprobe -v quiet -print_format json -show_streams \
   -rtsp_transport tcp \
-  "rtsp://admin:pass@192.168.1.10:554/Streaming/Channels/501"
+  "rtsp://<usuario>:<contraseña>@<ip_nvr>:554/Streaming/Channels/501"
 ```
 
 La salida indica el codec (`h264` o `hevc`), resolución, FPS y bitrate de cada stream.
@@ -239,4 +257,6 @@ La salida indica el codec (`h264` o `hevc`), resolución, FPS y bitrate de cada 
 | Uso recomendado | Monitoreo general y multiview | PTZ y operación en tiempo real |
 | ICE externo | No requerido | No requerido (red local) |
 
-El frontend usa HLS por defecto. WebRTC se puede activar manualmente por stream desde la UI.
+El frontend web usa HLS por defecto. El cliente nativo previsto y su requisito
+de relay autenticado se documentan en
+[`docs/native/LIVE_CLIENT_ARCHITECTURE.md`](docs/native/LIVE_CLIENT_ARCHITECTURE.md).

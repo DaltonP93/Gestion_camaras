@@ -89,7 +89,7 @@ Configurables individualmente desde la UI en **Configuración → Alertas**.
 Gmail (App Password):   smtp.gmail.com  puerto 587  secure: false
 Office 365:             smtp.office365.com  puerto 587  secure: false
 SSL directo (port 465): smtp.ejemplo.com  puerto 465  secure: true
-Relay interno sin auth: 192.168.1.50  puerto 25  secure: false
+Relay interno sin auth: <smtp_relay_host>  puerto 25  secure: false
 ```
 
 > Para Gmail con 2FA, generar una "Contraseña de aplicación" en la configuración de la cuenta Google.

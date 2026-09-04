@@ -27,16 +27,24 @@ import appearancePlugin from './routes/appearance'
 import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
+import { mediaGrantsRoutes } from './routes/mediaGrants'
+import { getMediaGrantManager, startRevokeRecovery } from './services/media/grant-service'
+import { SourceLifecycleController, startSourceLifecyclePoller, createMediaMtxPathLister } from './services/media/source-lifecycle'
 import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
 import { adminRoutes } from './routes/admin'
 import { analyticsRoutes } from './routes/analytics'
+import { aiDemoRoutes } from './routes/aiDemo'
 import { diagnosticsRoutes } from './routes/diagnostics'
+import { integrationsRoutes } from './routes/integrations'
+import { onvifRoutes } from './routes/onvif'
+import { hikConnectRoutes } from './routes/hikConnect'
+import { mediamtxAuthRoutes } from './routes/mediamtxAuth'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
-import { publishStream } from './services/stream'
-import { decryptNvrPasswordOrNull as decryptPass } from './services/credentials'
+import { publishStream, getActiveTranscodesList, stopTranscodeProcess } from './services/stream'
+import { decryptNvrPasswordOrNull as decryptPass, validateNvrCredentialKey } from './services/credentials'
 
 const server = Fastify({
   logger: {
@@ -72,8 +80,12 @@ async function main() {
   if (!process.env.JWT_REFRESH_SECRET) {
     server.log.warn('[startup] JWT_REFRESH_SECRET no definido — se usará JWT_SECRET como fallback. Define JWT_REFRESH_SECRET en .env para mayor seguridad.')
   }
-  if (!process.env.NVR_CREDENTIAL_KEY) {
-    server.log.warn('[startup] NVR_CREDENTIAL_KEY no definido — se usará JWT_SECRET para cifrar credenciales del NVR. Define NVR_CREDENTIAL_KEY en .env.')
+  try {
+    const nvrKeyWarning = validateNvrCredentialKey()
+    if (nvrKeyWarning) server.log.warn(nvrKeyWarning)
+  } catch (err) {
+    server.log.error((err as Error).message)
+    process.exit(1)
   }
   if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
     server.log.warn('[startup] JWT_SECRET parece muy corto (< 32 chars). Usa un secreto de al menos 32 caracteres aleatorios.')
@@ -193,11 +205,41 @@ async function main() {
   await server.register(profileRoutes, { prefix: '/api/profile' })
   await server.register(alertSettingsRoutes, { prefix: '/api/alerts' })
   await server.register(liveViewRoutes, { prefix: '/api/live-view' })
+  // C22.1 (P1): las rutas del plano de medios existen SÓLO con la flag activa.
+  // Con la flag apagada no se registran ⇒ 404 (comportamiento idéntico a C21).
+  if (process.env.NATIVE_PLAYBACK_ENABLED === 'true') {
+    await server.register(mediaGrantsRoutes, { prefix: '/api/live-view' })
+  }
   await server.register(searchRoutes, { prefix: '/api/search' })
   await server.register(nvrConfigRoutes, { prefix: '/api/nvrs' })
   await server.register(adminRoutes, { prefix: '/api/admin' })
   await server.register(analyticsRoutes, { prefix: '/api/analytics' })
+  // C22.1 (P1): la ruta demo de IA existe SÓLO con la flag activa (si no, 404).
+  if (process.env.AI_EVENTS_ENABLED === 'true') {
+    await server.register(aiDemoRoutes, { prefix: '/api/ai' })
+  }
   await server.register(diagnosticsRoutes, { prefix: '/api/diagnostics' })
+  // Estado de integraciones (P1): SIEMPRE registrado (no condicional a flags), para
+  // que la UI muestre "habilitado/deshabilitado" sin depender de un 404. Sólo reporta
+  // el estado de las flags; nunca secretos ni configuración sensible.
+  await server.register(integrationsRoutes, { prefix: '/api/integrations' })
+  // ONVIF (P1): rutas existen SÓLO con la flag activa. Con la flag apagada no se
+  // registran ⇒ 404 y ningún I/O ONVIF posible (comportamiento idéntico).
+  if (process.env.ONVIF_ENABLED === 'true') {
+    await server.register(onvifRoutes, { prefix: '/api/onvif' })
+  }
+  // Hik-Connect (P1): provider de conectividad remota (fallback vía nube). Las
+  // rutas existen SÓLO con la flag activa; con la flag apagada no se registran ⇒
+  // 404 y ningún I/O Hik-Connect posible (comportamiento idéntico).
+  if (process.env.HIK_CONNECT_ENABLED === 'true') {
+    await server.register(hikConnectRoutes, { prefix: '/api/hik-connect' })
+  }
+  // A1 · F0 — auth-hook de MediaMTX: rutas existen SÓLO con la flag activa. Con la
+  // flag apagada NO se registran ⇒ 404, ningún grant relay_session ni kick posible
+  // (comportamiento idéntico a hoy). A1 sigue NO-GO: esto es sólo código.
+  if (process.env.NATIVE_MEDIA_RELAY_ENABLED === 'true') {
+    await server.register(mediamtxAuthRoutes, { prefix: '/internal/mediamtx' })
+  }
   await server.register(metricsRoutes)  // /metrics (Prometheus), sin prefijo /api
   await server.register(wsHandler, { prefix: '/ws' })
 
@@ -254,12 +296,78 @@ async function main() {
   startHealthWorker(server)
   startSyncWorker(server)
 
+  // B1 — Recuperación de la revocación durable de medios. Si Redis cae durante un
+  // logout / cambio de permisos, `revokeUserMediaGrants` encola el usuario y el
+  // plano falla cerrado; aquí se drena ese outbox al reconectar Redis y en un
+  // barrido periódico, para que ningún grant viejo re-valide tras el outage.
+  // Inerte con las flags OFF y sin outage previo (no toca Redis si no hay pendientes).
+  const revokeRecovery = startRevokeRecovery(server)
+  server.addHook('onClose', async () => revokeRecovery.stop())
+
+  // Apagado elegante (A2): terminar los FFmpeg de transcode en vivo por su vía
+  // terminal ya existente cuando el servidor cierra. Los FFmpeg de preview/VOD
+  // se cierran en su propio hook onClose (routes/recordings.ts).
+  server.addHook('onClose', async () => {
+    for (const t of getActiveTranscodesList()) {
+      try { stopTranscodeProcess(t.streamPath) } catch { /* noop */ }
+    }
+  })
+
+  // N1 — Lifecycle de fuente MediaMTX → registro de instancia del plano de medios.
+  // SÓLO con NATIVE_SOURCE_LIFECYCLE_ENABLED activa: con la flag apagada no se
+  // arranca, ningún path se registra ⇒ `issue` sigue negándose (NO_MEDIA_INSTANCE)
+  // ⇒ comportamiento idéntico a C22.2. Sólo lee la API de MediaMTX (no la altera).
+  if (process.env.NATIVE_SOURCE_LIFECYCLE_ENABLED === 'true') {
+    const srcController = new SourceLifecycleController(getMediaGrantManager(server), {
+      log: (m) => server.log.info(`media_source ${m}`),
+    })
+    const srcPoller = startSourceLifecyclePoller(
+      srcController,
+      createMediaMtxPathLister(),
+      Number(process.env.NATIVE_SOURCE_LIFECYCLE_INTERVAL_MS) || 30_000,
+      (m) => server.log.warn(`media_source ${m}`),
+    )
+    server.addHook('onClose', async () => srcPoller.stop())
+    server.log.info('[startup] N1 source-lifecycle poller activo (NATIVE_SOURCE_LIFECYCLE_ENABLED=true)')
+  }
+
   // ─── Iniciar servidor ─────────────────────────────────────
   const host = process.env.API_HOST || '0.0.0.0'
   const port = parseInt(process.env.API_PORT || '4000')
 
   await server.listen({ host, port })
   server.log.info(`VisionCore API v1.0.0 commit=${COMMIT_SHA} corriendo en http://${host}:${port}`)
+
+  // ─── Apagado elegante (A2) ────────────────────────────────
+  // dumb-init reenvía SIGTERM a Node; sin este manejador el proceso salía de
+  // inmediato sin drenar Fastify ni disparar los hooks onClose (srcPoller,
+  // terminación de FFmpeg de transcode/preview/VOD), dejando hijos huérfanos en
+  // cada deploy/restart (invariante 5). server.close() ejecuta esos onClose.
+  // Idempotente: una segunda señal durante el cierre se ignora.
+  let shuttingDown = false
+  const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 15_000
+  const gracefulShutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return
+    shuttingDown = true
+    server.log.info(`[shutdown] señal ${signal} recibida — cerrando el servidor`)
+    const forceTimer = setTimeout(() => {
+      server.log.error(`[shutdown] timeout de ${SHUTDOWN_TIMEOUT_MS}ms — forzando salida`)
+      process.exit(1)
+    }, SHUTDOWN_TIMEOUT_MS)
+    forceTimer.unref?.()
+    try {
+      await server.close()
+      clearTimeout(forceTimer)
+      server.log.info('[shutdown] cierre completo')
+      process.exit(0)
+    } catch (err) {
+      clearTimeout(forceTimer)
+      server.log.error(`[shutdown] error durante el cierre: ${err instanceof Error ? err.message : String(err)}`)
+      process.exit(1)
+    }
+  }
+  process.once('SIGTERM', () => { void gracefulShutdown('SIGTERM') })
+  process.once('SIGINT', () => { void gracefulShutdown('SIGINT') })
   // TASK 1 — config efectiva del preview de grabaciones (commit + presupuesto real
   // + detección de override viejo). Confirma qué código/presupuesto corren.
   logPreviewStartupConfig((m) => server.log.info(m), COMMIT_SHA)

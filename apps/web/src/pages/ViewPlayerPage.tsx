@@ -14,6 +14,7 @@ import { createScopeGuard } from '@/lib/scopeGuard'
 import { EXIT_FULLSCREEN } from '@/lib/closeReasons'
 import { useViewportSessionLifecycle } from '@/lib/useViewportSessionLifecycle'
 import { pageShowAction } from '@/lib/bfcachePolicy'
+import { hdStartupMessage } from '@/lib/hdStartupMessage'
 import { VideoPlayer } from '@/components/cameras/VideoPlayer'
 import type { CameraPlaybackError } from '@/components/cameras/VideoPlayer'
 import { clsx } from 'clsx'
@@ -585,6 +586,13 @@ export function ViewPlayerPage() {
     const activeHls = fsState.hdStream?.hls ?? fsSlot?.stream?.hls
     const isHd      = fsState.phase === 'fullscreen_hd' && !!fsState.hdStream
     const badge     = buildStreamBadge(fsState, fsCamera)
+    const preparingHd = fsState.phase === 'starting_hd'
+      ? hdStartupMessage({
+          mainCodec: fsCamera?.mainCodec,
+          transcodingAvailable: true,
+          requestedType: fsState.hdStreamType,
+        })
+      : null
 
     return (
       <div className="flex flex-col h-full bg-black">
@@ -636,6 +644,7 @@ export function ViewPlayerPage() {
               streamResolution={isHd ? (fsCamera?.mainResolution ?? undefined) : (fsCamera?.subResolution ?? undefined)}
               onFullscreen={exitFullscreen}
               onStreamError={handleFsStreamError}
+              preparingMessage={preparingHd}
               objectFit={objectFit === 'adapt' ? 'contain' : objectFit}
               className="w-full h-full"
             />
@@ -645,7 +654,7 @@ export function ViewPlayerPage() {
               <span className="text-sm text-surface-400">{fsCamera?.name ?? 'Sin stream'}</span>
               {fsState.phase === 'starting_hd' && (
                 <span className="text-xs text-surface-500 flex items-center gap-1">
-                  <Loader2 size={11} className="animate-spin" /> Iniciando stream HD...
+                  <Loader2 size={11} className="animate-spin" /> {preparingHd}
                 </span>
               )}
             </div>

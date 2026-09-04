@@ -187,3 +187,82 @@ export const apiUpload = <T>(url: string, formData: FormData) =>
   api.post<T>(url, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   }).then((r) => r.data)
+
+// ─── Integraciones: estado de flags (ONVIF / Hik-Connect) ─────
+// SIEMPRE disponible (la ruta backend no es condicional a flags): devuelve
+// { onvif:{enabled}, hikConnect:{enabled} } para que la UI muestre el estado.
+import type {
+  IntegrationsStatus,
+  OnvifCredentials,
+  OnvifDiscoveredDevice,
+  OnvifDeviceInformation,
+  OnvifProfile,
+  OnvifPtzConfiguration,
+  OnvifImagingSettings,
+  OnvifImagingInput,
+  OnvifPtzVector,
+  HikConnectTokenStatus,
+  HikConnectHlsRequest,
+  HikConnectHlsResponse,
+  HikConnectIsapiRequest,
+  HikConnectIsapiResponse,
+} from '@/types'
+
+export const integrationsApi = {
+  getStatus: () => apiGet<IntegrationsStatus>('/integrations/status'),
+}
+
+// ─── ONVIF (ADMIN-only en el backend; rutas existen sólo con ONVIF_ENABLED) ──
+// Todas las credenciales del dispositivo viajan en el body (`creds`) y NUNCA se
+// persisten ni loguean en el cliente. La URI RTSP de getStreamUri se devuelve
+// para mostrarse transitoriamente en la UI admin; el cliente no la almacena.
+export const onvifApi = {
+  discover: () => apiPost<{ devices: OnvifDiscoveredDevice[] }>('/onvif/discover'),
+
+  deviceInformation: (deviceUrl: string, creds: OnvifCredentials) =>
+    apiPost<OnvifDeviceInformation>('/onvif/device-information', { deviceUrl, creds }),
+
+  profiles: (deviceUrl: string, creds: OnvifCredentials) =>
+    apiPost<{ profiles: OnvifProfile[] }>('/onvif/profiles', { deviceUrl, creds }),
+
+  streamUri: (deviceUrl: string, creds: OnvifCredentials, profileToken: string) =>
+    apiPost<{ uri: string }>('/onvif/stream-uri', { deviceUrl, creds, profileToken }),
+
+  ptzConfigurations: (deviceUrl: string, creds: OnvifCredentials) =>
+    apiPost<{ configurations: OnvifPtzConfiguration[] }>('/onvif/ptz/configurations', { deviceUrl, creds }),
+
+  ptzMove: (deviceUrl: string, creds: OnvifCredentials, profileToken: string, velocity: OnvifPtzVector) =>
+    apiPost<{ ok: true }>('/onvif/ptz/move', { deviceUrl, creds, profileToken, velocity }),
+
+  ptzStop: (deviceUrl: string, creds: OnvifCredentials, profileToken: string) =>
+    apiPost<{ ok: true }>('/onvif/ptz/stop', { deviceUrl, creds, profileToken }),
+
+  imagingGet: (deviceUrl: string, creds: OnvifCredentials, videoSourceToken: string) =>
+    apiPost<{ settings: OnvifImagingSettings }>('/onvif/imaging/get', { deviceUrl, creds, videoSourceToken }),
+
+  imagingSet: (deviceUrl: string, creds: OnvifCredentials, videoSourceToken: string, settings: OnvifImagingInput) =>
+    apiPost<{ ok: true }>('/onvif/imaging/set', { deviceUrl, creds, videoSourceToken, settings }),
+}
+
+// ─── Hik-Connect (ADMIN-only; rutas existen sólo con HIK_CONNECT_ENABLED) ────
+// AppKey/SecretKey viven SÓLO en el servidor (env): jamás se piden ni viajan
+// desde el cliente. `tokenStatus` devuelve METADATOS (areaDomain + expiración),
+// nunca el accessToken crudo. La URL HLS y la respuesta ISAPI son transitorias:
+// el cliente no las persiste ni loguea.
+export const hikConnectApi = {
+  tokenStatus: () => apiPost<HikConnectTokenStatus>('/hik-connect/token'),
+
+  getHls: ({ deviceSerial, channelNo }: HikConnectHlsRequest) =>
+    apiPost<HikConnectHlsResponse>('/hik-connect/hls', {
+      deviceSerial,
+      ...(channelNo !== undefined ? { channelNo } : {}),
+    }),
+
+  proxyIsapi: ({ deviceSerial, method, isapiPath, body }: HikConnectIsapiRequest) =>
+    apiPost<HikConnectIsapiResponse>('/hik-connect/isapi', {
+      deviceSerial,
+      method,
+      isapiPath,
+      ...(body !== undefined ? { body } : {}),
+    }),
+}

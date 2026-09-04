@@ -8,6 +8,7 @@ import { getStreamPath, getHlsUrl, getWebRtcUrl, publishStream, removeStream, re
 import type { NVR, Camera } from '@prisma/client'
 import { decryptNvrPassword as decryptPass } from './credentials'
 import { resolveGridProfile } from './transcode-profile'
+import { liveTranscodeHlsReadySeconds, liveTranscodeStartupTotal, liveStartupStageSeconds } from './metrics'
 import {
   getSessionTtl, decideSessionExpiry, decideProcessTermination, decideStopTermination,
   decideAttemptRelease, decideStaleSessionDelete, orphanViewKeys,
@@ -431,6 +432,15 @@ function currentProcessInstance(streamPath: string): string | undefined {
   return processInstances.get(streamPath)
 }
 function clearProcessInstance(streamPath: string): void { processInstances.delete(streamPath) }
+
+/**
+ * Instancia de proceso REAL vigente para un path (para el plano de grants de
+ * medios, C22.1/P0-2). Sólo existe para paths transcodificados main_h264; para
+ * el sub/main directo el plano usa el registro de instancias por path.
+ */
+export function getCurrentProcessInstance(streamPath: string): string | undefined {
+  return currentProcessInstance(streamPath)
+}
 
 /** Limpia todo el estado asociado a una instancia main_h264 ya terminada. */
 function clearTerminatedProcessState(streamPath: string, expectedInstanceId?: string): void {
@@ -2550,6 +2560,24 @@ async function startStreamCore(
         streamPath, TRANSCODE_HLS_READY_TIMEOUT_MS, 300,
         () => isTranscodeProcessAlive(streamPath),
       )
+      // Métrica del tiempo que el operador realmente percibe al abrir HD. La
+      // prueba de producción de C21 demostró que el cupo se libera en el mismo
+      // segundo; los ~5–7 s restantes son esta preparación HLS. Separar los
+      // desenlaces evita volver a confundir latencia de arranque con una fuga.
+      const startupOutcome = ready
+        ? 'ready'
+        : processExited
+          ? 'process_exited'
+          : manifestVisible
+            ? 'partial_manifest'
+            : 'timeout'
+      liveTranscodeHlsReadySeconds.observe({ outcome: startupOutcome }, elapsedMs / 1000)
+      liveTranscodeStartupTotal.inc({ outcome: startupOutcome })
+      // C22 · misma medición expuesta en el histograma de etapas (cardinalidad
+      // acotada: stage/outcome de conjuntos fijos). El resto de etapas
+      // (request→admission, close→cupo, espera, cliente) se documentan en
+      // docs/native/METRICS_LIVE_STARTUP.md.
+      liveStartupStageSeconds.observe({ stage: 'spawn_to_hls_ready', outcome: startupOutcome }, elapsedMs / 1000)
 
       if (!ready) {
         const stderrSnippet = getTranscodeStderr(streamPath)

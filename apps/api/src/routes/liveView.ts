@@ -2,8 +2,22 @@
 // Endpoint de viewport heartbeat: reconcilia cámaras visibles sin N llamadas individuales
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTranscodesDiagnostic, getStreamCounts, getSessionsDiagnostic, getStreamIdleTimeoutMs, getStreamHdIdleTimeoutMs } from '../services/stream-manager'
+import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTranscodesDiagnostic, getStreamCounts, getSessionsDiagnostic, getStreamIdleTimeoutMs, getStreamHdIdleTimeoutMs, getTranscodeSlots } from '../services/stream-manager'
 import { getFfmpegCapabilities, isTranscodingEnabled } from '../services/stream'
+import { negotiateLivePlaybackCapabilities } from '../services/live-playback-capabilities'
+import { decideLivePlayback } from '../services/live-playback-decision'
+import { getNativeReadiness } from '../services/media/grant-service'
+import { hasMediaAccess, deriveEffectiveType } from '../services/media/native-readiness'
+
+// C22 · flags apagadas por defecto ⇒ la respuesta es idéntica a C21.
+const NATIVE_PLAYBACK_ENABLED = process.env.NATIVE_PLAYBACK_ENABLED === 'true'
+
+function normalizeCodec(raw: string | null | undefined): 'h264' | 'hevc' | 'unknown' {
+  if (!raw) return 'unknown'
+  if (/hevc|h\.?265|hvc1/i.test(raw)) return 'hevc'
+  if (/h\.?264|avc/i.test(raw)) return 'h264'
+  return 'unknown'
+}
 
 const heartbeatSchema = z.object({
   viewId:           z.string().min(1).max(128),
@@ -13,6 +27,18 @@ const heartbeatSchema = z.object({
   suppressStartCameraIds: z.array(z.string()).max(25).optional(),
   layout:           z.number().int().positive().optional(),
   page:             z.number().int().min(0).optional(),
+})
+
+const clientCapabilitiesSchema = z.object({
+  runtime: z.enum(['web', 'windows', 'android', 'ios']),
+  codecs: z.array(z.enum(['h264', 'hevc'])).max(4),
+  hardwareDecodedCodecs: z.array(z.enum(['h264', 'hevc'])).max(4),
+  transports: z.array(z.enum(['hls', 'whep', 'rtsps'])).max(6),
+  maxHardwareDecoders: z.number().int().positive().max(1024).optional(),
+  // C22 (opcional): si se envían, y NATIVE_PLAYBACK_ENABLED está activo, la
+  // respuesta incluye una decisión explícita por-cámara (con eco de scope).
+  cameraId: z.string().min(1).max(128).optional(),
+  viewId: z.string().min(1).max(128).optional(),
 })
 
 export const liveViewRoutes: FastifyPluginAsync = async (server) => {
@@ -92,6 +118,69 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
       streamIdleTimeoutMs:   getStreamIdleTimeoutMs(),
       streamHdIdleTimeoutMs: getStreamHdIdleTimeoutMs(),
     })
+  })
+
+  // POST /api/live-view/client-capabilities
+  // Negocia capacidades SIN abrir un stream ni devolver una URL. Es la base
+  // del cliente nativo multiplataforma: hasta que exista relay autenticado con
+  // credenciales efímeras, `nativeDirect.available` permanece explícitamente
+  // false y el único fallback HEVC habilitado sigue siendo el del servidor.
+  server.post('/client-capabilities', { preHandler: [server.authenticate] }, async (request, reply) => {
+    const input = clientCapabilitiesSchema.parse(request.body)
+    const ffmpeg = getFfmpegCapabilities()
+    const serverCaps = {
+      ffmpegAvailable: ffmpeg.available,
+      transcodingEnabled: isTranscodingEnabled(),
+      maxTranscodeSessions: MAX_TRANSCODE_SESSIONS,
+    }
+    // Respuesta base = contrato C21 (sin cambios).
+    const base = negotiateLivePlaybackCapabilities(input, serverCaps)
+
+    // C22 (aditivo): con la flag activa y un cameraId, se agrega una DECISIÓN
+    // explícita por-cámara. Con la flag apagada la respuesta es idéntica a C21.
+    if (NATIVE_PLAYBACK_ENABLED && input.cameraId) {
+      const user = request.user
+      const cameraId = input.cameraId
+      const camera = await server.prisma.camera.findUnique({ where: { id: cameraId }, select: { mainCodec: true } })
+      const effectiveType = deriveEffectiveType(camera?.mainCodec)
+      // RBAC compartido con la EMISIÓN: live siempre; hd sólo si canHighQuality.
+      const perm = (user.role === 'ADMIN' || user.role === 'SUPERVISOR') ? null : await server.prisma.userPermission.findFirst({
+        where: { userId: user.sub, cameraId }, select: { canView: true, canHighQuality: true },
+      })
+      const access = {
+        live: hasMediaAccess({ role: user.role, effectiveType: 'sub', perm }),
+        hd: hasMediaAccess({ role: user.role, effectiveType: 'main', perm }),
+      }
+      const slots = getTranscodeSlots()
+      const availableTranscodeSlots = Math.max(0, slots.maxTranscodes - slots.activeProcessCount)
+      // Readiness UNIFICADA (mismo servicio que la emisión); ofrece transporte nativo.
+      const offersNativeTransport = input.transports.includes('rtsps') || input.transports.includes('whep')
+      const ready = await getNativeReadiness(server).evaluate(offersNativeTransport)
+      const decision = decideLivePlayback({
+        client: input,
+        server: serverCaps,
+        relayReady: ready.ready,
+        nativePlaybackEnabled: NATIVE_PLAYBACK_ENABLED,
+        camera: { mainCodec: normalizeCodec(camera?.mainCodec) },
+        capacity: { availableTranscodeSlots },
+        access,
+      })
+      // P0-3 · COHERENCIA: nativeDirect.available refleja EXACTAMENTE la decisión.
+      // Nunca se combina nativeDirect=false con una decisión nativa.
+      const isNative = decision.decision === 'native_hevc' || decision.decision === 'native_h264'
+      const coherent = {
+        ...base,
+        nativeDirect: {
+          ...base.nativeDirect,
+          available: isNative,
+          blockingReason: isNative ? null : base.nativeDirect.blockingReason,
+        },
+      }
+      // Eco de scope para que el cliente descarte respuestas tardías (viewport viejo).
+      return reply.send({ ...coherent, decision: { ...decision, cameraId, viewId: input.viewId ?? null } })
+    }
+
+    return reply.send(base)
   })
 
   // GET /api/live-view/transcodes

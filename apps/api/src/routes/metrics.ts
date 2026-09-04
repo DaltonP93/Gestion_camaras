@@ -11,6 +11,7 @@ import {
 } from '../services/metrics'
 import { getStreamConsumerRegistry } from '../services/stream-consumer-registry'
 import { getRecordingsMetrics } from './recordings'
+import { getTranscodeSlots } from '../services/stream-manager'
 
 const METRICS_TOKEN = process.env.METRICS_TOKEN || ''
 const ANALYTICS_URL = process.env.ANALYTICS_URL || 'http://analytics:8500'
@@ -39,6 +40,24 @@ function registerCollectorsOnce(): void {
     preview.set(undefined, m.previewSessions)
     vod.set(undefined, m.vodSessions)
     return [preview, vod]
+  })
+
+  // Capacidad de transcodificación de LiveView. `activeProcessCount` incluye
+  // procesos retenidos porque también ocupan un slot físico; así el tablero no
+  // puede afirmar que hay cupo cuando FFmpeg todavía lo consume.
+  registerMetricsCollector(() => {
+    const slots = getTranscodeSlots()
+    const capacity = new Gauge('visioncore_live_transcode_capacity', 'Capacidad maxima de FFmpeg para LiveView')
+    const active = new Gauge('visioncore_live_transcode_processes', 'Procesos FFmpeg que ocupan capacidad de LiveView')
+    const available = new Gauge('visioncore_live_transcode_available', 'Cupos de transcodificacion LiveView disponibles')
+    const starting = new Gauge('visioncore_live_transcode_starting', 'Transcodificaciones esperando HLS')
+    const retained = new Gauge('visioncore_live_transcode_retained', 'Procesos transcodificados retenidos sin sesion activa')
+    capacity.set(undefined, slots.maxTranscodes)
+    active.set(undefined, slots.activeProcessCount)
+    available.set(undefined, Math.max(0, slots.maxTranscodes - slots.activeProcessCount))
+    starting.set(undefined, slots.startingCount)
+    retained.set(undefined, slots.retainedCount)
+    return [capacity, active, available, starting, retained]
   })
 
   // Estado del servicio de analítica (best-effort, timeout corto).

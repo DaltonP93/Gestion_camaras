@@ -57,13 +57,16 @@ step "Backup de base de datos"
 if docker compose ps postgres 2>/dev/null | grep -q "running\|Up"; then
   BACKUP_FILE="backups/db_backup_$(date +%Y%m%d_%H%M%S).sql"
   mkdir -p backups
-  if docker compose exec -T postgres pg_dump -U visioncore visioncore > "$BACKUP_FILE" 2>/dev/null; then
+  # La base es visioncore_db (usuario visioncore); NO silenciar el error: si el
+  # backup falla mientras hay datos, abortar el deploy (el rollback depende de él).
+  if docker compose exec -T postgres pg_dump -U visioncore visioncore_db > "$BACKUP_FILE"; then
     ok "Backup guardado en $BACKUP_FILE"
   else
-    warn "No se pudo hacer backup de la DB (puede ser primera vez)"
+    rm -f "$BACKUP_FILE"
+    fail "El backup de la base de datos falló — se aborta el deploy. Revisá PostgreSQL antes de reintentar."
   fi
 else
-  warn "PostgreSQL no está corriendo — se omite backup"
+  warn "PostgreSQL no está corriendo — se omite backup (primera instalación)"
 fi
 
 # ── 4. Build ─────────────────────────────────────────────────

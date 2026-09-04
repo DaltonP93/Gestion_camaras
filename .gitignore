@@ -17,6 +17,10 @@ apps/api/.env
 apps/web/.env
 infra/**/.env
 
+# Frigate: config real con IPs/credenciales — nunca versionar (usar la plantilla
+# infra/frigate/config.example.yml). Solo la plantilla se versiona.
+infra/frigate/config.yml
+
 # Prisma generated
 apps/api/src/generated/
 

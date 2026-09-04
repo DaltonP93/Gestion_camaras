@@ -565,3 +565,119 @@ export interface AppearanceSettings {
   analyticsColor?: string | null
 }
 
+
+// ─── Integraciones (ONVIF / Hik-Connect) ──────────────────────
+// Estado que reporta GET /api/integrations/status. Sólo booleans de flags; el
+// backend NUNCA envía secretos ni configuración sensible por acá.
+export interface IntegrationsStatus {
+  onvif:      { enabled: boolean }
+  hikConnect: { enabled: boolean }
+}
+
+// Credenciales del dispositivo ONVIF. Viajan SÓLO en el body de las peticiones
+// ADMIN a /api/onvif/*; NUNCA se persisten (localStorage/sessionStorage) ni se
+// loguean en el cliente.
+export interface OnvifCredentials {
+  username: string
+  password: string
+}
+
+// Dispositivo descubierto por WS-Discovery. remoteAddress es la IP en la LAN.
+export interface OnvifDiscoveredDevice {
+  endpoint:      string | null
+  xaddrs:        string[]
+  types:         string | null
+  scopes:        string[]
+  remoteAddress: string
+}
+
+export interface OnvifDeviceInformation {
+  manufacturer:    string | null
+  model:           string | null
+  firmwareVersion: string | null
+  serialNumber:    string | null
+  hardwareId:      string | null
+}
+
+export interface OnvifProfile {
+  token:            string
+  name:             string | null
+  videoSourceToken: string | null
+  encoding:         string | null
+  width:            number | null
+  height:           number | null
+}
+
+export interface OnvifPtzConfiguration {
+  token:     string
+  name:      string | null
+  nodeToken: string | null
+}
+
+export type OnvifIrCutFilterMode = 'ON' | 'OFF' | 'AUTO'
+
+export interface OnvifImagingSettings {
+  brightness:      number | null
+  contrast:        number | null
+  colorSaturation: number | null
+  sharpness:       number | null
+  irCutFilter:     string | null
+  focus:           { autoFocusMode: string | null; defaultSpeed: number | null } | null
+}
+
+// Entrada para setImaging (todos opcionales). irCutFilter acotado a ON/OFF/AUTO.
+export interface OnvifImagingInput {
+  brightness?:      number
+  contrast?:        number
+  colorSaturation?: number
+  sharpness?:       number
+  irCutFilter?:     OnvifIrCutFilterMode
+  focus?:           { autoFocusMode?: 'AUTO' | 'MANUAL'; defaultSpeed?: number }
+}
+
+// Vector PTZ (pan/tilt/zoom), cada componente en [-1, 1].
+export interface OnvifPtzVector {
+  x?:    number
+  y?:    number
+  zoom?: number
+}
+
+// ─── Hik-Connect (proveedor cloud) ────────────────────────────
+// Metadatos del token que devuelve POST /api/hik-connect/token. NUNCA incluye el
+// accessToken crudo: sólo el areaDomain (base URL validada anti-SSRF) y su
+// expiración. `active` indica que hay un token vigente cacheado en el servidor.
+export interface HikConnectTokenStatus {
+  areaDomain:   string
+  expireTimeMs: number | null
+  active:       boolean
+}
+
+// Petición de URL HLS temporal (POST /api/hik-connect/hls).
+export interface HikConnectHlsRequest {
+  deviceSerial: string
+  channelNo?:   number
+}
+
+// Respuesta HLS: URL EFÍMERA (TTL ≤ 600s). Es transitoria: la UI la muestra para
+// copiarla, nunca la persiste ni la loguea.
+export interface HikConnectHlsResponse {
+  url:    string
+  ttlSec: number
+}
+
+export type HikConnectIsapiMethod = 'GET' | 'POST' | 'PUT' | 'DELETE'
+
+// Petición del ISAPI-proxy (POST /api/hik-connect/isapi). El `isapiPath` se valida
+// estrictamente en el servidor (anti-SSRF/inyección); debe empezar por /ISAPI/.
+export interface HikConnectIsapiRequest {
+  deviceSerial: string
+  method:       HikConnectIsapiMethod
+  isapiPath:    string
+  body?:        string
+}
+
+// Respuesta cruda del ISAPI-proxy. `result` es el cuerpo devuelto por el NVR; se
+// muestra transitoriamente en la UI admin, nunca se persiste ni loguea.
+export interface HikConnectIsapiResponse {
+  result: unknown
+}

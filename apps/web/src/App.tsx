@@ -15,6 +15,7 @@ import { NVRDetailPage } from '@/pages/NVRDetailPage'
 import { AlertsPage } from '@/pages/AlertsPage'
 import { ActivityPage } from '@/pages/ActivityPage'
 import { SettingsPage } from '@/pages/SettingsPage'
+import { IntegrationsPage } from '@/pages/IntegrationsPage'
 import { ViewsPage } from '@/pages/ViewsPage'
 import { ViewPlayerPage } from '@/pages/ViewPlayerPage'
 import { AppearancePage } from '@/pages/AppearancePage'
@@ -98,6 +99,11 @@ export default function App() {
           <Route path="settings" element={
             <ProtectedRoute roles={['ADMIN']}>
               <SettingsPage />
+            </ProtectedRoute>
+          } />
+          <Route path="integrations" element={
+            <ProtectedRoute roles={['ADMIN']}>
+              <IntegrationsPage />
             </ProtectedRoute>
           } />
           <Route path="profile" element={<ProfilePage />} />

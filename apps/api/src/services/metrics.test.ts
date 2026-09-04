@@ -1,6 +1,6 @@
 // Tests del registro de métricas Prometheus (formato de exposición).
 import { describe, it, expect } from 'vitest'
-import { Counter, Gauge, renderMetrics, registerMetricsCollector } from './metrics'
+import { Counter, Gauge, Histogram, renderMetrics, registerMetricsCollector } from './metrics'
 
 describe('Counter', () => {
   it('acumula y renderiza con labels', () => {
@@ -31,6 +31,32 @@ describe('Gauge', () => {
     const g = new Gauge('vc_g2', 'h')
     g.set({ msg: 'a"b\\c' }, 1)
     expect(g.render()).toContain('vc_g2{msg="a\\"b\\\\c"} 1')
+  })
+})
+
+describe('Histogram', () => {
+  it('renderiza buckets acumulativos, suma y conteo por labels', () => {
+    const h = new Histogram('vc_seconds', 'latencia', [1, 5, 10])
+    h.observe({ result: 'ready' }, 0.5)
+    h.observe({ result: 'ready' }, 7)
+    h.observe({ result: 'timeout' }, 12)
+
+    const out = h.render()
+    expect(out).toContain('# TYPE vc_seconds histogram')
+    expect(out).toContain('vc_seconds_bucket{result="ready",le="1"} 1')
+    expect(out).toContain('vc_seconds_bucket{result="ready",le="5"} 1')
+    expect(out).toContain('vc_seconds_bucket{result="ready",le="10"} 2')
+    expect(out).toContain('vc_seconds_bucket{result="ready",le="+Inf"} 2')
+    expect(out).toContain('vc_seconds_sum{result="ready"} 7.5')
+    expect(out).toContain('vc_seconds_count{result="timeout"} 1')
+  })
+
+  it('ignora valores no finitos y expone cero antes de observar', () => {
+    const h = new Histogram('vc_empty_seconds', 'latencia', [1])
+    h.observe(undefined, Number.NaN)
+    const out = h.render()
+    expect(out).toContain('vc_empty_seconds_bucket{le="+Inf"} 0')
+    expect(out).toContain('vc_empty_seconds_count 0')
   })
 })
 

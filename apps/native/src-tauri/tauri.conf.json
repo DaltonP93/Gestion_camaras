@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VisionCore",
+  "version": "0.0.0",
+  "identifier": "com.visioncore.native",
+  "build": {
+    "comment": "El frontend reutiliza la SPA React de apps/web. devUrl/frontendDist se ajustan al integrar el build en N2.",
+    "frontendDist": "../../web/dist"
+  },
+  "app": {
+    "windows": [
+      { "title": "VisionCore", "width": 1280, "height": 800, "resizable": true }
+    ],
+    "security": {
+      "comment": "CSP restrictiva; el video va por el decoder nativo (RTSPS), no por el webview.",
+      "csp": "default-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "app", "apk"],
+    "comment": "targets de referencia; el empaquetado real requiere el toolchain de cada plataforma (NO disponible en este entorno)."
+  }
+}

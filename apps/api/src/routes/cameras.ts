@@ -11,10 +11,7 @@ import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
 import { resolveCameraStatus } from '../services/camera-status-truth'
 import { AuditAction } from '../services/audit'
-import CryptoJS from 'crypto-js'
-
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-const decryptPass = (p: string) => CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
+import { decryptNvrPassword as decryptPass } from '../services/credentials'
 
 const sanitizeRtsp = (s: string | null | undefined): string | null => {
   if (!s) return s ?? null

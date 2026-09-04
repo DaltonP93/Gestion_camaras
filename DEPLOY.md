@@ -6,7 +6,7 @@
 - Git
 - Dominio con DNS apuntando al servidor (para HTTPS)
 - Puertos abiertos: 80, 443, 554 (RTSP), 8888 (HLS), 8889 (WebRTC)
-- Acceso de red a los NVRs: 192.168.1.10, .110, .111, .112
+- Acceso de red a los NVRs (IPs internas de la LAN de cámaras)
 
 ---
 

@@ -1,7 +1,6 @@
 // apps/api/src/routes/nvrConfig.ts
 // NVR channel video/audio configuration endpoints (read + write with backup).
 import type { FastifyPluginAsync } from 'fastify'
-import CryptoJS from 'crypto-js'
 import { z } from 'zod'
 import {
   getChannelVideoConfig,
@@ -10,17 +9,7 @@ import {
   getChannelCapabilities,
 } from '../services/nvr-config/hikvision'
 import { AuditAction } from '../services/audit'
-
-const ENCRYPTION_KEY = process.env.NVR_CREDENTIAL_KEY || process.env.JWT_SECRET || 'visioncore_key'
-
-function decryptPass(p: string): string | null {
-  try {
-    const plain = CryptoJS.AES.decrypt(p, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8)
-    return plain || null
-  } catch {
-    return null
-  }
-}
+import { decryptNvrPasswordOrNull as decryptPass } from '../services/credentials'
 
 export const nvrConfigRoutes: FastifyPluginAsync = async (server) => {
   // GET /api/nvrs/:nvrId/channels/:channelId/video-config

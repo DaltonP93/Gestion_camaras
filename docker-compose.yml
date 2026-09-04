@@ -51,9 +51,12 @@ services:
     volumes:
       - ./infra/mediamtx/mediamtx.yml:/mediamtx.yml:ro
     ports:
-      - "8554:8554"   # RTSP
-      - "8888:8888"   # HLS
-      - "8889:8889"   # WebRTC
+      # Puertos de medios atados a loopback: Nginx los alcanza por la red interna
+      # de docker; no deben quedar expuestos a todas las interfaces (MediaMTX corre
+      # con user: any). Ver AUDIT_DEVOPS / AUDIT_SECURITY (P1 superficie de medios).
+      - "127.0.0.1:8554:8554"   # RTSP
+      - "127.0.0.1:8888:8888"   # HLS
+      - "127.0.0.1:8889:8889"   # WebRTC
       # API REST de MediaMTX: interna (la usa el API vía red docker) — sólo localhost.
       - "127.0.0.1:9997:9997"
     networks:
@@ -199,6 +202,18 @@ services:
       ANALYTICS_MAX_WORKERS: ${ANALYTICS_MAX_WORKERS:-16}
       ANALYTICS_FALL_DETECTION_ENABLED: ${ANALYTICS_FALL_DETECTION_ENABLED:-false}
       ANALYTICS_ALPR_ENABLED: ${ANALYTICS_ALPR_ENABLED:-false}
+      # ── Ingestor de Frigate (fuente externa de detección) ────────
+      # Con FRIGATE_ENABLED=false el ingestor NO arranca ⇒ comportamiento idéntico.
+      # Frigate corre como servicio aparte bajo el profile "frigate" (no arranca
+      # en el `docker compose up` por defecto). Ver docs/frigate/DEPLOYMENT.md.
+      FRIGATE_ENABLED: ${FRIGATE_ENABLED:-false}
+      FRIGATE_URL: ${FRIGATE_URL:-http://frigate:5000}
+      FRIGATE_INGEST_MODE: ${FRIGATE_INGEST_MODE:-http}
+      FRIGATE_POLL_INTERVAL_SEC: ${FRIGATE_POLL_INTERVAL_SEC:-5}
+      FRIGATE_CAMERA_MAP: ${FRIGATE_CAMERA_MAP:-}
+      FRIGATE_FETCH_SNAPSHOTS: ${FRIGATE_FETCH_SNAPSHOTS:-true}
+      FRIGATE_MIN_CONFIDENCE: ${FRIGATE_MIN_CONFIDENCE:-0.6}
+      FRIGATE_SUPPORTED_CLASSES: ${FRIGATE_SUPPORTED_CLASSES:-person,car,truck,bus,motorcycle,bicycle}
     volumes:
       - analytics_models:/models
     depends_on:
@@ -209,6 +224,39 @@ services:
     dns:
       - 8.8.8.8
       - 1.1.1.1
+
+  # ─── Frigate (NVR con detección de objetos — fuente de analítica) ──
+  # OPT-IN: sólo arranca con `docker compose --profile frigate up -d frigate`.
+  # Sin el profile, el stack por defecto NO lo levanta (comportamiento idéntico).
+  # La API interna (5000) queda SOLO en la red docker (la consume el ingestor de
+  # analytics como http://frigate:5000); la UI autenticada (8971) se ata a loopback.
+  # Detector CPU por defecto; para Coral TPU / GPU NVIDIA ver docs/frigate/DEPLOYMENT.md.
+  # El config real (con IPs/credenciales) es infra/frigate/config.yml (gitignored);
+  # copiar de infra/frigate/config.example.yml. Nunca versionar credenciales/IPs.
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: visioncore_frigate
+    profiles: ["frigate"]
+    restart: unless-stopped
+    shm_size: ${FRIGATE_SHM_SIZE:-256mb}
+    environment:
+      # Substitución en config.yml vía {FRIGATE_RTSP_PASSWORD}. Nunca en el repo.
+      FRIGATE_RTSP_PASSWORD: ${FRIGATE_RTSP_PASSWORD:-}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./infra/frigate/config.yml:/config/config.yml:ro
+      - frigate_media:/media/frigate
+    tmpfs:
+      - /tmp/cache:size=1000000000
+    ports:
+      # UI autenticada de Frigate — sólo localhost del host.
+      - "127.0.0.1:8971:8971"
+      # NOTA: la API interna (5000) NO se publica: el ingestor la alcanza por la
+      # red docker (frigate:5000). No exponer 5000 ni go2rtc a la red externa.
+    networks:
+      - visioncore_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   # ─── Nginx (reverse proxy + SSL) ───────────────────────────
   nginx:
@@ -253,6 +301,7 @@ volumes:
   uploads_data:
   recordings_cache:
   analytics_models:
+  frigate_media:
 
 networks:
   visioncore_net:

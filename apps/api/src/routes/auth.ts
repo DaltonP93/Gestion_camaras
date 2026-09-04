@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
+import { revokeUserMediaGrants } from '../services/media/grant-service'
 import {
   generateTotpSecret, verifyTotpToken, getTotpQrCodeUri,
   generateBackupCodes, hashBackupCodes, verifyBackupCode,
@@ -680,7 +681,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     await server.prisma.session.deleteMany({
       where: { refreshToken: hashToken(refreshToken) },
     })
-    await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request)
+    // C22.1 (P0-1): el logout revoca los grants de medios vivos del usuario.
+    // B1: no se descarta el estado — 'pending' queda encolado (el plano falla
+    // cerrado) y se drena al recuperar Redis; se deja constancia en la auditoría.
+    const mediaRevoke = await revokeUserMediaGrants(server, request.user.sub)
+    await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request, { mediaRevoke })
     return reply.send({ message: 'Sesión cerrada' })
   })
 
