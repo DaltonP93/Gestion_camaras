@@ -8,10 +8,46 @@ import { MediaGrantManager } from './media-grants'
 import { createGrantStore, type RedisGrantClient } from './grant-store'
 import { NativeRelayReadiness } from './native-readiness'
 import { SingleActiveSessionPolicy } from './session-policy'
+import { connectionsToKick, performKick, noopKicker, type MediaMtxKicker } from './relay-kick'
 
 let singleton: MediaGrantManager | null = null
 let readiness: NativeRelayReadiness | null = null
 let sessionPolicy: SingleActiveSessionPolicy | null = null
+// A1 · F0 — kicker inyectable. Por defecto inerte (no hay MediaMTX vivo en F0);
+// el cableado real de la API de runtime de MediaMTX es F1/F2 (infra, NO hecho).
+let mediaKicker: MediaMtxKicker = noopKicker
+export function setMediaKicker(k: MediaMtxKicker): void { mediaKicker = k }
+
+const relayEnabled = (): boolean => process.env.NATIVE_MEDIA_RELAY_ENABLED === 'true'
+
+/**
+ * A1 · F0 — revoke→kick por USUARIO (logout / cambio de permisos). Con la flag
+ * OFF es un no-op ESTRICTO: no enumera bindings ni toca el kicker ⇒ comportamiento
+ * idéntico a hoy. Con la flag ON: enumera las conexiones vivas del usuario y las
+ * expulsa best-effort. Devuelve cuántas se expulsaron (0 con flag OFF).
+ */
+export async function kickConnectionsForUser(server: FastifyInstance, userId: string): Promise<number> {
+  if (!relayEnabled()) return 0
+  try {
+    const bindings = await getMediaGrantManager(server).listConnectionsForUser(userId)
+    const ids = connectionsToKick({ kind: 'user', userId }, bindings)
+    return await performKick(mediaKicker, ids)
+  } catch { return 0 }
+}
+
+/**
+ * A1 · F0 — revoke→kick por GRANTS (revocación por vista/sesión). No-op con flag OFF.
+ */
+export async function kickConnectionsForGrants(server: FastifyInstance, grantIds: string[]): Promise<number> {
+  if (!relayEnabled() || grantIds.length === 0) return 0
+  try {
+    const mgr = getMediaGrantManager(server)
+    const all: Awaited<ReturnType<typeof mgr.listConnectionsForGrant>> = []
+    for (const gid of grantIds) all.push(...await mgr.listConnectionsForGrant(gid))
+    const ids = connectionsToKick({ kind: 'grants', grantIds }, all)
+    return await performKick(mediaKicker, ids)
+  } catch { return 0 }
+}
 // Outbox en-proceso de revocaciones (epoch bump) que fallaron por backend caído.
 // Durante el outage el plano falla cerrado (readiness+validateAndClaim), así que
 // ningún grant es aceptable; al recuperar Redis se drena esta cola.
@@ -51,7 +87,16 @@ export function getSessionPolicy(server: FastifyInstance): SingleActiveSessionPo
   if (sessionPolicy) return sessionPolicy
   const mgr = getMediaGrantManager(server)
   sessionPolicy = new SingleActiveSessionPolicy(
-    { revokeBySession: (sid, uid) => mgr.revokeBySession(sid, uid) },
+    {
+      // A1·F0: al revocar la sesión previa, además expulsa sus conexiones vivas
+      // (flag ON). Con la flag OFF grantIds=[] ⇒ kick no-op ⇒ idéntico a hoy.
+      revokeBySession: async (sid, uid) => {
+        const grantIds = relayEnabled() ? await mgr.listGrantIdsForSession(sid) : []
+        const n = await mgr.revokeBySession(sid, uid)
+        if (grantIds.length) await kickConnectionsForGrants(server, grantIds)
+        return n
+      },
+    },
     process.env.SINGLE_ACTIVE_MEDIA_SESSION === 'true',
   )
   return sessionPolicy
@@ -67,7 +112,13 @@ export type RevokeStatus = 'applied' | 'pending' | 'failed'
  */
 export async function revokeUserMediaGrants(server: FastifyInstance, userId: string): Promise<RevokeStatus> {
   const outcome = await getMediaGrantManager(server).revokeAllForUser(userId)
-  if (outcome.status === 'applied') { pendingUserRevokes.delete(userId); return 'applied' }
+  if (outcome.status === 'applied') {
+    pendingUserRevokes.delete(userId)
+    // A1·F0: tras la revocación durable, expulsa conexiones de relay vivas del
+    // usuario (SOLO con la flag ON; OFF ⇒ no-op ⇒ idéntico a hoy).
+    await kickConnectionsForUser(server, userId)
+    return 'applied'
+  }
   pendingUserRevokes.add(userId)
   server.log.warn(`media_grant revoke_pending userId=${userId.slice(0, 8)} — backend caido, se reintentara`)
   return 'pending'
@@ -127,4 +178,5 @@ export function __resetMediaGrantManagerForTest(): void {
   readiness = null
   sessionPolicy = null
   pendingUserRevokes.clear()
+  mediaKicker = noopKicker
 }

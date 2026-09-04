@@ -10,7 +10,7 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import { getStreamPath } from '../services/stream'
-import { getMediaGrantManager, getNativeReadiness, getSessionPolicy } from '../services/media/grant-service'
+import { getMediaGrantManager, getNativeReadiness, getSessionPolicy, kickConnectionsForGrants } from '../services/media/grant-service'
 import { decideGrantIssuance, timingSafeEqualHex, sha256Hex } from '../services/media/media-grants'
 import { hasMediaAccess, deriveEffectiveType } from '../services/media/native-readiness'
 import type { GrantScopeQuery, MediaTransport } from '../services/media/contracts'
@@ -99,7 +99,12 @@ export const mediaGrantsRoutes: FastifyPluginAsync = async (server) => {
 
   server.delete('/media-grant/view/:viewId', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { viewId } = request.params as { viewId: string }
+    // A1·F0: captura los grantIds de la vista ANTES de revocar (flag ON) para
+    // expulsar sus conexiones vivas tras la revocación. Flag OFF ⇒ grantIds=[]
+    // ⇒ ningún I/O nuevo ⇒ comportamiento idéntico a hoy.
+    const grantIds = NATIVE_MEDIA_RELAY_ENABLED ? await manager.listGrantIdsForView(viewId) : []
     const revoked = await manager.revokeByView(viewId, request.user.sub)
+    if (grantIds.length) await kickConnectionsForGrants(server, grantIds)
     return reply.send({ revoked })
   })
 

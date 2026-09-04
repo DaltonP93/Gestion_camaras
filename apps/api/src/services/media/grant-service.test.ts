@@ -1,10 +1,12 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
 import { FakeRedis } from './redis-fake'
 import {
   getMediaGrantManager, revokeUserMediaGrants, retryPendingUserRevokes,
   startRevokeRecovery, __pendingUserRevokeCount, __resetMediaGrantManagerForTest,
+  setMediaKicker, kickConnectionsForGrants,
 } from './grant-service'
+import type { MediaMtxKicker } from './relay-kick'
 
 function fakeServer(redis: FakeRedis) {
   return { log: { info: () => {}, warn: () => {} }, redis } as any
@@ -107,5 +109,62 @@ describe('B1 · startRevokeRecovery (recuperación cableada; drenaje post-recone
     await new Promise((res) => setTimeout(res, 10))
     expect(__pendingUserRevokeCount()).toBe(0)
     rec.stop()
+  })
+})
+
+describe('A1·F0 · revoke→kick (SOLO con la flag ON; OFF ⇒ no-op idéntico a hoy)', () => {
+  function fakeKicker(): { kicker: MediaMtxKicker; kicked: string[] } {
+    const kicked: string[] = []
+    return { kicked, kicker: { async kick(id) { kicked.push(id) } } }
+  }
+  const prev = process.env.NATIVE_MEDIA_RELAY_ENABLED
+  afterEach(() => { if (prev === undefined) delete process.env.NATIVE_MEDIA_RELAY_ENABLED; else process.env.NATIVE_MEDIA_RELAY_ENABLED = prev })
+
+  it('flag ON: revocar por usuario expulsa SUS conexiones vivas', async () => {
+    process.env.NATIVE_MEDIA_RELAY_ENABLED = 'true'
+    const server = fakeServer(new FakeRedis())
+    const mgr = getMediaGrantManager(server)
+    const { kicker, kicked } = fakeKicker(); setMediaKicker(kicker)
+    await mgr.bindConnection('conn-A1', 'g1', 'userX', 'nvr_c_sub', 60_000)
+    await mgr.bindConnection('conn-A2', 'g2', 'userX', 'nvr_c_sub', 60_000)
+    await mgr.bindConnection('conn-B', 'g3', 'userY', 'nvr_c_sub', 60_000)
+
+    expect(await revokeUserMediaGrants(server, 'userX')).toBe('applied')
+    expect(kicked.sort()).toEqual(['conn-A1', 'conn-A2'])  // userY intacto
+  })
+
+  it('flag OFF: revocar por usuario NO expulsa nada (no-op)', async () => {
+    process.env.NATIVE_MEDIA_RELAY_ENABLED = 'false'
+    const server = fakeServer(new FakeRedis())
+    const mgr = getMediaGrantManager(server)
+    const { kicker, kicked } = fakeKicker(); setMediaKicker(kicker)
+    await mgr.bindConnection('conn-A1', 'g1', 'userX', 'nvr_c_sub', 60_000)
+
+    expect(await revokeUserMediaGrants(server, 'userX')).toBe('applied')
+    expect(kicked).toEqual([])
+  })
+
+  it('flag ON: kickConnectionsForGrants expulsa las conexiones de esos grants (vista/sesión)', async () => {
+    process.env.NATIVE_MEDIA_RELAY_ENABLED = 'true'
+    const server = fakeServer(new FakeRedis())
+    const mgr = getMediaGrantManager(server)
+    const { kicker, kicked } = fakeKicker(); setMediaKicker(kicker)
+    await mgr.bindConnection('c1', 'gV1', 'u', 'p', 60_000)
+    await mgr.bindConnection('c2', 'gV2', 'u', 'p', 60_000)
+    await mgr.bindConnection('c3', 'gOTHER', 'u', 'p', 60_000)
+
+    const n = await kickConnectionsForGrants(server, ['gV1', 'gV2'])
+    expect(n).toBe(2)
+    expect(kicked.sort()).toEqual(['c1', 'c2'])
+  })
+
+  it('flag OFF: kickConnectionsForGrants es no-op', async () => {
+    process.env.NATIVE_MEDIA_RELAY_ENABLED = 'false'
+    const server = fakeServer(new FakeRedis())
+    const mgr = getMediaGrantManager(server)
+    const { kicker, kicked } = fakeKicker(); setMediaKicker(kicker)
+    await mgr.bindConnection('c1', 'gV1', 'u', 'p', 60_000)
+    expect(await kickConnectionsForGrants(server, ['gV1'])).toBe(0)
+    expect(kicked).toEqual([])
   })
 })
