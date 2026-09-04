@@ -10,6 +10,7 @@ import multipart from '@fastify/multipart'
 import path from 'path'
 import fs from 'fs'
 import { redactUrlSecrets } from './lib/log-redact'
+import { resolveCorsOptions } from './lib/cors-config'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -124,14 +125,11 @@ async function main() {
   })
 
   // CORS: lista blanca por env var (CORS_ORIGINS=https://camaras.example.com,https://otro.com)
-  // Si no está definida, refleja el origin (compatibilidad con dev / detrás de nginx)
-  const corsOrigins = process.env.CORS_ORIGINS
-    ? process.env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
-    : null
-  await server.register(cors, {
-    origin: corsOrigins ?? true,
-    credentials: true,
-  })
+  // Con CORS_ORIGINS definido → comportamiento idéntico al histórico (allowlist +
+  // credenciales). Sin CORS_ORIGINS → NO se refleja cualquier origin con
+  // credenciales: sólo se permite localhost/127.0.0.1/[::1] (dev usable); el resto
+  // de orígenes cruzados quedan sin cabeceras CORS. Ver lib/cors-config.ts.
+  await server.register(cors, resolveCorsOptions(process.env.CORS_ORIGINS))
 
   await server.register(rateLimit, {
     max: 600,
