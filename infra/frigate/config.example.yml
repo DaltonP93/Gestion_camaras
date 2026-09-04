@@ -1,0 +1,76 @@
+# Frigate — plantilla de configuración para VisionCore (detector CPU).
+#
+# COPIÁ este archivo a  infra/frigate/config.yml  y completá con TUS datos.
+# infra/frigate/config.yml está gitignored: NUNCA versiones IPs, usuarios ni
+# contraseñas reales. La contraseña RTSP se inyecta por variable de entorno
+# FRIGATE_RTSP_PASSWORD (ver docker-compose.yml y .env), no la escribas acá.
+#
+# Ingest hacia VisionCore = HTTP polling (el ingestor de apps/analytics consulta
+# la API de Frigate en http://frigate:5000). Por eso MQTT queda DESHABILITADO.
+
+mqtt:
+  enabled: false
+
+# Detector CPU (default seguro; limita nº de cámaras/FPS).
+# Para Coral TPU:  edgetpu (type: edgetpu, device: usb|pci)
+# Para GPU NVIDIA: tensorrt (+ runtime nvidia en docker-compose). Ver DEPLOYMENT.md.
+detectors:
+  cpu1:
+    type: cpu
+    num_threads: 3
+
+# Presets de decodificación por CPU. Para hwaccel ver docs de Frigate.
+ffmpeg:
+  hwaccel_args: []
+
+# Detección de objetos que mapean a las tarjetas del dashboard de VisionCore.
+objects:
+  track:
+    - person
+    - car
+    - truck
+    - bus
+    - motorcycle
+    - bicycle
+  filters:
+    person:
+      min_score: 0.6
+      threshold: 0.7
+
+# Snapshots ON: el ingestor descarga /api/events/<id>/snapshot.jpg y los adjunta
+# al evento de analítica. Grabación de clips opcional (ajustá la retención).
+snapshots:
+  enabled: true
+  bounding_box: true
+  retain:
+    default: 7
+
+record:
+  enabled: false        # poné true si querés clips en Frigate; ajustá retención.
+  retain:
+    days: 3
+    mode: motion
+
+# ── Cámaras ────────────────────────────────────────────────────────────────
+# Un bloque por cámara. El NOMBRE de la cámara (aquí "camara_ejemplo") es el que
+# mapeás a un cameraId de VisionCore vía FRIGATE_CAMERA_MAP (JSON), p.ej.:
+#   FRIGATE_CAMERA_MAP={"camara_ejemplo":"<cameraId-de-VisionCore>"}
+# Usá el SUBSTREAM del NVR para detección (menos CPU). Reemplazá los placeholders.
+cameras:
+  camara_ejemplo:
+    enabled: true
+    ffmpeg:
+      inputs:
+        # Hikvision NVR substream (ejemplo). Canal NN => Channels/<NN>02 = sub.
+        # La contraseña viene de FRIGATE_RTSP_PASSWORD (env), NO la pongas literal.
+        - path: rtsp://<RTSP_USER>:{FRIGATE_RTSP_PASSWORD}@<NVR_IP>:554/Streaming/Channels/0102
+          roles:
+            - detect
+    detect:
+      width: 640
+      height: 480
+      fps: 5
+    # Zona de ejemplo para intrusión (opcional). Ajustá las coordenadas.
+    # zones:
+    #   entrada:
+    #     coordinates: 0,480,640,480,640,0,0,0

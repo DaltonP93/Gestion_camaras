@@ -816,8 +816,11 @@ prod — hecho; (4) diseñar A1 sin habilitar — hecho.
   PTZ/imaging) y Hik-Connect (token/HLS temporal/ISAPI-proxy), alimentados por
   `GET /api/integrations/status` (siempre disponible; muestra "deshabilitado"
   cuando la flag está OFF). Falta validación con hardware/cuenta reales.
-- **Despliegue de Frigate**: agregar el servicio a docker-compose + config.yml +
-  hardware de detección (requiere autorización); conexión y validación end-to-end.
+- **Despliegue de Frigate**: artefactos listos y validados (servicio opt-in bajo
+  profile `frigate` en docker-compose, `infra/frigate/config.example.yml`, env, y
+  runbook `docs/frigate/DEPLOYMENT.md`). Falta correrlo en el servidor real
+  (`docker compose --profile frigate up`), completar `config.yml` con cámaras
+  reales y validar el flujo end-to-end.
 - **A1 Fase F0** (código del auth-hook + session-grant, flag OFF) si se autoriza.
 - Cliente nativo (Tauri/Rust) por plataforma; adopción real de `waitForCapacity`.
 
@@ -853,7 +856,9 @@ prod — hecho; (4) diseñar A1 sin habilitar — hecho.
 - [x] **Hallazgos de auditoría:** consolidados en `docs/audits/LEADERSHIP_SYNTHESIS.md`
   + reportes por área (`AUDIT_DEV_ARCH.md`, `AUDIT_DEVOPS.md`, `AUDIT_SECURITY.md`).
 - [x] **Frigate (nuevo):** ingestor en `apps/analytics/app/frigate/`, flag
-  `FRIGATE_ENABLED`, diseño en `docs/frigate/INTEGRATION_DESIGN.md`. _Falta despliegue._
+  `FRIGATE_ENABLED`, diseño en `docs/frigate/INTEGRATION_DESIGN.md`. Despliegue
+  listo (profile `frigate` en compose + `infra/frigate/config.example.yml` +
+  runbook `docs/frigate/DEPLOYMENT.md`). _Falta correrlo en servidor real._
 - [ ] **Playback de grabaciones:** métricas reales de robustez del preview;
   decisión sobre Opción A (SDK) si aparece `RTSP_AUTH_OR_TRACK_DENIED` persistente.
 - [ ] **Validaciones en vivo:** `docker compose config`, Redis/Lua real, analytics
