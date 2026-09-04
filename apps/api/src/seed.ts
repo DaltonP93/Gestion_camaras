@@ -104,50 +104,57 @@ async function main() {
     console.log(`✅ Usuario admin creado: ${adminUsername} (contraseña definida por SEED_ADMIN_PASSWORD)`)
   }
 
-  // Crear usuarios de prueba
-  const supervisorHash = await bcrypt.hash('Super123!', 12)
-  await prisma.user.upsert({
-    where: { username: 'supervisor' },
-    update: {},
-    create: {
-      username: 'supervisor',
-      email: 'supervisor@visioncore.local',
-      passwordHash: supervisorHash,
-      fullName: 'Supervisor de Seguridad',
-      role: 'SUPERVISOR',
-      active: true,
-    },
-  })
+  // ─── Usuarios DEMO (supervisor / operador1 / auditor) ──────────
+  // Seguridad: en un deploy real NO se crean usuarios con contraseñas conocidas.
+  // Igual que el admin, estos usuarios de prueba se gatean por entorno:
+  //   - Sólo se crean si SEED_DEMO_USERS=true (opt-in explícito, típicamente dev).
+  //   - Con la opción activa, la contraseña de cada uno viene de su env dedicada
+  //     (SEED_SUPERVISOR_PASSWORD / SEED_OPERATOR_PASSWORD / SEED_AUDITOR_PASSWORD);
+  //     si falta, se genera una aleatoria fuerte y se muestra UNA sola vez.
+  //   - Sin SEED_DEMO_USERS, no se crea ningún usuario con password conocido.
+  // Esto no rompe el flujo del seed: el admin siempre se crea (arriba) y los NVRs
+  // se crean igual más abajo.
+  const seedDemoUsers = process.env.SEED_DEMO_USERS === 'true'
+  const demoCredentials: Array<{ username: string; password: string; generated: boolean; role: string }> = []
 
-  const operatorHash = await bcrypt.hash('Oper123!', 12)
-  await prisma.user.upsert({
-    where: { username: 'operador1' },
-    update: {},
-    create: {
-      username: 'operador1',
-      email: 'operador1@visioncore.local',
-      passwordHash: operatorHash,
-      fullName: 'Operador Turno Mañana',
-      role: 'OPERATOR',
-      active: true,
-    },
-  })
-
-  const auditorHash = await bcrypt.hash('Audit123!', 12)
-  await prisma.user.upsert({
-    where: { username: 'auditor' },
-    update: {},
-    create: {
-      username: 'auditor',
-      email: 'auditor@visioncore.local',
-      passwordHash: auditorHash,
-      fullName: 'Auditor de Seguridad',
-      role: 'AUDITOR',
-      active: true,
-    },
-  })
-
-  console.log('✅ Usuarios de prueba creados')
+  if (seedDemoUsers) {
+    const demoUsers = [
+      { username: 'supervisor', email: 'supervisor@visioncore.local', fullName: 'Supervisor de Seguridad', role: 'SUPERVISOR' as const, envVar: 'SEED_SUPERVISOR_PASSWORD' },
+      { username: 'operador1',  email: 'operador1@visioncore.local',  fullName: 'Operador Turno Mañana',    role: 'OPERATOR' as const,   envVar: 'SEED_OPERATOR_PASSWORD' },
+      { username: 'auditor',    email: 'auditor@visioncore.local',    fullName: 'Auditor de Seguridad',     role: 'AUDITOR' as const,    envVar: 'SEED_AUDITOR_PASSWORD' },
+    ]
+    for (const u of demoUsers) {
+      const provided = process.env[u.envVar]
+      const password = provided || crypto.randomBytes(18).toString('base64url')
+      const generated = !provided
+      const hash = await bcrypt.hash(password, 12)
+      await prisma.user.upsert({
+        where: { username: u.username },
+        update: {},
+        create: {
+          username: u.username,
+          email: u.email,
+          passwordHash: hash,
+          fullName: u.fullName,
+          role: u.role,
+          active: true,
+        },
+      })
+      demoCredentials.push({ username: u.username, password, generated, role: u.role })
+    }
+    console.log('✅ Usuarios DEMO creados (SEED_DEMO_USERS=true)')
+    const anyGenerated = demoCredentials.some((c) => c.generated)
+    if (anyGenerated) {
+      console.log('⚠️  Contraseñas DEMO generadas aleatoriamente (se muestran UNA sola vez — guardalas):')
+      for (const c of demoCredentials) {
+        if (c.generated) {
+          console.log(`      ${c.username.padEnd(11)} / ${c.password}   (${c.role})`)
+        }
+      }
+    }
+  } else {
+    console.log('ℹ️  Usuarios DEMO omitidos (SEED_DEMO_USERS!=true). Definí SEED_DEMO_USERS=true para crearlos en entornos de prueba.')
+  }
 
   // Crear los 4 NVRs
   for (const config of NVR_CONFIGS) {
@@ -191,9 +198,14 @@ async function main() {
   } else {
     console.log(`  ${adminUsername}      / (SEED_ADMIN_PASSWORD)  (Administrador)`)
   }
-  console.log('  supervisor / Super123!  (Supervisor)')
-  console.log('  operador1  / Oper123!   (Operador)')
-  console.log('  auditor    / Audit123!  (Auditor)')
+  if (seedDemoUsers) {
+    for (const c of demoCredentials) {
+      const shown = c.generated ? '(ver contraseña generada arriba)' : `(${c.username === 'supervisor' ? 'SEED_SUPERVISOR_PASSWORD' : c.username === 'operador1' ? 'SEED_OPERATOR_PASSWORD' : 'SEED_AUDITOR_PASSWORD'})`
+      console.log(`  ${c.username.padEnd(11)}/ ${shown}  (${c.role})`)
+    }
+  } else {
+    console.log('  (usuarios DEMO omitidos — definí SEED_DEMO_USERS=true para crearlos)')
+  }
 }
 
 main()
