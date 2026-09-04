@@ -1,137 +1,52 @@
 #!/bin/bash
-# upgrade-to-https.sh — Activar HTTPS en nginx luego de obtener el cert
-# Ejecutar DESPUÉS de haber corrido init-ssl.sh exitosamente
+# upgrade-to-https.sh — Activar/confirmar HTTPS en nginx luego de obtener el cert.
+# Ejecutar DESPUÉS de haber corrido init-ssl.sh exitosamente.
+#
+# ENDURECIMIENTO (auditoría de robustez, hallazgo P1): este script YA NO regenera
+# infra/nginx/nginx.conf mediante heredoc. La config versionada
+# (infra/nginx/nginx.conf) ES la config HTTPS endurecida y es la única fuente de
+# verdad, con:
+#   - logs SIN querystring/JWT ('$request_method $uri', nunca '$request'),
+#   - SIN CORS '*' (proxy_hide_header Access-Control-Allow-Origin en /hls/),
+#   - proxy_buffering off en el preview fMP4 y en HLS,
+#   - bloqueo de dotfiles / paths de ataque y cabeceras de seguridad (HSTS, etc.).
+#
+# La versión anterior sobrescribía ese archivo con un heredoc regresivo que, justo
+# en el cutover a producción, reintroducía la fuga de JWT en el access log
+# ('$request' con '?token=<JWT>'), reañadía 'Access-Control-Allow-Origin: *' y
+# perdía 'proxy_buffering off'. Ahora sólo se valida y se recarga la config
+# versionada — el bloque TLS proviene de la nginx.conf endurecida, no de un template.
 set -e
 
 DOMAIN="camaras.saa.com.py"
 NGINX_CONF="infra/nginx/nginx.conf"
 
-# Verificar que el cert existe
+# 1) Verificar que el certificado existe.
 if ! docker compose run --rm --entrypoint "" certbot \
     test -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" 2>/dev/null; then
   echo "❌ No existe el certificado. Primero ejecutar: bash infra/certbot/init-ssl.sh"
   exit 1
 fi
 
-echo "📝 Actualizando nginx.conf para HTTPS..."
-cat > "${NGINX_CONF}" << 'NGINXEOF'
-# infra/nginx/nginx.conf — HTTPS activado con Let's Encrypt
+# 2) Sanity check: la config versionada debe contener el server{} en 443 (HTTPS).
+#    Si no, quedó en un estado inesperado; abortar antes de recargar para no dejar
+#    nginx sirviendo una config sin TLS o sin endurecer.
+if ! grep -q "listen 443" "${NGINX_CONF}"; then
+  echo "❌ ${NGINX_CONF} no contiene un server{} en 443."
+  echo "   Se esperaba la config HTTPS endurecida versionada. Restaurala desde el"
+  echo "   repositorio (git checkout -- ${NGINX_CONF}) antes de continuar."
+  exit 1
+fi
 
-worker_processes auto;
-error_log /var/log/nginx/error.log warn;
-pid /var/run/nginx.pid;
+# 3) Validar la configuración DENTRO del contenedor y recargar (sin regenerar nada).
+echo "🔎 Validando la configuración de nginx (nginx -t)..."
+docker compose exec nginx nginx -t
 
-events {
-    worker_connections 1024;
-    use epoll;
-    multi_accept on;
-}
-
-http {
-    include       /etc/nginx/mime.types;
-    default_type  application/octet-stream;
-
-    map $http_upgrade $connection_upgrade {
-        default upgrade;
-        ''      close;
-    }
-
-    log_format main '$remote_addr - $remote_user [$time_local] '
-                    '"$request" $status $body_bytes_sent '
-                    '"$http_referer" "$http_user_agent"';
-    access_log /var/log/nginx/access.log main;
-
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-    keepalive_timeout 65;
-    gzip on;
-    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
-    client_max_body_size 100M;
-
-    upstream api          { server api:4000;      keepalive 32; }
-    upstream web          { server web:80;        keepalive 16; }
-    upstream mediamtx_hls { server mediamtx:8888; keepalive 16; }
-
-    server {
-        listen 80;
-        server_name camaras.saa.com.py;
-        location /.well-known/acme-challenge/ { root /var/www/certbot; }
-        location / { return 301 https://$host$request_uri; }
-    }
-
-    server {
-        listen 443 ssl http2;
-        server_name camaras.saa.com.py;
-
-        ssl_certificate     /etc/letsencrypt/live/camaras.saa.com.py/fullchain.pem;
-        ssl_certificate_key /etc/letsencrypt/live/camaras.saa.com.py/privkey.pem;
-        ssl_session_timeout  1d;
-        ssl_session_cache    shared:SSL:10m;
-        ssl_session_tickets  off;
-        ssl_protocols        TLSv1.2 TLSv1.3;
-        ssl_ciphers          ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256;
-        ssl_prefer_server_ciphers off;
-
-        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
-        add_header X-Content-Type-Options nosniff always;
-        add_header X-Frame-Options SAMEORIGIN always;
-
-        location /api/ {
-            proxy_pass http://api;
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 60s;
-            proxy_connect_timeout 10s;
-        }
-
-        location /ws/ {
-            proxy_pass http://api;
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection $connection_upgrade;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 3600s;
-        }
-
-        location /hls/ {
-            proxy_pass http://mediamtx_hls/;
-            proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_cache_bypass 1;
-            proxy_buffering off;
-            add_header Cache-Control "no-cache, no-store, must-revalidate";
-            add_header Access-Control-Allow-Origin "*";
-            add_header Access-Control-Allow-Methods "GET, OPTIONS";
-        }
-
-        location / {
-            proxy_pass http://web;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_intercept_errors on;
-            error_page 404 = @spa_fallback;
-        }
-
-        location @spa_fallback {
-            proxy_pass http://web;
-            proxy_set_header Host $host;
-        }
-    }
-}
-NGINXEOF
-
-echo "🔄 Recargando nginx con configuración HTTPS..."
+echo "🔄 Recargando nginx con la config HTTPS endurecida versionada..."
 docker compose exec nginx nginx -s reload
 
 echo ""
-echo "✅ HTTPS activado para https://${DOMAIN}"
+echo "✅ HTTPS activo para https://${DOMAIN} usando infra/nginx/nginx.conf (endurecida)."
+echo "   La renovación de certificados corre en el contenedor certbot; nginx además"
+echo "   recarga solo cada 6h para tomar el cert renovado (ver 'command' de nginx en"
+echo "   docker-compose.yml), por lo que no hace falta un reload manual tras renovar."
