@@ -1,7 +1,10 @@
 services:
   # ─── Base de datos PostgreSQL ───────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    # Minor pin (antes 16-alpine, que flota por minor). 16.4 fija la minor y deja
+    # flotar sólo la patch dentro de una línea estable de larga vida. NO cambiar la
+    # major (16) sin migración planificada del volumen de datos.
+    image: postgres:16.4-alpine
     container_name: visioncore_postgres
     restart: unless-stopped
     environment:
@@ -24,7 +27,8 @@ services:
 
   # ─── Redis (sesiones y caché) ───────────────────────────────
   redis:
-    image: redis:7-alpine
+    # Minor pin (antes 7-alpine). 7.4 fija la minor, patch flotante en línea estable.
+    image: redis:7.4-alpine
     container_name: visioncore_redis
     restart: unless-stopped
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -43,7 +47,10 @@ services:
 
   # ─── MediaMTX (proxy RTSP → HLS/WebRTC) ────────────────────
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    # Pin fijo (antes :latest). 1.9.3 es una release estable conocida de la línea
+    # 1.9.x; evita que un `pull` futuro cambie el comportamiento del componente
+    # crítico de streaming. Actualizar deliberadamente, no por deriva del tag.
+    image: bluenviron/mediamtx:1.9.3
     container_name: visioncore_mediamtx
     restart: unless-stopped
     environment:
@@ -234,7 +241,9 @@ services:
   # El config real (con IPs/credenciales) es infra/frigate/config.yml (gitignored);
   # copiar de infra/frigate/config.example.yml. Nunca versionar credenciales/IPs.
   frigate:
-    image: ghcr.io/blakeblackshear/frigate:stable
+    # Pin fijo (antes :stable, que flota). 0.14.1 es la última patch estable de la
+    # línea 0.14.x. Frigate es opt-in (profile) y no arranca en el stack por defecto.
+    image: ghcr.io/blakeblackshear/frigate:0.14.1
     container_name: visioncore_frigate
     profiles: ["frigate"]
     restart: unless-stopped
@@ -260,7 +269,8 @@ services:
 
   # ─── Nginx (reverse proxy + SSL) ───────────────────────────
   nginx:
-    image: nginx:alpine
+    # Minor pin (antes nginx:alpine). 1.27 fija la minor estable, patch flotante.
+    image: nginx:1.27-alpine
     container_name: visioncore_nginx
     restart: unless-stopped
     volumes:
@@ -285,7 +295,9 @@ services:
 
   # ─── Certbot (renovación automática SSL) ────────────────────
   certbot:
-    image: certbot/certbot:latest
+    # Pin fijo (antes :latest). v3.0.1 es una release estable conocida; evita que
+    # una renovación futura traiga un certbot con flags/comportamiento distinto.
+    image: certbot/certbot:v3.0.1
     container_name: visioncore_certbot
     restart: unless-stopped
     volumes:
