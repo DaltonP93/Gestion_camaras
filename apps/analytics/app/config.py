@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     frigate_fetch_snapshots: bool = True
     frigate_min_confidence: float = 0.6
     frigate_supported_classes: str = "person,car,truck,bus,motorcycle,bicycle"
+    # Cota del snapshot (bytes) para no cargar en memoria un blob enorme si
+    # Frigate devolviera un cuerpo anómalo. Default 5 MiB (muy por encima de un
+    # JPEG típico); si se excede se descarta el snapshot (el evento se POSTea
+    # igual, es opcional). 0 = sin límite. Flag FRIGATE_ENABLED OFF ⇒ irrelevante.
+    frigate_max_snapshot_bytes: int = 5 * 1024 * 1024
 
     class Config:
         env_prefix = ""  # variables planas: API_BASE_URL, ANALYTICS_SECRET, MODEL_PATH...

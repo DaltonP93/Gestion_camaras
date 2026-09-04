@@ -14,6 +14,10 @@ from typing import Any
 
 log = logging.getLogger("analytics.frigate.client")
 
+# Default razonable para la cota del snapshot base64 (5 MiB): muy por encima de
+# un JPEG de snapshot típico, protege ante un cuerpo anómalo/enorme.
+DEFAULT_MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024
+
 
 class FrigateHttpClient:
     """Cliente de la API HTTP de Frigate (polling de eventos + snapshots).
@@ -23,11 +27,23 @@ class FrigateHttpClient:
     como segmento de path del propio `base_url`.
     """
 
-    def __init__(self, base_url: str, *, transport: Any = None, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        transport: Any = None,
+        timeout: float = 15.0,
+        max_snapshot_bytes: int = DEFAULT_MAX_SNAPSHOT_BYTES,
+    ) -> None:
         self._base = (base_url or "").rstrip("/")
         self._timeout = timeout
         self._transport = transport  # inyectable para tests; None → httpx perezoso
         self._client: Any = None
+        # Cota del snapshot base64. <= 0 ⇒ sin límite.
+        try:
+            self._max_snapshot_bytes = int(max_snapshot_bytes)
+        except (TypeError, ValueError):
+            self._max_snapshot_bytes = DEFAULT_MAX_SNAPSHOT_BYTES
 
     # ── transporte perezoso ────────────────────────────────────────────────
     def _get(self, path: str, params: dict | None = None) -> Any:
@@ -82,10 +98,46 @@ class FrigateHttpClient:
             return None
         if getattr(resp, "status_code", 200) != 200:
             return None
+        limit = self._max_snapshot_bytes
+        # Rechazo temprano por Content-Length declarado, antes de leer el cuerpo.
+        if limit > 0:
+            declared = self._declared_length(resp)
+            if declared is not None and declared > limit:
+                log.warning(
+                    "frigate_snapshot_too_large id=%s content_length=%s limit=%s",
+                    event_id, declared, limit,
+                )
+                return None
         content = getattr(resp, "content", None)
         if not content:
             return None
+        # Cota efectiva sobre el cuerpo ya materializado (por si no vino
+        # Content-Length o mintió): se descarta el snapshot, el evento se POSTea
+        # igual (es opcional en el eventSchema).
+        if limit > 0 and len(content) > limit:
+            log.warning(
+                "frigate_snapshot_too_large id=%s bytes=%s limit=%s",
+                event_id, len(content), limit,
+            )
+            return None
         return base64.b64encode(content).decode("ascii")
+
+    @staticmethod
+    def _declared_length(resp: Any) -> int | None:
+        """Content-Length declarado (int) o None si ausente/ilegible."""
+        headers = getattr(resp, "headers", None)
+        if headers is None:
+            return None
+        try:
+            raw = headers.get("content-length")
+        except Exception:  # noqa: BLE001 — headers no dict-like
+            return None
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
 
     def close(self) -> None:
         if self._client is not None:
