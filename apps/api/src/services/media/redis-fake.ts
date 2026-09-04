@@ -9,7 +9,7 @@
 //
 // La ruta Lua real NO se valida en vivo en este entorno (sin Redis): ver docs.
 
-import { validateAndClaimReducer, type RedisGrantClient, type ValidateAndClaimInput } from './grant-store'
+import { validateAndClaimReducer, validateSessionReducer, type RedisGrantClient, type ValidateAndClaimInput } from './grant-store'
 import type { StoredMediaGrant, MediaTransport, MediaAction } from './contracts'
 
 export class FakeRedis implements RedisGrantClient {
@@ -57,6 +57,36 @@ export class FakeRedis implements RedisGrantClient {
       if (hasSession !== '') addSet(sessionIdx, member)
       // PEXPIRE sobre el índice de usuario: los sets del fake no tienen TTL ⇒ no-op.
       return 1
+    }
+    // A1 · F0 — bind atómico conexión↔grant + índices inversos (BIND_CONNECTION).
+    if (script.includes('BIND_CONNECTION')) {
+      const keys = args.slice(0, numKeys).map(String)
+      const argv = args.slice(numKeys).map(String)
+      const [connKey, userIdx, grantIdx] = keys
+      const [bindingJson, pxStr, member] = argv
+      this.kv.set(connKey, { v: bindingJson, exp: Date.now() + Number(pxStr) })
+      const addSet = (k: string, m: string): void => { let s = this.sets.get(k); if (!s) { s = new Set(); this.sets.set(k, s) } s.add(m) }
+      addSet(userIdx, member)
+      addSet(grantIdx, member)
+      return 1
+    }
+    // A1 · F0 — validación de sesión NO destructiva (VALIDATE_SESSION).
+    if (script.includes('VALIDATE_SESSION')) {
+      const keys = args.slice(0, numKeys).map(String)
+      const argv = args.slice(numKeys).map(String)
+      const [grantKey, epochKey, instKey] = keys
+      const [userId, cameraId, streamPath, transport, action, secretHash, nowStr] = argv
+      const rawGrant = this.live(grantKey)?.v
+      const grant = rawGrant ? (JSON.parse(rawGrant) as StoredMediaGrant) : null
+      const userEpoch = parseInt(this.live(epochKey)?.v ?? '0', 10)
+      const currentInstance = this.live(instKey)?.v ?? null
+      const input: ValidateAndClaimInput = {
+        grantId: grantKey, presentedSecretHash: secretHash,
+        scope: { userId, cameraId, streamPath, transport: transport as MediaTransport, action: action as MediaAction },
+        nowMs: Number(nowStr),
+      }
+      const { result } = validateSessionReducer({ grant, userEpoch, currentInstance }, input)
+      return JSON.stringify({ ok: result.ok, reason: result.reason })
     }
     if (!script.includes('VALIDATE_AND_CLAIM')) throw new Error('unknown script')
     const keys = args.slice(0, numKeys).map(String)

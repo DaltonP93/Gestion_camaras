@@ -23,7 +23,7 @@
 // NO VALIDADO en vivo es la ATOMICIDAD/linealizabilidad de EVAL en un Redis real
 // (garantía de Redis, no de nuestro código) — requiere un servidor Redis.
 
-import type { StoredMediaGrant, GrantRejectReason, GrantScopeQuery } from './contracts'
+import type { StoredMediaGrant, GrantRejectReason, GrantScopeQuery, ConnectionBinding } from './contracts'
 
 export type IndexKind = 'user' | 'view' | 'session'
 
@@ -66,6 +66,33 @@ export function validateAndClaimReducer(state: ClaimState, input: ValidateAndCla
   return { result: { ok: true, grant: g }, claim: true }
 }
 
+// A1 · F0 — Re-validación NO destructiva de un grant de SESIÓN de relay. Aplica
+// EXACTAMENTE las mismas verificaciones que `validateAndClaimReducer`
+// (REVOKED/EXPIRED/SCOPE/EPOCH/INSTANCE/SECRET) en el MISMO orden, pero SIN claim
+// y SIN REPLAYED: una conexión de medios es larga y MediaMTX re-consulta el hook
+// varias veces durante su vida; re-validar repetidamente debe seguir dando OK
+// mientras el grant siga vigente. Nunca marca uso ⇒ nunca devuelve REPLAYED.
+export interface SessionState {
+  grant: StoredMediaGrant | null
+  userEpoch: number
+  currentInstance: string | null
+}
+export function validateSessionReducer(state: SessionState, input: ValidateAndClaimInput): { result: ClaimResult } {
+  const g = state.grant
+  if (!g) return { result: { ok: false, reason: 'NOT_FOUND' } }
+  if (g.revokedAt !== null) return { result: { ok: false, reason: 'REVOKED' } }
+  if (input.nowMs >= g.expiresAt) return { result: { ok: false, reason: 'EXPIRED' } }
+  const s = input.scope
+  if (g.userId !== s.userId || g.cameraId !== s.cameraId || g.streamPath !== s.streamPath || g.transport !== s.transport || g.action !== s.action) {
+    return { result: { ok: false, reason: 'SCOPE_MISMATCH' } }
+  }
+  if (g.authorizationEpoch !== state.userEpoch) return { result: { ok: false, reason: 'EPOCH_MISMATCH' } }
+  if (state.currentInstance === null || state.currentInstance === undefined) return { result: { ok: false, reason: 'INSTANCE_REQUIRED' } }
+  if (g.mediaInstanceId !== state.currentInstance) return { result: { ok: false, reason: 'INSTANCE_MISMATCH' } }
+  if (g.secretHash !== input.presentedSecretHash) return { result: { ok: false, reason: 'SECRET_MISMATCH' } }
+  return { result: { ok: true, grant: g } }
+}
+
 export interface IssueIndices { viewId: string; sessionId?: string }
 
 export interface GrantStore {
@@ -80,6 +107,19 @@ export interface GrantStore {
 
   /** Transición atómica única: valida y reclama el uso. */
   validateAndClaim(input: ValidateAndClaimInput): Promise<ClaimResult>
+
+  /**
+   * A1 · F0 — Valida un grant de SESIÓN de relay SIN consumirlo (no destructiva,
+   * atómica, fail-closed). Relee grant+epoch+instancia y aplica el reducer de
+   * sesión. Puede llamarse muchas veces durante la vida de la conexión.
+   */
+  validateSession(input: ValidateAndClaimInput): Promise<ClaimResult>
+
+  /** A1 · F0 — Mapa conexión↔grant de sesiones de relay vivas (con TTL). */
+  bindConnection(connectionId: string, grantId: string, userId: string, streamPath: string, ttlMs: number): Promise<void>
+  unbindConnection(connectionId: string): Promise<void>
+  listConnectionsForUser(userId: string): Promise<ConnectionBinding[]>
+  listConnectionsForGrant(grantId: string): Promise<ConnectionBinding[]>
 
   /** Epoch de autorización por usuario (revocación durable). `bump` lanza si falla. */
   getUserEpoch(userId: string): Promise<number>
@@ -113,6 +153,8 @@ export class MemoryGrantStore implements GrantStore {
   private instances = new Map<string, string>()
   private instanceCounter = 0
   private up = true
+  // A1 · F0 — bindings conexión↔grant (con expiración por TTL).
+  private conns = new Map<string, { b: ConnectionBinding; exp: number }>()
 
   constructor(private readonly clock: () => number = () => Date.now()) {}
 
@@ -156,6 +198,40 @@ export class MemoryGrantStore implements GrantStore {
     const { result, claim } = validateAndClaimReducer(state, input)
     if (claim) this.claims.add(input.grantId)
     return result
+  }
+
+  // A1 · F0 — no destructiva: relee estado y valida sin marcar uso.
+  async validateSession(input: ValidateAndClaimInput): Promise<ClaimResult> {
+    if (!this.up) return { ok: false, reason: 'BACKEND_UNAVAILABLE' }
+    const grant = this.live(input.grantId)
+    const state: SessionState = {
+      grant,
+      userEpoch: grant ? (this.userEpochs.get(grant.userId) ?? 0) : 0,
+      currentInstance: grant ? (this.instances.get(grant.streamPath) ?? null) : null,
+    }
+    return validateSessionReducer(state, input).result
+  }
+
+  private liveConn(connectionId: string): ConnectionBinding | null {
+    const e = this.conns.get(connectionId)
+    if (!e) return null
+    if (this.clock() > e.exp) { this.conns.delete(connectionId); return null }
+    return e.b
+  }
+  async bindConnection(connectionId: string, grantId: string, userId: string, streamPath: string, ttlMs: number): Promise<void> {
+    if (!this.up) throw new Error('grant store unavailable')
+    this.conns.set(connectionId, { b: { connectionId, grantId, userId, streamPath }, exp: this.clock() + Math.max(1, ttlMs) })
+  }
+  async unbindConnection(connectionId: string): Promise<void> { this.conns.delete(connectionId) }
+  async listConnectionsForUser(userId: string): Promise<ConnectionBinding[]> {
+    const out: ConnectionBinding[] = []
+    for (const id of [...this.conns.keys()]) { const b = this.liveConn(id); if (b && b.userId === userId) out.push(b) }
+    return out
+  }
+  async listConnectionsForGrant(grantId: string): Promise<ConnectionBinding[]> {
+    const out: ConnectionBinding[] = []
+    for (const id of [...this.conns.keys()]) { const b = this.liveConn(id); if (b && b.grantId === grantId) out.push(b) }
+    return out
   }
 
   async getUserEpoch(userId: string): Promise<number> {
@@ -210,6 +286,10 @@ export const ik = (kind: IndexKind, key: string) => `${P}idx:${kind}:${key}`
 export const ekk = (userId: string) => `${P}epoch:user:${userId}`
 export const instk = (path: string) => `${P}inst:${path}`
 const INSTANCE_COUNTER = `${P}instctr`
+// A1 · F0 — claves del mapa conexión↔grant.
+export const connk = (connectionId: string) => `${P}conn:${connectionId}`
+export const connUserk = (userId: string) => `${P}idx:connuser:${userId}`
+export const connGrantk = (grantId: string) => `${P}idx:conngrant:${grantId}`
 
 // Script Lua de validateAndClaim (linealizable en el servidor Redis). Relee el
 // grant, el epoch del usuario, la instancia de la fuente y el estado de uso, y
@@ -246,6 +326,37 @@ redis.call('SADD', KEYS[2], ARGV[3])
 redis.call('SADD', KEYS[3], ARGV[3])
 if ARGV[4] ~= '' then redis.call('SADD', KEYS[4], ARGV[3]) end
 redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[5]))
+return 1`
+
+// A1 · F0 — Script Lua de validación de SESIÓN (NO destructivo, linealizable).
+// Idéntico a LUA_VALIDATE_AND_CLAIM salvo que NO comprueba ni marca el uso: no
+// hay REPLAYED y no escribe el claim. Puede re-ejecutarse durante toda la vida de
+// la conexión. Marcado VALIDATE_SESSION para el fake.
+export const LUA_VALIDATE_SESSION = `-- VALIDATE_SESSION
+local g = redis.call('GET', KEYS[1])
+if not g then return cjson.encode({ok=false, reason='NOT_FOUND'}) end
+local grant = cjson.decode(g)
+local now = tonumber(ARGV[7])
+if grant.revokedAt ~= nil and grant.revokedAt ~= cjson.null then return cjson.encode({ok=false, reason='REVOKED'}) end
+if now >= grant.expiresAt then return cjson.encode({ok=false, reason='EXPIRED'}) end
+if grant.userId ~= ARGV[1] or grant.cameraId ~= ARGV[2] or grant.streamPath ~= ARGV[3] or grant.transport ~= ARGV[4] or grant.action ~= ARGV[5] then return cjson.encode({ok=false, reason='SCOPE_MISMATCH'}) end
+local epoch = tonumber(redis.call('GET', KEYS[2]) or '0')
+if grant.authorizationEpoch ~= epoch then return cjson.encode({ok=false, reason='EPOCH_MISMATCH'}) end
+local inst = redis.call('GET', KEYS[3])
+if not inst then return cjson.encode({ok=false, reason='INSTANCE_REQUIRED'}) end
+if grant.mediaInstanceId ~= inst then return cjson.encode({ok=false, reason='INSTANCE_MISMATCH'}) end
+if grant.secretHash ~= ARGV[6] then return cjson.encode({ok=false, reason='SECRET_MISMATCH'}) end
+return cjson.encode({ok=true})`
+
+// A1 · F0 — bind atómico conexión↔grant + índices inversos (BIND_CONNECTION).
+//   KEYS[1]=conn  KEYS[2]=idx:connuser  KEYS[3]=idx:conngrant
+//   ARGV[1]=bindingJSON ARGV[2]=ttlMs ARGV[3]=connectionId(member)
+export const LUA_BIND_CONNECTION = `-- BIND_CONNECTION
+redis.call('SET', KEYS[1], ARGV[1], 'PX', tonumber(ARGV[2]))
+redis.call('SADD', KEYS[2], ARGV[3])
+redis.call('SADD', KEYS[3], ARGV[3])
+redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[2]))
+redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[2]))
 return 1`
 
 export class RedisGrantStore implements GrantStore {
@@ -289,6 +400,58 @@ export class RedisGrantStore implements GrantStore {
     } catch {
       return { ok: false, reason: 'BACKEND_UNAVAILABLE' }
     }
+  }
+
+  // A1 · F0 — no destructiva: EVAL del script de sesión (sin claim). Fail-closed.
+  async validateSession(input: ValidateAndClaimInput): Promise<ClaimResult> {
+    try {
+      const grant = await this.getGrant(input.grantId)
+      const epochKey = grant ? ekk(grant.userId) : ekk('_')
+      const instKey = grant ? instk(grant.streamPath) : instk('_')
+      const raw = await this.redis.eval(
+        LUA_VALIDATE_SESSION, 3,
+        gk(input.grantId), epochKey, instKey,
+        input.scope.userId, input.scope.cameraId, input.scope.streamPath, input.scope.transport, input.scope.action,
+        input.presentedSecretHash, String(input.nowMs),
+      )
+      const parsed = JSON.parse(String(raw)) as { ok: boolean; reason?: GrantRejectReason }
+      return parsed.ok ? { ok: true, grant: grant! } : { ok: false, reason: parsed.reason }
+    } catch {
+      return { ok: false, reason: 'BACKEND_UNAVAILABLE' }
+    }
+  }
+
+  async bindConnection(connectionId: string, grantId: string, userId: string, streamPath: string, ttlMs: number): Promise<void> {
+    const px = Math.max(1, ttlMs)
+    const binding: ConnectionBinding = { connectionId, grantId, userId, streamPath }
+    await this.redis.eval(
+      LUA_BIND_CONNECTION, 3,
+      connk(connectionId), connUserk(userId), connGrantk(grantId),
+      JSON.stringify(binding), String(px), connectionId,
+    )
+  }
+  async unbindConnection(connectionId: string): Promise<void> {
+    const raw = await this.redis.get(connk(connectionId))
+    if (raw) {
+      const b = JSON.parse(raw) as ConnectionBinding
+      await this.redis.srem(connUserk(b.userId), connectionId)
+      await this.redis.srem(connGrantk(b.grantId), connectionId)
+    }
+    await this.redis.del(connk(connectionId))
+  }
+  private async resolveConns(ids: string[]): Promise<ConnectionBinding[]> {
+    const out: ConnectionBinding[] = []
+    for (const id of ids) {
+      const raw = await this.redis.get(connk(id))
+      if (raw) out.push(JSON.parse(raw) as ConnectionBinding)
+    }
+    return out
+  }
+  async listConnectionsForUser(userId: string): Promise<ConnectionBinding[]> {
+    return this.resolveConns((await this.redis.smembers(connUserk(userId))) ?? [])
+  }
+  async listConnectionsForGrant(grantId: string): Promise<ConnectionBinding[]> {
+    return this.resolveConns((await this.redis.smembers(connGrantk(grantId))) ?? [])
   }
 
   async getUserEpoch(userId: string): Promise<number> {

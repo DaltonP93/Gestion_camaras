@@ -24,6 +24,7 @@ import {
   type GrantAuditRecord,
   type MediaCodec,
   type MediaTransport,
+  type ConnectionBinding,
 } from './contracts'
 
 export function sha256Hex(input: string): string {
@@ -83,6 +84,8 @@ export function buildGrant(params: BuildGrantInternal, clock: GrantClock, random
     authorizationEpoch: params.authorizationEpoch,
     issuedAt: now,
     expiresAt,
+    // Construcción existente ⇒ SIEMPRE handshake (uso único). A1·F0 no cambia esto.
+    kind: 'handshake',
     revokedAt: null,
   }
   const issued: IssuedMediaGrant = {
@@ -146,6 +149,56 @@ export class MediaGrantManager {
     return { ok: true, issued }
   }
 
+  /**
+   * A1 · F0 — Emite un grant de SESIÓN de relay (`kind:'relay_session'`, long-lived).
+   * Idénticas invariantes que `issue` (exige instancia real, captura epoch), pero
+   * el grant NO es de uso único: lo re-valida `validateSession` sin consumirse.
+   */
+  async issueSession(params: MintGrantParams): Promise<IssueResult> {
+    let instance: string | null
+    let epoch: number
+    try {
+      instance = await this.store.currentInstance(params.streamPath)
+      if (instance === null) return { ok: false, code: 'NO_MEDIA_INSTANCE' }
+      epoch = await this.store.getUserEpoch(params.userId)
+    } catch { return { ok: false, code: 'BACKEND_UNAVAILABLE' } }
+
+    const built = buildGrant({ ...params, mediaInstanceId: instance, authorizationEpoch: epoch }, this.clock, this.random)
+    const stored: StoredMediaGrant = { ...built.stored, kind: 'relay_session' }
+    try {
+      await this.store.issueGrant(stored, { viewId: params.viewId, sessionId: params.sessionId }, Math.max(1, Math.floor(params.ttlMs)))
+    } catch { return { ok: false, code: 'BACKEND_UNAVAILABLE' } }
+    this.audit({ event: 'grant_issued', grantId: stored.grantId, userId: stored.userId, cameraId: stored.cameraId, transport: stored.transport, at: stored.issuedAt })
+    return { ok: true, issued: built.issued }
+  }
+
+  /**
+   * A1 · F0 — Re-valida un grant de sesión SIN consumirlo (no destructiva). Se
+   * llama en cada callback de auth del relay durante la vida de la conexión.
+   */
+  async validateSession(presented: GrantPresentation, scope: GrantScopeQuery): Promise<GrantValidation> {
+    const now = this.clock.now()
+    const result = await this.store.validateSession({
+      grantId: presented.grantId,
+      presentedSecretHash: sha256Hex(presented.secret),
+      scope, nowMs: now,
+    })
+    this.audit({
+      event: result.ok ? 'grant_used' : (result.reason === 'EXPIRED' ? 'grant_expired' : 'grant_rejected'),
+      grantId: presented.grantId, userId: scope.userId, cameraId: scope.cameraId, transport: scope.transport,
+      reason: result.ok ? undefined : result.reason, at: now,
+    })
+    return result
+  }
+
+  /** A1 · F0 — mapa conexión↔grant (passthrough al store). */
+  bindConnection(connectionId: string, grantId: string, userId: string, streamPath: string, ttlMs: number): Promise<void> {
+    return this.store.bindConnection(connectionId, grantId, userId, streamPath, ttlMs)
+  }
+  unbindConnection(connectionId: string): Promise<void> { return this.store.unbindConnection(connectionId) }
+  listConnectionsForUser(userId: string): Promise<ConnectionBinding[]> { return this.store.listConnectionsForUser(userId) }
+  listConnectionsForGrant(grantId: string): Promise<ConnectionBinding[]> { return this.store.listConnectionsForGrant(grantId) }
+
   /** Consume atómicamente (una sola transición linealizable). */
   async consume(presented: GrantPresentation, scope: GrantScopeQuery): Promise<GrantValidation> {
     const now = this.clock.now()
@@ -202,6 +255,10 @@ export class MediaGrantManager {
   }
   revokeByView(viewId: string, byUserId?: string): Promise<number> { return this.revokeIndex('view', viewId, byUserId) }
   revokeBySession(sessionId: string, byUserId?: string): Promise<number> { return this.revokeIndex('session', sessionId, byUserId) }
+
+  /** A1·F0 — grantIds de un índice (para calcular el kick de conexiones vivas). */
+  listGrantIdsForView(viewId: string): Promise<string[]> { return this.store.listIndex('view', viewId) }
+  listGrantIdsForSession(sessionId: string): Promise<string[]> { return this.store.listIndex('session', sessionId) }
 
   async peek(grantId: string): Promise<StoredMediaGrant | null> { return this.store.getGrant(grantId) }
 

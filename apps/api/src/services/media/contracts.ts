@@ -90,8 +90,34 @@ export interface StoredMediaGrant {
   authorizationEpoch: number
   issuedAt: number
   expiresAt: number
+  /**
+   * Modo del grant (A1 · F0, tras `NATIVE_MEDIA_RELAY_ENABLED`):
+   *   - `'handshake'` (DEFAULT / ausente ≡ handshake): grant de USO ÚNICO — el
+   *     consumo atómico lo hace `validateAndClaim` y un segundo uso es REPLAYED.
+   *     TODA construcción existente (buildGrant, tests) queda en este modo, así
+   *     que el comportamiento C22 no cambia.
+   *   - `'relay_session'`: grant de SESIÓN de medios (long-lived). Una conexión de
+   *     medios es larga y debe re-validarse en cada callback de auth del relay SIN
+   *     consumirse; lo valida `validateSession` (no destructivo, sin REPLAYED).
+   * El campo es OPCIONAL para no romper ninguna construcción/tests previos; su
+   * ausencia se interpreta SIEMPRE como `'handshake'`.
+   */
+  kind?: 'handshake' | 'relay_session'
   /** Grant de uso único (handshake). El consumo atómico lo hace `validateAndClaim`. */
   revokedAt: number | null
+}
+
+/**
+ * A1 · F0 — Vínculo conexión↔grant de una sesión de relay viva. Lo escribe el
+ * auth-hook al admitir una lectura y lo enumera `revoke→kick` para cortar
+ * conexiones activas al revocar. NUNCA contiene secretos, credenciales ni URIs.
+ */
+export interface ConnectionBinding {
+  /** Id de conexión/reader que reporta MediaMTX (payload `id`). */
+  connectionId: string
+  grantId: string
+  userId: string
+  streamPath: string
 }
 
 /**
