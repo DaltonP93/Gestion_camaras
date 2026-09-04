@@ -8,7 +8,7 @@ import { Prisma } from '@prisma/client'
 import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
-import { broadcastAlert } from './websocket'
+import { broadcastAlertScoped } from './websocket'
 import { sendAlertNotification } from '../services/notification.service'
 import { decryptNvrPasswordOrNull } from '../services/credentials'
 import { buildRtspUrl, buildRtspUrlMasked } from '../services/hikvision'
@@ -291,11 +291,11 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       alertId = alert.id
       analyticsAlertsCreatedTotal.inc({ type: body.type })
 
-      broadcastAlert({
+      await broadcastAlertScoped(server.prisma, camera.id, {
         type: 'alert',
         alert: {
           id: alert.id, type: alert.type, severity: alert.severity,
-          message: alert.message, nvrName: camera.nvr.name,
+          message: alert.message, cameraId: camera.id, nvrName: camera.nvr.name,
           cameraName: camera.name, snapshotUrl, createdAt: alert.createdAt,
         },
       })

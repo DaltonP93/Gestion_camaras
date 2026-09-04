@@ -825,9 +825,19 @@ Auditoría de robustez en `docs/audits/ROBUSTNESS_CYCLE2.md`. Implementado y ver
   (admin sin password por defecto conocido).
 - Verificación: `tsc` 0 · `vitest` 1233 · YAML/bash OK. El comportamiento
   de la app queda idéntico salvo lo aprobado (CORS default + defaults de deploy).
-- Pendientes menores: healthcheck de mediamtx (imagen `scratch`, requiere cambio
-  de imagen — decisión), usuarios demo del seed con passwords conocidos, CSP sin
-  `unsafe-inline` (nonces Vite), rate-limit en Redis, test automatizado de IDOR.
+- **Sub-lote menor (Ciclo 2)** — implementado y verificado (tsc 0 · vitest 1268):
+  seed de usuarios demo por env (`SEED_DEMO_USERS`; sin passwords conocidos en
+  deploy real); rate-limit con store en Redis si `REDIS_URL` (degrada seguro sin
+  él); tests de regresión IDOR (`rbac-idor.route.test.ts`); CSP más estricta
+  (`scriptSrc` sin `unsafe-inline` + `scriptSrcAttr 'none'`; `styleSrcElem/Attr`
+  conservan inline por el theming dinámico y los `style=` de React); y **scope de
+  alertas/eventos por permiso de cámara** (`canView`) en listado, conteos, summary,
+  mutaciones y broadcast WS (ADMIN sin restricción; alertas sin `cameraId` siguen
+  globales; `alerts.route.test.ts`).
+- Pendientes menores restantes: healthcheck de mediamtx (imagen `scratch`,
+  requiere cambio de imagen — decisión); scope por cámara de `/analytics/*` events
+  (hoy ADMIN/SUPERVISOR/AUDITOR); revocación de permisos no cierra conexiones WS
+  vivas (aplica en el siguiente broadcast).
 
 ### Todavía no realizado (siguiente desarrollo)
 - **ONVIF** ✅ y **Hik-Connect** ✅ implementados (flags OFF, con tests) **y

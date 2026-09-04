@@ -3,6 +3,7 @@ import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
+import Redis from 'ioredis'
 import { beginRequest, type RequestTicket } from './services/stream-manager'
 import websocket from '@fastify/websocket'
 import staticFiles from '@fastify/static'
@@ -11,6 +12,7 @@ import path from 'path'
 import fs from 'fs'
 import { redactUrlSecrets } from './lib/log-redact'
 import { resolveCorsOptions } from './lib/cors-config'
+import { cspDirectives } from './lib/security-headers'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -110,16 +112,11 @@ async function main() {
 
   // ─── Plugins de seguridad ──────────────────────────────────
   await server.register(helmet, {
+    // Directivas CSP endurecidas y documentadas en lib/security-headers.ts
+    // (scriptSrc sin 'unsafe-inline' + scriptSrcAttr 'none'; style-src separado
+    // en directivas granulares con 'unsafe-inline' acotado a atributos/elem).
     contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'unsafe-inline'"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", 'data:', 'blob:'],
-        mediaSrc: ["'self'", 'blob:'],
-        connectSrc: ["'self'", 'ws:', 'wss:'],
-        frameAncestors: ["'self'"],
-      },
+      directives: cspDirectives,
     },
     crossOriginResourcePolicy: { policy: 'same-site' },
   })
@@ -131,9 +128,38 @@ async function main() {
   // de orígenes cruzados quedan sin cabeceras CORS. Ver lib/cors-config.ts.
   await server.register(cors, resolveCorsOptions(process.env.CORS_ORIGINS))
 
+  // Rate-limit. Store:
+  //   - Con REDIS_URL definido → conexión ioredis DEDICADA (contador compartido
+  //     entre workers/instancias; el store en memoria por-proceso lo multiplicaba
+  //     por el nº de procesos). Opciones recomendadas para que un Redis caído NO
+  //     bloquee requests: `enableOfflineQueue:false` + `maxRetriesPerRequest:1` +
+  //     `connectTimeout` corto ⇒ las comandas fallan rápido y `@fastify/rate-limit`
+  //     degrada a PERMITIR (skipOnError=true por defecto). Un Redis ausente no
+  //     rompe el arranque (el plugin no espera conexión al registrarse) ni las
+  //     requests (degradación segura).
+  //   - Sin REDIS_URL → store en memoria (comportamiento idéntico al histórico).
+  // No se cambian `max`/`timeWindow`.
+  let rateLimitRedis: Redis | undefined
+  if (process.env.REDIS_URL) {
+    rateLimitRedis = new Redis(process.env.REDIS_URL, {
+      connectTimeout: 500,
+      maxRetriesPerRequest: 1,
+      enableOfflineQueue: false,
+    })
+    // Sin este listener, un error de socket de ioredis sería un 'unhandled error
+    // event' capaz de tumbar el proceso. No se expone la URL de Redis.
+    rateLimitRedis.on('error', (err: Error & { code?: string }) => {
+      server.log.warn(`[rate-limit] redis no disponible (degradando a permitir): ${err?.code || err?.message || 'unknown'}`)
+    })
+    server.addHook('onClose', async () => {
+      try { rateLimitRedis?.disconnect() } catch { /* noop */ }
+    })
+  }
+
   await server.register(rateLimit, {
     max: 600,
     timeWindow: '1 minute',
+    ...(rateLimitRedis ? { redis: rateLimitRedis } : {}),
     errorResponseBuilder: () => ({
       statusCode: 429,
       error: 'Too Many Requests',
