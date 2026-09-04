@@ -16,6 +16,20 @@ import { getStreamPath, publishStream, markAnalyticsConsumer } from '../services
 import { configureStreamConsumerRegistry, setStreamConsumerLogger } from '../services/stream-consumer-registry'
 import { analyticsEventsTotal, analyticsEventsRejectedTotal, analyticsAlertsCreatedTotal } from '../services/metrics'
 import { AuditAction } from '../services/audit'
+import { getViewableCameraIds } from '../services/camera-scope'
+
+// Scope de VISIBILIDAD por cámara del usuario que consulta analítica (RBAC, DEV15).
+// Consistente con el scope de alertas (routes/alerts.ts):
+//   ADMIN          → sin restricción (isAdmin=true; allowed no se usa).
+//   resto de roles → sólo eventos de sus cámaras `canView`.
+// A diferencia de las alertas, AnalyticsEvent.cameraId es REQUERIDO (todo evento
+// pertenece a una cámara), así que NO hay caso `cameraId=null` visible para todos.
+// Fuente de los cameraIds permitidos: getViewableCameraIds (camera-scope.ts).
+async function resolveAnalyticsScope(prisma: any, user: { role?: string; sub: string }) {
+  const isAdmin = user.role === 'ADMIN'
+  const allowed = isAdmin ? [] : await getViewableCameraIds(prisma, user.sub)
+  return { isAdmin, allowed }
+}
 
 const ANALYTICS_SECRET = process.env.ANALYTICS_SECRET || ''
 const UPLOADS_DIR      = process.env.UPLOADS_DIR || '/app/uploads'
@@ -387,7 +401,17 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
       from?: string; to?: string; page?: string; limit?: string
     }
     const where: any = {}
-    if (q.cameraId) where.cameraId = q.cameraId
+    // RBAC (DEV15): un no-admin sólo ve eventos de sus cámaras `canView`. El scope
+    // se AND-ea con el resto de filtros; si pidió ?cameraId=<ajena> la intersección
+    // queda vacía ⇒ resultado vacío (mismo comportamiento que el listado de alertas).
+    const { isAdmin, allowed } = await resolveAnalyticsScope(server.prisma, request.user)
+    if (!isAdmin) where.cameraId = { in: allowed }
+    if (q.cameraId) {
+      // Intersección con el scope: si ya hay filtro de scope, sólo pasa si la
+      // cámara pedida está permitida (para no-admin), si no ⇒ conjunto vacío.
+      if (isAdmin) where.cameraId = q.cameraId
+      else where.cameraId = { in: allowed.includes(q.cameraId) ? [q.cameraId] : [] }
+    }
     if (q.type) where.type = q.type
     if (q.className) where.className = q.className
     if (q.zoneName) where.zoneName = { contains: q.zoneName, mode: 'insensitive' }
@@ -484,7 +508,18 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
 
     // Si se pidió filtro de cámara/NVR pero la intersección quedó vacía, el filtro
     // sigue "activo": debe devolver 0 resultados, no todo (cameraId IN []).
-    const cameraFilterActive = nvrIds.length > 0 || cameraIds.length > 0
+    let cameraFilterActive = nvrIds.length > 0 || cameraIds.length > 0
+
+    // RBAC (DEV15): un no-admin NO ve todas las cámaras — su scope efectivo es su
+    // set `canView`. Sin filtro explícito ⇒ el filtro base es su canView; con filtro
+    // (nvrIds/cameraIds) ⇒ INTERSECCIÓN de lo pedido con su canView. ADMIN: sin cambios.
+    const { isAdmin, allowed } = await resolveAnalyticsScope(server.prisma, request.user)
+    if (!isAdmin) {
+      cameraFilter = cameraFilterActive
+        ? cameraFilter.filter(id => allowed.includes(id))   // intersección con canView
+        : [...allowed]                                       // sin filtro ⇒ sólo canView
+      cameraFilterActive = true   // el no-admin queda SIEMPRE scopeado por cámara
+    }
 
     const where: any = { occurredAt: { gte: from, lte: to } }
     if (cameraFilterActive) where.cameraId = { in: cameraFilter }
@@ -689,6 +724,13 @@ export const analyticsRoutes: FastifyPluginAsync = async (server) => {
   //   503             servicio Analytics desconectado o arrancando
   server.get('/live-frame/:cameraId', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
     const { cameraId } = request.params as { cameraId: string }
+    // RBAC (DEV15): un no-admin sólo puede ver el frame de una cámara con `canView`.
+    // Se comprueba ANTES de tocar config/servicio para no filtrar estado de cámaras
+    // ajenas (un 409/404 revelaría su existencia/estado de analítica).
+    const { isAdmin, allowed } = await resolveAnalyticsScope(server.prisma, request.user)
+    if (!isAdmin && !allowed.includes(cameraId)) {
+      return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
+    }
     // 409 si la analítica está deshabilitada para la cámara (evita polling inútil)
     const cfg = await server.prisma.cameraAnalyticsConfig.findUnique({
       where: { cameraId }, select: { enabled: true },
