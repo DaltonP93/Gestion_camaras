@@ -44,6 +44,7 @@ import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
 import { publishStream, getActiveTranscodesList, stopTranscodeProcess } from './services/stream'
+import { reRegisterStreams } from './services/stream-reregister'
 import { decryptNvrPasswordOrNull as decryptPass, validateNvrCredentialKey } from './services/credentials'
 
 const server = Fastify({
@@ -380,22 +381,17 @@ async function main() {
         where: { active: true },
         include: { cameras: { where: { active: true } } },
       })
-      let count = 0
-      let skipped = 0
-      for (const nvr of nvrs) {
-        const plainPass = decryptPass(nvr.password)
-        if (!plainPass) {
-          server.log.error(`[startup] DECRYPT_ERROR para NVR ${nvr.name} (${nvr.id}) — streams omitidos. Verifica NVR_CREDENTIAL_KEY y vuelve a guardar las credenciales del NVR.`)
-          skipped++
-          continue
-        }
-        const nvrDecrypted = { ...nvr, password: plainPass }
-        for (const camera of nvr.cameras) {
-          await publishStream(nvrDecrypted as any, camera)
-          count++
-        }
-      }
-      server.log.info(`[startup] ${count} paths on-demand registrados en MediaMTX (RTSP inactivo hasta primer viewer — sourceOnDemand=true)${skipped > 0 ? ` | ${skipped} NVR(s) omitidos por DECRYPT_ERROR` : ''}`)
+      // Aislamiento por cámara: un fallo puntual de publishStream no aborta el
+      // re-registro del resto del lote (ver services/stream-reregister.ts).
+      await reRegisterStreams(nvrs as any, {
+        decryptPass,
+        publishStream: (nvr, camera) => publishStream(nvr as any, camera as any),
+        log: {
+          info: (m) => server.log.info(m),
+          warn: (m) => server.log.warn(m),
+          error: (m) => server.log.error(m),
+        },
+      })
     } catch (err) {
       server.log.warn(`[startup] Error registrando streams en MediaMTX: ${err}`)
     }
