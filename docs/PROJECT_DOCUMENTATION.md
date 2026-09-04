@@ -809,6 +809,26 @@ NO-GO (`NATIVE_MEDIA_RELAY_ENABLED=false`).
 (2) atar MediaMTX a 127.0.0.1 — hecho; (3) `NVR_CREDENTIAL_KEY` obligatoria en
 prod — hecho; (4) diseñar A1 sin habilitar — hecho.
 
+### Ciclo 2 de robustez (rama reiniciada sobre `main` mergeado)
+
+Auditoría de robustez en `docs/audits/ROBUSTNESS_CYCLE2.md`. Implementado y verificado:
+- **Robustez segura** (sin cambio de comportamiento): logging de IPs enmascarado
+  (invariante #6), try/catch por cámara en re-registro al arranque, `forget()` de
+  sesión de medios en logout, `/metrics` timing-safe, handler `on('error')` de
+  Redis, cota de tamaño del snapshot de Frigate.
+- **Endurecimiento aprobado**: pin de imágenes docker (mediamtx 1.9.3, certbot
+  v3.0.1, frigate 0.14.1, postgres/redis/nginx a minor); healthchecks web/
+  analytics/frigate + `nginx` espera `web` sano; recarga periódica de nginx para
+  tomar certs renovados; `upgrade-to-https.sh` ya no regresiona la nginx.conf
+  endurecida; **CORS** por defecto sin reflejar origin+credenciales (solo
+  localhost sin allowlist); `POSTGRES_PASSWORD` y credenciales del seed **por env**
+  (admin sin password por defecto conocido).
+- Verificación: `tsc` 0 · `vitest` 1233 · YAML/bash OK. El comportamiento
+  de la app queda idéntico salvo lo aprobado (CORS default + defaults de deploy).
+- Pendientes menores: healthcheck de mediamtx (imagen `scratch`, requiere cambio
+  de imagen — decisión), usuarios demo del seed con passwords conocidos, CSP sin
+  `unsafe-inline` (nonces Vite), rate-limit en Redis, test automatizado de IDOR.
+
 ### Todavía no realizado (siguiente desarrollo)
 - **ONVIF** ✅ y **Hik-Connect** ✅ implementados (flags OFF, con tests) **y
   cableados a la UI**: página admin **Integraciones** (`apps/web/src/pages/IntegrationsPage.tsx`,
