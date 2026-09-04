@@ -12,6 +12,7 @@ import path from 'path'
 import fs from 'fs'
 import { redactUrlSecrets } from './lib/log-redact'
 import { resolveCorsOptions } from './lib/cors-config'
+import { cspDirectives } from './lib/security-headers'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -111,16 +112,11 @@ async function main() {
 
   // ─── Plugins de seguridad ──────────────────────────────────
   await server.register(helmet, {
+    // Directivas CSP endurecidas y documentadas en lib/security-headers.ts
+    // (scriptSrc sin 'unsafe-inline' + scriptSrcAttr 'none'; style-src separado
+    // en directivas granulares con 'unsafe-inline' acotado a atributos/elem).
     contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'unsafe-inline'"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", 'data:', 'blob:'],
-        mediaSrc: ["'self'", 'blob:'],
-        connectSrc: ["'self'", 'ws:', 'wss:'],
-        frameAncestors: ["'self'"],
-      },
+      directives: cspDirectives,
     },
     crossOriginResourcePolicy: { policy: 'same-site' },
   })
