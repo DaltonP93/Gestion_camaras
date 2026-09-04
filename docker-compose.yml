@@ -191,6 +191,15 @@ services:
       - api
     networks:
       - visioncore_net
+    # Healthcheck: la imagen es nginx:alpine (busybox). Se usa el wget de busybox
+    # (no hay curl) para pedir la raíz del estático servido en :80. 127.0.0.1
+    # explícito para no depender de la resolución IPv6 de 'localhost'.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   # ─── Analítica de video (Supervision + YOLOX/ONNX) ─────────
   # CPU por defecto. Para GPU NVIDIA ver apps/analytics/README.md.
@@ -231,6 +240,16 @@ services:
     dns:
       - 8.8.8.8
       - 1.1.1.1
+    # Healthcheck: la imagen trae curl. GET /health responde 200 mientras FastAPI
+    # viva (a propósito no refleja el estado del modelo — eso se ve en /status — para
+    # no reiniciar el contenedor por un modelo caído). start_period amplio porque el
+    # modelo ONNX se descarga en el primer arranque.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8500/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   # ─── Frigate (NVR con detección de objetos — fuente de analítica) ──
   # OPT-IN: sólo arranca con `docker compose --profile frigate up -d frigate`.
@@ -266,6 +285,16 @@ services:
       - visioncore_net
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Healthcheck: la imagen de Frigate (Debian) trae curl. GET /api/version en la
+    # API interna (5000). Servicio opt-in (profile "frigate"): no arranca en el stack
+    # por defecto y ningún otro servicio depende de él, así que este check no afecta
+    # el arranque normal. start_period amplio (Frigate tarda en levantar detectores).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/api/version || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
 
   # ─── Nginx (reverse proxy + SSL) ───────────────────────────
   nginx:
@@ -282,12 +311,14 @@ services:
       - "443:443"
     depends_on:
       # Esperar a que el API esté SANO (no sólo iniciado) para no producir 502
-      # transitorios mientras corren migraciones / arranque. web y mediamtx sólo
-      # necesitan estar iniciados.
+      # transitorios mientras corren migraciones / arranque. web también se espera
+      # SANO (ya tiene healthcheck). mediamtx corre desde una imagen `scratch` (sin
+      # shell ni cliente HTTP) por lo que no admite un healthcheck interno estándar
+      # → se mantiene service_started.
       api:
         condition: service_healthy
       web:
-        condition: service_started
+        condition: service_healthy
       mediamtx:
         condition: service_started
     networks:
