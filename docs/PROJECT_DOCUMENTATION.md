@@ -834,10 +834,12 @@ Auditoría de robustez en `docs/audits/ROBUSTNESS_CYCLE2.md`. Implementado y ver
   alertas/eventos por permiso de cámara** (`canView`) en listado, conteos, summary,
   mutaciones y broadcast WS (ADMIN sin restricción; alertas sin `cameraId` siguen
   globales; `alerts.route.test.ts`).
+- **Scope de eventos de Analítica por cámara** ✅: `/events`, `/summary` (todas
+  las agregaciones) y `/live-frame/:cameraId` scopeados por `canView` (ADMIN sin
+  restricción; SUPERVISOR/AUDITOR solo sus cámaras); `analytics.route.test.ts`.
 - Pendientes menores restantes: healthcheck de mediamtx (imagen `scratch`,
-  requiere cambio de imagen — decisión); scope por cámara de `/analytics/*` events
-  (hoy ADMIN/SUPERVISOR/AUDITOR); revocación de permisos no cierra conexiones WS
-  vivas (aplica en el siguiente broadcast).
+  requiere cambio de imagen — decisión); revocación de permisos no cierra
+  conexiones WS vivas (aplica en el siguiente broadcast).
 
 ### Todavía no realizado (siguiente desarrollo)
 - **ONVIF** ✅ y **Hik-Connect** ✅ implementados (flags OFF, con tests) **y
