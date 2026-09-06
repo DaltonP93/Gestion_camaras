@@ -127,6 +127,53 @@ describe.skipIf(!HAVE_REDIS)('revoke-outbox · durable + Redis REAL', () => {
     expect(other.reason).not.toBe('REVOKE_PENDING')
   })
 
+  it('el CAMINO ACTIVO (issue/consume) también falla CERRADO con deuda; tras drenar ⇒ EPOCH_MISMATCH', async () => {
+    // Las rutas reales usan manager.issue()/consume(), NO issueSession/validateSession.
+    const durable = new InMemoryMediaRevokeOutbox()
+    setMediaRevokeOutboxForTest(durable)
+
+    // Fase A · Redis sano: fuente + grant vivo de la víctima.
+    const proxy = new FailableRedis(env.client)
+    const server: any = { log, redis: proxy }
+    const mgr = getMediaGrantManager(server)
+    await mgr.registerSource('nvr_c_sub')
+    const r = await mgr.issue({ userId: 'victim', viewId: 'v', cameraId: 'cam-1', streamPath: 'nvr_c_sub', effectiveType: 'sub', codec: 'h264', transport: 'rtsps', device: 'win', ttlMs: 30_000 })
+    if (!r.ok) throw new Error('issue inicial: ' + r.code)
+
+    // Fase B · Redis CAÍDO en el logout: la deuda queda durable (no se bumpeó epoch).
+    proxy.down = true
+    expect(await revokeUserMediaGrants(server, 'victim')).toBe('pending')
+
+    // Fase C · Redis VUELVE pero el drenaje AÚN NO corrió: issue() y consume() del
+    // camino activo deben rechazar REVOKE_PENDING (antes de tocar el store).
+    proxy.down = false
+    const issAgain = await mgr.issue({ userId: 'victim', viewId: 'v', cameraId: 'cam-1', streamPath: 'nvr_c_sub', effectiveType: 'sub', codec: 'h264', transport: 'rtsps', device: 'win', ttlMs: 30_000 })
+    expect(issAgain.ok).toBe(false)
+    if (!issAgain.ok) expect(issAgain.code).toBe('REVOKE_PENDING')
+    const cons = await mgr.consume({ grantId: r.issued.grantId, secret: r.issued.secret }, scope)
+    expect(cons.ok).toBe(false)
+    expect(cons.reason).toBe('REVOKE_PENDING')
+
+    // Un usuario SIN deuda no queda bloqueado por issue().
+    const innocent = await mgr.issue({ userId: 'inocente', viewId: 'v', cameraId: 'cam-1', streamPath: 'nvr_c_sub', effectiveType: 'sub', codec: 'h264', transport: 'rtsps', device: 'win', ttlMs: 30_000 })
+    expect(innocent.ok).toBe(true)
+
+    // Fase D · Drenaje ⇒ epoch bumpeado; se limpia la deuda.
+    await env.raw.del(ik('user', 'victim')) // aislar la garantía por EPOCH (no por revokedAt)
+    expect(await retryPendingUserRevokes(server)).toBe(1)
+    expect(__pendingUserRevokeCount()).toBe(0)
+
+    // El grant anterior (epoch 0) ya no consume: EPOCH_MISMATCH (no REVOKE_PENDING).
+    const after = await mgr.consume({ grantId: r.issued.grantId, secret: r.issued.secret }, scope)
+    expect(after.ok).toBe(false)
+    expect(after.reason).toBe('EPOCH_MISMATCH')
+
+    // Sin deuda pendiente, un nuevo issue de la víctima procede (la AUTORIZACIÓN/RBAC
+    // vigente se aplica en la ruta, no en el manager).
+    const fresh = await mgr.issue({ userId: 'victim', viewId: 'v', cameraId: 'cam-1', streamPath: 'nvr_c_sub', effectiveType: 'sub', codec: 'h264', transport: 'rtsps', device: 'win', ttlMs: 30_000 })
+    expect(fresh.ok).toBe(true)
+  })
+
   it('drenaje CONCURRENTE in-memory (mismo proceso): una sola aplicación por fila', async () => {
     // NB: NO es multi-worker/cross-process — son dos drenajes en el mismo event
     // loop sobre un único InMemoryMediaRevokeOutbox. La toma síncrona (claiming)

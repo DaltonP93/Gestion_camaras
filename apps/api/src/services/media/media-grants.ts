@@ -150,6 +150,11 @@ export class MediaGrantManager {
   healthy(): Promise<boolean> { return this.store.healthy() }
 
   async issue(params: MintGrantParams): Promise<IssueResult> {
+    // Fail-closed (C23·H2·P2): las rutas activas usan issue()/consume(), no sólo
+    // issueSession/validateSession. Con deuda de revocación DURABLE pendiente para
+    // el usuario, NO se emite ningún grant — aunque el drenaje del epoch aún no
+    // haya corrido (Redis pudo estar caído al hacer logout/quitar permisos).
+    if (await this.revokeDebtBlocks(params.userId)) return { ok: false, code: 'REVOKE_PENDING' }
     // EXIGE una instancia de fuente real vigente: no se inventa por el path.
     let instance: string | null
     let epoch: number
@@ -230,6 +235,13 @@ export class MediaGrantManager {
   /** Consume atómicamente (una sola transición linealizable). */
   async consume(presented: GrantPresentation, scope: GrantScopeQuery): Promise<GrantValidation> {
     const now = this.clock.now()
+    // Fail-closed (C23·H2·P2): consume() es el camino activo de consumo de grants.
+    // Con deuda de revocación durable pendiente para el usuario del scope, se
+    // DENIEGA antes de reclamar (aunque el epoch de Redis todavía no se bumpeó).
+    if (await this.revokeDebtBlocks(scope.userId)) {
+      this.audit({ event: 'grant_rejected', grantId: presented.grantId, userId: scope.userId, cameraId: scope.cameraId, transport: scope.transport, reason: 'REVOKE_PENDING', at: now })
+      return { ok: false, reason: 'REVOKE_PENDING' }
+    }
     const result = await this.store.validateAndClaim({
       grantId: presented.grantId,
       presentedSecretHash: sha256Hex(presented.secret),

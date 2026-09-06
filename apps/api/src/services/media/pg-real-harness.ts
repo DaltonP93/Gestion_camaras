@@ -25,7 +25,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import { PrismaClient } from '@prisma/client'
-import { assertDisposableLocalHost } from './test-host-guard'
+import { assertDestructiveTestAllowed } from './test-host-guard'
 import type { PrismaOutboxClient, PrismaOutboxTx } from './revoke-outbox'
 
 const TEST_URL = process.env.DATABASE_URL_TEST
@@ -104,14 +104,24 @@ export interface EphemeralOutboxDb {
 }
 
 /**
+ * Construye la URL con `?schema=<schema>` REEMPLAZANDO cualquier `schema` previo
+ * (no anexando un segundo, que dejaría ambiguo cuál gana). Puro y testeable.
+ */
+export function buildScopedUrl(baseUrl: string, schema: string): string {
+  const u = new URL(baseUrl)
+  u.searchParams.set('schema', schema) // set REEMPLAZA; append dejaría dos schema=
+  return u.toString()
+}
+
+/**
  * Crea un schema aislado con la tabla `media_revoke_outbox`, ejecuta `fn` con un
  * PrismaClient real + adapter, y limpia (DROP SCHEMA) pase lo que pase.
  */
 export async function withEphemeralOutboxDb<T>(fn: (db: EphemeralOutboxDb) => Promise<T>): Promise<T> {
   if (!TEST_URL) throw new Error('DATABASE_URL_TEST no definido')
-  // Guard: sólo destinos descartables locales/CI (loopback), ANTES de conectar o
-  // ejecutar CREATE/DROP SCHEMA CASCADE.
-  assertDisposableLocalHost(TEST_URL, 'DATABASE_URL_TEST')
+  // Guard: loopback + señal EXPLÍCITA de instancia descartable, ANTES de conectar o
+  // de ejecutar CREATE/DROP SCHEMA CASCADE (loopback solo no prueba desechabilidad).
+  assertDestructiveTestAllowed(TEST_URL, 'DATABASE_URL_TEST', 'PG_TEST_DISPOSABLE')
   const schema = `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 
   // Bootstrap: crear el schema con una conexión sobre la URL base.
@@ -122,7 +132,7 @@ export async function withEphemeralOutboxDb<T>(fn: (db: EphemeralOutboxDb) => Pr
     await boot.$disconnect()
   }
 
-  const scopedUrl = TEST_URL + (TEST_URL.includes('?') ? '&' : '?') + `schema=${schema}`
+  const scopedUrl = buildScopedUrl(TEST_URL, schema) // REEMPLAZA cualquier schema previo
   const prisma = new PrismaClient({ datasources: { db: { url: scopedUrl } } })
   try {
     await applyMigration0033(prisma) // migración REAL 0033 dentro del schema aislado

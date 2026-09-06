@@ -61,6 +61,11 @@ jobs:
           DATABASE_URL_TEST: postgresql://ci:ci@localhost:5432/ci
           REQUIRE_REAL_REDIS: '1'
           REQUIRE_REAL_PG: '1'
+          # Señal EXPLÍCITA de que los servicios son efímeros/descartables del job
+          # (contenedores del `services:`). Los harnesses NO ejecutan FLUSHDB /
+          # DROP SCHEMA sin esta autorización (loopback por sí solo no basta).
+          REDIS_TEST_DISPOSABLE: '1'
+          PG_TEST_DISPOSABLE: '1'
         run: npm test
 
   web:

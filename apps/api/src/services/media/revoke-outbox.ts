@@ -75,7 +75,7 @@ export class InMemoryMediaRevokeOutbox implements MediaRevokeOutboxRepo {
   }
 }
 
-// ─── impl Postgres (durable, real; SKIP LOCKED NOT_VALIDATED en test) ─
+// ─── impl Postgres (durable, real; SKIP LOCKED VALIDADO en test) ─
 /** Subconjunto estructural del PrismaClient que usa el outbox. */
 export interface PrismaOutboxClient {
   mediaRevokeOutbox: {

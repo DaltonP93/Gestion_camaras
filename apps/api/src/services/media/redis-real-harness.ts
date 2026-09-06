@@ -6,10 +6,14 @@
 //
 // DOS MODOS de obtención del servidor:
 //   1. `REDIS_TEST_URL` (CI): se conecta a un Redis REAL provisto por el entorno
-//      (p. ej. el `services: redis` del job). Se aísla con un índice de DB
-//      aleatorio + FLUSHDB, y `stop()` limpia esa DB. NO se lanza ningún proceso.
-//   2. binario local (dev): lanza un `redis-server` efímero (puerto alto, sin
-//      persistencia) y lo termina en `stop()`.
+//      (p. ej. el `services: redis` del job). El índice de DB se asigna de forma
+//      ATÓMICA y DETERMINISTA (contador en la DB 0 ⇒ 1..15 distintos por suite, sin
+//      colisión entre procesos), y `stop()` limpia esa DB. El FLUSHDB exige la señal
+//      explícita `REDIS_TEST_DISPOSABLE=1` (loopback solo no autoriza destructivo).
+//      NO se lanza ningún proceso.
+//   2. binario local (dev): lanza un `redis-server` efímero PROPIO (puerto alto, sin
+//      persistencia) y lo termina en `stop()`. Al ser instancia propia por corrida,
+//      no requiere la señal de desechabilidad.
 //
 // DETECCIÓN SÍNCRONA Y FIABLE (`redisServerAvailable`): usa `spawnSync`, no
 // `spawn`. `spawn` NO lanza en ausencia del binario — emite un evento `error`
@@ -20,7 +24,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import Redis from 'ioredis'
 import type { RedisGrantClient } from './grant-store'
-import { assertDisposableLocalHost } from './test-host-guard'
+import { assertDestructiveTestAllowed } from './test-host-guard'
 
 export interface EphemeralRedis {
   client: RedisGrantClient
@@ -92,15 +96,23 @@ function stopProcess(proc: ChildProcess): Promise<void> {
 export async function startEphemeralRedis(): Promise<EphemeralRedis> {
   // ── Modo CI: conectar al Redis provisto (REDIS_TEST_URL), aislado por DB ──
   if (TEST_URL) {
-    // Guard: sólo destinos descartables locales/CI (loopback), ANTES de conectar.
-    assertDisposableLocalHost(TEST_URL, 'REDIS_TEST_URL')
-    // Aislamiento DETERMINISTA por worker de vitest (no aleatorio): un worker corre
-    // sus archivos EN SERIE, así que su DB no colisiona con otro worker. Evita la
-    // colisión posible de elegir 1 de 16 al azar entre suites paralelas.
-    const workerRaw = Number(process.env.VITEST_WORKER_ID ?? process.env.VITEST_POOL_ID ?? '0')
-    const db = ((Number.isFinite(workerRaw) ? workerRaw : 0) % 16 + 16) % 16
+    // Guard: loopback + señal EXPLÍCITA de instancia descartable, ANTES de FLUSHDB.
+    // (loopback por sí solo no prueba que sea desechable.)
+    assertDestructiveTestAllowed(TEST_URL, 'REDIS_TEST_URL', 'REDIS_TEST_DISPOSABLE')
+    // Aislamiento por ASIGNACIÓN ATÓMICA de DB (no worker%16, que colisiona entre
+    // procesos separados o cuando el id supera 16). Un contador en la DB 0 reparte
+    // índices distintos 1..15 a suites concurrentes (la DB 0 se reserva para el
+    // contador y NO se limpia). Determinista y sin colisión hasta 15 concurrentes.
+    const alloc = new Redis(TEST_URL, { db: 0, maxRetriesPerRequest: 3 })
+    let db: number
+    try {
+      const n = await alloc.incr('__vc_test_db_alloc__')
+      db = (Number(n) % 15) + 1 // 1..15
+    } finally {
+      await closeClient(alloc)
+    }
     const raw = new Redis(TEST_URL, { db, maxRetriesPerRequest: 3 })
-    await raw.flushdb() // arranca limpio en ESTA DB dedicada del worker
+    await raw.flushdb() // arranca limpio en ESTA DB dedicada (1..15), nunca la 0
     const stop = async (): Promise<void> => {
       try { await raw.flushdb() } catch { /* noop */ }
       await closeClient(raw)
