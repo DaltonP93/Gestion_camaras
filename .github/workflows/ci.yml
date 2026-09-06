@@ -10,6 +10,28 @@ jobs:
   api:
     name: API (typecheck + tests)
     runs-on: ubuntu-latest
+    # Servicios REALES y efímeros para las suites de integración (C23·H2): Redis
+    # para grants/revocación y Postgres para la atomicidad SKIP LOCKED del outbox.
+    # No son remotos ni de producción: contenedores desechables del propio job.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s --health-timeout 3s --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,6 +54,13 @@ jobs:
         run: npm run build
       - name: Tests
         working-directory: apps/api
+        # Redis y Postgres REALES obligatorios: REQUIRE_* hace FALLAR (no omitir en
+        # silencio) las suites de integración si el servicio no está disponible.
+        env:
+          REDIS_TEST_URL: redis://localhost:6379
+          DATABASE_URL_TEST: postgresql://ci:ci@localhost:5432/ci
+          REQUIRE_REAL_REDIS: '1'
+          REQUIRE_REAL_PG: '1'
         run: npm test
 
   web:

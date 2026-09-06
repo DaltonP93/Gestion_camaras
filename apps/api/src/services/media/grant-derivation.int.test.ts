@@ -15,9 +15,9 @@ import { RedisGrantStore } from './grant-store'
 import { SourceLifecycleController } from './source-lifecycle'
 import { deriveMediaRequest, type DeriveDeps } from './grant-derivation'
 import { MediaGrantManager } from './media-grants'
-import { startEphemeralRedis, redisServerAvailable, type EphemeralRedis } from './redis-real-harness'
+import { startEphemeralRedis, assertRedisRequiredOrSkip, type EphemeralRedis } from './redis-real-harness'
 
-const HAVE_REDIS = redisServerAvailable()
+const HAVE_REDIS = assertRedisRequiredOrSkip()
 
 const CAM = { id: 'cam-1', channel: 9, mainCodec: 'HEVC', subCodec: 'H264', nvr: { id: 'nvr1' } }
 const STREAM = `nvr_${CAM.nvr.id}_ch${String(CAM.channel).padStart(2, '0')}_main`

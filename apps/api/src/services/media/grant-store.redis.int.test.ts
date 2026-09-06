@@ -10,10 +10,10 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { RedisGrantStore, type ValidateAndClaimInput } from './grant-store'
-import { startEphemeralRedis, redisServerAvailable, type EphemeralRedis } from './redis-real-harness'
+import { startEphemeralRedis, assertRedisRequiredOrSkip, type EphemeralRedis } from './redis-real-harness'
 import type { StoredMediaGrant } from './contracts'
 
-const HAVE_REDIS = redisServerAvailable()
+const HAVE_REDIS = assertRedisRequiredOrSkip()
 
 function grant(over: Partial<StoredMediaGrant> = {}): StoredMediaGrant {
   return {

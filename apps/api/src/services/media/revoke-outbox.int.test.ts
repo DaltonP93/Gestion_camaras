@@ -9,16 +9,17 @@
 //   RECHAZADO (EPOCH_MISMATCH).
 //
 // También: fail-closed del relay mientras hay deuda pendiente, y drenaje
-// multi-worker sin doble procesamiento destructivo (dos drenajes concurrentes ⇒
-// una sola aplicación).
+// CONCURRENTE sobre la MISMA cola in-memory (dos drenajes en el mismo proceso ⇒
+// una sola aplicación por fila). OJO: esto NO es "multi-worker/cross-process" —
+// son dos drenajes en un único event loop sobre un único objeto InMemory. La
+// atomicidad multi-worker REAL (FOR UPDATE SKIP LOCKED entre transacciones/procesos
+// distintos) se valida contra Postgres efímero real en `revoke-outbox.pg.int.test.ts`.
 //
-// La durabilidad se prueba con la impl EN MEMORIA de la interfaz durable, que se
-// re-inyecta tras el "reinicio" (representa Postgres, que persiste). La atomicidad
-// SKIP LOCKED de la impl Postgres NO está validada en vivo (no hay servidor
-// Postgres en el entorno; sólo el cliente psql) ⇒ NOT_VALIDATED, documentado.
+// La durabilidad ante reinicio se prueba con la impl EN MEMORIA de la interfaz
+// durable, re-inyectada tras el "reinicio" (representa la persistencia de Postgres).
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
-import { startEphemeralRedis, redisServerAvailable, type EphemeralRedis } from './redis-real-harness'
+import { startEphemeralRedis, assertRedisRequiredOrSkip, type EphemeralRedis } from './redis-real-harness'
 import { ik, type RedisGrantClient } from './grant-store'
 import { InMemoryMediaRevokeOutbox } from './revoke-outbox'
 import {
@@ -26,7 +27,7 @@ import {
   setMediaRevokeOutboxForTest, __resetMediaGrantManagerForTest, __pendingUserRevokeCount,
 } from './grant-service'
 
-const HAVE_REDIS = redisServerAvailable()
+const HAVE_REDIS = assertRedisRequiredOrSkip()
 
 /** Proxy sobre ioredis que puede simular una caída (toda op lanza) SIN perder los
  *  datos ya escritos en el Redis real subyacente (como un outage de red). */
@@ -126,13 +127,17 @@ describe.skipIf(!HAVE_REDIS)('revoke-outbox · durable + Redis REAL', () => {
     expect(other.reason).not.toBe('REVOKE_PENDING')
   })
 
-  it('drenaje multi-worker: dos drenajes concurrentes ⇒ una sola aplicación (sin doble proceso)', async () => {
+  it('drenaje CONCURRENTE in-memory (mismo proceso): una sola aplicación por fila', async () => {
+    // NB: NO es multi-worker/cross-process — son dos drenajes en el mismo event
+    // loop sobre un único InMemoryMediaRevokeOutbox. La toma síncrona (claiming)
+    // evita el doble proceso EN PROCESO; el equivalente entre procesos (SKIP
+    // LOCKED) se valida en revoke-outbox.pg.int.test.ts contra Postgres real.
     const durable = new InMemoryMediaRevokeOutbox()
     await durable.enqueue('u1')
     await durable.enqueue('u2')
     let applies = 0
     const apply = async (): Promise<boolean> => { applies++; return true }
-    // Dos "workers" drenando a la vez sobre la MISMA cola durable.
+    // Dos drenajes a la vez sobre la MISMA cola in-memory.
     const [a, b] = await Promise.all([durable.drain(apply), durable.drain(apply)])
     expect(a + b).toBe(2)          // exactamente 2 filas aplicadas en total
     expect(applies).toBe(2)        // cada fila aplicada UNA vez (sin doble proceso)

@@ -15,11 +15,12 @@
 //     memoria marca la fila "en proceso" de forma síncrona (event loop de un solo
 //     hilo) antes de cualquier await.
 //
-// La impl Postgres es CÓDIGO REAL (usada en producción vía server.prisma) pero su
-// atomicidad SKIP LOCKED NO está validada en vivo aquí (no hay servidor Postgres
-// en el entorno de test — sólo el cliente psql). La interfaz durable y el
-// comportamiento idempotente/fail-closed SÍ se validan con la impl en memoria y
-// con Redis REAL. Ver revoke-outbox.int.test.ts (marcado NOT_VALIDATED para PG).
+// La impl Postgres es CÓDIGO REAL (usada en producción vía server.prisma). Su
+// atomicidad `FOR UPDATE SKIP LOCKED` está VALIDADA contra Postgres efímero real en
+// `revoke-outbox.pg.int.test.ts` (dos drenajes concurrentes toman filas distintas;
+// mutar SKIP LOCKED → el test falla por bloqueo). La interfaz durable y el
+// comportamiento idempotente/fail-closed también se validan con la impl en memoria
+// y con Redis REAL (`revoke-outbox.int.test.ts`).
 
 export interface MediaRevokeOutboxRepo {
   /** Registra DURABLEMENTE la intención de revocar (una fila por intención). */
