@@ -3,6 +3,12 @@ from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
+# SHA-256 conocido del yolox_s.onnx oficial (Megvii, release 0.1.1rc0). Se verifica
+# tras la descarga en runtime; NO ejecutar un binario descargado sin verificar.
+# Override por env MODEL_SHA256 sólo para modelos propios (vacío = omitir con warning).
+EXPECTED_MODEL_SHA256 = "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063"
+
+
 class Settings(BaseSettings):
     # API Node de VisionCore (red interna de docker)
     api_base_url: str = "http://api:4000"
@@ -19,6 +25,11 @@ class Settings(BaseSettings):
     model_url: str = (
         "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx"
     )
+    # SHA-256 esperado del modelo. Default = hash del yolox_s.onnx oficial; override
+    # por env MODEL_SHA256 para modelos propios. Vacío = omitir verificación (warn).
+    model_sha256: str = Field(
+        default=EXPECTED_MODEL_SHA256,
+        validation_alias=AliasChoices("MODEL_SHA256", "ANALYTICS_MODEL_SHA256"))
     input_size: int = 640  # 640 para yolox_s/m, 416 para yolox_tiny/nano
 
     # Reintento de descarga/carga del modelo cuando falla (no reinicia el proceso)
