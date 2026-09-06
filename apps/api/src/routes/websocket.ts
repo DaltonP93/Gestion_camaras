@@ -71,6 +71,34 @@ export async function broadcastAlertScoped(
   }
 }
 
+// Fuerza el cierre de TODAS las conexiones WebSocket vivas de un usuario.
+//
+// Se invoca tras revocar permisos (logout / cambio o borrado de permisos): sin
+// esto, las conexiones abiertas seguirían recibiendo pushes con los permisos
+// viejos hasta el siguiente broadcast (ver "Limitación conocida" arriba). Al
+// cerrarlas, el cliente se ve forzado a reconectar y re-autenticar con el JWT
+// vigente, re-evaluando permisos en el handler de conexión.
+//
+// El `onClose` existente ya limpia el mapa (borra el ws y elimina la entrada del
+// userId si queda vacía); aquí NO se duplica esa limpieza. Devuelve cuántos
+// sockets se cerraron. Seguro si el usuario no tiene conexiones (devuelve 0).
+export function closeUserSockets(
+  userId: string,
+  code = 4003,
+  reason = 'permissions_changed',
+): number {
+  const clients = wsClients.get(userId)
+  if (!clients) return 0
+  // Copia defensiva: ws.close() puede disparar 'close' síncronamente y mutar el Set.
+  const sockets = [...clients]
+  let closed = 0
+  for (const ws of sockets) {
+    ws.close(code, reason)
+    closed++
+  }
+  return closed
+}
+
 export function broadcastToUser(userId: string, payload: object) {
   const clients = wsClients.get(userId)
   if (!clients) return
