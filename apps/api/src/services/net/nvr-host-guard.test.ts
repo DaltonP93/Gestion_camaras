@@ -94,7 +94,6 @@ describe('assertSafeNvrHost — bloqueados (SSRF)', () => {
     ['brackets + mayúsculas', '[FD00:EC2::254]'],
     ['expandida completa', 'fd00:0ec2:0000:0000:0000:0000:0000:0254'],
     ['expandida sin ceros a la izquierda', 'fd00:ec2:0:0:0:0:0:254'],
-    ['con zone-id', 'fd00:ec2::254%eth0'],
   ])('bloquea metadatos IPv6 en forma %s', (_label, host) => {
     expect(code(() => assertSafeNvrHost(host))).toBe('SSRF_BLOCKED')
   })
@@ -104,9 +103,38 @@ describe('assertSafeNvrHost — bloqueados (SSRF)', () => {
     expect(code(() => assertSafeNvrHost('fd00:ec2:::254'))).toBe('INVALID_HOST')   // ':::'
     expect(code(() => assertSafeNvrHost('12345::1'))).toBe('INVALID_HOST')         // hextet > 4 dígitos
   })
-  it('rechaza octetos IPv4 inválidos (>255) como SSRF_BLOCKED', () => {
-    expect(code(() => assertSafeNvrHost('999.1.1.1'))).toBe('SSRF_BLOCKED')
-    expect(code(() => assertSafeNvrHost('10.0.0.300'))).toBe('SSRF_BLOCKED')
+  it('IPv6 con zone-id ⇒ INVALID_HOST (se RECHAZA, no se elimina en silencio)', () => {
+    expect(code(() => assertSafeNvrHost('fd00:ec2::254%eth0'))).toBe('INVALID_HOST') // metadata + zona ⇒ rechazo
+    expect(code(() => assertSafeNvrHost('fe80::1%eth0'))).toBe('INVALID_HOST')
+    expect(code(() => assertSafeNvrHost('fd12::1%25eth0'))).toBe('INVALID_HOST')
+  })
+  // BYPASS SSRF por parser diferencial: "010" es OCTAL en WHATWG URL/axios (=8),
+  // pero decimal-con-cero-a-la-izquierda para un parser ingenuo. Se RECHAZAN todas
+  // las formas no canónicas (ceros a la izquierda / fuera de rango) ⇒ INVALID_HOST,
+  // así el guard y el cliente jamás interpretan destinos distintos.
+  it('IPv4 no canónica ⇒ SIEMPRE rechazada (jamás permitida)', () => {
+    // La garantía de seguridad es "no se conecta". Todas se rechazan (throw).
+    for (const h of ['010.010.010.010', '010.0.0.1', '0172.020.0.1', '192.168.001.005', '08.8.8.8']) {
+      expect(code(() => assertSafeNvrHost(h)), h).not.toBeUndefined()
+    }
+  })
+  it('IPv4 con ceros a la izquierda (grupos ≤3 dígitos) ⇒ INVALID_HOST explícito', () => {
+    // '010'→OCTAL 8 en WHATWG/axios; con forma de cuádruple punteado ⇒ INVALID_HOST.
+    for (const h of ['010.010.010.010', '010.0.0.1', '192.168.001.005', '08.8.8.8']) {
+      expect(code(() => assertSafeNvrHost(h)), h).toBe('INVALID_HOST')
+    }
+    // '0172' tiene 4 dígitos: no es forma de cuádruple punteado ⇒ se rechaza como hostname.
+    expect(code(() => assertSafeNvrHost('0172.020.0.1'))).toBe('SSRF_BLOCKED')
+  })
+  it('IPv4 fuera de rango (>255) ⇒ INVALID_HOST', () => {
+    expect(code(() => assertSafeNvrHost('999.1.1.1'))).toBe('INVALID_HOST')
+    expect(code(() => assertSafeNvrHost('10.0.0.300'))).toBe('INVALID_HOST')
+  })
+  it('IPv4 canónica con octeto "0" sigue siendo válida en su clasificación', () => {
+    // 0.0.0.0 es canónica (octeto exacto "0") ⇒ se clasifica y se bloquea como no-especificada.
+    expect(code(() => assertSafeNvrHost('0.0.0.0'))).toBe('SSRF_BLOCKED')
+    // 10.0.0.0 canónica y privada ⇒ permitida.
+    expect(() => assertSafeNvrHost('10.0.0.0')).not.toThrow()
   })
   it('rechaza host vacío como INVALID_HOST', () => {
     expect(code(() => assertSafeNvrHost(''))).toBe('INVALID_HOST')

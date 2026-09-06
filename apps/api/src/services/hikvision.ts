@@ -7,7 +7,7 @@ import {
   parseChannelHealthXml, mapOnlineToStatus,
   type NvrChannelHealth,
 } from './hikvision-channel-health'
-import { maskIp, redactIps } from '../lib/log-redact'
+import { maskIp, redactLog, redactError } from '../lib/log-redact'
 import { assertSafeNvrHost } from './net/nvr-host-guard'
 
 // ─── Interfaces ───────────────────────────────────────────────
@@ -531,7 +531,7 @@ function parseInputProxyChannelBody(
       const uniqueFields = [...new Set(fieldMatches)].slice(0, 20).join(', ')
       console.warn(
         `[InputProxy] ${logContext} channelsParsed=0 rootTag="${rootTag}" detectedFields=[${uniqueFields}]` +
-        ` first1000=${redactIps(bodyStr.slice(0, 1000).replace(/\s+/g, ' '))}`
+        ` first1000=${redactLog(bodyStr.slice(0, 1000).replace(/\s+/g, ' '))}`
       )
     }
     return entries
@@ -642,13 +642,13 @@ async function fetchInputProxyChannels(
       }
 
       if (res.status !== 200) {
-        console.warn(`[InputProxy] ${maskIp(nvr.ipAddress)} ${label} HTTP=${res.status}: ${redactIps(body.slice(0, 200))}`)
+        console.warn(`[InputProxy] ${maskIp(nvr.ipAddress)} ${label} HTTP=${res.status}: ${redactLog(body.slice(0, 200))}`)
         continue
       }
 
       const hasChannels = body.includes('InputProxyChannel')
       if (!hasChannels) {
-        console.warn(`[InputProxy] ${maskIp(nvr.ipAddress)} ${label} HTTP=200 bodyXml=${body.trimStart().startsWith('<')} bytes=${body.length} no InputProxyChannel: ${redactIps(body.slice(0, 200))}`)
+        console.warn(`[InputProxy] ${maskIp(nvr.ipAddress)} ${label} HTTP=200 bodyXml=${body.trimStart().startsWith('<')} bytes=${body.length} no InputProxyChannel: ${redactLog(body.slice(0, 200))}`)
         continue
       }
 
@@ -667,7 +667,7 @@ async function fetchInputProxyChannels(
       // Only return if we actually parsed something — otherwise try next variant
       if (entries.length > 0) return { entries, variantUsed: label }
     } catch (e: any) {
-      console.warn(`[InputProxy] ${label} network error: ${e?.code || e?.message}`)
+      console.warn(`[InputProxy] ${label} network error: ${redactError(e)}`)
     }
   }
 
@@ -975,7 +975,7 @@ export async function getNvrChannelHealth(nvr: NVR): Promise<NvrChannelHealth[]>
     const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '')
     for (const e of parseChannelHealthXml(body, 'inputproxy_status')) put(e)
   } catch (e: any) {
-    console.warn(`[channel-health] ${maskIp(nvr.ipAddress)} status endpoint error: ${e?.code || e?.message || 'unknown'}`)
+    console.warn(`[channel-health] ${maskIp(nvr.ipAddress)} status endpoint error: ${redactError(e)}`)
   }
 
   // 2) InputProxy /channels (variantes con manejo de Digest) — completa canales
@@ -996,7 +996,7 @@ export async function getNvrChannelHealth(nvr: NVR): Promise<NvrChannelHealth[]>
         })
       }
     } catch (e: any) {
-      console.warn(`[channel-health] ${maskIp(nvr.ipAddress)} inputproxy channels error: ${e?.code || e?.message || 'unknown'}`)
+      console.warn(`[channel-health] ${maskIp(nvr.ipAddress)} inputproxy channels error: ${redactError(e)}`)
     }
   }
 
@@ -1020,7 +1020,7 @@ export async function getNvrChannelHealth(nvr: NVR): Promise<NvrChannelHealth[]>
       }
       for (const id of ids) put({ channel: id, status: 'UNKNOWN', source: 'videoinput_fallback' })
     } catch (e: any) {
-      console.warn(`[channel-health] ${maskIp(nvr.ipAddress)} videoinput fallback error: ${e?.code || e?.message || 'unknown'}`)
+      console.warn(`[channel-health] ${maskIp(nvr.ipAddress)} videoinput fallback error: ${redactError(e)}`)
     }
   }
 
@@ -1819,7 +1819,7 @@ async function searchRecordingsPage(
     const parsed = blocks.map((block, index) => parseSearchMatchItem(block, nvr.id, channel, position + index))
     const withUri = parsed.filter(r => r.playbackURI).length
     if (blocks.length > 0 && withUri === 0) {
-      console.warn(`[hikvision] search ch=${channel} total=${blocks.length} withPlaybackUri=0 first_block_snippet=${redactIps(blocks[0].slice(0, 400).replace(/\s+/g, ' '))}`)
+      console.warn(`[hikvision] search ch=${channel} total=${blocks.length} withPlaybackUri=0 first_block_snippet=${redactLog(blocks[0].slice(0, 400).replace(/\s+/g, ' '))}`)
     }
     return { items: parsed, status: respStatus }
   }
@@ -1900,7 +1900,7 @@ export async function searchRecordings(
         }
         console.log(`[recordings] search_chunk nvrId=${nvr.id} ch=${channel} from=${new Date(chunkStart).toISOString()} to=${new Date(chunkEnd).toISOString()} count=${page.items.length} new=${newItems}`)
       } catch (err: any) {
-        console.warn(`[recordings] search_chunk_error nvrId=${nvr.id} ch=${channel} from=${new Date(chunkStart).toISOString()} err=${err?.message}`)
+        console.warn(`[recordings] search_chunk_error nvrId=${nvr.id} ch=${channel} from=${new Date(chunkStart).toISOString()} err=${redactError(err)}`)
       }
       chunkStart = chunkEnd
       chunks++

@@ -39,6 +39,7 @@ import {
   METADATA_HOSTS,
   METADATA_IPV6_CANON,
   isIpv4,
+  isDottedQuadShape,
   isPrivateIpv4,
   isLoopbackIpv4,
   isUnspecifiedIpv4,
@@ -87,7 +88,15 @@ export function assertSafeNvrHost(rawHost: string): void {
     throw new NvrHostError('SSRF_BLOCKED', 'destino de metadatos cloud bloqueado')
   }
 
-  if (isIpv4(host)) {
+  // Cualquier cosa con forma de cuádruple punteado se trata como IPv4 literal y se
+  // EXIGE canónica: sin ceros a la izquierda (salvo el octeto exacto "0"). Un
+  // "010.010.010.010" NO es 10.10.10.10 — WHATWG URL/axios lo leen como OCTAL
+  // (8.8.8.8, público). Rechazar la forma no canónica cierra el bypass por parser
+  // diferencial y garantiza que el guard y el cliente interpretan el MISMO destino.
+  if (isDottedQuadShape(host)) {
+    if (!isIpv4(host)) {
+      throw new NvrHostError('INVALID_HOST', 'IPv4 no canónica (ceros a la izquierda o fuera de rango)')
+    }
     if (isLinkLocalIpv4(host)) throw new NvrHostError('SSRF_BLOCKED', 'IP link-local bloqueada (169.254.0.0/16)')
     if (isLoopbackIpv4(host)) throw new NvrHostError('SSRF_BLOCKED', 'IP loopback bloqueada')
     if (isUnspecifiedIpv4(host)) throw new NvrHostError('SSRF_BLOCKED', 'IP no especificada bloqueada')

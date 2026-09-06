@@ -26,14 +26,39 @@ export const METADATA_IPV6 = new Set([
   'fd00:ec2::254',
 ])
 
-export function isIpv4(host: string): boolean {
+/** Forma SINTÁCTICA de cuádruple punteado (4 grupos de 1-3 dígitos), posiblemente
+ *  NO canónica (p. ej. con ceros a la izquierda). Se usa para detectar "parece una
+ *  IPv4 literal" y exigir entonces forma canónica. */
+export function isDottedQuadShape(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host)
 }
 
+// Octeto CANÓNICO: sin ceros a la izquierda (excepto el octeto exacto "0").
+const CANONICAL_OCTET = /^(0|[1-9]\d{0,2})$/
+
+/**
+ * IPv4 CANÓNICA ⇒ octetos. Rechaza ceros a la izquierda ("010", "00"), porque
+ * WHATWG URL / axios los interpretan como OCTAL ("010" → 8): un guard que los lea
+ * como decimal validaría un destino DISTINTO del que se conecta (bypass SSRF por
+ * parser diferencial). El octeto exacto "0" sí es válido. Devuelve null si no es
+ * canónica o está fuera de rango.
+ */
 export function ipv4Octets(host: string): number[] | null {
-  const parts = host.split('.').map((p) => Number(p))
-  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null
-  return parts
+  const parts = host.split('.')
+  if (parts.length !== 4) return null
+  const out: number[] = []
+  for (const p of parts) {
+    if (!CANONICAL_OCTET.test(p)) return null
+    const n = Number(p)
+    if (n < 0 || n > 255) return null
+    out.push(n)
+  }
+  return out
+}
+
+/** IPv4 literal CANÓNICA (estricta: sin ceros a la izquierda). */
+export function isIpv4(host: string): boolean {
+  return ipv4Octets(host) !== null
 }
 
 /** ¿La IPv4 está en un rango privado/loopback/CGNAT? (incluye loopback 127/8). */
@@ -87,8 +112,10 @@ export function normalizeIpv6(host: string): string {
 export function expandIpv6(raw: string): string | null {
   if (raw == null) return null
   let h = raw.trim().replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
-  const pct = h.indexOf('%')
-  if (pct !== -1) h = h.slice(0, pct) // zona/scope-id: no aplica a destino remoto
+  // Zone-id (scope-id, `%eth0`): NO es un destino remoto válido. Se RECHAZA (null),
+  // no se elimina en silencio — eliminarlo cambiaría el host que se valida vs. el
+  // que se conecta.
+  if (h.includes('%')) return null
   if (!h.includes(':')) return null   // no es IPv6
   if (/[^0-9a-f:.]/.test(h)) return null
 

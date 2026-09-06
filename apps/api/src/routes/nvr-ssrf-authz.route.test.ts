@@ -106,6 +106,45 @@ describe('P1-b SSRF — POST /api/nvrs/test-connection valida el host del NVR', 
     expect(res.json().errorCode).not.toBe('SSRF_BLOCKED')
     await app.close()
   })
+
+  // BYPASS por parser diferencial: connectionTestSchema.ipAddress es
+  // z.string().min(1), así que llega tal cual al guard. "010.010.010.010" NO debe
+  // pasar como 10.x — WHATWG URL/axios lo leen OCTAL (8.8.8.8, público). El guard
+  // lo rechaza (INVALID_HOST) ANTES de tocar red, en /test-connection y /detect.
+  it('RECHAZA IPv4 no canónica 010.010.010.010 en /test-connection ⇒ 400 (no llega a la red)', async () => {
+    const app = await build(ADMIN, [])
+    const res = await app.inject({
+      method: 'POST', url: '/api/nvrs/test-connection',
+      payload: { ipAddress: '010.010.010.010', port: 80, username: 'svc', password: 'secreta' },
+    })
+    expect(res.statusCode).toBe(400)
+    expect(res.json().errorCode).toBe('INVALID_HOST')
+    expect(res.json().errorCode).not.toBe('PASSWORD_MISSING') // nunca avanzó al cliente
+    await app.close()
+  })
+
+  it('RECHAZA IPv4 no canónica 010.010.010.010 en /detect ⇒ 400', async () => {
+    const app = await build(ADMIN, [])
+    const res = await app.inject({
+      method: 'POST', url: '/api/nvrs/detect',
+      payload: { ipAddress: '010.010.010.010', port: 80, username: 'svc', password: 'secreta' },
+    })
+    expect(res.statusCode).toBe(400)
+    expect(res.json().errorCode).toBe('INVALID_HOST')
+    await app.close()
+  })
+
+  it('el error de host NO filtra el host ni credenciales en la respuesta', async () => {
+    const app = await build(ADMIN, [])
+    const res = await app.inject({
+      method: 'POST', url: '/api/nvrs/test-connection',
+      payload: { ipAddress: '010.010.010.010', port: 80, username: 'svc', password: 'secreta' },
+    })
+    const body = JSON.stringify(res.json())
+    expect(body).not.toContain('010.010.010.010')
+    expect(body).not.toContain('secreta')
+    await app.close()
+  })
 })
 
 describe('P1-c authz — GET /api/nvrs/:id exige canView (no-ADMIN)', () => {

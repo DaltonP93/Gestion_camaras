@@ -20,7 +20,7 @@ import {
   isMaskedPassword,
 } from '../services/credentials'
 import { assertSafeNvrHost, isNvrHostError } from '../services/net/nvr-host-guard'
-import { maskIp, maskUser, redactIps } from '../lib/log-redact'
+import { maskIp, maskUser, redactError } from '../lib/log-redact'
 import {
   userCanAccessNvr,
   userCanAccessNvrWide,
@@ -414,7 +414,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         storageReason = permDenied
           ? `Usuario sin permiso para leer almacenamiento (HTTP ${httpSt}) — usa un usuario Administrador del NVR`
           : `No soportado por este modelo/firmware (HTTP ${httpSt})`
-        server.log.warn(`[storage] ${nvr.name} (${maskIp(nvr.ipAddress)}): ${redactIps(e.message)}`)
+        server.log.warn(`[storage] ${nvr.name} (${maskIp(nvr.ipAddress)}): ${redactError(e)}`)
       } else {
         server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
         return reply.status(500).send({ message: 'No se pudo sincronizar almacenamiento del NVR. Ver logs del servidor.' })
@@ -451,7 +451,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         usersReason = permDenied
           ? `Usuario sin permiso para gestión de usuarios (HTTP ${httpSt}) — usa un usuario Administrador del NVR`
           : `No soportado por este modelo/firmware (HTTP ${httpSt})`
-        server.log.warn(`[users] ${nvr.name} (${maskIp(nvr.ipAddress)}): ${redactIps(e.message)}`)
+        server.log.warn(`[users] ${nvr.name} (${maskIp(nvr.ipAddress)}): ${redactError(e)}`)
       } else {
         throw e
       }
@@ -1274,7 +1274,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
         server.log.info(`[nvr-create] ${nvr.name} (${maskIp(nvr.ipAddress)}) onboarding done: ipCams=${ipCams.length} source=${sourceUsed}`)
       } catch (err: any) {
-        server.log.warn(`[nvr-create] ${nvr.name} onboarding error: ${redactIps(err?.message ?? '')}`)
+        server.log.warn(`[nvr-create] ${nvr.name} onboarding error: ${redactError(err)}`)
       }
     })()
 
