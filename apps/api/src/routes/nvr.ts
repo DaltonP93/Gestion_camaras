@@ -286,8 +286,12 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
 
   async function userCanAccessNvr(userId: string, role: string, nvrId: string): Promise<boolean> {
     if (role === 'ADMIN' || role === 'SUPERVISOR') return true
+    // RBAC por recurso: un no-privilegiado sólo accede al NVR si tiene un permiso
+    // REAL de lectura (canView=true) sobre el NVR o sobre alguna de sus cámaras.
+    // Antes bastaba la mera existencia de una fila UserPermission (aunque canView
+    // fuese false) ⇒ acceso laxo. Alineado con camera-scope / cameras.ts.
     const perm = await server.prisma.userPermission.findFirst({
-      where: { userId, OR: [{ nvrId }, { camera: { nvrId } }] },
+      where: { userId, canView: true, OR: [{ nvrId }, { camera: { nvrId } }] },
       select: { id: true },
     })
     return !!perm
