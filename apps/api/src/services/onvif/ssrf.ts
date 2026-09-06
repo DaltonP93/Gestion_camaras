@@ -23,67 +23,21 @@
 // fuerte. La comprobación es puramente sintáctica y determinista ⇒ testeable.
 
 import { OnvifError } from './errors'
+import {
+  METADATA_HOSTS,
+  isIpv4,
+  isPrivateIpv4,
+  isLinkLocalIpv4,
+  isPrivateIpv6,
+  isLinkLocalIpv6,
+  looksLikeIpv6,
+} from '../net/ip-classify'
 
 export interface SsrfPolicy {
   /** Hostnames extra permitidos (exactos, en minúscula). Default vacío. */
   allowedHosts?: string[]
   /** Permitir IPs públicas (SÓLO si el operador lo decide). Default false. */
   allowPublic?: boolean
-}
-
-const METADATA_HOSTS = new Set([
-  '169.254.169.254',
-  'metadata.google.internal',
-  'metadata',
-  'metadata.goog',
-])
-
-function isIpv4(host: string): boolean {
-  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host)
-}
-
-function ipv4Octets(host: string): number[] | null {
-  const parts = host.split('.').map((p) => Number(p))
-  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null
-  return parts
-}
-
-/** ¿La IPv4 está en un rango privado/loopback/CGNAT permitido? */
-function isPrivateIpv4(host: string): boolean {
-  const o = ipv4Octets(host)
-  if (!o) return false
-  const [a, b] = o
-  if (a === 10) return true // 10.0.0.0/8
-  if (a === 127) return true // loopback
-  if (a === 172 && b >= 16 && b <= 31) return true // 172.16.0.0/12
-  if (a === 192 && b === 168) return true // 192.168.0.0/16
-  if (a === 100 && b >= 64 && b <= 127) return true // 100.64.0.0/10 CGNAT
-  return false
-}
-
-function isLinkLocalIpv4(host: string): boolean {
-  const o = ipv4Octets(host)
-  return !!o && o[0] === 169 && o[1] === 254 // 169.254.0.0/16 (incluye metadatos)
-}
-
-function normalizeIpv6(host: string): string {
-  return host.replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
-}
-
-function isPrivateIpv6(host: string): boolean {
-  const h = normalizeIpv6(host)
-  if (h === '::1') return true // loopback
-  if (h.startsWith('fc') || h.startsWith('fd')) return true // ULA fc00::/7
-  return false
-}
-
-function isLinkLocalIpv6(host: string): boolean {
-  const h = normalizeIpv6(host)
-  return h.startsWith('fe80') // link-local
-}
-
-function looksLikeIpv6(host: string): boolean {
-  return host.includes(':')
 }
 
 /**

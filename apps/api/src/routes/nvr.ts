@@ -19,6 +19,20 @@ import {
   decryptNvrPasswordOrNull as safeDecrypt,
   isMaskedPassword,
 } from '../services/credentials'
+import { assertSafeNvrHost, isNvrHostError } from '../services/net/nvr-host-guard'
+
+// Valida el host/IP del NVR contra SSRF (metadatos cloud, loopback, link-local).
+// Devuelve un objeto de error tipado para responder 400, o null si es seguro.
+// No incluye la IP en la respuesta ni en logs (invariante 6 del handoff).
+function nvrHostError(host: string): { errorCode: string; message: string } | null {
+  try {
+    assertSafeNvrHost(host)
+    return null
+  } catch (e) {
+    if (isNvrHostError(e)) return { errorCode: e.code, message: 'Host de NVR no permitido (SSRF): usa una IP de la LAN.' }
+    throw e
+  }
+}
 
 // Strip debug/non-schema fields before passing a HikStorageDisk to Prisma
 function sanitizeDiskForDb(disk: any) {
@@ -55,6 +69,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   // POST /api/nvrs/test-connection
   server.post('/test-connection', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const raw = connectionTestSchema.parse(request.body)
+
+    const hostErr = nvrHostError(raw.ipAddress)
+    if (hostErr) return reply.status(400).send({ success: false, ...hostErr })
 
     // Resolve password: use provided value, or load from stored NVR when editing
     let password = raw.password || ''
@@ -114,6 +131,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   // POST /api/nvrs/detect — Auto-detectar info del NVR
   server.post('/detect', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const raw = connectionTestSchema.parse(request.body)
+
+    const hostErr = nvrHostError(raw.ipAddress)
+    if (hostErr) return reply.status(400).send({ success: false, ...hostErr })
 
     // Resolve password: use provided value, or load from stored NVR when editing
     let password = raw.password || ''
@@ -1142,6 +1162,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.post('/', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const data = nvrSchema.parse(request.body)
 
+    const hostErr = nvrHostError(data.ipAddress)
+    if (hostErr) return reply.status(400).send({ success: false, ...hostErr })
+
     const nvr = await server.prisma.nVR.create({
       data: { ...data, password: encryptPassword(data.password), location: data.location || null },
     })
@@ -1208,6 +1231,11 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.put('/:id', { preHandler: [server.authorize(['ADMIN'])] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const data = nvrSchema.partial().parse(request.body)
+
+    if (data.ipAddress !== undefined) {
+      const hostErr = nvrHostError(data.ipAddress)
+      if (hostErr) return reply.status(400).send({ success: false, ...hostErr })
+    }
 
     const existing = await server.prisma.nVR.findUnique({ where: { id } })
     if (!existing) return reply.status(404).send({ message: 'NVR no encontrado' })

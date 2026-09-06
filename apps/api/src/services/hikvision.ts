@@ -8,6 +8,7 @@ import {
   type NvrChannelHealth,
 } from './hikvision-channel-health'
 import { maskIp, redactIps } from '../lib/log-redact'
+import { assertSafeNvrHost } from './net/nvr-host-guard'
 
 // ─── Interfaces ───────────────────────────────────────────────
 
@@ -149,6 +150,10 @@ function buildDigestAuth(
 
 function createHikClient(nvr: { ipAddress: string; port: number; username: string; password: string }, timeoutMs = 10000): AxiosInstance {
   const { username, password } = nvr
+
+  // Defensa en profundidad SSRF: bloquea metadatos cloud/loopback/link-local antes
+  // de emitir cualquier request ISAPI. Los NVR legítimos en LAN pasan sin cambios.
+  assertSafeNvrHost(nvr.ipAddress)
 
   const client = axios.create({
     baseURL: `http://${nvr.ipAddress}:${nvr.port}`,
@@ -555,6 +560,9 @@ function parseInputProxyChannelBody(
 async function fetchInputProxyChannels(
   nvr: { ipAddress: string; port: number; username: string; password: string },
 ): Promise<{ entries: InputProxyEntry[]; variantUsed: string | null }> {
+  // Defensa en profundidad SSRF: este helper construye la baseURL a mano (bypass
+  // del cliente axios compartido), así que debe validar el host por su cuenta.
+  assertSafeNvrHost(nvr.ipAddress)
   const baseUrl = `http://${nvr.ipAddress}:${nvr.port}`
   const hikHeaders = {
     'X-Requested-With': 'XMLHttpRequest',
