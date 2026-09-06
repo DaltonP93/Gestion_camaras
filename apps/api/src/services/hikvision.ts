@@ -159,6 +159,13 @@ function createHikClient(nvr: { ipAddress: string; port: number; username: strin
     baseURL: `http://${nvr.ipAddress}:${nvr.port}`,
     timeout: timeoutMs,
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    // Anti-SSRF: NO seguir redirecciones. Un NVR ISAPI legítimo nunca responde 3xx
+    // para estas lecturas; un 3xx hacia loopback/metadatos sería un vector de SSRF
+    // y, además, Axios reenviaría la cabecera Authorization (Basic/Digest) al nuevo
+    // origen. Con maxRedirects:0 Axios trata cualquier 3xx como respuesta final
+    // (no sigue el `Location`), y el reintento Digest/Basic hereda esta política por
+    // usar este mismo cliente. No hay necesidad de negocio de seguir redirecciones.
+    maxRedirects: 0,
   })
 
   client.interceptors.response.use(undefined, async (err) => {
