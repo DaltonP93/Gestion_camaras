@@ -116,6 +116,8 @@ jobs:
       # bloquean. Falla ante HIGH/CRITICAL prod en paquetes fuera del allowlist de
       # deuda conocida (axios/form-data, pre-existentes). Un paquete prod NUEVO con
       # HIGH/CRITICAL rompe CI.
+      - name: Self-test fail-closed de la política de audit (pruebas negativas)
+        run: bash scripts/check-npm-audit.test.sh
       - name: Auditar dependencias de producción (api + web)
         run: bash scripts/check-npm-audit.sh apps/api apps/web
 
