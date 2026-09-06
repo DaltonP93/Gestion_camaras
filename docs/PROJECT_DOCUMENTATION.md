@@ -837,9 +837,13 @@ Auditoría de robustez en `docs/audits/ROBUSTNESS_CYCLE2.md`. Implementado y ver
 - **Scope de eventos de Analítica por cámara** ✅: `/events`, `/summary` (todas
   las agregaciones) y `/live-frame/:cameraId` scopeados por `canView` (ADMIN sin
   restricción; SUPERVISOR/AUDITOR solo sus cámaras); `analytics.route.test.ts`.
-- Pendientes menores restantes: healthcheck de mediamtx (imagen `scratch`,
-  requiere cambio de imagen — decisión); revocación de permisos no cierra
-  conexiones WS vivas (aplica en el siguiente broadcast).
+- **Healthcheck de MediaMTX** ✅: imagen a la variante `1.9.3-ffmpeg` (con shell)
+  + healthcheck `wget` contra la API 9997; `depends_on` de nginx sigue en
+  `service_started`. (Verificación empírica del tag/cliente HTTP queda para el
+  arranque real; el comentario documenta fallback a `curl` y reversión a `1.9.3`.)
+- **Revocación cierra conexiones WS vivas** ✅: `closeUserSockets(userId)` cableado
+  tras la revocación en logout y en cambio/borrado de permisos → el cliente
+  reconecta y re-autentica con permisos nuevos (ya no espera al siguiente broadcast).
 
 ### Todavía no realizado (siguiente desarrollo)
 - **ONVIF** ✅ y **Hik-Connect** ✅ implementados (flags OFF, con tests) **y
