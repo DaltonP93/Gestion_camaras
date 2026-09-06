@@ -9,19 +9,35 @@
 // desarrollo), aquí:
 //
 //   1. BLOQUEO DURO de 169.254.0.0/16 (incluye el endpoint de metadatos cloud
-//      169.254.169.254) y de los hostnames de metadatos conocidos.
+//      169.254.169.254) y de los hostnames/IPs de metadatos conocidos (Alibaba
+//      100.100.100.200 dentro de CGNAT, y fd00:ec2::254 IPv6 dentro de ULA).
 //   2. BLOQUEO de loopback (127.0.0.0/8, ::1) y de la dirección no especificada
 //      (0.0.0.0, ::) — un NVR real jamás vive ahí; permitirlo abriría SSRF a
 //      servicios locales del servidor.
 //   3. BLOQUEO de IPv6 link-local (fe80::/10).
-//   4. Se PERMITEN IPs privadas IPv4 (10/8, 172.16/12, 192.168/16, CGNAT 100.64/10)
-//      e IPv6 ULA (fc00::/7): son las redes donde viven los NVR legítimos.
+//
+// POLÍTICA LAN PERMITIDA (allowlist explícita — todo lo demás se rechaza):
+//   IPv4 privadas:  10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918) y
+//                   100.64.0.0/10 (CGNAT, RFC6598) — MENOS 100.100.100.200.
+//   IPv6:           fc00::/7 (ULA) — MENOS los endpoints de metadatos IPv6.
+//   Se aceptan porque son exactamente los rangos donde vive un NVR en una LAN/
+//   red de operador; una IP pública o de metadatos jamás debería configurarse.
+//
+// IP-LITERAL-ONLY (anti DNS-rebinding): sólo se admite una IP literal como host
+// del NVR. Los hostnames (incluidos localhost, *.local y *.lan) se RECHAZAN: sin
+// resolución+fijado de IP no se puede garantizar a qué dirección se conecta y un
+// nombre podría re-resolver a metadatos/loopback entre validación y conexión.
+// El schema Zod de NVR ya exige `.ip()`, así que esto es coherente con el modelo
+// de datos. FUTURO: si algún día se necesita hostname, la alternativa segura es
+// resolver el nombre, validar TODAS las direcciones devueltas contra esta misma
+// política y fijar la conexión (connect) a la IP validada — no admitir el nombre.
 //
 // La comprobación es puramente sintáctica y determinista ⇒ testeable. No resuelve
 // DNS ni loguea la IP/URL (invariante 6 del handoff).
 
 import {
   METADATA_HOSTS,
+  METADATA_IPV6,
   isIpv4,
   isPrivateIpv4,
   isLoopbackIpv4,
@@ -32,6 +48,7 @@ import {
   isUnspecifiedIpv6,
   isLinkLocalIpv6,
   looksLikeIpv6,
+  normalizeIpv6,
 } from './ip-classify'
 
 export type NvrHostErrorCode =
@@ -57,14 +74,15 @@ export function isNvrHostError(e: unknown): e is NvrHostError {
  * Valida el host/IP de un NVR según la política LAN-only anti-SSRF. Lanza
  * `NvrHostError` si no es seguro. Idempotente y sin efectos secundarios.
  *
- * Acepta el literal tal cual se guarda en `NVR.ipAddress` (normalmente una IP,
- * el schema Zod usa `.ip()`), pero también tolera hostnames LAN por robustez.
+ * Exige una IP LITERAL (IPv4 o IPv6) tal cual se guarda en `NVR.ipAddress`
+ * (el schema Zod usa `.ip()`). Cualquier hostname se rechaza (IP-literal-only).
  */
 export function assertSafeNvrHost(rawHost: string): void {
   const host = (rawHost ?? '').trim().toLowerCase()
   if (!host) throw new NvrHostError('INVALID_HOST', 'host de NVR vacío')
 
-  // 1) Metadatos cloud: bloqueo duro.
+  // 1) Metadatos de proveedor (hostname o IPv4 literal): bloqueo duro y primero,
+  //    para que 100.100.100.200 no pase como CGNAT en la rama IPv4 de abajo.
   if (METADATA_HOSTS.has(host)) {
     throw new NvrHostError('SSRF_BLOCKED', 'destino de metadatos cloud bloqueado')
   }
@@ -78,6 +96,9 @@ export function assertSafeNvrHost(rawHost: string): void {
   }
 
   if (looksLikeIpv6(host)) {
+    const norm = normalizeIpv6(host)
+    // Metadatos IPv6 (fd00:ec2::254) — bloqueo antes de la allow de ULA.
+    if (METADATA_IPV6.has(norm)) throw new NvrHostError('SSRF_BLOCKED', 'destino de metadatos cloud bloqueado')
     if (isLinkLocalIpv6(host)) throw new NvrHostError('SSRF_BLOCKED', 'IPv6 link-local bloqueada')
     if (isLoopbackIpv6(host)) throw new NvrHostError('SSRF_BLOCKED', 'IPv6 loopback bloqueada')
     if (isUnspecifiedIpv6(host)) throw new NvrHostError('SSRF_BLOCKED', 'IPv6 no especificada bloqueada')
@@ -85,13 +106,8 @@ export function assertSafeNvrHost(rawHost: string): void {
     throw new NvrHostError('SSRF_BLOCKED', 'IPv6 fuera del rango privado (LAN) permitido')
   }
 
-  // Hostname (no IP). El schema de NVR exige `.ip()`, así que esto es un backstop:
-  // sólo se admiten localhost/LAN mDNS y se rechaza el resto por defecto (evita
-  // DNS-rebinding hacia metadatos o destinos externos). `localhost` se rechaza:
-  // resuelve a loopback y un NVR real jamás es localhost.
-  if (host === 'localhost') {
-    throw new NvrHostError('SSRF_BLOCKED', 'localhost bloqueado para NVR')
-  }
-  if (host.endsWith('.local') || host.endsWith('.lan')) return // mDNS/LAN
-  throw new NvrHostError('SSRF_BLOCKED', 'hostname no permitido para NVR (LAN-only)')
+  // No es IP literal ⇒ es un hostname. IP-literal-only: se rechaza TODO hostname
+  // (localhost, *.local, *.lan y cualquier FQDN) para no depender de una
+  // resolución DNS que podría re-apuntar a metadatos/loopback (DNS-rebinding).
+  throw new NvrHostError('SSRF_BLOCKED', 'sólo se admite IP literal para NVR (hostname rechazado, anti DNS-rebinding)')
 }

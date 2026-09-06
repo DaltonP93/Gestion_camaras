@@ -7,12 +7,23 @@
 // NO resuelve DNS (eso ocurre al conectar); por eso los hostnames se acotan
 // fuerte aguas arriba. Aquí sólo se clasifican literales y hostnames conocidos.
 
-/** Hostnames de metadatos cloud (bloqueo duro en cualquier política). */
+/** Hostnames / IPs literales de metadatos de proveedor cloud (bloqueo duro en
+ *  cualquier política). Incluye AWS/GCP/Azure (169.254.169.254, ya cae en
+ *  link-local) y Alibaba (100.100.100.200), que CAE dentro del rango CGNAT
+ *  100.64.0.0/10 — de otro modo `isPrivateIpv4` lo daría por LAN legítima. */
 export const METADATA_HOSTS = new Set([
   '169.254.169.254',
+  '100.100.100.200',      // Alibaba Cloud ECS metadata (dentro de CGNAT)
   'metadata.google.internal',
   'metadata',
   'metadata.goog',
+])
+
+/** Endpoints de metadatos de proveedor sobre IPv6 (forma normalizada, sin
+ *  brackets y en minúsculas). fd00:ec2::254 (AWS IMDS IPv6) cae en ULA fc00::/7,
+ *  así que `isPrivateIpv6` lo permitiría — hay que bloquearlo explícitamente. */
+export const METADATA_IPV6 = new Set([
+  'fd00:ec2::254',
 ])
 
 export function isIpv4(host: string): boolean {

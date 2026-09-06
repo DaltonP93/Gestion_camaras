@@ -28,8 +28,6 @@ describe('assertSafeNvrHost — LAN permitida (NVRs legítimos)', () => {
     '100.64.0.1',        // CGNAT
     'fd12::1',           // ULA IPv6
     '[fd00::abcd]',      // ULA IPv6 con brackets
-    'nvr.local',         // mDNS LAN
-    'grabador.lan',      // LAN
   ])('permite %s', (host) => {
     expect(() => assertSafeNvrHost(host)).not.toThrow()
   })
@@ -71,6 +69,23 @@ describe('assertSafeNvrHost — bloqueados (SSRF)', () => {
   })
   it('bloquea localhost', () => {
     expect(code(() => assertSafeNvrHost('localhost'))).toBe('SSRF_BLOCKED')
+  })
+  it('IP-literal-only: rechaza hostname mDNS *.local', () => {
+    expect(code(() => assertSafeNvrHost('nvr.local'))).toBe('SSRF_BLOCKED')
+  })
+  it('IP-literal-only: rechaza hostname *.lan', () => {
+    expect(code(() => assertSafeNvrHost('grabador.lan'))).toBe('SSRF_BLOCKED')
+  })
+  it('bloquea metadatos Alibaba 100.100.100.200 aunque caiga en CGNAT', () => {
+    expect(code(() => assertSafeNvrHost('100.100.100.200'))).toBe('SSRF_BLOCKED')
+  })
+  it('bloquea metadatos IPv6 fd00:ec2::254 aunque caiga en ULA', () => {
+    expect(code(() => assertSafeNvrHost('fd00:ec2::254'))).toBe('SSRF_BLOCKED')
+    expect(code(() => assertSafeNvrHost('[fd00:ec2::254]'))).toBe('SSRF_BLOCKED')
+  })
+  it('rechaza octetos IPv4 inválidos (>255) como SSRF_BLOCKED', () => {
+    expect(code(() => assertSafeNvrHost('999.1.1.1'))).toBe('SSRF_BLOCKED')
+    expect(code(() => assertSafeNvrHost('10.0.0.300'))).toBe('SSRF_BLOCKED')
   })
   it('rechaza host vacío como INVALID_HOST', () => {
     expect(code(() => assertSafeNvrHost(''))).toBe('INVALID_HOST')
