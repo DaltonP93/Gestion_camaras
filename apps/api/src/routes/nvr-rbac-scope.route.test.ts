@@ -53,10 +53,13 @@ const cameras: Record<string, { id: string; nvrId: string; channel: number; name
   'cam-c': { id: 'cam-c', nvrId: 'nvr-1', channel: 3, name: 'C', channelCode: 'D3' },
   'cam-x': { id: 'cam-x', nvrId: 'nvr-2', channel: 1, name: 'X', channelCode: 'D1' },
 }
+// Campos NVR-wide sensibles (IP/usuario/puerto/serial/firmware/errores) presentes
+// a propósito, para verificar campo por campo que NO se filtran a un camera-scoped.
 const nvrsById: Record<string, any> = {
-  'nvr-1': { id: 'nvr-1', name: 'NVR Uno', ipAddress: '10.0.0.9', port: 80, username: 'svc', password: 'enc' },
-  'nvr-2': { id: 'nvr-2', name: 'NVR Dos', ipAddress: '10.0.0.10', port: 80, username: 'svc', password: 'enc' },
+  'nvr-1': { id: 'nvr-1', name: 'NVR Uno', ipAddress: '10.0.0.9', port: 80, username: 'svc', password: 'enc', serialNumber: 'SN-111', firmware: 'V5.7', recordingProvider: 'ISAPI', lastError: 'x' },
+  'nvr-2': { id: 'nvr-2', name: 'NVR Dos', ipAddress: '10.0.0.10', port: 80, username: 'svc', password: 'enc', serialNumber: 'SN-222', firmware: 'V5.7', recordingProvider: 'ISAPI', lastError: 'y' },
 }
+const hddsOf = (_nvrId: string) => [{ id: 'hdd1', diskNumber: 1, capacity: '4TB' }]
 const camsOf = (nvrId: string) => Object.values(cameras).filter((c) => c.nvrId === nvrId)
 
 function makePrisma(perms: Perm[]) {
@@ -72,7 +75,7 @@ function makePrisma(perms: Perm[]) {
       },
       findMany: async ({ where }: any) => {
         const ids: string[] = where?.id?.in ?? Object.keys(nvrsById)
-        return ids.filter((id) => nvrsById[id]).map((id) => ({ ...nvrsById[id], cameras: camsOf(id), hdds: [] }))
+        return ids.filter((id) => nvrsById[id]).map((id) => ({ ...nvrsById[id], cameras: camsOf(id), hdds: hddsOf(id) }))
       },
       update: async ({ where, data }: any) => ({ ...(nvrsById[where.id] ?? {}), ...data }),
     },
@@ -165,6 +168,37 @@ describe('GET /api/nvrs — filtra por lo visible (canView + scope de cámara)',
     const res = await app.inject({ method: 'GET', url: '/api/nvrs' })
     const body = res.json()
     expect(body.map((n: any) => n.id).sort()).toEqual(['nvr-1', 'nvr-2'])
+    await app.close()
+  })
+
+  // PROYECCIÓN MÍNIMA — campo por campo: un camera-scoped NO debe recibir NINGÚN
+  // dato NVR-wide en el listado (antes se devolvía el objeto NVR completo).
+  it('camera-scoped ⇒ proyección MÍNIMA (id+name+sus cámaras), sin datos NVR-wide', async () => {
+    const app = await build({ sub: 'op1', role: 'OPERATOR' }, [camScoped('op1', 'cam-b')])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs' })
+    const body = res.json()
+    expect(body).toHaveLength(1)
+    const nvr = body[0]
+    // Lo permitido: identidad + sólo su cámara.
+    expect(Object.keys(nvr).sort()).toEqual(['cameras', 'id', 'name'])
+    expect(nvr.id).toBe('nvr-1')
+    expect(nvr.name).toBe('NVR Uno')
+    expect(nvr.cameras.map((c: any) => c.id)).toEqual(['cam-b'])
+    // Campo por campo: NINGÚN dato NVR-wide ni credencial.
+    for (const f of ['ipAddress', 'username', 'password', 'port', 'serialNumber', 'firmware', 'recordingProvider', 'lastError', 'hdds']) {
+      expect(nvr[f], `no debe exponerse '${f}' a un camera-scoped`).toBeUndefined()
+    }
+    await app.close()
+  })
+
+  it('NVR-scoped ⇒ contrato completo (incluye ipAddress y hdds; nunca password)', async () => {
+    const app = await build({ sub: 'op1', role: 'OPERATOR' }, [nvrScoped('op1', 'nvr-1')])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs' })
+    const nvr = res.json()[0]
+    expect(nvr.ipAddress).toBe('10.0.0.9')
+    expect(nvr.hdds).toHaveLength(1)
+    expect(nvr.serialNumber).toBe('SN-111')
+    expect(nvr.password).toBeUndefined() // password nunca se envía
     await app.close()
   })
 })

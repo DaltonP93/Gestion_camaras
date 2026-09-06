@@ -306,12 +306,20 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       orderBy: { name: 'asc' },
     })
 
+    // PROYECCIÓN MÍNIMA fail-closed. Un permiso NVR-scoped ve el contrato completo
+    // (metadatos + HDDs de todo el dispositivo). Un permiso CAMERA-scoped recibe
+    // SÓLO lo necesario para identificar/mostrar sus cámaras: id + name del NVR y
+    // sus cámaras visibles (campos ya mínimos). NUNCA datos NVR-wide —
+    // ipAddress, username, puertos, serial, firmware, errores, HDDs, capacidades—,
+    // que antes se filtraban al devolver `{...nvr}` completo aunque el permiso
+    // fuera de una sola cámara.
     const filtered = nvrs.map((nvr: any) => {
       const scope = visible.get(nvr.id)
-      const cameras = scope?.all
-        ? nvr.cameras
-        : (nvr.cameras ?? []).filter((c: any) => scope?.cameraIds.includes(c.id))
-      return { ...nvr, cameras, password: undefined }
+      if (scope?.all) {
+        return { ...nvr, password: undefined } // NVR-scoped: contrato completo
+      }
+      const cameras = (nvr.cameras ?? []).filter((c: any) => scope?.cameraIds.includes(c.id))
+      return { id: nvr.id, name: nvr.name, cameras } // camera-scoped: mínimo
     })
 
     return reply.send(filtered)

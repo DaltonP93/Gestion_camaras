@@ -112,3 +112,22 @@ por `routes/auth.ts:868` / `users.ts:166`. Sólo `canManageAppearance` se lee pa
 
 El endurecimiento (hacer ENFORCED o quitar del modal los UI_ONLY) queda como
 follow-up con autorización explícita del propietario — no se ejecuta en este PR.
+
+## Decisión propuesta por cada campo UI_ONLY (P2 — requiere autorización)
+
+Los cinco campos **UI_ONLY** son controles EVADIBLES: sugieren protección que el
+backend no aplica. **No constituyen RBAC**. Propuesta concreta por campo
+(implementación en un PR aparte, con autorización; NO en este PR):
+
+| Campo | Ámbito | Decisión propuesta | Justificación |
+|---|---|---|---|
+| `canUseTranscode` | cámara | **ELIMINAR del modal** | No existe un gate "por cámara" de transcode: el HD/main_h264 se decide por códec/cupo y el acceso HD ya lo gobierna `canHighQuality` (ENFORCED). Mantenerlo promete un control inexistente. |
+| `canTranscode` | feature | **ELIMINAR del modal** | Duplica a `canUseTranscode` a nivel feature y tampoco se lee. Sin semántica de gate propia. |
+| `canViewDashboard` | feature | **ENFORCE backend** | `/dashboard/overview` (`routes/dashboard.ts:10`) está abierto a cualquier autenticado y agrega conteos NVR/cámara/alerta. Gate mínimo: exigir el flag resuelto (`resolveFeaturePermissions`) en la ruta. |
+| `canViewLive` (feature) | feature | **ELIMINAR del modal** | El acceso a vivo ya está gateado POR CÁMARA por `canView` (ENFORCED en `liveView.ts`/`native-readiness.ts`). El flag feature no se lee y da falsa sensación de control. |
+| `canViewAlerts` | feature | **ELIMINAR del modal** | Las alertas ya se filtran por `canView` de recurso (`alert-query.ts:61`). El flag feature no se lee. |
+
+Regla general de la propuesta: **enforcement backend** cuando el recurso es
+NVR-wide/agregado y hoy queda abierto (dashboard); **eliminación del modal** cuando
+el control real ya lo cumple `canView`/`canHighQuality`/rol y el flag sólo aparenta
+proteger. En ningún caso se declara RBAC completo por estos campos.
