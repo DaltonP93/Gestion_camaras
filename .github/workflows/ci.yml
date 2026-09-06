@@ -77,6 +77,17 @@ jobs:
       - name: Validar docker-compose.yml
         run: docker compose -f docker-compose.yml config -q
 
+  migrations:
+    name: Prefijos de migración (sin duplicados nuevos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Falla si se agrega un prefijo numérico de migración duplicado NUEVO.
+      # Los duplicados históricos 0009/0031 están en una allowlist explícita
+      # dentro del script (no se renombran: romperían _prisma_migrations).
+      - name: Verificar prefijos de migración
+        run: bash scripts/check-migration-prefixes.sh
+
   analytics-image:
     name: Analytics image (native deps smoke test)
     runs-on: ubuntu-latest
