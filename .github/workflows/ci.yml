@@ -103,6 +103,22 @@ jobs:
           docker run --rm visioncore-analytics:ci \
             python -c "import cv2, onnxruntime, supervision; print('imports OK')"
 
+  audit:
+    name: npm audit (prod HIGH/CRITICAL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Política (ver docs/audits/AUDIT_DEVOPS.md): `npm audit --omit=dev` sólo
+      # sobre dependencias de PRODUCCIÓN (dev-only NO bloquea); low/moderate NO
+      # bloquean. Falla ante HIGH/CRITICAL prod en paquetes fuera del allowlist de
+      # deuda conocida (axios/form-data, pre-existentes). Un paquete prod NUEVO con
+      # HIGH/CRITICAL rompe CI.
+      - name: Auditar dependencias de producción (api + web)
+        run: bash scripts/check-npm-audit.sh apps/api apps/web
+
   licenses:
     name: Licencias (sin GPL/AGPL)
     runs-on: ubuntu-latest
