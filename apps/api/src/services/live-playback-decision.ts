@@ -108,18 +108,3 @@ export function decideLivePlayback(input: LivePlaybackDecisionInput): LivePlayba
   }
   return { ...serverFallback(input), nativeBlockedReason: blocked }
 }
-
-// ─── admisión / espera de cupo (helper PURO, no cableado al flujo real) ──
-export interface AdmissionInput { maxSlots: number; activeSlots: number; cancelRequested: boolean }
-export interface AdmissionResult { action: 'start' | 'wait' | 'cancelled'; retriable: boolean }
-
-/**
- * NOTA (honestidad): predicado PURO probado. La aplicación real del límite de 2
- * transcodes sigue en el lifecycle de stream-manager (invariante C1–C21); esto
- * NO es un flujo nuevo cableado.
- */
-export function decideAdmissionOrWait(i: AdmissionInput): AdmissionResult {
-  if (i.cancelRequested) return { action: 'cancelled', retriable: false }
-  if (i.activeSlots < i.maxSlots) return { action: 'start', retriable: false }
-  return { action: 'wait', retriable: true }
-}
