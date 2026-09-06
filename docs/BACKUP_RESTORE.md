@@ -1,9 +1,15 @@
 # Backup y restauración — VisionCore (estado real)
 
-> Actualizado: 2026-09-06. Base: `main` = `0f9d1f5`. Fuente: AGENTE 2 (DevOps) verificado contra código.
-> **Honestidad radical:** NO hay backup programado ni copia offsite. Este documento describe lo que existe
-> hoy, el procedimiento manual, y qué falta (marcado como pendiente/decisión). Toca la evidencia de
-> grabaciones (invariante de negocio #1): tratar con máxima cautela.
+> Actualizado: 2026-09-06 (ciclo C23). Base: `main` = `0f9d1f5` (INTACTO). Fuente: AGENTE 2 (DevOps)
+> verificado contra código.
+> **Honestidad radical:** en `main` NO hay backup programado ni copia offsite. Este documento describe lo
+> que existe hoy en `main`, el procedimiento manual, y qué falta. Toca la evidencia de grabaciones
+> (invariante de negocio #1): tratar con máxima cautela.
+>
+> **Ciclo C23 — #174 (`fe51727`, PR Draft, NO en `main`):** valida **backup/restore end-to-end contra un
+> Postgres efímero** y agrega `deploy.sh` fail-fast (aborta si el backup falla). Esto sube la prueba de
+> restauración de `NOT_TESTED` a **validado contra PG efímero real** — pero **solo dentro del PR Draft**;
+> `main` sigue sin esa validación, sin cron y sin offsite.
 
 ---
 
@@ -17,7 +23,7 @@
 | Retención | NOT_PRESENT | Sin política de retención/rotación |
 | WAL / réplica / captura continua | NOT_PRESENT | Postgres es contenedor + volumen único (SPOF) |
 | Restauración | PRESENTE (manual, nunca ejercitada aquí) | `psql ... < backup.sql` (`DEPLOY.md:124-126`) |
-| Prueba de restauración | NOT_TESTED | Nunca ejercitada en CI/local en este entorno |
+| Prueba de restauración | NOT_TESTED en `main` / **validado en #174 (Draft) contra Postgres efímero** | Nunca ejercitada en `main`; #174 la ejerce end-to-end contra PG efímero (NO en `main`) |
 | Backup de grabaciones (media) | Fuera del dump SQL | El dump cubre solo Postgres; la evidencia de video no está en este backup |
 
 > ⚠ El `deploy.sh` de la **raíz** (distinto de `scripts/deploy.sh`) NO hace backup. Usar siempre
@@ -57,14 +63,14 @@ docker compose start api
 
 | Ítem | Prioridad | Naturaleza |
 |---|---|---|
-| Script de backup+restore probado localmente | P1 | Seguro/reproducible (Dev) |
-| Documentar y cronometrar RTO (prueba de restauración real) | P1 | Verificación |
+| Script de backup+restore probado localmente | P1 | **Abordado por #174 (Draft): validado contra Postgres efímero** — pendiente de fusionar a `main` |
+| Documentar y cronometrar RTO (prueba de restauración real) | P1 | Verificación (RTO aún no cronometrado) |
 | Cron de backup programado | P1/P2 | **Decisión de infra** (frecuencia) |
 | Copia offsite (destino externo) | P1/P2 | **Decisión de infra/costo** |
 | Retención/rotación de backups | P2 | Configuración |
 | WAL / réplica (RPO continuo) | P2/P3 | **Decisión de arquitectura** |
 | Estrategia de backup de la evidencia de video (no solo SQL) | P2 | **Decisión** (invariante #1) |
-| Quitar el silenciado de migración del `deploy.sh` raíz | P1 | Seguro (Dev) |
+| Quitar el silenciado de migración del `deploy.sh` raíz | P1 | Seguro (Dev). #174 (Draft) agrega `deploy.sh` fail-fast |
 
 ## 5. Referencias
 

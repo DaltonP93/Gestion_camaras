@@ -1,6 +1,7 @@
 # Historia de desarrollo — VisionCore
 
-> Actualizado: 2026-09-06. Base: `main` = `0f9d1f5`. Reconstruido de `git log` de `main` y de los
+> Actualizado: 2026-09-06 (ciclo C23). Base: `main` = `0f9d1f5` (INTACTO; nada del C23 fusionado —
+> ver §2.5). Reconstruido de `git log` de `main` y de los
 > documentos de trabajo (`docs/native/*`, `docs/audit*`, `phase-a1-*`). Sin transcripciones de chat.
 > "Qué pidió el propietario → qué se implementó → PR/commit → tests → qué quedó incompleto/reemplazado."
 
@@ -33,6 +34,31 @@ Rama `claude/multi-agent-project-audit-hf14wq`, 3 commits por delante de `main` 
 | `b2a3f88` | feat(ws): cerrar conexiones WebSocket al revocar permisos | Aborda el riesgo de revocación WS in-process (parcial: sigue por-proceso) |
 | `2e11493` | chore(compose): healthcheck de MediaMTX con variante `-ffmpeg` | En `main` la imagen es `bluenviron/mediamtx:1.9.3` (sin `-ffmpeg`) |
 | `0df8886` | docs: cerrar 2 pendientes menores | Documental |
+
+## 2.5 Ciclo C23 (2026-09-06) — PRs Draft, NADA fusionado a `main`
+
+> **`main` sigue INTACTO en `0f9d1f5`.** Todo el C23 vive en PRs **Draft** OFF de `main` (`OPEN_PR_DRAFT`).
+> No confundir "PR existe" con "está en `main`". Diferenciar siempre: *merged* ≠ *Draft* ≠ *simulado*
+> (mock/in-memory) ≠ *NOT_VALIDATED* (real no ejercido) ≠ *PLANNED*.
+
+| PR | Rama | Head | Hito | Contenido | Validación real / límites |
+|---|---|---|---|---|---|
+| **#171** | `fix/nvr-ssrf-authz` | `6e633df` | Hito 1 | SSRF profundo (`maxRedirects:0` en clientes ISAPI, `/scan` rechaza redes reservadas, IP-literal-only anti-rebinding, metadata de proveedor bloqueada) + RBAC centralizado (`services/access-policy.ts`, `GET /api/nvrs` con `canView`, `video-audio[/:channel]`, scoping por cámara/NVR) | vitest **1342**, mutación **19/19**; tests conductuales con **servidor HTTP real** + `fastify.inject` |
+| **#173** | `fix/grant-plane-c23` | `ab5a48b` | Hito 2 | Tiempo atómico Redis (`redis.call('TIME')`), outbox de revocación durable (migración `0033_media_revoke_outbox`, fail-closed `REVOKE_PENDING`), readiness por path unificada (`grant-derivation.ts`) | vitest **1295**, mutación **19/19**; **Redis real validado** (grants/revocación/readiness). Atomicidad Postgres `SKIP LOCKED` = **NOT_VALIDATED** (sin servidor PG) |
+| **#174** | `fix/ops-backup-ci-c23` | `fe51727` | Hito 7 | `deploy.sh` fail-fast; backup/restore **validado real** contra **Postgres efímero**; guard CI de prefijos de migración; `npm ci` en Dockerfiles; job CI de `npm audit` prod; checksum sha256 del modelo YOLOX | analytics **93/93**; backup/restore ejercido contra PG efímero. `npm ci` fija deps npm, **NO** las imágenes base por digest |
+| **#172** | `fix/web-deps-high` | `e82bb28` | deps web | 5/6 vulns HIGH de `apps/web` resueltas | **1 HIGH pendiente = `vite` (solo dev-server, requiere major)** → follow-up |
+| **#170** | `docs/state-reconstruction` | — | Hito 8 | Docs canónicos (ESTE PR) | — |
+| **#169** | `docs/update-ai-handoff-pr-168` | — | — | Handoff auto-generado (2 observaciones de Codex) | **SUPERSEDED por #170** (ver abajo) |
+
+**Hitos NO ejecutados en C23 (`PLANNED`, pendientes de decisión de foco):** Hito 3 (relay A1 real),
+Hito 4 (cliente nativo Tauri), Hito 5 (E2E web), Hito 6 (IA productiva). No hay código de estos en
+ningún PR C23; no describirlos como "en progreso".
+
+**#169 SUPERSEDED por #170.** El handoff auto-generado #169 queda **`SUPERSEDED`** por este PR (#170):
+sus 2 observaciones válidas de Codex se incorporaron a los docs canónicos —
+(i) resolución de alertas = **solo ADMIN/SUPERVISOR** (lectura = todos los roles dentro de su `canView`),
+(ii) las imágenes base **flotan y NO están pinneadas por digest** (`npm ci` de #174 fija deps, no imágenes).
+**Cerrar #169 requiere autorización expresa del propietario — no cerrarlo automáticamente.**
 
 ## 3. Ciclos de auditoría multi-agente (contexto)
 

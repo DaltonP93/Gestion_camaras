@@ -1,6 +1,7 @@
 # Evidencia de pruebas — VisionCore
 
-> Actualizado: 2026-09-06. Base: `main` = `0f9d1f5`.
+> Actualizado: 2026-09-06 (ciclo C23). Base: `main` = `0f9d1f5` (INTACTO). La evidencia de §1–§3 es de
+> `main`; la evidencia de los PRs Draft C23 está en §5 (esos números viven en los PRs, NO en `main`).
 > Clasificación: **TESTED_CI** (corre en `.github/workflows/ci.yml`), **TESTED_LOCAL** (ejecutable
 > localmente / ejercido por un auditor sin instalar en prod), **NOT_TESTED** (sin cobertura automatizada).
 > No se ejecutaron servicios/contenedores/NVR/DB reales al redactar (solo lectura). Los conteos exactos
@@ -76,3 +77,20 @@ De AGENTE 4 (seguridad), reproducibles en laboratorio aislado:
 6. XSS → robo de JWT de `localStorage` (CSP como defensa; evaluar cookie httpOnly).
 7. SSRF ADMIN vía ISAPI: apuntar `test-connection`/`scan` a `169.254.169.254`/loopback/rangos internos.
 8. Grants de medios (flags ON en lab): replay/expiry/epoch/scope/fail-closed sin Redis.
+
+## 5. Evidencia por PR Draft del ciclo C23 (NO en `main`)
+
+> Estos conteos y validaciones viven en los PRs Draft, no en `main`. Diferenciar siempre lo probado
+> **contra real** de lo probado con **mocks/in-memory** y de lo **NOT_VALIDATED**.
+
+| PR (head) | Suite / evidencia | Clasificación |
+|---|---|---|
+| **#171** `6e633df` (SSRF + RBAC) | vitest **1342**; mutación **19/19**; tests conductuales con **servidor HTTP real** + `fastify.inject` (SSRF y RBAC ejercidos, no solo mockeados) | TESTED_LOCAL (real, en el PR) |
+| **#173** `ab5a48b` (grant plane) | vitest **1295**; mutación **19/19**; **Redis real**: grants, revocación y readiness por path validados | TESTED_LOCAL (Redis real) |
+| **#173** — atomicidad outbox Postgres (`SKIP LOCKED`) | `0033_media_revoke_outbox`; lógica testeada pero **NO ejercida contra Postgres real** (sin servidor PG) | **NOT_VALIDATED** |
+| **#173** — outbox / scripts Lua en tests | outbox en implementación **InMemory**; Lua vía **wasmoon** (no Redis Lua nativo) | SIMULATED (mock/in-memory) |
+| **#174** `fe51727` (ops/backup/CI) | analytics **93/93**; **backup/restore ejercido end-to-end contra Postgres efímero**; guard CI de prefijos de migración; job `npm audit` prod; checksum sha256 del modelo YOLOX | TESTED_LOCAL (PG efímero real) |
+| **#172** `e82bb28` (deps web) | 5/6 vulns HIGH de `apps/web` resueltas; **1 HIGH pendiente = `vite` (solo dev-server, requiere major)** → follow-up | TESTED_LOCAL |
+
+**Navegador / toolchain (E2E web, build de imágenes api/web, arranque del stack): AÚN NO ejercido** en C23
+(Hito 5 = `PLANNED`). No hay evidencia de ejecución en navegador ni de arranque real del stack.

@@ -1,6 +1,6 @@
 # Handoff operativo para IA — VisionCore (ENTRADA CANÓNICA)
 
-> Actualizado: 2026-09-06. Reconstrucción de estado multi-agente.
+> Actualizado: 2026-09-06 (ciclo C23). Reconstrucción de estado multi-agente.
 > Alcance: contexto del código versionado. NO describe ni autoriza cambios en producción.
 > **Criterio de aceptación de este documento:** otro agente (p. ej. Codex) debe poder
 > continuar el trabajo SOLO con la URL del repositorio + este archivo.
@@ -11,6 +11,8 @@
 
 1. `git status --short` (debe estar limpio) y `git log -1` para confirmar el HEAD.
 2. Confirmar la línea base: `main` = `0f9d1f54c525f3959e75730689f943f4602ff921` (fusión del PR #168).
+   **Ciclo C23 (2026-09-06): `main` sigue INTACTO en este SHA — nada del C23 está fusionado.** Todo
+   el trabajo C23 vive en PRs **Draft** fuera de `main` (§5.1). No confundir "existe un PR" con "está en main".
 3. Leer, en este orden: esta sección, §1 (propósito), §4 (estado real por capa),
    `docs/IMPLEMENTATION_STATUS.md`, `docs/REQUIREMENTS_TRACEABILITY.md`, `docs/SECURITY.md`,
    `docs/DEPLOYMENT.md`.
@@ -20,9 +22,13 @@
 **Vocabulario de estados usado en todos los docs canónicos:**
 `MERGED_VERIFIED` (en main + cubierto por tests/lógica pura testeada),
 `MERGED_UNVERIFIED` (en main, cableado, sin cobertura suficiente o sin ejercicio contra hardware real),
-`OPEN_PR_*`, `PARTIAL`, `SIMULATED_ONLY`, `BLOCKED_HARDWARE`, `BLOCKED_SPEC`, `PLANNED`,
+`OPEN_PR_DRAFT` (existe en un PR Draft OFF de `main`, NO fusionado), `PARTIAL`, `SIMULATED_ONLY`,
+`BLOCKED_HARDWARE`, `BLOCKED_SPEC`, `PLANNED`, `NOT_VALIDATED` (código presente y con tests, pero
+NO ejercido contra el servicio/hardware real que lo haría fiable — p. ej. atomicidad Postgres sin PG real),
 `NOT_PRESENT` (no existe en el repo, con evidencia de ausencia), `SUPERSEDED`, `REJECTED`.
-Nunca se declara "completo" sin archivo + evidencia.
+Nunca se declara "completo" sin archivo + evidencia. **Distinguir siempre:** *merged* (en `main`) ≠
+*OPEN_PR_DRAFT* (en un PR sin fusionar) ≠ *simulado* (mock/in-memory) ≠ *NOT_VALIDATED* (real no ejercido)
+≠ *PLANNED* (aún no ejecutado).
 
 ---
 
@@ -72,7 +78,11 @@ Tailwind `^3.4.6`, Radix UI. Dev: TypeScript `^5.5.3`, `vitest ^4.1.10`.
 **Imágenes Docker** (`docker-compose.yml`, estado de `main`): `postgres:16.4-alpine`, `redis:7.4-alpine`,
 `bluenviron/mediamtx:1.9.3`, `ghcr.io/blakeblackshear/frigate:0.14.1`, `nginx:1.27-alpine`,
 `certbot/certbot:v3.0.1`. Imágenes de build: `node:20-alpine` (api/web), `python:3.11-slim` (analytics).
-Ningún servicio usa digest `@sha256:`; `nginx:alpine` interno de web y bases de build flotan por patch.
+**Ningún servicio usa digest `@sha256:`.** `node:20-alpine` (api), `python:3.11-slim` (analytics),
+`nginx:alpine` (interno de la imagen de web) y varios tags de compose **flotan por patch**: NO son
+reproducibles bit-a-bit aunque tengan un tag "fijo". El PR Draft **#174** agrega `npm ci` en los
+Dockerfiles (reproducibilidad de las *dependencias npm*), pero **NO** fija las imágenes base por digest;
+el pin por digest queda como follow-up. No describir el stack como "totalmente reproducible".
 CI usa Node 22 (leve desalineación con Node 20 de las imágenes).
 
 ---
@@ -86,6 +96,12 @@ Detalle completo con archivo/PR/commit/test en `docs/IMPLEMENTATION_STATUS.md`.
 - PTZ (ISAPI `PTZCtrl/.../continuous` + vía ONVIF).
 - 2FA TOTP obligatoria por política, step-up, rotación de refresh con detección de reúso, AuditLog.
 - Alertas/notificaciones por WebSocket + email (`services/notification.service.ts`, `healthWorker`).
+  **Contrato RBAC de alertas (inequívoco, verificado en `routes/alerts.ts`):**
+  *lectura/listado* de alertas y eventos = **todos los roles autenticados, pero limitados a su scope
+  `canView`** (ADMIN sin restricción; el resto solo alertas de sus cámaras + alertas sin `cameraId`);
+  *resolución* (`PUT /api/alerts/:id/resolve`) = **solo ADMIN/SUPERVISOR** (`authorize(['ADMIN','SUPERVISOR'])`,
+  `routes/alerts.ts:122`). Un **OPERATOR o AUDITOR NO puede resolver ni una alerta de una cámara que sí
+  puede ver.** (Observación de Codex sobre #169, verificada.)
 - ONVIF (núcleo SOAP/WS-Discovery testeado; flag `ONVIF_ENABLED` **OFF**).
 - Plano de medios C22 (`services/media/*`): grants hash-only, uso único atómico (Lua/Redis), epoch durable.
 
@@ -119,7 +135,23 @@ sin validar contra hardware/cuenta; cliente Tauri = `BLOCKED_SPEC`.
 ## 5. Línea base y control de versiones
 
 - Rama principal: `main` = **`0f9d1f54c525f3959e75730689f943f4602ff921`** (tip: "Merge pull request #168").
-- **PRs abiertos:** solo **#169** (documentación automática). No hay otros PRs de código abiertos.
+  **Al cierre del ciclo C23 `main` sigue en este SHA: NADA del C23 se fusionó.**
+
+### 5.1 PRs Draft del ciclo C23 (todos OFF de `main`, SIN fusionar — `OPEN_PR_DRAFT`)
+
+| PR | Rama | Head | Hito | Contenido (resumen) | Validación |
+|---|---|---|---|---|---|
+| **#171** | `fix/nvr-ssrf-authz` | `6e633df` | Hito 1 | SSRF profundo (`maxRedirects:0` en clientes ISAPI, `/scan` rechaza redes reservadas, IP-literal-only anti-rebinding, metadata de proveedor bloqueada) + RBAC centralizado (`services/access-policy.ts`, `GET /api/nvrs` con `canView`, `video-audio[/:channel]`, scoping por cámara/NVR) | vitest **1342**, mutación **19/19**; tests conductuales con servidor HTTP real + `fastify.inject` |
+| **#173** | `fix/grant-plane-c23` | `ab5a48b` | Hito 2 | Tiempo atómico Redis (`redis.call('TIME')`), outbox de revocación durable (migración `0033_media_revoke_outbox`, fail-closed `REVOKE_PENDING`), readiness por path unificada (`grant-derivation.ts`) | vitest **1295**, mutación **19/19**; **Redis real validado**. Atomicidad Postgres `SKIP LOCKED` = **NOT_VALIDATED** (sin servidor PG) |
+| **#174** | `fix/ops-backup-ci-c23` | `fe51727` | Hito 7 | `deploy.sh` fail-fast, backup/restore **validado real** contra Postgres efímero, guard CI de prefijos de migración, `npm ci` en Dockerfiles, job CI de `npm audit` prod, checksum sha256 del modelo YOLOX | analytics **93/93**; backup/restore ejercido contra PG efímero |
+| **#172** | `fix/web-deps-high` | `e82bb28` | deps web | 5/6 vulns HIGH de `apps/web` resueltas | **1 HIGH pendiente = `vite` (solo dev-server), requiere major** → follow-up |
+| **#170** | `docs/state-reconstruction` | — | Hito 8 | Docs canónicos (ESTE PR). No abrir PR nuevo | — |
+| **#169** | `docs/update-ai-handoff-pr-168` | — | — | Handoff auto-generado (2 observaciones de Codex). **SUPERSEDED por #170** — su contenido válido está incorporado aquí; cerrar solo con autorización del propietario (§12.1) | — |
+
+- **Hitos aún NO ejecutados en C23 (`PLANNED`, pendientes de decisión de foco):** Hito 3 (relay A1
+  real), Hito 4 (cliente nativo Tauri), Hito 5 (E2E web), Hito 6 (IA productiva). No existe código de
+  estos en ningún PR C23; no describirlos como en progreso.
+
 - **Trabajo pendiente SIN fusionar y SIN PR** — rama `claude/multi-agent-project-audit-hf14wq`, 3 commits
   por delante de `main`, estado = *"pendiente en rama, sin PR"* (NO forma parte de `main`):
   - `b2a3f88` feat(ws): cerrar conexiones WebSocket al revocar permisos.
@@ -133,24 +165,34 @@ sin validar contra hardware/cuenta; cliente Tauri = `BLOCKED_SPEC`.
 ## 6. Riesgos de seguridad (top; detalle en `docs/SECURITY.md`)
 
 Postura de aplicación **sólida** (0 vulns en `apps/api`; CORS/CSP endurecidos; AES-256-GCM para NVR;
-MFA; rate-limit Redis; refresh con detección de reúso). Riesgos residuales vigentes:
+MFA; rate-limit Redis; refresh con detección de reúso). Riesgos residuales vigentes (estado **de `main`**;
+los "aborda" refieren a PRs Draft NO fusionados — el riesgo sigue vigente en `main`):
 1. **P1 — RBAC de live view depende de la frontera de red.** MediaMTX acepta `user: any`; HLS/WebRTC no
    revalida JWT y el `streamPath` es determinista. Quien alcance `/hls/` reconstruye cualquier cámara.
+   *No hay fix en C23; sigue siendo blocker P0 para habilitar lo nativo (§12).*
 2. **P1 — Vulns HIGH en `apps/web`** (axios prototype-pollution/DoS/bypass; form-data CRLF). CI no las bloquea.
+   *#172 (Draft) resuelve 5/6; queda 1 HIGH = `vite` (solo dev-server, requiere major) como follow-up.*
 3. **P1 — SSRF en ISAPI Hikvision** (`services/hikvision.ts`): destino elegible por ADMIN sin allowlist.
+   *#171 (Draft) lo aborda a fondo (`maxRedirects:0`, rechazo de redes reservadas, anti-rebinding). No en `main`.*
 4. **P1/P3 — `userCanAccessNvr` laxo** (`routes/nvr.ts:267`): no exige `canView`.
+   *#171 (Draft) centraliza RBAC en `services/access-policy.ts` con `canView`. No en `main`.*
 5. **P2 — JWT en `localStorage`** (exfiltrable por XSS); **token WS en la URL**.
 
 ---
 
 ## 7. Estado DevOps (top; detalle en `docs/DEPLOYMENT.md` y `docs/BACKUP_RESTORE.md`)
 
-Maduro: secretos con fail-fast, MediaMTX atado a loopback, apagado elegante, imágenes pinneadas,
-healthchecks, rate-limit multi-worker-safe. Huecos reales:
+Maduro: secretos con fail-fast, MediaMTX atado a loopback, apagado elegante, imágenes fijadas **por tag**
+(NO por digest), healthchecks, rate-limit multi-worker-safe. Huecos reales (estado de `main`):
+- **Imágenes fijadas por tag pero NO por digest** (`node:20-alpine`, `python:3.11-slim`, `nginx:alpine`
+  interno de web y tags de compose **flotan por patch**): no es reproducibilidad total. Pin por digest = follow-up.
 - **Sin backup programado/offsite; RPO/RTO indefinidos.** Único backup = manual pre-deploy en `scripts/deploy.sh`.
+  *#174 (Draft) valida backup/restore real contra Postgres efímero y agrega `deploy.sh` fail-fast; NO en `main`.*
 - `deploy.sh` **raíz** (distinto de `scripts/deploy.sh`) silencia fallos de migración (`migrate deploy 2>/dev/null || true`).
 - CI no aplica migraciones contra DB real, no corre lint/SAST/`npm audit` gate; `migration_lock.toml` ausente.
-- Builds no reproducibles (`npm install` en vez de `npm ci`); modelo de analytics se descarga de GitHub en runtime.
+  *#174 (Draft) agrega guard CI de prefijos de migración + job de `npm audit` prod; NO en `main`.*
+- Builds de deps npm no reproducibles (`npm install`); modelo de analytics se descarga de GitHub en runtime.
+  *#174 (Draft) migra a `npm ci` y agrega checksum sha256 del modelo YOLOX; NO en `main`.*
 
 ---
 
@@ -210,7 +252,38 @@ Detalle en `docs/TEST_EVIDENCE.md`.
 
 ## 12. Backlog priorizado y primera tarea
 
-**P0:** ninguno abierto y directo hoy (secretos con fail-fast; sin migración destructiva pendiente).
+### 12.0 Estado P0 — distinción explícita (reemplaza el viejo "P0: ninguno")
+
+Decir "P0 ninguno" era engañoso. La lectura correcta se separa en 4 categorías:
+
+**(a) Seguro HOY** — porque las flags nativas están OFF y el plano de medios es **inerte**:
+`NATIVE_PLAYBACK_ENABLED` / `NATIVE_MEDIA_RELAY_ENABLED` OFF en `main`. Mientras estén OFF, los grants de
+medios, el relay y el cliente nativo no procesan tráfico: no hay P0 explotable por esa vía en la config por defecto.
+
+**(b) Blocker P0 para HABILITAR lo nativo** — NO encender las flags nativas sin resolver, todos, estos:
+1. **Relay A1 real NO implementado** (Hito 3 = `PLANNED`; no hay relay autenticado funcional en ningún PR C23).
+2. **MediaMTX `user: any`** — sin auth por path, el aislamiento del live/relay depende solo de la frontera de red.
+3. **Atomicidad Postgres del outbox de revocación = `NOT_VALIDATED`** — el `SKIP LOCKED` del outbox de #173
+   (Draft) NO se ejerció contra un Postgres real (no había servidor PG); su fail-closed depende de esa atomicidad.
+
+**(c) Probado con mocks / in-memory** (correcto para lógica, insuficiente como prueba de producción):
+outbox de revocación en implementación **InMemory**; ejecución de scripts Lua vía **wasmoon** (no un Redis con
+Lua nativo); suites de rutas con dependencias mockeadas. Sirve para regresión de lógica, no valida el runtime real.
+
+**(d) Probado contra REAL** (evidencia fuerte):
+- **Redis real** (en #173, Draft): grants, revocación y readiness por path.
+- **Postgres efímero** (en #174, Draft): backup/restore end-to-end.
+- **Navegador / toolchain** (E2E web, build de imágenes, arranque del stack): **aún NO** ejercido.
+
+### 12.1 #169 SUPERSEDED por #170
+
+El PR **#169** (`docs/update-ai-handoff-pr-168`, handoff auto-generado) queda **`SUPERSEDED` por #170**
+(este PR de docs canónicos): sus 2 observaciones válidas de Codex (RBAC de resolución de alertas =
+solo ADMIN/SUPERVISOR — §4; imágenes que "flotan" y NO están pinneadas por digest — §3/§7) ya están
+incorporadas aquí. **No cerrar #169 automáticamente: requiere autorización expresa del propietario.**
+
+### 12.2 Backlog por prioridad
+
 **P1:** (a) bump de deps HIGH en `apps/web`; (b) allowlist anti-SSRF en `services/hikvision.ts`;
 (c) endurecer `userCanAccessNvr` para exigir `canView` (`routes/nvr.ts:267`); (d) backup/restore probado
 + quitar el silenciado de migración en `deploy.sh` raíz.

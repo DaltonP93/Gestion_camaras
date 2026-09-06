@@ -1,6 +1,8 @@
 # Seguridad — VisionCore (documento canónico consolidado)
 
-> Actualizado: 2026-09-06. Base: `main` = `0f9d1f5`. Fuente: AGENTE 4 (auditoría de seguridad)
+> Actualizado: 2026-09-06 (ciclo C23). Base: `main` = `0f9d1f5` (INTACTO; nada del C23 fusionado).
+> Los riesgos abajo son el estado **de `main`**; donde un PR Draft C23 los aborda se marca "(#N, Draft — NO en `main`)":
+> el riesgo sigue vigente en `main` hasta que se fusione. Fuente: AGENTE 4 (auditoría de seguridad)
 > verificada contra código. Sin secretos/IPs reales (solo `archivo:línea` y tipo).
 > Consolida y reemplaza como entrada canónica a: raíz `SECURITY.md` (stale: describe cifrado con
 > crypto-js/fallback JWT_SECRET, ya superado por AES-256-GCM), `docs/security/SECURITY_AUDIT.md` (tabla
@@ -35,9 +37,9 @@ El plano de aplicación propio es **sólido** y mejoró de forma medible respect
 | # | Sev | Riesgo | Evidencia | Estado |
 |---|---|---|---|---|
 | 1 | **P1** | **RBAC de live view depende de la frontera de red.** MediaMTX acepta `user: any`; HLS/WebRTC no revalida JWT; `streamPath` determinista ⇒ quien alcance `/hls/` reconstruye cualquier cámara | `services/stream.ts` (path determinista); `THREAT_MODEL_NATIVE_MEDIA.md` | PRESENTE (documentado/aceptado; relay autenticado = NO-GO). Mayor riesgo residual real |
-| 2 | **P1** | **Vulns HIGH en `apps/web`** (axios prototype-pollution/DoS/bypass; form-data CRLF) + moderate react-router. CI no las bloquea | `apps/web/package.json`; `npm audit` | PRESENTE (TESTED_LOCAL). Fix seguro: bump de deps |
-| 3 | **P1** | **SSRF en ISAPI Hikvision.** `ipAddress` del body (solo ADMIN) sin allowlist ⇒ SSRF a hosts internos/metadata; además HTTP en claro (Digest sin TLS) | `services/hikvision.ts:150-156`; `routes/nvr.ts` (test-connection/detect/scan) | PRESENTE. Fix: allowlist contra NVRs registrados (`maxRedirects:0` ya presente) |
-| 4 | **P1/P3** | **`userCanAccessNvr` laxo:** acepta cualquier fila de permiso sobre el NVR (sin `canView`) ⇒ un OPERATOR con solo `canPtz` lee device-info/storage | `routes/nvr.ts:267-274` (vs `middleware/requireAuth.ts:18` que sí exige `canView`) | PRESENTE. Fix: usar el patrón camera-scope estricto |
+| 2 | **P1** | **Vulns HIGH en `apps/web`** (axios prototype-pollution/DoS/bypass; form-data CRLF) + moderate react-router. CI no las bloquea | `apps/web/package.json`; `npm audit` | PRESENTE en `main`. **#172 (Draft) resuelve 5/6 HIGH; queda 1 HIGH = `vite` (solo dev-server, requiere major) → follow-up** (NO en `main`) |
+| 3 | **P1** | **SSRF en ISAPI Hikvision.** `ipAddress` del body (solo ADMIN) sin allowlist ⇒ SSRF a hosts internos/metadata; además HTTP en claro (Digest sin TLS) | `services/hikvision.ts:150-156`; `routes/nvr.ts` (test-connection/detect/scan) | PRESENTE en `main`. **#171 (Draft): SSRF profundo — `maxRedirects:0` en clientes ISAPI, `/scan` rechaza redes reservadas, IP-literal-only anti-rebinding, metadata de proveedor bloqueada** (NO en `main`) |
+| 4 | **P1/P3** | **`userCanAccessNvr` laxo:** acepta cualquier fila de permiso sobre el NVR (sin `canView`) ⇒ un OPERATOR con solo `canPtz` lee device-info/storage | `routes/nvr.ts:267-274` (vs `middleware/requireAuth.ts:18` que sí exige `canView`) | PRESENTE en `main`. **#171 (Draft): RBAC centralizado en `services/access-policy.ts`, `GET /api/nvrs` con `canView`, scoping por cámara/NVR** (NO en `main`) |
 | 5 | **P2** | **JWT de acceso en `localStorage`/`sessionStorage`** ⇒ exfiltrable por XSS | `apps/web/src/lib/api.ts:16,27`; `stores/authStore.ts:51` | PRESENTE. Mitigado por CSP; no es cookie httpOnly |
 | 6 | **P3** | **Token del WS viaja en la URL** (`/ws/alerts?token=<JWT>`) ⇒ fuga por history/referrer/logs | `routes/websocket.ts:117-121` | PRESENTE. Mitigado: redacción en logs propios |
 | 7 | **P3** | **JWT no refleja cambios de rol/permiso hasta expirar** (sin tokenVersion/epoch contra DB en el plano API) | `plugins/auth.ts:65-83`; `middleware/requireAuth.ts` | PRESENTE. Mitigado por TTL corto + step-up + cierre WS + epoch de medios |
@@ -46,6 +48,18 @@ El plano de aplicación propio es **sólido** y mejoró de forma medible respect
 | — | P3 | XML ISAPI parseado por regex (sin XXE hoy, frágil para SOAP futuro) | `services/hikvision.ts` | PRESENTE (preventivo) |
 
 ---
+
+## 2.1 Contrato RBAC de alertas (observación de Codex #169, verificada — inequívoco)
+
+Para evitar ambigüedad en el próximo agente:
+- **Lectura / listado / resumen** de alertas y eventos (`GET /api/alerts`, `/summary`, `/unread`, etc.):
+  **todos los roles autenticados**, pero **estrictamente limitados a su scope `canView`** (ADMIN sin
+  restricción; el resto solo alertas de sus cámaras + alertas sin `cameraId`) — `resolveAlertScope`, `routes/alerts.ts:16-37`.
+- **Resolución** (`PUT /api/alerts/:id/resolve`): **SOLO ADMIN/SUPERVISOR** —
+  `preHandler: server.authorize(['ADMIN','SUPERVISOR'])` (`routes/alerts.ts:122`). Un **OPERATOR o AUDITOR
+  NO puede resolver ni una alerta de una cámara que sí puede ver.** (Además, dentro de ADMIN/SUPERVISOR, un
+  SUPERVISOR queda acotado a su `canView`.) No es un bug: es el contrato vigente. Documentarlo así para no
+  "corregirlo" por error hacia un modelo más laxo.
 
 ## 3. Reconciliación (sección 7 del mandato)
 

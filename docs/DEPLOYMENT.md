@@ -1,7 +1,8 @@
 # Despliegue — VisionCore (canónico consolidado)
 
-> Actualizado: 2026-09-06. Base: `main` = `0f9d1f5`. Consolida raíz `DEPLOY.md`,
-> `docs/frigate/DEPLOYMENT.md` y los hallazgos de la auditoría DevOps (AGENTE 2).
+> Actualizado: 2026-09-06 (ciclo C23). Base: `main` = `0f9d1f5` (INTACTO; nada del C23 fusionado).
+> Lo descrito es el estado **de `main`**; las mejoras DevOps del C23 (#174) están en un PR **Draft**, NO en `main`.
+> Consolida raíz `DEPLOY.md`, `docs/frigate/DEPLOYMENT.md` y los hallazgos de la auditoría DevOps (AGENTE 2).
 > No autoriza despliegue: cualquier `up`/`migrate`/`restart`/`down` en entorno no local requiere
 > aprobación expresa. No hay despliegue verificado desde este entorno.
 
@@ -90,16 +91,24 @@ Servicios esperados: `postgres`, `redis`, `mediamtx`, `api`, `web`, `nginx`, `ce
 ## 7. Imágenes (pin y reproducibilidad)
 
 `postgres:16.4-alpine`, `redis:7.4-alpine`, `bluenviron/mediamtx:1.9.3`, `frigate 0.14.1`,
-`nginx:1.27-alpine`, `certbot v3.0.1`; build api/web `node:20-alpine`, analytics `python:3.11-slim`.
-⚠ Sin digest `@sha256:`; api/web usan `npm install` (no `npm ci`) ⇒ builds no reproducibles (backlog P2);
-el modelo de analytics se descarga de GitHub en el primer arranque (dep externa en runtime, sin checksum).
+`nginx:1.27-alpine`, `certbot v3.0.1`; build api/web `node:20-alpine`, analytics `python:3.11-slim`;
+`nginx:alpine` interno de la imagen de web.
+⚠ **Ningún servicio usa digest `@sha256:`.** Aunque los tags parezcan "fijos", `node:20-alpine`,
+`python:3.11-slim`, `nginx:alpine` y varios tags de compose **flotan por patch**: el stack **NO es
+reproducible bit-a-bit**. En `main`, api/web usan `npm install` (no `npm ci`) y el modelo de analytics se
+descarga de GitHub en el primer arranque sin checksum.
+El PR Draft **#174** (NO en `main`) migra a `npm ci` (fija las *dependencias npm*) y agrega checksum sha256
+del modelo YOLOX, pero **NO** fija las imágenes base por digest. **Pin por digest = follow-up pendiente**;
+no describir el despliegue como "totalmente reproducible".
 
 ## 8. Qué valida CI y qué NO
 
 Valida (6 jobs): `api` (tsc+vitest), `web` (tsc+build+vitest), `analytics` (compileall+unittest),
 `compose` (`docker compose config -q`), `analytics-image` (build+smoke import), `licenses` (sin GPL/AGPL).
-**No** valida: lint, `migrate deploy` real, gate de `npm audit`, SAST/secret-scan, build-gate de api/web,
-escaneo de imágenes, e2e, backup/restore. Detalle en `docs/TEST_EVIDENCE.md`.
+**No** valida (en `main`): lint, `migrate deploy` real, gate de `npm audit`, SAST/secret-scan, build-gate de
+api/web, escaneo de imágenes, e2e, backup/restore. Detalle en `docs/TEST_EVIDENCE.md`.
+> El PR Draft **#174** (NO en `main`) agrega un **guard CI de prefijos de migración duplicados** y un **job
+> CI de `npm audit` prod (HIGH/CRITICAL) con allowlist**; NO agrega `migrate deploy` real contra Postgres ni e2e.
 
 ## 9. Rollback
 
@@ -110,7 +119,8 @@ bash scripts/rollback.sh <commit>   # checkout + rebuild + redeploy
 
 ## 10. Advertencias operativas (resumen)
 
-- **Sin backup programado/offsite; RPO/RTO indefinidos** — invariante #1 en riesgo. Ver `docs/BACKUP_RESTORE.md`.
+- **Sin backup programado/offsite; RPO/RTO indefinidos** en `main` — invariante #1 en riesgo. Ver `docs/BACKUP_RESTORE.md`.
+  *#174 (Draft, NO en `main`) valida backup/restore real contra Postgres efímero y hace `deploy.sh` fail-fast.*
 - `deploy.sh` raíz peligroso (silencia migración) — usar `scripts/deploy.sh`.
 - Migraciones solo-hacia-adelante; CI no las prueba contra DB real; `migration_lock.toml` ausente.
 - MediaMTX `user: any` (mitigado por loopback); relay autenticado = NO-GO.
