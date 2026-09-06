@@ -55,13 +55,32 @@ services:
     # Pin fijo (antes :latest). 1.9.3 es una release estable conocida de la línea
     # 1.9.x; evita que un `pull` futuro cambie el comportamiento del componente
     # crítico de streaming. Actualizar deliberadamente, no por deriva del tag.
-    image: bluenviron/mediamtx:1.9.3
+    #
+    # Variante `-ffmpeg` (antes la `scratch` pura :1.9.3): mismo binario de MediaMTX
+    # 1.9.3 pero sobre una base con shell + busybox, lo que aporta un cliente HTTP
+    # (wget de busybox) para poder tener healthcheck interno. NO cambia el
+    # comportamiento de streaming: nuestra `infra/mediamtx/mediamtx.yml` no usa
+    # ninguna feature de ffmpeg (runOnDemand/runOnPublish externos), sólo el proxy
+    # RTSP→HLS/WebRTC del propio binario. Revertir = volver a `bluenviron/mediamtx:1.9.3`
+    # y borrar el bloque `healthcheck` de abajo (la imagen scratch no admite check interno).
+    image: bluenviron/mediamtx:1.9.3-ffmpeg
     container_name: visioncore_mediamtx
     restart: unless-stopped
     environment:
       MTX_PROTOCOLS: tcp
     volumes:
       - ./infra/mediamtx/mediamtx.yml:/mediamtx.yml:ro
+    # Healthcheck: consulta la API interna de MediaMTX en 9997 (misma que usa el API
+    # por la red docker). wget de busybox (lo trae la variante -ffmpeg); 127.0.0.1
+    # explícito para no depender de la resolución IPv6 de 'localhost'. Si algún día
+    # la base no trajera wget, sustituir por el cliente disponible (p.ej. curl -fsS).
+    # start_period corto: el binario levanta rápido, no corre migraciones.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9997/v3/config/global/get || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     ports:
       # Puertos de medios atados a loopback: Nginx los alcanza por la red interna
       # de docker; no deben quedar expuestos a todas las interfaces (MediaMTX corre
@@ -324,9 +343,10 @@ services:
     depends_on:
       # Esperar a que el API esté SANO (no sólo iniciado) para no producir 502
       # transitorios mientras corren migraciones / arranque. web también se espera
-      # SANO (ya tiene healthcheck). mediamtx corre desde una imagen `scratch` (sin
-      # shell ni cliente HTTP) por lo que no admite un healthcheck interno estándar
-      # → se mantiene service_started.
+      # SANO (ya tiene healthcheck). mediamtx SÍ tiene healthcheck propio (variante
+      # -ffmpeg), pero se mantiene deliberadamente en service_started: no queremos
+      # atar el arranque de nginx a que su check pase, para evitar un deadlock de
+      # arranque si el healthcheck tardara. nginx tolera un mediamtx aún no listo.
       api:
         condition: service_healthy
       web:
