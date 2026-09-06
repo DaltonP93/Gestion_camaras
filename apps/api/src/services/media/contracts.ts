@@ -38,6 +38,10 @@ export type LivePlaybackReason =
   | 'HD_PERMISSION_MISSING'
   | 'RELAY_BACKEND_NOT_READY'
   | 'NO_TRANSCODE_CAPACITY'
+  // C23·H2·P3 — el path EXACTO no tiene una mediaInstanceId vigente: la emisión
+  // respondería NO_MEDIA_INSTANCE, así que la negociación NO ofrece nativo y cae a
+  // fallback explicando este motivo.
+  | 'NO_MEDIA_INSTANCE'
 
 /**
  * Grant tal como lo recibe el cliente en la emisión. `secret` viaja UNA sola vez;

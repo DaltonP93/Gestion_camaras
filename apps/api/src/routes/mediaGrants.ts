@@ -9,10 +9,9 @@
 
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { getStreamPath } from '../services/stream'
 import { getMediaGrantManager, getNativeReadiness, getSessionPolicy, kickConnectionsForGrants } from '../services/media/grant-service'
 import { decideGrantIssuance, timingSafeEqualHex, sha256Hex } from '../services/media/media-grants'
-import { hasMediaAccess, deriveEffectiveType } from '../services/media/native-readiness'
+import { deriveMediaRequest } from '../services/media/grant-derivation'
 import type { GrantScopeQuery, MediaTransport } from '../services/media/contracts'
 
 const NATIVE_PLAYBACK_ENABLED = process.env.NATIVE_PLAYBACK_ENABLED === 'true'
@@ -37,9 +36,6 @@ const validateSchema = z.object({
   // verificarse en esta frontera (ver comentario en scope).
   cameraId:   z.string().min(1).max(200).optional(),
 })
-function codecOf(raw: string | null | undefined): 'h264' | 'hevc' {
-  return /hevc|h\.?265|hvc1/i.test(raw ?? '') ? 'hevc' : 'h264'
-}
 
 export const mediaGrantsRoutes: FastifyPluginAsync = async (server) => {
   const manager = getMediaGrantManager(server)
@@ -49,18 +45,15 @@ export const mediaGrantsRoutes: FastifyPluginAsync = async (server) => {
     const user = request.user
     const body = issueSchema.parse(request.body)
 
-    const camera = await server.prisma.camera.findUnique({ where: { id: body.cameraId }, include: { nvr: true } })
-    if (!camera || !camera.nvr) return reply.status(404).send({ code: 'CAMERA_NOT_FOUND' })
-
-    const effectiveType = deriveEffectiveType(camera.mainCodec)
-    const codec = effectiveType === 'main' ? 'hevc' : codecOf(camera.subCodec)
-    const streamPath = getStreamPath(camera.nvr, camera, effectiveType)
-
-    // RBAC compartido con la negociación.
-    const perm = (user.role === 'ADMIN' || user.role === 'SUPERVISOR') ? null : await server.prisma.userPermission.findFirst({
-      where: { userId: user.sub, cameraId: body.cameraId }, select: { canView: true, canHighQuality: true },
-    })
-    const hasCameraAccess = hasMediaAccess({ role: user.role, effectiveType, perm })
+    // DERIVACIÓN COMPARTIDA con la negociación (/client-capabilities): misma cámara,
+    // tipo, codec, streamPath, RBAC y readiness por PATH (mediaInstanceId vigente).
+    const derived = await deriveMediaRequest(
+      { prisma: server.prisma as any, role: user.role, userId: user.sub, currentInstance: (p) => manager.currentInstance(p) },
+      body.cameraId,
+    )
+    if (!derived.ok) return reply.status(404).send({ code: 'CAMERA_NOT_FOUND' })
+    const { effectiveType, codec, streamPath, access } = derived.derived
+    const hasCameraAccess = effectiveType === 'main' ? access.hd : access.live
 
     // Readiness UNIFICADA (comprueba store atómico + Redis vivo + secreto + transporte).
     const ready = await readiness.evaluate(true)
