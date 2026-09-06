@@ -10,13 +10,22 @@
 // calificado que usa el SQL de la clase) resuelva ahí; al terminar hace
 // `DROP SCHEMA … CASCADE`. Suites concurrentes no se pisan.
 //
-// FIDELIDAD: se ejerce la CLASE REAL `PrismaMediaRevokeOutbox`. Su `drain` usa
-// `$transaction` + `$queryRaw`/`$executeRaw` (incluido el `FOR UPDATE SKIP LOCKED`
-// real) contra este Postgres real. Los tres métodos CRUD del delegate
-// (`create/count/findMany`) se implementan aquí con SQL crudo, para no depender de
-// la regeneración del cliente Prisma (irrelevante para la garantía de locking).
+// FIDELIDAD y LIMITACIÓN (declaradas):
+//   - El SCHEMA se crea aplicando la MIGRACIÓN REAL `0033_media_revoke_outbox`
+//     (el mismo .sql versionado), no un CREATE TABLE a mano ⇒ se valida la
+//     migración real, no un esquema inventado.
+//   - Se ejerce la CLASE REAL `PrismaMediaRevokeOutbox`. Su `drain` usa
+//     `$transaction` + `$queryRaw`/`$executeRaw` (incluido `FOR UPDATE SKIP LOCKED`)
+//     contra este Postgres real.
+//   - LIMITACIÓN: los tres métodos CRUD del delegate (`create/count/findMany`) se
+//     implementan aquí con SQL crudo (adapter), NO con el delegate Prisma generado
+//     — por el quirk de generación del cliente en el monorepo. No se afirma validar
+//     el delegate generado; sí la migración real y el camino SKIP LOCKED real.
 
+import { readFileSync, existsSync } from 'node:fs'
+import path from 'node:path'
 import { PrismaClient } from '@prisma/client'
+import { assertDisposableLocalHost } from './test-host-guard'
 import type { PrismaOutboxClient, PrismaOutboxTx } from './revoke-outbox'
 
 const TEST_URL = process.env.DATABASE_URL_TEST
@@ -35,15 +44,31 @@ export function assertPgRequiredOrSkip(): boolean {
   return have
 }
 
-const CREATE_TABLE = `
-  CREATE TABLE "media_revoke_outbox" (
-    "id"          TEXT NOT NULL,
-    "userId"      TEXT NOT NULL,
-    "requestedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "appliedAt"   TIMESTAMP(3),
-    "attempts"    INTEGER NOT NULL DEFAULT 0,
-    CONSTRAINT "media_revoke_outbox_pkey" PRIMARY KEY ("id")
-  )`
+// Ruta a la migración REAL 0033 (desde apps/api, cwd de los tests / CI).
+function migration0033Path(): string {
+  const candidates = [
+    path.resolve(process.cwd(), '../../prisma/migrations/0033_media_revoke_outbox/migration.sql'),
+    path.resolve(__dirname, '../../../../../prisma/migrations/0033_media_revoke_outbox/migration.sql'),
+  ]
+  for (const c of candidates) if (existsSync(c)) return c
+  throw new Error('no se encontró la migración 0033 real (media_revoke_outbox)')
+}
+
+/** Ejecuta el .sql de la migración REAL, sentencia por sentencia (Prisma
+ *  $executeRawUnsafe corre una a la vez). Ignora comentarios `--`. */
+async function applyMigration0033(prisma: PrismaClient): Promise<void> {
+  const sql = readFileSync(migration0033Path(), 'utf8')
+  const statements = sql
+    .split('\n')
+    .filter((l) => !l.trim().startsWith('--'))
+    .join('\n')
+    .split(';')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+  for (const stmt of statements) {
+    await prisma.$executeRawUnsafe(stmt)
+  }
+}
 
 let cuidSeq = 0
 function genId(): string { return `r${Date.now().toString(36)}${(cuidSeq++).toString(36)}${Math.random().toString(36).slice(2, 8)}` }
@@ -84,6 +109,9 @@ export interface EphemeralOutboxDb {
  */
 export async function withEphemeralOutboxDb<T>(fn: (db: EphemeralOutboxDb) => Promise<T>): Promise<T> {
   if (!TEST_URL) throw new Error('DATABASE_URL_TEST no definido')
+  // Guard: sólo destinos descartables locales/CI (loopback), ANTES de conectar o
+  // ejecutar CREATE/DROP SCHEMA CASCADE.
+  assertDisposableLocalHost(TEST_URL, 'DATABASE_URL_TEST')
   const schema = `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 
   // Bootstrap: crear el schema con una conexión sobre la URL base.
@@ -97,7 +125,7 @@ export async function withEphemeralOutboxDb<T>(fn: (db: EphemeralOutboxDb) => Pr
   const scopedUrl = TEST_URL + (TEST_URL.includes('?') ? '&' : '?') + `schema=${schema}`
   const prisma = new PrismaClient({ datasources: { db: { url: scopedUrl } } })
   try {
-    await prisma.$executeRawUnsafe(CREATE_TABLE)
+    await applyMigration0033(prisma) // migración REAL 0033 dentro del schema aislado
     return await fn({ prisma, adapter: outboxAdapter(prisma) })
   } finally {
     try { await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`) } catch { /* noop */ }

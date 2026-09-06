@@ -20,6 +20,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import Redis from 'ioredis'
 import type { RedisGrantClient } from './grant-store'
+import { assertDisposableLocalHost } from './test-host-guard'
 
 export interface EphemeralRedis {
   client: RedisGrantClient
@@ -91,9 +92,15 @@ function stopProcess(proc: ChildProcess): Promise<void> {
 export async function startEphemeralRedis(): Promise<EphemeralRedis> {
   // ── Modo CI: conectar al Redis provisto (REDIS_TEST_URL), aislado por DB ──
   if (TEST_URL) {
-    const db = Math.floor(Math.random() * 16) // aísla suites concurrentes
+    // Guard: sólo destinos descartables locales/CI (loopback), ANTES de conectar.
+    assertDisposableLocalHost(TEST_URL, 'REDIS_TEST_URL')
+    // Aislamiento DETERMINISTA por worker de vitest (no aleatorio): un worker corre
+    // sus archivos EN SERIE, así que su DB no colisiona con otro worker. Evita la
+    // colisión posible de elegir 1 de 16 al azar entre suites paralelas.
+    const workerRaw = Number(process.env.VITEST_WORKER_ID ?? process.env.VITEST_POOL_ID ?? '0')
+    const db = ((Number.isFinite(workerRaw) ? workerRaw : 0) % 16 + 16) % 16
     const raw = new Redis(TEST_URL, { db, maxRetriesPerRequest: 3 })
-    await raw.flushdb() // arranca limpio en esta DB
+    await raw.flushdb() // arranca limpio en ESTA DB dedicada del worker
     const stop = async (): Promise<void> => {
       try { await raw.flushdb() } catch { /* noop */ }
       await closeClient(raw)

@@ -6,7 +6,11 @@
 // entre transacciones concurrentes — dos "workers" toman filas DISTINTAS a la vez
 // y ninguna fila se procesa dos veces. Reemplaza el viejo NOT_VALIDATED de PG.
 //
-// Nunca apunta a una base remota/producción (ver pg-real-harness.ts).
+// El schema se crea aplicando la MIGRACIÓN REAL 0033 (no un CREATE TABLE a mano).
+// LIMITACIÓN declarada: los CRUD del delegate (create/count/findMany) se ejercen vía
+// SQL crudo (adapter), no el delegate Prisma generado (quirk de generación en el
+// monorepo); el camino `drain`/`SKIP LOCKED` sí es 100% real. El guard de host
+// (test-host-guard.ts) sólo admite destinos loopback descartables — nunca remoto/prod.
 
 import { describe, it, expect } from 'vitest'
 import { PrismaMediaRevokeOutbox } from './revoke-outbox'
