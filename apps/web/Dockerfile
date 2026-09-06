@@ -1,7 +1,8 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
-RUN npm install
+# npm ci: instala exactamente lo fijado en package-lock.json (build reproducible).
+RUN npm ci
 COPY . .
 RUN npm run build
 
