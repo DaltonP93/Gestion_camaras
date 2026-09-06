@@ -220,9 +220,25 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const axios = (await import('axios')).default
     const ips = Array.from({ length: Math.max(0, end - start) + 1 }, (_, i) => `${subnet}.${start + i}`)
 
+    // Anti-SSRF: valida CADA IP candidata contra la política LAN (loopback 127/8,
+    // link-local/metadatos 169.254, no especificada 0.x, CGNAT-metadata Alibaba,
+    // octetos inválidos y rangos no permitidos) ANTES de abrir cualquier conexión.
+    // Si la subred base es reservada/inválida, todas sus IPs fallan el guard y
+    // respondemos 400 sin emitir un solo probe (contador de hits del NVR = 0).
+    for (const ip of ips) {
+      const hostErr = nvrHostError(ip)
+      if (hostErr) {
+        return reply.status(400).send({
+          success: false,
+          errorCode: hostErr.errorCode,
+          message: 'Subred/IP no permitida para escaneo (reservada, de metadatos o fuera de la LAN).',
+        })
+      }
+    }
+
     const probe = async (ip: string) => {
       try {
-        const cfg: any = { timeout: 2000, validateStatus: (s: number) => s < 500 }
+        const cfg: any = { timeout: 2000, validateStatus: (s: number) => s < 500, maxRedirects: 0 }
         if (username && password) cfg.auth = { username, password }
         const res = await axios.get(`http://${ip}:${port}/ISAPI/System/deviceInfo`, cfg)
 
