@@ -1,8 +1,11 @@
-// E2E en navegador REAL del ciclo de vida de pantalla completa de ViewPlayerPage.
+// TEST DE INTEGRACIÓN EN NAVEGADOR (Playwright) — NO un E2E de stack completo.
 //
-// Monta el COMPONENTE REAL (ver e2e/harness/main.tsx) en Chromium y ejerce, a
-// través de la UI y de eventos reales del DOM, el contrato de LIBERACIÓN RÁPIDA
-// (Hito 5, C23):
+// Monta el COMPONENTE REAL `ViewPlayerPage` (ver e2e/harness/main.tsx) en Chromium
+// con la API interceptada por un MOCK y `VideoPlayer` reemplazado por un STUB. Por
+// eso NO es un E2E completo: no hay API real, ni MediaMTX, ni FFmpeg, ni NVR, ni
+// frames HLS, ni cupos ni latencia reales (todo eso es NOT_VALIDATED — ver
+// e2e/README.md). Lo que SÍ valida, en un navegador real y con eventos reales del
+// DOM, es el CICLO DE VIDA de sesiones (contrato de LIBERACIÓN RÁPIDA, Hito 5·C23):
 //
 //   1. Un cierre deliberado libera la sesión de INMEDIATO por identidad (no espera
 //      al TTL del servidor).
@@ -47,11 +50,18 @@ function identityClosesFor(mock: ApiMock, startAttemptId: string) {
   return mock.closes.filter((c) => c.expectedStartAttemptId === startAttemptId && c.status === 200)
 }
 
-test.describe('ViewPlayer — liberación rápida de pantalla completa', () => {
+test.describe('ViewPlayer — integración en navegador (API mock + VideoPlayer stub)', () => {
   let mock: ApiMock
 
   test.beforeEach(async ({ page }) => {
     mock = await installApiMock(page)
+  })
+
+  // Contrato estricto del mock: ninguna ruta /api inesperada (una llamada no
+  // prevista respondería 500 y quedaría registrada). Si esto falla, el test tocó
+  // un endpoint que el mock no modela — se corrige el mock, no se enmascara.
+  test.afterEach(() => {
+    expect(mock.unexpected, `rutas /api inesperadas: ${mock.unexpected.join(', ')}`).toEqual([])
   })
 
   test('1 · cierre deliberado libera la sesión HD por identidad, de inmediato', async ({ page }) => {
@@ -142,22 +152,27 @@ test.describe('ViewPlayer — liberación rápida de pantalla completa', () => {
     await expect.poll(() => mock.activeCount(), { timeout: 15_000 }).toBe(0)
   })
 
-  test('5 · bfcache: pagehide abandona la vista (closeView); pageshow persistido recarga', async ({ page }) => {
+  test('5 · handlers bfcache: pagehide ⇒ closeView(keepalive); pageshow persistido ⇒ recarga', async ({ page }) => {
+    // ALCANCE: valida la LÓGICA DE LOS HANDLERS de la página ante eventos
+    // `pagehide`/`pageshow` reales del DOM. La expulsión y restauración REALES del
+    // bfcache del navegador (sin control fiable en headless) son NOT_VALIDATED: se
+    // despachan eventos sintéticos para ejercer el wiring, no el store del bfcache.
     await loadGrid(page)
-    const viewsBefore = mock.starts.length  // (no importa; medimos GET /views por recarga)
+    const viewGetsBefore = mock.viewGetCount()
+    expect(viewGetsBefore).toBeGreaterThanOrEqual(1) // la carga inicial pidió /views
 
     // `pagehide` ⇒ disposeView ⇒ cierre de TODA la vista con keepalive.
     await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })))
     await expect.poll(() => mock.viewCloses.length).toBeGreaterThanOrEqual(1)
     expect(mock.viewCloses[0].viewId).toMatch(/^vp_/)
 
-    // `pageshow` persistido ⇒ recarga limpia (la vista fue abandonada). La recarga
-    // real vuelve a montar el harness ⇒ nuevo GET /views. Lo detectamos esperando
-    // a que el tile vuelva a aparecer tras el navigate de recarga.
+    // `pageshow` persistido ⇒ el handler recarga (vista abandonada). La recarga
+    // REAL remonta el harness ⇒ un GET /views ADICIONAL. Aserción concreta:
+    // viewGetCount aumenta (no una variable muerta).
     const navPromise = page.waitForEvent('framenavigated').catch(() => null)
     await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })))
     await navPromise
     await expect(page.getByTestId('video-camA')).toBeVisible()
-    void viewsBefore
+    await expect.poll(() => mock.viewGetCount()).toBeGreaterThan(viewGetsBefore)
   })
 })

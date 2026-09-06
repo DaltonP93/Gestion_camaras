@@ -78,10 +78,14 @@ export interface ApiMock {
   starts: StartCall[]
   closes: CloseCall[]
   viewCloses: ViewCloseCall[]
+  /** Rutas /api NO previstas por el mock (contrato estricto: debe quedar vacío). */
+  unexpected: string[]
   /** Cantidad de sesiones "activas" (abiertas y no cerradas por identidad). */
   activeCount(): number
   /** ¿Sigue activa esta identidad? */
   isActive(startAttemptId: string): boolean
+  /** Cuántas veces se pidió GET /views/:id (para detectar la recarga real). */
+  viewGetCount(): number
   /** Retiene la respuesta de `start-stream` de una cámara hasta `releaseStart`. */
   holdStart(cameraId: string): void
   releaseStart(cameraId: string): void
@@ -93,9 +97,11 @@ export async function installApiMock(page: Page): Promise<ApiMock> {
   const starts: StartCall[] = []
   const closes: CloseCall[] = []
   const viewCloses: ViewCloseCall[] = []
+  const unexpected: string[] = []                  // rutas /api no previstas
   const active = new Set<string>()                 // startAttemptId vigentes
   const holds = new Map<string, Deferred>()        // cameraId → gate de start
   const failClose = new Set<string>()              // cameraId con 500 pendiente
+  let viewGets = 0                                 // GET /views/:id (recarga real)
 
   const json = (route: Route, body: unknown, status = 200) =>
     route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
@@ -106,7 +112,7 @@ export async function installApiMock(page: Page): Promise<ApiMock> {
     const p = url.pathname.replace(/^.*?\/api/, '') // parte tras /api
 
     // ── GET vista / cámara / stream sub ──
-    if (method === 'GET' && /^\/views\/[^/]+$/.test(p)) return json(route, VIEW)
+    if (method === 'GET' && /^\/views\/[^/]+$/.test(p)) { viewGets++; return json(route, VIEW) }
     if (method === 'GET' && /^\/cameras\/[^/]+\/stream$/.test(p)) {
       const cameraId = p.split('/')[2]
       return json(route, subStream(cameraId))
@@ -163,8 +169,11 @@ export async function installApiMock(page: Page): Promise<ApiMock> {
       return json(route, { streams: {} })
     }
 
-    // Cualquier otra ruta /api: 200 vacío (no debería ocurrir en estos tests).
-    return json(route, {})
+    // CONTRATO ESTRICTO: cualquier ruta /api NO prevista es un fallo del test, no
+    // un 200 vacío que enmascare llamadas inesperadas. Se registra y se responde
+    // 500; los tests afirman que `unexpected` quedó vacío.
+    unexpected.push(`${method} ${p}`)
+    return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'unexpected route in mock', route: `${method} ${p}` }) })
   })
 
   // Los .m3u8/.ts del stub no se piden (VideoPlayer está aliaseado), pero por si
@@ -172,9 +181,10 @@ export async function installApiMock(page: Page): Promise<ApiMock> {
   await page.route('**/hls/**', (route) => route.abort())
 
   return {
-    starts, closes, viewCloses,
+    starts, closes, viewCloses, unexpected,
     activeCount: () => active.size,
     isActive: (id: string) => active.has(id),
+    viewGetCount: () => viewGets,
     holdStart: (cameraId: string) => { if (!holds.has(cameraId)) holds.set(cameraId, deferred()) },
     releaseStart: (cameraId: string) => { holds.get(cameraId)?.resolve(); holds.delete(cameraId) },
     failNextClose: (cameraId: string) => { failClose.add(cameraId) },
