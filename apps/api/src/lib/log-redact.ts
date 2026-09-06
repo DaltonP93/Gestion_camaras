@@ -44,3 +44,9 @@ export function redactIps(text: string): string {
   if (!text) return text
   return text.replace(IPV4_RE, '$1.x.x')
 }
+
+/** Enmascara un nombre de usuario para logs (invariante #6): nunca el valor.
+ *  Devuelve 'set'/'unset' — indica si había credencial sin filtrar cuál. */
+export function maskUser(user?: string | null): string {
+  return user && String(user).trim() ? 'set' : 'unset'
+}

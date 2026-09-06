@@ -37,7 +37,7 @@
 
 import {
   METADATA_HOSTS,
-  METADATA_IPV6,
+  METADATA_IPV6_CANON,
   isIpv4,
   isPrivateIpv4,
   isLoopbackIpv4,
@@ -48,7 +48,7 @@ import {
   isUnspecifiedIpv6,
   isLinkLocalIpv6,
   looksLikeIpv6,
-  normalizeIpv6,
+  expandIpv6,
 } from './ip-classify'
 
 export type NvrHostErrorCode =
@@ -96,9 +96,14 @@ export function assertSafeNvrHost(rawHost: string): void {
   }
 
   if (looksLikeIpv6(host)) {
-    const norm = normalizeIpv6(host)
+    // Canonicalización SEMÁNTICA: una IPv6 malformada es fail-closed (INVALID_HOST),
+    // nunca se deja caer a las ramas de abajo. Y la comparación con metadatos se
+    // hace por VALOR canónico, así ninguna forma expandida/con IPv4 embebida evade
+    // el bloqueo para colarse por la allow de ULA.
+    const canon = expandIpv6(host)
+    if (!canon) throw new NvrHostError('INVALID_HOST', 'IPv6 malformada')
     // Metadatos IPv6 (fd00:ec2::254) — bloqueo antes de la allow de ULA.
-    if (METADATA_IPV6.has(norm)) throw new NvrHostError('SSRF_BLOCKED', 'destino de metadatos cloud bloqueado')
+    if (METADATA_IPV6_CANON.has(canon)) throw new NvrHostError('SSRF_BLOCKED', 'destino de metadatos cloud bloqueado')
     if (isLinkLocalIpv6(host)) throw new NvrHostError('SSRF_BLOCKED', 'IPv6 link-local bloqueada')
     if (isLoopbackIpv6(host)) throw new NvrHostError('SSRF_BLOCKED', 'IPv6 loopback bloqueada')
     if (isUnspecifiedIpv6(host)) throw new NvrHostError('SSRF_BLOCKED', 'IPv6 no especificada bloqueada')

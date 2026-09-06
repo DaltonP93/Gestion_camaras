@@ -66,31 +66,107 @@ export function isLinkLocalIpv4(host: string): boolean {
   return !!o && o[0] === 169 && o[1] === 254 // 169.254.0.0/16 (incluye metadatos)
 }
 
+/** Normalización LÉXICA (sólo brackets + minúsculas). Conservada por
+ *  compatibilidad; para comparar IPs por VALOR usar `expandIpv6` (semántica). */
 export function normalizeIpv6(host: string): string {
   return host.replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
 }
 
+/**
+ * Expansión SEMÁNTICA de una IPv6 a su forma canónica de 8 hextetos de 4 dígitos
+ * (p. ej. `fd00:ec2::254`, `FD00:EC2::254`, `[fd00:ec2::254]` y
+ * `fd00:0ec2:0000:0000:0000:0000:0000:0254` → todas dan
+ * `fd00:0ec2:0000:0000:0000:0000:0000:0254`). Devuelve `null` si NO es una IPv6
+ * válida — el llamador debe tratar `null` como fail-closed, no como "no aplica".
+ *
+ * Sin esto, la comparación era léxica: una forma expandida (o con IPv4 embebida)
+ * del endpoint de metadatos evadía el set de bloqueo y caía en la allow de ULA.
+ * Soporta IPv4 embebida en el último grupo (`::ffff:192.168.0.1`) y descarta el
+ * zone-id (`%eth0`), que no es válido para un destino remoto.
+ */
+export function expandIpv6(raw: string): string | null {
+  if (raw == null) return null
+  let h = raw.trim().replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
+  const pct = h.indexOf('%')
+  if (pct !== -1) h = h.slice(0, pct) // zona/scope-id: no aplica a destino remoto
+  if (!h.includes(':')) return null   // no es IPv6
+  if (/[^0-9a-f:.]/.test(h)) return null
+
+  const dbl = (h.match(/::/g) || []).length
+  if (dbl > 1) return null
+
+  const toHextets = (parts: string[]): string[] | null => {
+    const out: string[] = []
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i]
+      if (p === '') return null // grupo vacío fuera de '::' ⇒ inválido
+      if (p.includes('.')) {
+        if (i !== parts.length - 1) return null // IPv4 sólo como último componente
+        const o = ipv4Octets(p)
+        if (!o) return null
+        out.push((((o[0] << 8) | o[1]) >>> 0).toString(16).padStart(4, '0'))
+        out.push((((o[2] << 8) | o[3]) >>> 0).toString(16).padStart(4, '0'))
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(p)) return null
+        out.push(p.padStart(4, '0'))
+      }
+    }
+    return out
+  }
+
+  let full: string[]
+  if (dbl === 1) {
+    const [l, r] = h.split('::')
+    const head = l ? l.split(':') : []
+    const tail = r ? r.split(':') : []
+    const h2 = toHextets(head)
+    const t2 = toHextets(tail)
+    if (h2 === null || t2 === null) return null
+    const missing = 8 - (h2.length + t2.length)
+    if (missing < 1) return null // '::' representa ≥1 grupo de ceros
+    full = [...h2, ...Array(missing).fill('0000'), ...t2]
+  } else {
+    const groups = toHextets(h.split(':'))
+    if (groups === null || groups.length !== 8) return null
+    full = groups
+  }
+  if (full.length !== 8) return null
+  return full.join(':')
+}
+
+const IPV6_UNSPECIFIED = '0000:0000:0000:0000:0000:0000:0000:0000'
+const IPV6_LOOPBACK    = '0000:0000:0000:0000:0000:0000:0000:0001'
+
 export function isPrivateIpv6(host: string): boolean {
-  const h = normalizeIpv6(host)
-  if (h === '::1') return true // loopback
-  if (h.startsWith('fc') || h.startsWith('fd')) return true // ULA fc00::/7
-  return false
+  const c = expandIpv6(host)
+  if (!c) return false
+  if (c === IPV6_LOOPBACK) return true // loopback (se mantiene como en el contrato previo)
+  const g0 = c.slice(0, 4)
+  return g0.startsWith('fc') || g0.startsWith('fd') // ULA fc00::/7
 }
 
 export function isLoopbackIpv6(host: string): boolean {
-  return normalizeIpv6(host) === '::1'
+  return expandIpv6(host) === IPV6_LOOPBACK
 }
 
 /** IPv6 no especificada :: (todo cero). */
 export function isUnspecifiedIpv6(host: string): boolean {
-  const h = normalizeIpv6(host)
-  return h === '::' || /^0+(:0+)*$/.test(h)
+  return expandIpv6(host) === IPV6_UNSPECIFIED
 }
 
 export function isLinkLocalIpv6(host: string): boolean {
-  return normalizeIpv6(host).startsWith('fe80') // link-local
+  const c = expandIpv6(host)
+  if (!c) return false
+  const g0 = parseInt(c.slice(0, 4), 16)
+  return g0 >= 0xfe80 && g0 <= 0xfebf // fe80::/10 link-local
 }
 
 export function looksLikeIpv6(host: string): boolean {
   return host.includes(':')
 }
+
+/** Set de metadatos IPv6 en forma CANÓNICA (expandida), para comparar por valor
+ *  sin depender de la representación textual. */
+export const METADATA_IPV6_CANON: ReadonlySet<string> = new Set(
+  [...METADATA_IPV6].map((h) => expandIpv6(h)).filter((h): h is string => h !== null),
+)

@@ -32,6 +32,12 @@ vi.mock('../services/hikvision', async (orig) => {
     ...actual,
     // Devuelve un config marcador por canal para poder afirmar qué canales se leyeron.
     fetchChannelVideoConfig: vi.fn(async (_nvr: any, ch: number) => ({ channel: ch, main: null, sub: null, fetchedAt: 't' })),
+    // Enumeración ISAPI del dispositivo completo: nvr-1 → 3 canales, nvr-2 → 1.
+    // Permite verificar que un camera-scoped NO enumera todas las cámaras del NVR.
+    getIpCameraList: vi.fn(async (nvr: any) => {
+      const chans = nvr?.id === 'nvr-1' ? [1, 2, 3] : nvr?.id === 'nvr-2' ? [1] : []
+      return chans.map((ch) => ({ channel: ch, channelCode: `D${ch}`, name: `ch${ch}`, ipAddress: '', protocol: '', managementPort: 80, securityStatus: '', status: 'online' }))
+    }),
   }
 })
 
@@ -56,7 +62,14 @@ const camsOf = (nvrId: string) => Object.values(cameras).filter((c) => c.nvrId =
 function makePrisma(perms: Perm[]) {
   return {
     nVR: {
-      findUnique: async ({ where }: any) => nvrsById[where.id] ?? null,
+      findUnique: async ({ where, include }: any) => {
+        const base = nvrsById[where.id]
+        if (!base) return null
+        // Honrar `include` como Prisma: /:id pide { cameras, hdds }.
+        return include
+          ? { ...base, ...(include.cameras ? { cameras: camsOf(where.id) } : {}), ...(include.hdds ? { hdds: [] } : {}) }
+          : base
+      },
       findMany: async ({ where }: any) => {
         const ids: string[] = where?.id?.in ?? Object.keys(nvrsById)
         return ids.filter((id) => nvrsById[id]).map((id) => ({ ...nvrsById[id], cameras: camsOf(id), hdds: [] }))
@@ -234,6 +247,88 @@ describe('GET /api/nvrs/:id/video-audio/:channel — scope a nivel de canal', ()
     const app = await build({ sub: 'adm1', role: 'ADMIN' }, [])
     const res = await app.inject({ method: 'GET', url: '/api/nvrs/nvr-1/video-audio/2' })
     expect(res.statusCode).toBe(200)
+    await app.close()
+  })
+})
+
+// ── FAIL-CLOSED: endpoints NVR-WIDE exigen NVR-scoped, NUNCA camera-scoped ──────
+// Escenario del set: cam-a/cam-b/cam-c en nvr-1 (mismo NVR), cam-x en nvr-2 (otro).
+// Un permiso camera-scoped (una sola cámara de nvr-1) NO puede leer recursos de
+// todo el dispositivo: antes `userCanAccessNvr` los dejaba pasar (leak).
+describe('GET /api/nvrs/:id — recurso NVR-wide (todas las cámaras + HDDs)', () => {
+  it('camera-scoped a cam-b ⇒ 403 (no puede leer el NVR completo)', async () => {
+    const app = await build({ sub: 'op1', role: 'OPERATOR' }, [camScoped('op1', 'cam-b')])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs/nvr-1' })
+    expect(res.statusCode).toBe(403)
+    await app.close()
+  })
+  it('NVR-scoped ⇒ 200 con todas las cámaras del NVR', async () => {
+    const app = await build({ sub: 'op1', role: 'OPERATOR' }, [nvrScoped('op1', 'nvr-1')])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs/nvr-1' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().cameras.map((c: any) => c.id).sort()).toEqual(['cam-a', 'cam-b', 'cam-c'])
+    await app.close()
+  })
+  it('ADMIN ⇒ 200', async () => {
+    const app = await build({ sub: 'adm1', role: 'ADMIN' }, [])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs/nvr-1' })
+    expect(res.statusCode).toBe(200)
+    await app.close()
+  })
+})
+
+describe('endpoints NVR-wide de dispositivo ⇒ fail-closed para camera-scoped', () => {
+  // Sólo negativos: la guarda responde 403 ANTES de tocar red (getNVRStatus,
+  // getDeviceInfo, HDDs, recording-capabilities), por eso no requieren mock de red.
+  const wideEndpoints = ['/status', '/device-info', '/storage', '/recording-capabilities']
+  for (const ep of wideEndpoints) {
+    it(`GET /api/nvrs/nvr-1${ep} · camera-scoped (cam-b) ⇒ 403`, async () => {
+      const app = await build({ sub: 'op1', role: 'OPERATOR' }, [camScoped('op1', 'cam-b')])
+      const res = await app.inject({ method: 'GET', url: `/api/nvrs/nvr-1${ep}` })
+      expect(res.statusCode).toBe(403)
+      await app.close()
+    })
+    it(`GET /api/nvrs/nvr-1${ep} · NVR-scoped de OTRO NVR (nvr-2) ⇒ 403`, async () => {
+      const app = await build({ sub: 'op1', role: 'OPERATOR' }, [nvrScoped('op1', 'nvr-2')])
+      const res = await app.inject({ method: 'GET', url: `/api/nvrs/nvr-1${ep}` })
+      expect(res.statusCode).toBe(403)
+      await app.close()
+    })
+  }
+})
+
+// ── GET /api/nvrs/:id/cameras — enumeración filtrada al scope del usuario ───────
+describe('GET /api/nvrs/:id/cameras — un camera-scoped NO enumera todo el NVR', () => {
+  it('camera-scoped a cam-b ⇒ SOLO cam-b en fromDb y SOLO su canal en fromNvr', async () => {
+    const app = await build({ sub: 'op1', role: 'OPERATOR' }, [camScoped('op1', 'cam-b')])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs/nvr-1/cameras' })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    // dos cámaras del MISMO NVR (cam-a, cam-c) NO deben aparecer.
+    expect(body.fromDb.map((c: any) => c.id)).toEqual(['cam-b'])
+    expect(body.fromNvr.map((c: any) => c.channel)).toEqual([2]) // canal de cam-b
+    await app.close()
+  })
+  it('camera-scoped sobre nvr-2 (otro NVR) ⇒ 403 en nvr-1', async () => {
+    const app = await build({ sub: 'op1', role: 'OPERATOR' }, [camScoped('op1', 'cam-x')])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs/nvr-1/cameras' })
+    expect(res.statusCode).toBe(403)
+    await app.close()
+  })
+  it('NVR-scoped ⇒ enumera TODAS las cámaras del NVR (fromDb y fromNvr)', async () => {
+    const app = await build({ sub: 'op1', role: 'OPERATOR' }, [nvrScoped('op1', 'nvr-1')])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs/nvr-1/cameras' })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body.fromDb.map((c: any) => c.id).sort()).toEqual(['cam-a', 'cam-b', 'cam-c'])
+    expect(body.fromNvr.map((c: any) => c.channel).sort()).toEqual([1, 2, 3])
+    await app.close()
+  })
+  it('ADMIN ⇒ enumera todo', async () => {
+    const app = await build({ sub: 'adm1', role: 'ADMIN' }, [])
+    const res = await app.inject({ method: 'GET', url: '/api/nvrs/nvr-1/cameras' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().fromNvr.map((c: any) => c.channel).sort()).toEqual([1, 2, 3])
     await app.close()
   })
 })

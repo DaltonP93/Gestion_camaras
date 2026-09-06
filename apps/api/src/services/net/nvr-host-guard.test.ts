@@ -28,6 +28,8 @@ describe('assertSafeNvrHost — LAN permitida (NVRs legítimos)', () => {
     '100.64.0.1',        // CGNAT
     'fd12::1',           // ULA IPv6
     '[fd00::abcd]',      // ULA IPv6 con brackets
+    'FD12::1',           // ULA IPv6 en mayúsculas (normalización semántica)
+    'fc00:0000:0000:0000:0000:0000:0000:00ab', // ULA IPv6 expandida
   ])('permite %s', (host) => {
     expect(() => assertSafeNvrHost(host)).not.toThrow()
   })
@@ -82,6 +84,25 @@ describe('assertSafeNvrHost — bloqueados (SSRF)', () => {
   it('bloquea metadatos IPv6 fd00:ec2::254 aunque caiga en ULA', () => {
     expect(code(() => assertSafeNvrHost('fd00:ec2::254'))).toBe('SSRF_BLOCKED')
     expect(code(() => assertSafeNvrHost('[fd00:ec2::254]'))).toBe('SSRF_BLOCKED')
+  })
+  // Normalización SEMÁNTICA: TODA representación del endpoint de metadatos debe
+  // bloquearse, no sólo la forma compacta en minúsculas. Antes la comparación era
+  // léxica y la forma expandida se colaba por la allow de ULA (fc00::/7).
+  it.each([
+    ['comprimida', 'fd00:ec2::254'],
+    ['mayúsculas', 'FD00:EC2::254'],
+    ['brackets + mayúsculas', '[FD00:EC2::254]'],
+    ['expandida completa', 'fd00:0ec2:0000:0000:0000:0000:0000:0254'],
+    ['expandida sin ceros a la izquierda', 'fd00:ec2:0:0:0:0:0:254'],
+    ['con zone-id', 'fd00:ec2::254%eth0'],
+  ])('bloquea metadatos IPv6 en forma %s', (_label, host) => {
+    expect(code(() => assertSafeNvrHost(host))).toBe('SSRF_BLOCKED')
+  })
+  it('IPv6 malformada ⇒ INVALID_HOST (fail-closed, no cae en ninguna allow)', () => {
+    expect(code(() => assertSafeNvrHost('fd00:ec2::254::1'))).toBe('INVALID_HOST') // doble '::'
+    expect(code(() => assertSafeNvrHost('gggg::1'))).toBe('INVALID_HOST')          // hex inválido
+    expect(code(() => assertSafeNvrHost('fd00:ec2:::254'))).toBe('INVALID_HOST')   // ':::'
+    expect(code(() => assertSafeNvrHost('12345::1'))).toBe('INVALID_HOST')         // hextet > 4 dígitos
   })
   it('rechaza octetos IPv4 inválidos (>255) como SSRF_BLOCKED', () => {
     expect(code(() => assertSafeNvrHost('999.1.1.1'))).toBe('SSRF_BLOCKED')

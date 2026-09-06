@@ -35,6 +35,29 @@ export async function userCanAccessNvr(
 }
 
 /**
+ * ¿El usuario puede acceder a recursos NVR-WIDE (de todo el dispositivo, no de una
+ * cámara)? FAIL-CLOSED: sólo privilegiado o un permiso NVR-SCOPED real
+ * (nvrId + cameraId=null + canView). Un permiso CAMERA-scoped NO habilita estos
+ * endpoints — enumeran/exponen recursos del NVR completo (lista de cámaras del
+ * dispositivo, HDDs, device-info, estado del NVR, capacidad de grabación), que un
+ * usuario con acceso a una sola cámara no debe poder leer.
+ *
+ * Contrasta con `userCanAccessNvr` (relación con el NVR por CUALQUIER vía, incl.
+ * camera-scoped), que sólo debe gatear colecciones POR-CÁMARA que además se
+ * filtran al scope del usuario, nunca recursos de todo el dispositivo.
+ */
+export async function userCanAccessNvrWide(
+  prisma: PrismaLike, userId: string, role: string, nvrId: string,
+): Promise<boolean> {
+  if (isPrivilegedRole(role)) return true
+  const nvrScoped = await prisma.userPermission.findFirst({
+    where: { userId, canView: true, nvrId, cameraId: null },
+    select: { id: true },
+  })
+  return !!nvrScoped
+}
+
+/**
  * ¿El usuario puede acceder a un CANAL concreto del NVR? Un permiso NVR-scoped
  * (cameraId=null) cubre todos los canales; un permiso camera-scoped sólo cubre el
  * canal de esa cámara. Así un usuario con permiso sobre una sola cámara NO puede

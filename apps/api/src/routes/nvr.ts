@@ -20,8 +20,10 @@ import {
   isMaskedPassword,
 } from '../services/credentials'
 import { assertSafeNvrHost, isNvrHostError } from '../services/net/nvr-host-guard'
+import { maskIp, maskUser, redactIps } from '../lib/log-redact'
 import {
   userCanAccessNvr,
+  userCanAccessNvrWide,
   userCanAccessNvrChannel,
   getVisibleNvrMap,
 } from '../services/access-policy'
@@ -110,7 +112,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const data = { ipAddress: raw.ipAddress, port: raw.port, username: raw.username, password }
     const result = await testNVRConnection(data)
 
-    server.log.info(`[test-connection] ${data.ipAddress}:${data.port} errorCode=${result.errorCode ?? 'none'} user=${data.username} passwordSource=${passwordSource} reachable=${result.reachable}`)
+    server.log.info(`[test-connection] ${maskIp(data.ipAddress)}:${data.port} errorCode=${result.errorCode ?? 'none'} user=${maskUser(data.username)} passwordSource=${passwordSource} reachable=${result.reachable}`)
 
     if (!result.reachable) {
       const httpStatus = (result.errorCode === 'AUTH_FAILED') ? 422 : 503
@@ -184,7 +186,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       if (!conn?.reachable) {
         const errorCode = conn?.errorCode ?? 'NETWORK_UNREACHABLE'
         const message   = conn?.errorMessage ?? 'No se pudo conectar al NVR'
-        server.log.warn(`[detect] ${data.ipAddress}:${data.port} errorCode=${errorCode} user=${data.username} passwordSource=${passwordSource}`)
+        server.log.warn(`[detect] ${maskIp(data.ipAddress)}:${data.port} errorCode=${errorCode} user=${maskUser(data.username)} passwordSource=${passwordSource}`)
         const httpStatus = errorCode === 'AUTH_FAILED' ? 422 : 503
         return reply.status(httpStatus).send({
           success: false, errorCode, message, hint: conn?.hint, endpoints: conn?.endpoints,
@@ -194,7 +196,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       const d = info.status === 'fulfilled' ? info.value : null
       const c = channels.status === 'fulfilled' ? channels.value : []
 
-      server.log.info(`[detect] ${data.ipAddress}:${data.port} ok model=${conn.model || d?.model} channels=${c.length || d?.channelCount}`)
+      server.log.info(`[detect] ${maskIp(data.ipAddress)}:${data.port} ok model=${conn.model || d?.model} channels=${c.length || d?.channelCount}`)
       return reply.send({
         success: true,
         model:           d?.model || conn.model || '',
@@ -323,7 +325,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    // NVR-WIDE (incluye TODAS las cámaras y HDDs): fail-closed, exige NVR-scoped.
+    if (!await userCanAccessNvrWide(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({
       where: { id },
@@ -337,7 +340,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/status', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    // NVR-WIDE (estado del dispositivo completo): fail-closed, exige NVR-scoped.
+    if (!await userCanAccessNvrWide(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -356,7 +360,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/device-info', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    // NVR-WIDE (info del dispositivo completo): fail-closed, exige NVR-scoped.
+    if (!await userCanAccessNvrWide(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -372,7 +377,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/storage', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    // NVR-WIDE (HDDs del dispositivo completo): fail-closed, exige NVR-scoped.
+    if (!await userCanAccessNvrWide(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -400,7 +406,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         storageReason = permDenied
           ? `Usuario sin permiso para leer almacenamiento (HTTP ${httpSt}) — usa un usuario Administrador del NVR`
           : `No soportado por este modelo/firmware (HTTP ${httpSt})`
-        server.log.warn(`[storage] ${nvr.name} (${nvr.ipAddress}): ${e.message}`)
+        server.log.warn(`[storage] ${nvr.name} (${maskIp(nvr.ipAddress)}): ${redactIps(e.message)}`)
       } else {
         server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
         return reply.status(500).send({ message: 'No se pudo sincronizar almacenamiento del NVR. Ver logs del servidor.' })
@@ -437,7 +443,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         usersReason = permDenied
           ? `Usuario sin permiso para gestión de usuarios (HTTP ${httpSt}) — usa un usuario Administrador del NVR`
           : `No soportado por este modelo/firmware (HTTP ${httpSt})`
-        server.log.warn(`[users] ${nvr.name} (${nvr.ipAddress}): ${e.message}`)
+        server.log.warn(`[users] ${nvr.name} (${maskIp(nvr.ipAddress)}): ${redactIps(e.message)}`)
       } else {
         throw e
       }
@@ -460,13 +466,27 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
     const nvrDec = { ...nvr, password: decryptPassword(nvr.password) }
-    const ipCams = await getIpCameraList(nvrDec as any)
+    let ipCams = await getIpCameraList(nvrDec as any)
 
     // También retornar las cámaras de DB
-    const dbCams = await server.prisma.camera.findMany({
+    let dbCams = await server.prisma.camera.findMany({
       where: { nvrId: id },
       orderBy: { channel: 'asc' },
     })
+
+    // RBAC POR-CÁMARA (least-privilege): un permiso camera-scoped NO puede enumerar
+    // todas las cámaras del NVR. Si el usuario no es privilegiado ni NVR-scoped, se
+    // filtra tanto la lista de DB como la enumeración ISAPI (`fromNvr`) a SOLO sus
+    // cámaras visibles — por id en DB y por canal en la lista del dispositivo.
+    if (!['ADMIN', 'SUPERVISOR'].includes(u.role)) {
+      const scope = (await getVisibleNvrMap(server.prisma, u.sub)).get(id)
+      if (!scope?.all) {
+        const allowedIds = new Set(scope?.cameraIds ?? [])
+        dbCams = dbCams.filter((c: any) => allowedIds.has(c.id))
+        const visibleChannels = new Set(dbCams.map((c: any) => c.channel))
+        ipCams = ipCams.filter((c: any) => visibleChannels.has(c.channel))
+      }
+    }
 
     // Estado EFECTIVO resuelto server-side (fuente de verdad única, P0): la tabla
     // NO debe confiar en rtspMainOk/online HISTÓRICOS cuando el NVR reporta el canal
@@ -1054,7 +1074,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const conn = await testNVRConnection(nvrDec as any).catch(() => null)
     result.connection = { ok: conn?.reachable ?? false, errorCode: conn?.errorCode }
     if (!conn?.reachable) {
-      server.log.warn(`[onboard] ${nvr.name} (${nvr.ipAddress}) connection failed: ${conn?.errorCode ?? 'NETWORK_UNREACHABLE'}`)
+      server.log.warn(`[onboard] ${nvr.name} (${maskIp(nvr.ipAddress)}) connection failed: ${conn?.errorCode ?? 'NETWORK_UNREACHABLE'}`)
     }
 
     // Step 2: Device info
@@ -1178,7 +1198,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     publishAllStreams(nvrDec as any, allCameras).catch(() => {})
     result.streams = { published: allCameras.length }
 
-    server.log.info(`[onboard] ${nvr.name} (${nvr.ipAddress}): cameras=${camerasSynced} names=${nameUpdated} ips=${ipUpdated} ports=${portUpdated} source=${sourceUsed} isapi=${isapIStatus}`)
+    server.log.info(`[onboard] ${nvr.name} (${maskIp(nvr.ipAddress)}): cameras=${camerasSynced} names=${nameUpdated} ips=${ipUpdated} ports=${portUpdated} source=${sourceUsed} isapi=${isapIStatus}`)
     await AuditAction(server.prisma, request.user.sub, 'NVR_ONBOARDED', id, request, result)
 
     return reply.send({ success: true, nvrId: id, ...result })
@@ -1244,9 +1264,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
           validateAndUpdateCameraHealth(server.prisma, cam.nvr as any, cam as any).catch(() => {})
         )).catch(() => {})
 
-        server.log.info(`[nvr-create] ${nvr.name} (${nvr.ipAddress}) onboarding done: ipCams=${ipCams.length} source=${sourceUsed}`)
+        server.log.info(`[nvr-create] ${nvr.name} (${maskIp(nvr.ipAddress)}) onboarding done: ipCams=${ipCams.length} source=${sourceUsed}`)
       } catch (err: any) {
-        server.log.warn(`[nvr-create] ${nvr.name} onboarding error: ${err?.message}`)
+        server.log.warn(`[nvr-create] ${nvr.name} onboarding error: ${redactIps(err?.message ?? '')}`)
       }
     })()
 
@@ -1310,7 +1330,8 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/recording-capabilities', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    // NVR-WIDE (capacidad de grabación del dispositivo): fail-closed, exige NVR-scoped.
+    if (!await userCanAccessNvrWide(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
