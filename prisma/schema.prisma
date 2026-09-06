@@ -653,3 +653,23 @@ model AlertSettings {
 
   @@map("alert_settings")
 }
+
+// ─── Outbox durable de revocación de medios (C23·H2·P2) ──────────────
+// Registro DURABLE de la intención de revocar los grants de medios de un usuario
+// (logout / cambio de permisos). Sobrevive a un reinicio del API durante una
+// caída de Redis: la fila se escribe en Postgres ANTES/independiente de tocar
+// Redis, y un worker idempotente aplica el bump de epoch y marca `appliedAt`.
+// Mientras exista una fila sin aplicar para un usuario, el relay falla CERRADO.
+// NUNCA almacena grants, secretos ni tokens: sólo userId + timestamps + intentos.
+model MediaRevokeOutbox {
+  id          String    @id @default(cuid())
+  userId      String
+  requestedAt DateTime  @default(now())
+  appliedAt   DateTime?
+  attempts    Int       @default(0)
+
+  // Consulta caliente del fail-closed y del drenaje: pendientes por usuario.
+  @@index([userId, appliedAt])
+  @@index([appliedAt])
+  @@map("media_revoke_outbox")
+}

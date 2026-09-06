@@ -143,6 +143,10 @@ export type GrantRejectReason =
   | 'EPOCH_MISMATCH'
   | 'REPLAYED'
   | 'BACKEND_UNAVAILABLE'
+  // C23·H2·P2 — deuda de revocación DURABLE sin aplicar para el usuario: el relay
+  // FALLA CERRADO (no valida grants de sesión) hasta que el drenaje aplique el
+  // bump de epoch. No lo produce la Lua; lo impone el manager antes del store.
+  | 'REVOKE_PENDING'
 
 export interface GrantValidation {
   ok: boolean

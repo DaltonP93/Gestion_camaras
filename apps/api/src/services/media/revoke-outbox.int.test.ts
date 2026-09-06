@@ -1,0 +1,150 @@
+// apps/api/src/services/media/revoke-outbox.int.test.ts
+//
+// C23·H2·P2 — INTEGRACIÓN: outbox durable de revocación + Redis REAL.
+//
+// Escenario clave (durabilidad ante reinicio durante caída de Redis):
+//   Redis "caído" → logout (fila DURABLE en el outbox) → REINICIO COMPLETO del
+//   proceso (se recrean los singletons del servicio desde cero, SIN ningún Set en
+//   memoria) → Redis vuelve → drenaje → epoch incrementado → un grant anterior es
+//   RECHAZADO (EPOCH_MISMATCH).
+//
+// También: fail-closed del relay mientras hay deuda pendiente, y drenaje
+// multi-worker sin doble procesamiento destructivo (dos drenajes concurrentes ⇒
+// una sola aplicación).
+//
+// La durabilidad se prueba con la impl EN MEMORIA de la interfaz durable, que se
+// re-inyecta tras el "reinicio" (representa Postgres, que persiste). La atomicidad
+// SKIP LOCKED de la impl Postgres NO está validada en vivo (no hay servidor
+// Postgres en el entorno; sólo el cliente psql) ⇒ NOT_VALIDATED, documentado.
+
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { startEphemeralRedis, redisServerAvailable, type EphemeralRedis } from './redis-real-harness'
+import { ik, type RedisGrantClient } from './grant-store'
+import { InMemoryMediaRevokeOutbox } from './revoke-outbox'
+import {
+  getMediaGrantManager, revokeUserMediaGrants, retryPendingUserRevokes,
+  setMediaRevokeOutboxForTest, __resetMediaGrantManagerForTest, __pendingUserRevokeCount,
+} from './grant-service'
+
+const HAVE_REDIS = redisServerAvailable()
+
+/** Proxy sobre ioredis que puede simular una caída (toda op lanza) SIN perder los
+ *  datos ya escritos en el Redis real subyacente (como un outage de red). */
+class FailableRedis implements RedisGrantClient {
+  down = false
+  constructor(private readonly inner: RedisGrantClient) {}
+  private g<T>(fn: () => Promise<T>): Promise<T> { if (this.down) return Promise.reject(new Error('redis down')); return fn() }
+  get(k: string) { return this.g(() => this.inner.get(k)) }
+  set(k: string, v: string, m: 'PX', ttl: number, nx?: 'NX') { return this.g(() => nx ? this.inner.set(k, v, m, ttl, nx) : this.inner.set(k, v, m, ttl)) }
+  del(k: string) { return this.g(() => this.inner.del(k)) }
+  sadd(k: string, m: string) { return this.g(() => this.inner.sadd(k, m)) }
+  srem(k: string, m: string) { return this.g(() => this.inner.srem(k, m)) }
+  smembers(k: string) { return this.g(() => this.inner.smembers(k)) }
+  pexpire(k: string, ttl: number) { return this.g(() => this.inner.pexpire(k, ttl)) }
+  incr(k: string) { return this.g(() => this.inner.incr(k)) }
+  ping() { return this.g(() => this.inner.ping()) }
+  eval(script: string, numKeys: number, ...args: (string | number)[]) { return this.g(() => this.inner.eval(script, numKeys, ...args)) }
+}
+
+const log = { info: () => {}, warn: () => {} }
+const scope = { userId: 'victim', cameraId: 'cam-1', streamPath: 'nvr_c_sub', transport: 'rtsps' as const, action: 'read' as const }
+
+describe.skipIf(!HAVE_REDIS)('revoke-outbox · durable + Redis REAL', () => {
+  let env: EphemeralRedis
+  beforeAll(async () => { env = await startEphemeralRedis() })
+  afterAll(async () => { await env?.stop() })
+  beforeEach(() => __resetMediaGrantManagerForTest())
+
+  it('durabilidad ante reinicio durante caída de Redis ⇒ drenaje ⇒ EPOCH_MISMATCH', async () => {
+    // Outbox DURABLE compartido (representa Postgres: sobrevive al "reinicio").
+    const durable = new InMemoryMediaRevokeOutbox()
+    setMediaRevokeOutboxForTest(durable)
+
+    // Fase A · Redis sano: fuente + grant vivo del usuario.
+    const proxyUp = new FailableRedis(env.client)
+    const serverA: any = { log, redis: proxyUp }
+    const mgrA = getMediaGrantManager(serverA)
+    await mgrA.registerSource('nvr_c_sub')
+    const r = await mgrA.issue({ userId: 'victim', viewId: 'v', cameraId: 'cam-1', streamPath: 'nvr_c_sub', effectiveType: 'sub', codec: 'h264', transport: 'rtsps', device: 'win', ttlMs: 30_000 })
+    if (!r.ok) throw new Error('issue: ' + r.code)
+
+    // Fase B · Redis CAÍDO durante el logout: la intención queda DURABLE (pending).
+    proxyUp.down = true
+    expect(await revokeUserMediaGrants(serverA, 'victim')).toBe('pending')
+    expect(__pendingUserRevokeCount()).toBe(1)
+
+    // REINICIO COMPLETO del proceso: se destruyen los singletons (NO hay Set en
+    // memoria); sólo el outbox DURABLE persiste, así que lo re-inyectamos.
+    __resetMediaGrantManagerForTest()
+    setMediaRevokeOutboxForTest(durable)
+
+    // Redis vuelve (proxy nuevo, sano, sobre el MISMO Redis real: el grant sigue ahí).
+    const proxyDown2 = new FailableRedis(env.client)
+    const serverB: any = { log, redis: proxyDown2 }
+
+    // La deuda pendiente sobrevivió al reinicio.
+    expect(__pendingUserRevokeCount()).toBe(1)
+
+    // Aislamos la garantía por EPOCH (T9/P0-2): simulamos que el índice por-usuario
+    // se perdió (escritura tardía / outage), borrándolo, de modo que el marcado
+    // cosmético revokedAt NO alcance al grant. Sólo el bump de epoch puede
+    // invalidarlo ⇒ el rechazo será EPOCH_MISMATCH, no REVOKED.
+    await env.raw.del(ik('user', 'victim'))
+
+    // Drenaje ⇒ epoch incrementado en Redis real.
+    const drained = await retryPendingUserRevokes(serverB)
+    expect(drained).toBe(1)
+    expect(__pendingUserRevokeCount()).toBe(0)
+
+    // El grant anterior (epoch 0) ya no valida: EPOCH_MISMATCH por el epoch bumpeado.
+    const mgrB = getMediaGrantManager(serverB)
+    const res = await mgrB.consume({ grantId: r.issued.grantId, secret: r.issued.secret }, scope)
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('EPOCH_MISMATCH')
+  })
+
+  it('fail-closed del relay mientras hay deuda pendiente (REVOKE_PENDING), aun con Redis caído', async () => {
+    const durable = new InMemoryMediaRevokeOutbox()
+    setMediaRevokeOutboxForTest(durable)
+    const proxy = new FailableRedis(env.client)
+    const server: any = { log, redis: proxy }
+    const mgr = getMediaGrantManager(server)
+    await mgr.registerSource('nvr_c_sub')
+
+    proxy.down = true
+    expect(await revokeUserMediaGrants(server, 'victim')).toBe('pending')
+
+    // issueSession y validateSession fallan CERRADO por la deuda (antes del store).
+    const iss = await mgr.issueSession({ userId: 'victim', viewId: 'v', cameraId: 'cam-1', streamPath: 'nvr_c_sub', effectiveType: 'sub', codec: 'h264', transport: 'rtsps', device: 'win', ttlMs: 30_000 })
+    expect(iss.ok).toBe(false)
+    if (!iss.ok) expect(iss.code).toBe('REVOKE_PENDING')
+    const vs = await mgr.validateSession({ grantId: 'whatever', secret: 'x' }, scope)
+    expect(vs.reason).toBe('REVOKE_PENDING')
+
+    // Un usuario SIN deuda no queda bloqueado por esta vía (aunque Redis caído dé otro deny).
+    const other = await mgr.validateSession({ grantId: 'g', secret: 's' }, { ...scope, userId: 'inocente' })
+    expect(other.reason).not.toBe('REVOKE_PENDING')
+  })
+
+  it('drenaje multi-worker: dos drenajes concurrentes ⇒ una sola aplicación (sin doble proceso)', async () => {
+    const durable = new InMemoryMediaRevokeOutbox()
+    await durable.enqueue('u1')
+    await durable.enqueue('u2')
+    let applies = 0
+    const apply = async (): Promise<boolean> => { applies++; return true }
+    // Dos "workers" drenando a la vez sobre la MISMA cola durable.
+    const [a, b] = await Promise.all([durable.drain(apply), durable.drain(apply)])
+    expect(a + b).toBe(2)          // exactamente 2 filas aplicadas en total
+    expect(applies).toBe(2)        // cada fila aplicada UNA vez (sin doble proceso)
+    expect(await durable.pendingUserIds()).toEqual([])
+  })
+
+  it('apply fallido deja la fila pendiente (idempotente en el reintento)', async () => {
+    const durable = new InMemoryMediaRevokeOutbox()
+    await durable.enqueue('u1')
+    expect(await durable.drain(async () => false)).toBe(0)     // Redis caído ⇒ no aplica
+    expect(await durable.hasPending('u1')).toBe(true)
+    expect(await durable.drain(async () => true)).toBe(1)      // reintento ⇒ aplica
+    expect(await durable.hasPending('u1')).toBe(false)
+  })
+})
