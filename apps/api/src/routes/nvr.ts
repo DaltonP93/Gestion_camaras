@@ -20,6 +20,11 @@ import {
   isMaskedPassword,
 } from '../services/credentials'
 import { assertSafeNvrHost, isNvrHostError } from '../services/net/nvr-host-guard'
+import {
+  userCanAccessNvr,
+  userCanAccessNvrChannel,
+  getVisibleNvrMap,
+} from '../services/access-policy'
 
 // Valida el host/IP del NVR contra SSRF (metadatos cloud, loopback, link-local).
 // Devuelve un objeto de error tipado para responder 400, o null si es seguro.
@@ -284,40 +289,41 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         include: nvrInclude,
         orderBy: { name: 'asc' },
       })
-    } else {
-      const permissions = await server.prisma.userPermission.findMany({
-        where: { userId: user.sub, nvrId: { not: null } },
-        select: { nvrId: true },
-      })
-      const nvrIds = permissions.map((p: any) => p.nvrId!).filter(Boolean)
-      nvrs = await server.prisma.nVR.findMany({
-        where: { id: { in: nvrIds } },
-        include: nvrInclude,
-        orderBy: { name: 'asc' },
-      })
+      return reply.send(nvrs.map((nvr: any) => ({ ...nvr, password: undefined })))
     }
 
-    return reply.send(nvrs.map((nvr: any) => ({ ...nvr, password: undefined })))
+    // No-privilegiado: RBAC por recurso. Antes se listaba cualquier NVR con una
+    // fila de permiso (aunque canView=false) y sin cubrir permisos camera-scoped.
+    // Ahora exigimos canView=true y filtramos las cámaras a lo visible: un permiso
+    // NVR-scoped muestra todas sus cámaras; uno camera-scoped, sólo esa cámara.
+    const visible = await getVisibleNvrMap(server.prisma, user.sub)
+    const nvrIds = [...visible.keys()]
+    nvrs = await server.prisma.nVR.findMany({
+      where: { id: { in: nvrIds } },
+      include: nvrInclude,
+      orderBy: { name: 'asc' },
+    })
+
+    const filtered = nvrs.map((nvr: any) => {
+      const scope = visible.get(nvr.id)
+      const cameras = scope?.all
+        ? nvr.cameras
+        : (nvr.cameras ?? []).filter((c: any) => scope?.cameraIds.includes(c.id))
+      return { ...nvr, cameras, password: undefined }
+    })
+
+    return reply.send(filtered)
   })
 
-  async function userCanAccessNvr(userId: string, role: string, nvrId: string): Promise<boolean> {
-    if (role === 'ADMIN' || role === 'SUPERVISOR') return true
-    // RBAC por recurso: un no-privilegiado sólo accede al NVR si tiene un permiso
-    // REAL de lectura (canView=true) sobre el NVR o sobre alguna de sus cámaras.
-    // Antes bastaba la mera existencia de una fila UserPermission (aunque canView
-    // fuese false) ⇒ acceso laxo. Alineado con camera-scope / cameras.ts.
-    const perm = await server.prisma.userPermission.findFirst({
-      where: { userId, canView: true, OR: [{ nvrId }, { camera: { nvrId } }] },
-      select: { id: true },
-    })
-    return !!perm
-  }
+  // RBAC por recurso centralizado en services/access-policy.ts (userCanAccessNvr /
+  // userCanAccessNvrChannel / getVisibleNvrMap). Ver ese módulo para la semántica
+  // NVR-scoped vs camera-scoped.
 
   // GET /api/nvrs/:id
   server.get('/:id', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({
       where: { id },
@@ -331,7 +337,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/status', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -350,7 +356,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/device-info', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -366,7 +372,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/storage', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -448,7 +454,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/cameras', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -1304,7 +1310,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   server.get('/:id/recording-capabilities', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const u = request.user
-    if (!await userCanAccessNvr(u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
@@ -1631,11 +1637,24 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
   // GET /api/nvrs/:id/video-audio — Get all channel configs from ISAPI
   server.get('/:id/video-audio', { preHandler: [server.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string }
+    const u = request.user
+    // RBAC por recurso: antes esta ruta sólo exigía autenticación (bypass). Ahora
+    // aplica la política de acceso al NVR y, si el permiso es camera-scoped, sólo
+    // devuelve la config de las cámaras visibles (no las demás del NVR).
+    if (!await userCanAccessNvr(server.prisma, u.sub, u.role, id)) return reply.status(403).send({ message: 'Sin permiso' })
+
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
 
-    // Get all cameras from DB for this NVR
-    const cameras = await server.prisma.camera.findMany({ where: { nvrId: id }, orderBy: { channel: 'asc' } })
+    // Get cameras from DB for this NVR, restringidas al scope del usuario.
+    let cameras = await server.prisma.camera.findMany({ where: { nvrId: id }, orderBy: { channel: 'asc' } })
+    if (!['ADMIN', 'SUPERVISOR'].includes(u.role)) {
+      const scope = (await getVisibleNvrMap(server.prisma, u.sub)).get(id)
+      if (!scope?.all) {
+        const allowed = new Set(scope?.cameraIds ?? [])
+        cameras = cameras.filter((c: any) => allowed.has(c.id))
+      }
+    }
     if (cameras.length === 0) return reply.send([])
 
     const decPass = decryptPassword(nvr.password)
@@ -1662,6 +1681,13 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const { id, channel } = request.params as { id: string; channel: string }
     const channelNo = parseInt(channel, 10)
     if (isNaN(channelNo) || channelNo < 1) return reply.status(400).send({ message: 'Canal inválido' })
+
+    // RBAC a nivel de canal: NVR-scoped cubre todos los canales; camera-scoped sólo
+    // el canal de su cámara. Antes esta ruta sólo exigía autenticación (bypass).
+    const u = request.user
+    if (!await userCanAccessNvrChannel(server.prisma, u.sub, u.role, id, channelNo)) {
+      return reply.status(403).send({ message: 'Sin permiso' })
+    }
 
     const nvr = await server.prisma.nVR.findUnique({ where: { id } })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
