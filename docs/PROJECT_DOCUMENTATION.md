@@ -1,5 +1,13 @@
 # VisionCore — Documentación Técnica Integral
 
+> ⚠ **SUPERSEDED (2026-09-06) — índice histórico.** La entrada canónica es ahora
+> `docs/AI_HANDOFF.md`, con detalle en `docs/IMPLEMENTATION_STATUS.md`,
+> `docs/REQUIREMENTS_TRACEABILITY.md`, `docs/DEVELOPMENT_HISTORY.md`, `docs/TEST_EVIDENCE.md`,
+> `docs/HARDWARE_STATUS.md`, `docs/SECURITY.md`, `docs/DEPLOYMENT.md` y `docs/BACKUP_RESTORE.md`.
+> Este documento se conserva como referencia histórica; puede contener afirmaciones desactualizadas
+> (p. ej. §17 afirma que ONVIF/Hik-Connect no existen, pero SÍ existen en `main` `0f9d1f5`, gated por flag).
+> Ante discrepancia, prevalecen los documentos canónicos.
+
 > **Fuente única de verdad del proyecto.** Documento vivo. Última actualización:
 > 2026-09-03. Rama de trabajo: `claude/multi-agent-project-audit-hf14wq`
 > (estado **c22**, commit `0b3c2f8` — importación local de c22 ≈ `9fbb01f`
