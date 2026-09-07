@@ -6,10 +6,15 @@
 //
 // DOS MODOS de obtención del servidor:
 //   1. `REDIS_TEST_URL` (CI): se conecta a un Redis REAL provisto por el entorno
-//      (p. ej. el `services: redis` del job). El índice de DB se asigna de forma
-//      ATÓMICA y DETERMINISTA (contador en la DB 0 ⇒ 1..15 distintos por suite, sin
-//      colisión entre procesos), y `stop()` limpia esa DB. El FLUSHDB exige la señal
-//      explícita `REDIS_TEST_DISPOSABLE=1` (loopback solo no autoriza destructivo).
+//      (p. ej. el `services: redis` del job). El aislamiento es por NAMESPACE ÚNICO
+//      por corrida (keyPrefix aleatorio), NO por índice de DB: el viejo pool circular
+//      `(INCR % 15) + 1` reusaba una DB ACTIVA en la asignación 16 (wrap) y el FLUSHDB
+//      borraba datos de corridas vecinas en esa DB compartida. Un prefijo único aísla
+//      TODAS las claves del store (ioredis aplica `keyPrefix` también a los KEYS de
+//      EVAL, así que los scripts Lua quedan namespaced) y soporta CONCURRENCIA
+//      ILIMITADA. `stop()` borra SÓLO las claves de ESTE prefijo (SCAN + UNLINK),
+//      nunca FLUSHDB. La operación destructiva (borrado por prefijo) exige igualmente
+//      la señal explícita `REDIS_TEST_DISPOSABLE=1` (loopback solo no autoriza).
 //      NO se lanza ningún proceso.
 //   2. binario local (dev): lanza un `redis-server` efímero PROPIO (puerto alto, sin
 //      persistencia) y lo termina en `stop()`. Al ser instancia propia por corrida,
@@ -22,6 +27,7 @@
 // de inmediato, así que la ausencia se detecta sin eventos colgados.
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import Redis from 'ioredis'
 import type { RedisGrantClient } from './grant-store'
 import { assertDestructiveTestAllowed } from './test-host-guard'
@@ -80,6 +86,20 @@ async function closeClient(raw: Redis): Promise<void> {
   try { await raw.quit() } catch { try { raw.disconnect() } catch { /* noop */ } }
 }
 
+/** Borra SÓLO las claves bajo `prefix` con SCAN (no bloqueante) + UNLINK. Nunca
+ *  FLUSHDB: no toca datos de otras corridas que compartan la instancia Redis. Usa
+ *  un cliente SIN keyPrefix (el MATCH de SCAN no es una key y no se prefija solo). */
+async function deleteByPrefix(client: Redis, prefix: string): Promise<void> {
+  let cursor = '0'
+  do {
+    const [next, keys] = await client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 500)
+    cursor = next
+    if (keys.length > 0) {
+      try { await client.unlink(...keys) } catch { await client.del(...keys) }
+    }
+  } while (cursor !== '0')
+}
+
 /** Termina un proceso hijo esperando su `exit` real (SIGTERM y backstop SIGKILL). */
 function stopProcess(proc: ChildProcess): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -94,28 +114,27 @@ function stopProcess(proc: ChildProcess): Promise<void> {
 
 /** Levanta (o conecta) un Redis efímero y devuelve un cliente listo para usar. */
 export async function startEphemeralRedis(): Promise<EphemeralRedis> {
-  // ── Modo CI: conectar al Redis provisto (REDIS_TEST_URL), aislado por DB ──
+  // ── Modo CI: conectar al Redis provisto (REDIS_TEST_URL), aislado por NAMESPACE ──
   if (TEST_URL) {
-    // Guard: loopback + señal EXPLÍCITA de instancia descartable, ANTES de FLUSHDB.
+    // Guard: loopback + señal EXPLÍCITA de instancia descartable, ANTES de borrar nada.
     // (loopback por sí solo no prueba que sea desechable.)
     assertDestructiveTestAllowed(TEST_URL, 'REDIS_TEST_URL', 'REDIS_TEST_DISPOSABLE')
-    // Aislamiento por ASIGNACIÓN ATÓMICA de DB (no worker%16, que colisiona entre
-    // procesos separados o cuando el id supera 16). Un contador en la DB 0 reparte
-    // índices distintos 1..15 a suites concurrentes (la DB 0 se reserva para el
-    // contador y NO se limpia). Determinista y sin colisión hasta 15 concurrentes.
-    const alloc = new Redis(TEST_URL, { db: 0, maxRetriesPerRequest: 3 })
-    let db: number
-    try {
-      const n = await alloc.incr('__vc_test_db_alloc__')
-      db = (Number(n) % 15) + 1 // 1..15
-    } finally {
-      await closeClient(alloc)
-    }
-    const raw = new Redis(TEST_URL, { db, maxRetriesPerRequest: 3 })
-    await raw.flushdb() // arranca limpio en ESTA DB dedicada (1..15), nunca la 0
+    // Aislamiento por PREFIJO ÚNICO por corrida (no por índice de DB: el pool circular
+    // (INCR%15)+1 reusaba una DB activa en la asignación 16 y el FLUSHDB borraba datos
+    // de corridas vecinas). Un prefijo aleatorio no colisiona ni siquiera con >15
+    // corridas concurrentes. ioredis aplica `keyPrefix` también a los KEYS de EVAL, de
+    // modo que TODAS las claves del store (incluidos los scripts Lua) quedan namespaced.
+    const ns = `vc_test:${process.pid.toString(36)}:${Date.now().toString(36)}:${randomBytes(8).toString('hex')}:`
+    // Cliente del store: SIEMPRE con el prefijo (get/set/eval/… quedan namespaced).
+    const raw = new Redis(TEST_URL, { keyPrefix: ns, maxRetriesPerRequest: 3 })
+    // Cliente admin SIN prefijo: sólo para el barrido de limpieza (SCAN MATCH ns*).
+    const admin = new Redis(TEST_URL, { maxRetriesPerRequest: 3 })
     const stop = async (): Promise<void> => {
-      try { await raw.flushdb() } catch { /* noop */ }
+      // Limpieza que borra SÓLO las claves de ESTE prefijo (jamás FLUSHDB ⇒ sin
+      // borrado cruzado entre corridas concurrentes que comparten la instancia).
+      try { await deleteByPrefix(admin, ns) } catch { /* noop */ }
       await closeClient(raw)
+      await closeClient(admin)
     }
     return { client: raw as unknown as RedisGrantClient, raw, port: 0, stop }
   }

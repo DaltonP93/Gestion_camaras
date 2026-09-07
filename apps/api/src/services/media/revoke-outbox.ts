@@ -22,9 +22,24 @@
 // comportamiento idempotente/fail-closed también se validan con la impl en memoria
 // y con Redis REAL (`revoke-outbox.int.test.ts`).
 
+/** Subconjunto MÍNIMO de un cliente de transacción Prisma capaz de insertar una
+ *  fila del outbox. Permite encolar la intención de revocar DENTRO de la MISMA
+ *  transacción que la mutación de sesión/permisos del caller (atomicidad C23·H2·P1). */
+export interface MediaRevokeOutboxTxClient {
+  mediaRevokeOutbox: { create(args: { data: { userId: string } }): Promise<unknown> }
+}
+
 export interface MediaRevokeOutboxRepo {
   /** Registra DURABLEMENTE la intención de revocar (una fila por intención). */
   enqueue(userId: string): Promise<void>
+  /**
+   * Igual que `enqueue`, pero usando el cliente de TRANSACCIÓN del caller, de modo
+   * que la intención de revocar y la mutación de sesión/permisos se confirmen de
+   * forma ATÓMICA (mismo commit PostgreSQL). Si esta operación falla, la transacción
+   * del caller debe hacer ROLLBACK completo (nunca declarar "Sesión cerrada" /
+   * "Permisos actualizados"). Ver `revokeUserMediaGrantsAtomic`.
+   */
+  enqueueInTx(tx: MediaRevokeOutboxTxClient, userId: string): Promise<void>
   /** ¿Existe deuda de revocación SIN aplicar para el usuario? (fail-closed). */
   hasPending(userId: string): Promise<boolean>
   /** Usuarios con al menos una fila pendiente (para el drenaje / diagnóstico). */
@@ -47,6 +62,12 @@ export class InMemoryMediaRevokeOutbox implements MediaRevokeOutboxRepo {
 
   async enqueue(userId: string): Promise<void> {
     this.rows.push({ id: ++this.seq, userId, appliedAt: null, attempts: 0, claiming: false })
+  }
+  /** En memoria NO hay transacción PostgreSQL real: esta impl ES su propio almacén
+   *  durable (sólo tests). Encola directamente e ignora `tx`. La atomicidad real
+   *  mutación+intención se valida contra Postgres/dobles transaccionales, no aquí. */
+  async enqueueInTx(_tx: MediaRevokeOutboxTxClient, userId: string): Promise<void> {
+    await this.enqueue(userId)
   }
   async hasPending(userId: string): Promise<boolean> {
     return this.rows.some((r) => r.userId === userId && r.appliedAt === null)
@@ -95,6 +116,12 @@ export class PrismaMediaRevokeOutbox implements MediaRevokeOutboxRepo {
 
   async enqueue(userId: string): Promise<void> {
     await this.prisma.mediaRevokeOutbox.create({ data: { userId } })
+  }
+  /** Inserta la fila del outbox usando el cliente de TRANSACCIÓN del caller: la
+   *  intención de revocar queda en el MISMO commit que la mutación de sesión/permisos.
+   *  Si el INSERT falla, la excepción propaga ⇒ la transacción del caller hace ROLLBACK. */
+  async enqueueInTx(tx: MediaRevokeOutboxTxClient, userId: string): Promise<void> {
+    await tx.mediaRevokeOutbox.create({ data: { userId } })
   }
   async hasPending(userId: string): Promise<boolean> {
     return (await this.prisma.mediaRevokeOutbox.count({ where: { userId, appliedAt: null } })) > 0

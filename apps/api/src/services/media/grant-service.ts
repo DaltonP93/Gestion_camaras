@@ -9,7 +9,7 @@ import { createGrantStore, type RedisGrantClient } from './grant-store'
 import { NativeRelayReadiness } from './native-readiness'
 import { SingleActiveSessionPolicy } from './session-policy'
 import { connectionsToKick, performKick, noopKicker, type MediaMtxKicker } from './relay-kick'
-import { InMemoryMediaRevokeOutbox, PrismaMediaRevokeOutbox, type MediaRevokeOutboxRepo, type PrismaOutboxClient } from './revoke-outbox'
+import { InMemoryMediaRevokeOutbox, PrismaMediaRevokeOutbox, type MediaRevokeOutboxRepo, type MediaRevokeOutboxTxClient, type PrismaOutboxClient } from './revoke-outbox'
 
 let singleton: MediaGrantManager | null = null
 let readiness: NativeRelayReadiness | null = null
@@ -63,16 +63,45 @@ export function setMediaRevokeOutboxForTest(repo: MediaRevokeOutboxRepo | null):
   activeOutbox = null
 }
 
+/** ¿Estamos en un runtime de test (vitest)? Sólo entonces se tolera el outbox en
+ *  memoria SIN inyección explícita; en producción la ausencia del delegate durable
+ *  es un FAIL-CLOSED (ver abajo). */
+function isTestRuntime(): boolean {
+  return process.env.VITEST === 'true' || process.env.NODE_ENV === 'test'
+}
+
+/**
+ * Outbox durable de revocación. C23·H2·P1 — FAIL-CLOSED: en producción la intención
+ * de revocar DEBE persistir en Postgres; si falta el delegate Prisma
+ * (`mediaRevokeOutbox` + `$transaction`) NO degradamos a memoria en silencio (eso
+ * perdería la durabilidad y volvería fail-OPEN la revocación). La impl en memoria
+ * sólo se usa por INYECCIÓN EXPLÍCITA de test (`setMediaRevokeOutboxForTest`) o, como
+ * conveniencia, bajo runtime de test (vitest) cuando no hay ni inyección ni delegate.
+ */
 export function getMediaRevokeOutbox(server: FastifyInstance): MediaRevokeOutboxRepo {
   if (activeOutbox) return activeOutbox
+  // 1) Inyección EXPLÍCITA de test: la vía canónica a una impl no-Postgres.
   if (outboxOverride) { activeOutbox = outboxOverride; return activeOutbox }
+  // 2) Producción: EXIGE el delegate durable de Postgres.
   const prisma = (server as any).prisma
   if (prisma && prisma.mediaRevokeOutbox && typeof prisma.$transaction === 'function') {
     activeOutbox = new PrismaMediaRevokeOutbox(prisma as PrismaOutboxClient)
-  } else {
-    activeOutbox = new InMemoryMediaRevokeOutbox()
+    return activeOutbox
   }
-  return activeOutbox
+  // 3) Sólo en runtime de test sin inyección ni delegate: memoria (no exige Postgres
+  //    a cada unit test). NUNCA en producción.
+  if (isTestRuntime()) { activeOutbox = new InMemoryMediaRevokeOutbox(); return activeOutbox }
+  // 4) Producción sin outbox durable ⇒ FAIL-CLOSED (no se degrada en silencio).
+  throw new Error('C23·H2·P1: outbox de revocación de medios no disponible (falta el delegate Prisma `mediaRevokeOutbox` o `$transaction`). Fail-closed: no se emiten/validan grants sin durabilidad de la intención de revocación.')
+}
+
+/**
+ * FAIL-CLOSED en el ARRANQUE: fuerza la resolución del outbox durable para que un
+ * despliegue sin el delegate Prisma ABORTE el arranque en vez de diferir el fallo al
+ * primer logout / cambio de permisos. Idempotente (cachea el singleton).
+ */
+export function assertRevokeOutboxAvailable(server: FastifyInstance): void {
+  getMediaRevokeOutbox(server)
 }
 
 export function getMediaGrantManager(server: FastifyInstance): MediaGrantManager {
@@ -146,11 +175,51 @@ export async function revokeUserMediaGrants(server: FastifyInstance, userId: str
     server.log.warn(`media_grant revoke_enqueue_failed userId=${userId.slice(0, 8)} — outbox durable no disponible`)
     return 'failed'
   }
-  // 2) Intentar drenar de inmediato (aplica el bump de epoch si Redis está sano).
+  // 2) Intención durable OK: drenar (epoch) y devolver el estado real.
+  return drainRevokeAndStatus(server, userId, outbox)
+}
+
+/**
+ * C23·H2·P1 — Revocación de grants de medios ATÓMICA con la mutación de sesión /
+ * permisos del caller. La mutación (`mutate(tx)`) y la INTENCIÓN de revocar
+ * (fila del outbox durable) se confirman en la MISMA transacción PostgreSQL:
+ *
+ *   - Si `mutate` o el INSERT del outbox fallan ⇒ ROLLBACK total: ni la sesión se
+ *     cierra, ni los permisos cambian, ni queda intención a medias. La excepción
+ *     PROPAGA para que la ruta responda no-2xx (JAMÁS "Sesión cerrada" /
+ *     "Permisos actualizados").
+ *   - Si el commit tiene éxito ⇒ la intención ya es DURABLE. Se intenta drenar el
+ *     epoch (best-effort). Si Redis está caído, devuelve 'pending' y el plano falla
+ *     cerrado hasta el drenaje (los grants viejos no re-validan). Nunca 'failed'
+ *     tras un commit exitoso (la durabilidad ya está garantizada).
+ *
+ * Exige `prisma.$transaction` real (fail-closed si no está): la atomicidad no puede
+ * emularse sin transacción.
+ */
+export async function revokeUserMediaGrantsAtomic(
+  server: FastifyInstance,
+  userId: string,
+  mutate: (tx: MediaRevokeOutboxTxClient) => Promise<void>,
+): Promise<RevokeStatus> {
+  const outbox = getMediaRevokeOutbox(server) // fail-closed si falta el delegate durable
+  const prisma = (server as any).prisma
+  if (!prisma || typeof prisma.$transaction !== 'function') {
+    throw new Error('C23·H2·P1: revokeUserMediaGrantsAtomic requiere prisma.$transaction (fail-closed): la mutación y la intención de revocar deben confirmarse atómicas.')
+  }
+  // FASE A — mutación + intención de revocar en UNA sola transacción PG.
+  await prisma.$transaction(async (tx: MediaRevokeOutboxTxClient) => {
+    await mutate(tx)
+    await outbox.enqueueInTx(tx, userId)
+  })
+  // FASE B — commit OK ⇒ intención durable. Drenaje best-effort (fail-closed hasta él).
+  return drainRevokeAndStatus(server, userId, outbox)
+}
+
+/** Fase común post-intención-durable: drena el epoch y computa el estado real
+ *  ('applied' | 'pending'). Expulsa conexiones de relay vivas tras aplicar. */
+async function drainRevokeAndStatus(server: FastifyInstance, userId: string, outbox: MediaRevokeOutboxRepo): Promise<RevokeStatus> {
   const mgr = getMediaGrantManager(server)
   await outbox.drain((uid) => mgr.revokeAllForUser(uid).then((o) => o.status === 'applied'))
-  // 3) Estado real para ESTE usuario: si queda deuda pendiente, 'pending' (el plano
-  //    falla cerrado mientras tanto); si no, 'applied'.
   if (await outbox.hasPending(userId)) {
     server.log.warn(`media_grant revoke_pending userId=${userId.slice(0, 8)} — backend caido, se reintentara`)
     return 'pending'
