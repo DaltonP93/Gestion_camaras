@@ -60,6 +60,13 @@ export function SettingsPage() {
     HDD_ERROR: true, MOTION_DETECTED: false, RECORDING_ERROR: true, AUTH_FAILED: false,
   })
   const [minSeverity, setMinSeverity] = useState<AlertSettings['minSeverity']>('HIGH')
+  // ── Integraciones: canales de webhook (Slack / Teams / genérico) ──
+  const [slackEnabled, setSlackEnabled] = useState(false)
+  const [slackWebhookUrl, setSlackWebhookUrl] = useState('')
+  const [teamsEnabled, setTeamsEnabled] = useState(false)
+  const [teamsWebhookUrl, setTeamsWebhookUrl] = useState('')
+  const [webhookEnabled, setWebhookEnabled] = useState(false)
+  const [webhookUrl, setWebhookUrl] = useState('')
   const [testEmail, setTestEmail] = useState('')
   const [sendingTest, setSendingTest] = useState(false)
   const [deliveries, setDeliveries] = useState<any[]>([])
@@ -126,6 +133,13 @@ export function SettingsPage() {
         setRecipientEmails(s.recipientEmails)
         setAlertTypes(s.alertTypes as Record<string, boolean>)
         setMinSeverity(s.minSeverity)
+        // Canales salientes (Slack / Teams / webhook). Las URLs llegan enmascaradas.
+        setSlackEnabled(!!s.slackEnabled)
+        setSlackWebhookUrl(s.slackWebhookUrl ?? '')
+        setTeamsEnabled(!!s.teamsEnabled)
+        setTeamsWebhookUrl(s.teamsWebhookUrl ?? '')
+        setWebhookEnabled(!!s.webhookEnabled)
+        setWebhookUrl(s.webhookUrl ?? '')
       })
       .catch(() => {}) // non-admin will get 403, ignore
       .finally(() => setLoadingAlerts(false))
@@ -187,9 +201,32 @@ export function SettingsPage() {
     }
   }
 
+  const handleSaveIntegrations = async () => {
+    setSaving(true)
+    try {
+      // No reenviar la URL enmascarada: si el usuario no editó el campo, el backend
+      // conserva el valor real (borra el campo === MASK antes del upsert).
+      const updated = await apiPut<AlertSettings>('/alerts/settings', {
+        slackEnabled, slackWebhookUrl,
+        teamsEnabled, teamsWebhookUrl,
+        webhookEnabled, webhookUrl,
+      })
+      setAlertSettings(updated)
+      setSlackWebhookUrl(updated.slackWebhookUrl ?? '')
+      setTeamsWebhookUrl(updated.teamsWebhookUrl ?? '')
+      setWebhookUrl(updated.webhookUrl ?? '')
+      toast.success('Integraciones guardadas')
+    } catch {
+      // error toast shown by api interceptor
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const handleSave = async () => {
     if (tab === 'alertas') return handleSaveAlerts()
     if (tab === 'seguridad') return handleSaveSecurity()
+    if (tab === 'integraciones') return handleSaveIntegrations()
     // Otras pestañas aún no persisten server-side — no simular un guardado falso.
     toast('Esta sección todavía no persiste cambios en el servidor.', { icon: 'ℹ️' })
   }
@@ -761,7 +798,14 @@ export function SettingsPage() {
                       <div className="text-xs text-surface-400">Enviar alertas a un canal de Slack</div>
                     </div>
                   </div>
-                  <input className="input text-xs" placeholder="https://hooks.slack.com/services/..." />
+                  <Toggle value={slackEnabled} onChange={setSlackEnabled} label="Habilitar Slack" />
+                  <input
+                    className={clsx('input text-xs', !slackEnabled && 'opacity-50')}
+                    placeholder="https://hooks.slack.com/services/..."
+                    disabled={!slackEnabled}
+                    value={slackWebhookUrl}
+                    onChange={(e) => setSlackWebhookUrl(e.target.value)}
+                  />
                   <p className="text-xs text-surface-500">Crea un Incoming Webhook en tu workspace de Slack.</p>
                 </div>
 
@@ -775,7 +819,14 @@ export function SettingsPage() {
                       <div className="text-xs text-surface-400">Notificaciones en un canal de Teams</div>
                     </div>
                   </div>
-                  <input className="input text-xs" placeholder="https://outlook.office.com/webhook/..." />
+                  <Toggle value={teamsEnabled} onChange={setTeamsEnabled} label="Habilitar Teams" />
+                  <input
+                    className={clsx('input text-xs', !teamsEnabled && 'opacity-50')}
+                    placeholder="https://outlook.office.com/webhook/..."
+                    disabled={!teamsEnabled}
+                    value={teamsWebhookUrl}
+                    onChange={(e) => setTeamsWebhookUrl(e.target.value)}
+                  />
                 </div>
 
                 <div className="p-4 border border-surface-600 rounded-lg space-y-3">
@@ -788,7 +839,14 @@ export function SettingsPage() {
                       <div className="text-xs text-surface-400">Compatible con n8n, Zapier, IFTTT y cualquier sistema</div>
                     </div>
                   </div>
-                  <input className="input text-xs" placeholder="https://tu-servidor.com/webhook/alertas" />
+                  <Toggle value={webhookEnabled} onChange={setWebhookEnabled} label="Habilitar webhook genérico" />
+                  <input
+                    className={clsx('input text-xs', !webhookEnabled && 'opacity-50')}
+                    placeholder="https://tu-servidor.com/webhook/alertas"
+                    disabled={!webhookEnabled}
+                    value={webhookUrl}
+                    onChange={(e) => setWebhookUrl(e.target.value)}
+                  />
                   <p className="text-xs text-surface-500">
                     Recibirás un POST JSON con: type, severity, message, nvrId, cameraId, timestamp.
                   </p>

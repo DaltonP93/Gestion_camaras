@@ -1,6 +1,8 @@
 // Notification Service — orquesta canales de notificación para alertas VisionCore
 import type { PrismaClient } from '@prisma/client'
 import { sendAlertEmail } from './providers/email.provider'
+import { sendToChannel, type ChannelKind, type ChannelAlert } from './providers/channel.provider'
+import { maskIp } from '../lib/log-redact'
 
 const SEVERITY_ORDER: Record<string, number> = { LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 }
 
@@ -105,37 +107,41 @@ function buildEmailText(alert: AlertForNotification, extra: { nvrName?: string; 
   return lines.filter(Boolean).join('\n')
 }
 
+/** Etiqueta NO sensible del destino de un canal para el historial de entregas.
+ *  NUNCA guarda la URL completa del webhook (Slack/Teams incluyen un token secreto
+ *  en la ruta). Sólo el host, con la IP enmascarada si es IPv4 (invariante #6). */
+function channelRecipientLabel(kind: ChannelKind, url: string): string {
+  try {
+    const host = new URL(url).hostname
+    const shown = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ? maskIp(host) : host
+    return `${kind} · ${shown}`
+  } catch {
+    return kind
+  }
+}
+
 export async function sendAlertNotification(
   prisma: PrismaClient,
   alert: AlertForNotification,
 ): Promise<void> {
-  // 1. Cargar settings y verificar reglas
+  // 1. Cargar settings. Ya NO se corta si el email está deshabilitado: los canales
+  //    de webhook (Slack/Teams/genérico) se despachan de forma independiente.
   const settings = await prisma.alertSettings.findUnique({ where: { id: 'singleton' } })
-  if (!settings || !settings.emailEnabled) return
+  if (!settings) return
+  const s = settings as any
 
-  // 2. Verificar severidad mínima
+  // 2. Gate de severidad mínima (compartido por todos los canales)
   const minSev = SEVERITY_ORDER[settings.minSeverity] ?? 2
   const alertSev = SEVERITY_ORDER[alert.severity] ?? 0
   if (alertSev < minSev) return
 
-  // 3. Verificar tipo habilitado
+  // 3. Gate de tipo habilitado (compartido)
   const alertTypes = (typeof settings.alertTypes === 'string'
     ? JSON.parse(settings.alertTypes as string)
     : settings.alertTypes) as Record<string, boolean>
   if (alertTypes[alert.type] === false) return
 
-  // 4. Verificar duplicado — no enviar si ya hay un delivery exitoso reciente (< 30 min)
-  const recentDelivery = await prisma.notificationDelivery.findFirst({
-    where: {
-      alertId: alert.id,
-      channel: 'email',
-      status: 'sent',
-      sentAt: { gte: new Date(Date.now() - 30 * 60 * 1000) },
-    },
-  })
-  if (recentDelivery) return
-
-  // 5. Cargar contexto (NVR/cámara)
+  // 4. Cargar contexto (NVR/cámara) una vez
   const extra: { nvrName?: string; cameraName?: string } = {}
   if (alert.nvrId) {
     const nvr = await prisma.nVR.findUnique({ where: { id: alert.nvrId }, select: { name: true } })
@@ -155,46 +161,49 @@ export async function sendAlertNotification(
     RECORDING_ERROR: 'Error de Grabación',
     AUTH_FAILED: 'Fallo de Autenticación',
   }
-
   const subject = `[VisionCore] ${alert.severity}: ${typeLabels[alert.type] || alert.type}${extra.nvrName ? ` — ${extra.nvrName}` : ''}`
 
-  // 6. Registrar delivery pendiente con TODO el contexto denormalizado (tipo,
-  //    cámara, NVR, asunto) y la marca del intento — así el historial es completo
-  //    aunque la alerta se elimine por retención (P1).
-  const attemptedAt = new Date()
-  const delivery = await prisma.notificationDelivery.create({
+  // ── Helpers de despacho por canal (dedup 30 min + registro de entrega) ──────
+  const recentlySent = async (channel: string): Promise<boolean> => !!(await prisma.notificationDelivery.findFirst({
+    where: { alertId: alert.id, channel, status: 'sent', sentAt: { gte: new Date(Date.now() - 30 * 60 * 1000) } },
+  }))
+  const openDelivery = (channel: string, recipient: string) => prisma.notificationDelivery.create({
     data: {
-      alertId: alert.id,
-      channel: 'email',
-      status: 'pending',
-      recipient: settings.recipientEmails,
-      attemptedAt,
-      subject,
-      alertType: alert.type,
-      cameraName: extra.cameraName ?? null,
-      nvrName: extra.nvrName ?? null,
+      alertId: alert.id, channel, status: 'pending', recipient, attemptedAt: new Date(),
+      subject, alertType: alert.type, cameraName: extra.cameraName ?? null, nvrName: extra.nvrName ?? null,
     } as any,
   })
+  const closeDelivery = (id: string, ok: boolean, recipient: string, error?: string | null, errorCode?: string | null) => {
+    const now = new Date()
+    return prisma.notificationDelivery.update({
+      where: { id },
+      data: { status: ok ? 'sent' : 'failed', recipient, error: error || null, errorCode: errorCode ?? null, sentAt: ok ? now : null, failedAt: ok ? null : now } as any,
+    })
+  }
 
-  // 7. Enviar email
-  const result = await sendAlertEmail(prisma, {
-    subject,
-    html: buildEmailHtml(alert, extra),
-    text: buildEmailText(alert, extra),
-  })
+  // 5. EMAIL (comportamiento previo, intacto)
+  if (settings.emailEnabled && !(await recentlySent('email'))) {
+    const delivery = await openDelivery('email', settings.recipientEmails)
+    const result = await sendAlertEmail(prisma, { subject, html: buildEmailHtml(alert, extra), text: buildEmailText(alert, extra) })
+    await closeDelivery(delivery.id, result.success, result.recipient || settings.recipientEmails, result.error, (result as any).errorCode)
+  }
 
-  // 8. Actualizar registro. Los FALLIDOS registran failedAt (no dependen de sentAt)
-  //    y errorCode; se cuenta el intento (attempts) para el historial.
-  const now = new Date()
-  await prisma.notificationDelivery.update({
-    where: { id: delivery.id },
-    data: {
-      status: result.success ? 'sent' : 'failed',
-      recipient: result.recipient || settings.recipientEmails,
-      error: result.error || null,
-      errorCode: (result as any).errorCode ?? null,
-      sentAt: result.success ? now : null,
-      failedAt: result.success ? null : now,
-    } as any,
-  })
+  // 6. CANALES DE WEBHOOK (Slack / Teams / genérico) — cada uno independiente
+  const channelAlert: ChannelAlert = {
+    type: alert.type, severity: alert.severity, message: alert.message,
+    nvrId: alert.nvrId ?? null, cameraId: alert.cameraId ?? null,
+    nvrName: extra.nvrName ?? null, cameraName: extra.cameraName ?? null,
+  }
+  const channels: Array<{ kind: ChannelKind; enabled: boolean; url: string }> = [
+    { kind: 'slack',   enabled: !!s.slackEnabled,   url: s.slackWebhookUrl || '' },
+    { kind: 'teams',   enabled: !!s.teamsEnabled,   url: s.teamsWebhookUrl || '' },
+    { kind: 'webhook', enabled: !!s.webhookEnabled, url: s.webhookUrl || '' },
+  ]
+  for (const ch of channels) {
+    if (!ch.enabled || !ch.url) continue
+    if (await recentlySent(ch.kind)) continue
+    const delivery = await openDelivery(ch.kind, channelRecipientLabel(ch.kind, ch.url))
+    const r = await sendToChannel(ch.kind, ch.url, channelAlert)
+    await closeDelivery(delivery.id, r.success, channelRecipientLabel(ch.kind, ch.url), r.error, r.errorCode)
+  }
 }

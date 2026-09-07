@@ -649,6 +649,14 @@ model AlertSettings {
   recipientEmails String   @default("")
   alertTypes      Json     @default("{\"CAMERA_OFFLINE\":true,\"NVR_OFFLINE\":true,\"HDD_FULL\":true,\"HDD_ERROR\":true,\"MOTION_DETECTED\":false,\"RECORDING_ERROR\":true,\"AUTH_FAILED\":false}")
   minSeverity     String   @default("HIGH")
+  // Canales de webhook salientes (además del email). URLs configuradas por ADMIN;
+  // se validan contra SSRF y NUNCA se registran completas en el historial (llevan token).
+  slackEnabled    Boolean  @default(false)
+  slackWebhookUrl String   @default("")
+  teamsEnabled    Boolean  @default(false)
+  teamsWebhookUrl String   @default("")
+  webhookEnabled  Boolean  @default(false)
+  webhookUrl      String   @default("")
   updatedAt       DateTime @updatedAt
 
   @@map("alert_settings")
