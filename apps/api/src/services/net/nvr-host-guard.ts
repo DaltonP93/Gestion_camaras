@@ -125,3 +125,30 @@ export function assertSafeNvrHost(rawHost: string): void {
   // resolución DNS que podría re-apuntar a metadatos/loopback (DNS-rebinding).
   throw new NvrHostError('SSRF_BLOCKED', 'sólo se admite IP literal para NVR (hostname rechazado, anti DNS-rebinding)')
 }
+
+/**
+ * Valida el host del NVR (igual que `assertSafeNvrHost`) y DEVUELVE la forma
+ * CANÓNICA lista para construir una URL, de modo que el cliente HTTP se conecte
+ * EXACTAMENTE al destino validado (no a otra representación):
+ *
+ *   - IPv4: la IP canónica tal cual (el guard ya la exigió canónica).
+ *   - IPv6: la forma canónica (expandida) ENTRE CORCHETES — p. ej. `[fd12::1]` ⇒
+ *     `[fd12:0000:0000:0000:0000:0000:0000:0001]`. Sin corchetes, `http://fd12::1:80`
+ *     es una URL AMBIGUA/errónea (`:1:80`), y el cliente podría apuntar a un destino
+ *     distinto del validado. Con corchetes la URL es inequívoca.
+ *
+ * Lanza `NvrHostError` (sin la IP en el mensaje) si el host no es seguro.
+ */
+export function assertSafeNvrHostForUrl(rawHost: string): string {
+  assertSafeNvrHost(rawHost)
+  const host = (rawHost ?? '').trim().toLowerCase()
+  if (looksLikeIpv6(host)) {
+    const bare = host.replace(/^\[/, '').replace(/\]$/, '')
+    // `assertSafeNvrHost` ya validó semánticamente la IPv6; este chequeo es defensivo.
+    // Se devuelve el literal VALIDADO entre corchetes (el parser WHATWG/axios lo
+    // canonicaliza de forma determinista y apunta al MISMO destino validado).
+    if (!expandIpv6(bare)) throw new NvrHostError('INVALID_HOST', 'IPv6 malformada')
+    return `[${bare}]`
+  }
+  return host
+}

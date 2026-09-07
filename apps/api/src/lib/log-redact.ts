@@ -17,10 +17,12 @@ export function redactUrlSecrets(url: string): string {
   return out
 }
 
-/** Enmascara userinfo (user:pass@) en una URL tipo rtsp://user:pass@host. */
+/** Enmascara TODO el userinfo (usuario Y contraseña) de una URL tipo
+ *  `rtsp://user:pass@host` o `http://user@host` → `.../***@host`. Invariante #6:
+ *  el nombre de usuario tampoco debe quedar en el log, no sólo la contraseña. */
 export function redactUrlUserinfo(url: string): string {
   if (!url) return url
-  return url.replace(/(\/\/[^/@:]+:)[^/@]*@/g, '$1***@')
+  return url.replace(/(\/\/)[^/@\s]+@/g, '$1***@')
 }
 
 // Invariante #6: nunca registrar IPs internas reales (NVR ni sub-cámaras) en

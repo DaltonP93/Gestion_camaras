@@ -416,7 +416,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
           : `No soportado por este modelo/firmware (HTTP ${httpSt})`
         server.log.warn(`[storage] ${nvr.name} (${maskIp(nvr.ipAddress)}): ${redactError(e)}`)
       } else {
-        server.log.error({ err: e }, '[storage] Error sincronizando HDDs del NVR')
+        // NUNCA loguear el Error/AxiosError crudo: Pino serializaría config.url /
+        // config.auth / headers.Authorization y filtraría host y credenciales del NVR.
+        server.log.error(`[storage] ${nvr.name} (${maskIp(nvr.ipAddress)}) error sincronizando HDDs: ${redactError(e)}`)
         return reply.status(500).send({ message: 'No se pudo sincronizar almacenamiento del NVR. Ver logs del servidor.' })
       }
     }

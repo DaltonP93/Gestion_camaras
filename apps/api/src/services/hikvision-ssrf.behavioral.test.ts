@@ -26,9 +26,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-// No-op del guard: permite alcanzar 127.0.0.1 en las pruebas de red.
+// No-op del guard: permite alcanzar 127.0.0.1 en las pruebas de red. La variante
+// "ForUrl" devuelve el host tal cual (los servidores de prueba viven en 127.0.0.1).
 vi.mock('./net/nvr-host-guard', () => ({
   assertSafeNvrHost: () => {},
+  assertSafeNvrHostForUrl: (h: string) => h,
   isNvrHostError: () => false,
 }))
 

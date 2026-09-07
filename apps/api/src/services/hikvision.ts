@@ -8,7 +8,7 @@ import {
   type NvrChannelHealth,
 } from './hikvision-channel-health'
 import { maskIp, redactLog, redactError } from '../lib/log-redact'
-import { assertSafeNvrHost } from './net/nvr-host-guard'
+import { assertSafeNvrHost, assertSafeNvrHostForUrl } from './net/nvr-host-guard'
 
 // ─── Interfaces ───────────────────────────────────────────────
 
@@ -152,11 +152,13 @@ function createHikClient(nvr: { ipAddress: string; port: number; username: strin
   const { username, password } = nvr
 
   // Defensa en profundidad SSRF: bloquea metadatos cloud/loopback/link-local antes
-  // de emitir cualquier request ISAPI. Los NVR legítimos en LAN pasan sin cambios.
-  assertSafeNvrHost(nvr.ipAddress)
+  // de emitir cualquier request ISAPI. Devuelve el host CANÓNICO (IPv6 entre
+  // corchetes) para construir la URL: se conecta al MISMO destino que se validó, no
+  // a otra representación (p. ej. una IPv6 sin corchetes daría una URL ambigua).
+  const urlHost = assertSafeNvrHostForUrl(nvr.ipAddress)
 
   const client = axios.create({
-    baseURL: `http://${nvr.ipAddress}:${nvr.port}`,
+    baseURL: `http://${urlHost}:${nvr.port}`,
     timeout: timeoutMs,
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     // Anti-SSRF: NO seguir redirecciones. Un NVR ISAPI legítimo nunca responde 3xx
@@ -176,7 +178,7 @@ function createHikClient(nvr: { ipAddress: string; port: number; username: strin
         err.config._digestRetried = true
         const cfg: AxiosRequestConfig & { _digestRetried?: boolean } = err.config
         const method = (cfg.method ?? 'GET').toUpperCase()
-        const url    = new URL(cfg.url ?? '/', `http://${nvr.ipAddress}`)
+        const url    = new URL(cfg.url ?? '/', `http://${urlHost}`)
         const uri    = url.pathname + url.search
         cfg.headers  = cfg.headers ?? {}
         cfg.headers['Authorization'] = buildDigestAuth(username, password, method, uri, wwwAuth)
@@ -568,9 +570,11 @@ async function fetchInputProxyChannels(
   nvr: { ipAddress: string; port: number; username: string; password: string },
 ): Promise<{ entries: InputProxyEntry[]; variantUsed: string | null }> {
   // Defensa en profundidad SSRF: este helper construye la baseURL a mano (bypass
-  // del cliente axios compartido), así que debe validar el host por su cuenta.
-  assertSafeNvrHost(nvr.ipAddress)
-  const baseUrl = `http://${nvr.ipAddress}:${nvr.port}`
+  // del cliente axios compartido), así que debe validar el host por su cuenta y
+  // usar la forma canónica (IPv6 entre corchetes) para no conectar a un destino
+  // distinto del validado.
+  const urlHost = assertSafeNvrHostForUrl(nvr.ipAddress)
+  const baseUrl = `http://${urlHost}:${nvr.port}`
   const hikHeaders = {
     'X-Requested-With': 'XMLHttpRequest',
     'If-Modified-Since': '0',

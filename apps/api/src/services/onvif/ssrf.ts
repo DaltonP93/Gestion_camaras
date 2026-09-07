@@ -25,6 +25,8 @@
 import { OnvifError } from './errors'
 import {
   METADATA_HOSTS,
+  METADATA_IPV6_CANON,
+  expandIpv6,
   isIpv4,
   isPrivateIpv4,
   isLinkLocalIpv4,
@@ -59,8 +61,22 @@ export function assertSafeDeviceUrl(deviceUrl: string, policy: SsrfPolicy = {}):
   const host = rawHost.toLowerCase()
   const allowed = new Set((policy.allowedHosts ?? []).map((h) => h.toLowerCase()))
 
-  // 1) Metadatos cloud / link-local: bloqueo duro (aunque estén en allowedHosts).
+  // 1) Metadatos cloud: bloqueo DURO, ANTES de cualquier allow (allowedHosts /
+  //    allowPublic NO pueden desbloquearlos). Cubre hostnames + IPv4 literales
+  //    (METADATA_HOSTS).
   if (METADATA_HOSTS.has(host)) throw new OnvifError('SSRF_BLOCKED', 'destino de metadatos cloud bloqueado')
+
+  // IPv6: comparación por VALOR CANÓNICO (expandido) contra el set de metadatos, de
+  // modo que las formas comprimida / expandida / en mayúsculas del endpoint (p. ej.
+  // fd00:ec2::254 de AWS IMDS, que cae en ULA fc00::/7 y de otro modo `isPrivateIpv6`
+  // PERMITIRÍA) NO evadan el bloqueo. Se resuelve ANTES de isPrivateIpv6/allowedHosts/
+  // allowPublic. `expandIpv6` devuelve null para IPv6 malformada / con zone-id ⇒
+  // fail-closed (rechazo explícito: no se valida una representación y se conecta a otra).
+  if (looksLikeIpv6(host)) {
+    const canon = expandIpv6(host)
+    if (canon === null) throw new OnvifError('SSRF_BLOCKED', 'IPv6 no canonicalizable (rechazada)')
+    if (METADATA_IPV6_CANON.has(canon)) throw new OnvifError('SSRF_BLOCKED', 'destino de metadatos cloud (IPv6) bloqueado')
+  }
 
   if (isIpv4(host)) {
     if (isLinkLocalIpv4(host)) throw new OnvifError('SSRF_BLOCKED', 'IP link-local bloqueada')

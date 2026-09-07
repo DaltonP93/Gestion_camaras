@@ -11,6 +11,7 @@ describe('redactLog — invariante #6: ni host ni credenciales en el log', () =>
     // No debe quedar NINGÚN octeto/credencial sensible.
     expect(out).not.toContain('30.40')
     expect(out).not.toContain('s3cr3t')
+    expect(out).not.toContain('admin')        // el USUARIO del userinfo tampoco queda
     expect(out).not.toContain('fd12:3456:789a')
     expect(out).not.toContain('eyJhbGciOiJIUzI1.abc.def')
     expect(out).not.toContain('YWRtaW46czNjcjN0')
@@ -19,6 +20,13 @@ describe('redactLog — invariante #6: ni host ni credenciales en el log', () =>
     // Ningún token vivo tras Bearer/Basic/Authorization (todo colapsado a ***).
     expect(out).not.toMatch(/Bearer\s+[A-Za-z0-9]/)
     expect(out).not.toMatch(/Basic\s+[A-Za-z0-9]/)
+  })
+
+  it('redacta el userinfo completo, incluso sin contraseña (user@host)', () => {
+    const out = redactLog('GET http://operador@10.0.0.5:8000/ISAPI/System/deviceInfo')
+    expect(out).not.toContain('operador')     // usuario redactado aun sin ":pass"
+    expect(out).toContain('***@')
+    expect(out).toContain('10.0.x.x')
   })
 
   it('redactError nunca expone host/credencial del AxiosError', () => {

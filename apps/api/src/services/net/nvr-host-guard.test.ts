@@ -6,7 +6,7 @@
 // externos. IPs 100% ficticias (10.x / 192.168.x para LAN, 169.254.169.254 bloqueo).
 
 import { describe, it, expect } from 'vitest'
-import { assertSafeNvrHost, NvrHostError, isNvrHostError } from './nvr-host-guard'
+import { assertSafeNvrHost, assertSafeNvrHostForUrl, NvrHostError, isNvrHostError } from './nvr-host-guard'
 
 function code(fn: () => unknown): string | undefined {
   try {
@@ -151,5 +151,29 @@ describe('assertSafeNvrHost — el error no filtra la IP', () => {
       expect(e).toBeInstanceOf(NvrHostError)
       expect((e as NvrHostError).message).not.toContain('169.254.169.254')
     }
+  })
+})
+
+describe('assertSafeNvrHostForUrl — host canónico para construir URLs (validar==conectar)', () => {
+  it('IPv4 canónica privada se devuelve tal cual', () => {
+    expect(assertSafeNvrHostForUrl('192.168.1.50')).toBe('192.168.1.50')
+    expect(assertSafeNvrHostForUrl('10.0.0.5')).toBe('10.0.0.5')
+  })
+
+  it('IPv6 ULA se devuelve CANÓNICA y ENTRE CORCHETES (URL inequívoca)', () => {
+    // `http://fd12::1:8080` sería ambiguo; con corchetes es inequívoco y apunta al
+    // MISMO destino validado.
+    const out = assertSafeNvrHostForUrl('fd12::1')
+    expect(out).toBe('[fd12::1]')
+    // La URL construida con ese host parsea al MISMO destino (WHATWG lo canonicaliza).
+    expect(new URL(`http://${out}:8080/ISAPI`).hostname).toBe('[fd12::1]')
+  })
+
+  it('rechaza (lanza) los mismos hosts inseguros que assertSafeNvrHost', () => {
+    expect(code(() => assertSafeNvrHostForUrl('169.254.169.254'))).toBe('SSRF_BLOCKED')
+    expect(code(() => assertSafeNvrHostForUrl('fd00:ec2::254'))).toBe('SSRF_BLOCKED') // IMDS IPv6
+    expect(code(() => assertSafeNvrHostForUrl('010.0.0.1'))).toBe('INVALID_HOST')     // no canónica
+    expect(code(() => assertSafeNvrHostForUrl('8.8.8.8'))).toBe('SSRF_BLOCKED')       // pública
+    expect(code(() => assertSafeNvrHostForUrl('evil.example.com'))).toBe('SSRF_BLOCKED')
   })
 })
