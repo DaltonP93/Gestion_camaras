@@ -4,7 +4,7 @@
 // workflow is implemented.
 import axios from 'axios'
 import crypto from 'crypto'
-import { assertSafeNvrHost } from '../net/nvr-host-guard'
+import { assertSafeNvrHostForUrl } from '../net/nvr-host-guard'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -63,11 +63,13 @@ function buildDigest(
 
 function makeClient(creds: NvrCredentials, timeoutMs = 10000) {
   const { username, password } = creds
-  // Defensa en profundidad SSRF: valida el host (IP-literal LAN) antes de emitir
-  // cualquier request ISAPI de configuración de video/audio.
-  assertSafeNvrHost(creds.ipAddress)
+  // Defensa en profundidad SSRF: valida el host (IP-literal LAN) y usa la forma
+  // CANÓNICA para construir la URL (IPv6 entre corchetes) — igual que services/
+  // hikvision.ts — de modo que se conecte EXACTAMENTE al destino validado y una IPv6
+  // no genere una URL ambigua (`http://fd12::1:80`).
+  const urlHost = assertSafeNvrHostForUrl(creds.ipAddress)
   const client = axios.create({
-    baseURL: `http://${creds.ipAddress}:${creds.port}`,
+    baseURL: `http://${urlHost}:${creds.port}`,
     timeout: timeoutMs,
     headers: { Accept: 'application/xml, text/xml, */*' },
     // Anti-SSRF: no seguir 3xx (evita saltos a loopback/metadatos y el reenvío de
@@ -82,7 +84,7 @@ function makeClient(creds: NvrCredentials, timeoutMs = 10000) {
       if (wwwAuth.toLowerCase().startsWith('digest')) {
         err.config._digestRetried = true
         const method = (err.config.method ?? 'GET').toUpperCase()
-        const url    = new URL(err.config.url ?? '/', `http://${creds.ipAddress}`)
+        const url    = new URL(err.config.url ?? '/', `http://${urlHost}`)
         err.config.headers['Authorization'] = buildDigest(username, password, method, url.pathname + url.search, wwwAuth)
         return client.request(err.config)
       }

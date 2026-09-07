@@ -1,9 +1,9 @@
 // src/components/UserPermissionsModal.tsx
 import { useEffect, useState, useCallback } from 'react'
 import {
-  X, Check, Shield, Server, Video, Download, Zap,
-  Radio, RefreshCw, Settings, Bell, Eye, Film, AlertTriangle,
-  Database, Star, UserCheck, Monitor, Layout, ToggleLeft,
+  X, Check, Shield, Server, Video, Download,
+  Radio, RefreshCw, Settings, Bell, Eye, Film,
+  Database, Star, UserCheck, Layout, ToggleLeft,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'

@@ -1699,7 +1699,9 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
           const config = await fetchChannelVideoConfig(nvrDec as any, cam.channel)
           return { cameraId: cam.id, channelCode: (cam as any).channelCode, cameraName: cam.name, ...config }
         } catch (e: any) {
-          return { cameraId: cam.id, channel: cam.channel, channelCode: (cam as any).channelCode, cameraName: cam.name, error: e.message, main: null, sub: null, fetchedAt: new Date().toISOString() }
+          // Invariante #6: el mensaje de un AxiosError puede traer la IP:puerto del NVR;
+          // se redacta también en el cuerpo de respuesta (no sólo en logs).
+          return { cameraId: cam.id, channel: cam.channel, channelCode: (cam as any).channelCode, cameraName: cam.name, error: redactError(e), main: null, sub: null, fetchedAt: new Date().toISOString() }
         }
       })
     )
