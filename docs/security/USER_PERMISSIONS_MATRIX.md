@@ -113,11 +113,20 @@ por `routes/auth.ts:868` / `users.ts:166`. Sólo `canManageAppearance` se lee pa
 El endurecimiento (hacer ENFORCED o quitar del modal los UI_ONLY) queda como
 follow-up con autorización explícita del propietario — no se ejecuta en este PR.
 
-## Decisión propuesta por cada campo UI_ONLY (P2 — requiere autorización)
+## Decisión por cada campo UI_ONLY — IMPLEMENTADA (follow-up autorizado)
 
-Los cinco campos **UI_ONLY** son controles EVADIBLES: sugieren protección que el
-backend no aplica. **No constituyen RBAC**. Propuesta concreta por campo
-(implementación en un PR aparte, con autorización; NO en este PR):
+> **Estado:** el propietario autorizó el endurecimiento. Ejecutado en este mismo PR
+> (#171), sin migraciones ni cambios de contrato del API:
+> - `canViewDashboard` ⇒ **ENFORCED_BACKEND**: `GET /api/dashboard/overview` exige
+>   ahora el flag resuelto (`services/dashboard-policy.ts` + gate en `routes/dashboard.ts`).
+>   ADMIN siempre pasa; default `true` por rol ⇒ sólo bloquea un override explícito.
+> - `canUseTranscode` (cámara), `canTranscode` (feature), `canViewLive` (feature),
+>   `canViewAlerts` (feature) ⇒ **retirados de `UserPermissionsModal.tsx`** (la UI ya
+>   no ofrece la casilla). Los campos siguen en el schema/plantillas de rol pero no
+>   se leen; el modal ya no promete un control inexistente.
+
+Los cinco campos **UI_ONLY** eran controles EVADIBLES: sugerían protección que el
+backend no aplicaba. **No constituyen RBAC**. Decisión por campo (ya aplicada):
 
 | Campo | Ámbito | Decisión propuesta | Justificación |
 |---|---|---|---|
