@@ -4,6 +4,7 @@
 // workflow is implemented.
 import axios from 'axios'
 import crypto from 'crypto'
+import { assertSafeNvrHost } from '../net/nvr-host-guard'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -62,10 +63,17 @@ function buildDigest(
 
 function makeClient(creds: NvrCredentials, timeoutMs = 10000) {
   const { username, password } = creds
+  // Defensa en profundidad SSRF: valida el host (IP-literal LAN) antes de emitir
+  // cualquier request ISAPI de configuración de video/audio.
+  assertSafeNvrHost(creds.ipAddress)
   const client = axios.create({
     baseURL: `http://${creds.ipAddress}:${creds.port}`,
     timeout: timeoutMs,
     headers: { Accept: 'application/xml, text/xml, */*' },
+    // Anti-SSRF: no seguir 3xx (evita saltos a loopback/metadatos y el reenvío de
+    // la cabecera Authorization Digest/Basic a otro origen). El reintento Digest
+    // hereda esta política por reutilizar este cliente. Ver nvr-host-guard.ts.
+    maxRedirects: 0,
   })
   client.interceptors.response.use(undefined, async (err) => {
     const res = err.response

@@ -17,10 +17,12 @@ export function redactUrlSecrets(url: string): string {
   return out
 }
 
-/** Enmascara userinfo (user:pass@) en una URL tipo rtsp://user:pass@host. */
+/** Enmascara TODO el userinfo (usuario Y contraseña) de una URL tipo
+ *  `rtsp://user:pass@host` o `http://user@host` → `.../***@host`. Invariante #6:
+ *  el nombre de usuario tampoco debe quedar en el log, no sólo la contraseña. */
 export function redactUrlUserinfo(url: string): string {
   if (!url) return url
-  return url.replace(/(\/\/[^/@:]+:)[^/@]*@/g, '$1***@')
+  return url.replace(/(\/\/)[^/@\s]+@/g, '$1***@')
 }
 
 // Invariante #6: nunca registrar IPs internas reales (NVR ni sub-cámaras) en
@@ -43,4 +45,48 @@ export function maskIp(ip?: string | null): string {
 export function redactIps(text: string): string {
   if (!text) return text
   return text.replace(IPV4_RE, '$1.x.x')
+}
+
+/** Enmascara un nombre de usuario para logs (invariante #6): nunca el valor.
+ *  Devuelve 'set'/'unset' — indica si había credencial sin filtrar cuál. */
+export function maskUser(user?: string | null): string {
+  return user && String(user).trim() ? 'set' : 'unset'
+}
+
+// IPv6 embebida (con o sin brackets, con o sin zone-id): ≥2 grupos hextet-colon.
+// Amplio a propósito — para logs preferimos colapsar de más que filtrar un host.
+const IPV6_RE = /\[?(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?:%[0-9a-z]+)?\]?/gi
+
+/**
+ * Sanitiza CUALQUIER texto que vaya al log (invariante #6): colapsa IPv4 (→a.b.x.x)
+ * e IPv6 (→[ipv6]), userinfo `user:pass@`, tokens de query sensibles, y encabezados
+ * `Authorization: Bearer/Basic <token>`. Nunca deja host/credencial en claro.
+ */
+export function redactLog(text: string): string {
+  if (!text) return ''
+  let out = String(text)
+  out = redactUrlUserinfo(out)                       // //user:pass@host → //user:***@host
+  out = redactUrlSecrets(out)                        // ?token=…&password=… → ***
+  out = out.replace(IPV6_RE, '[ipv6]')               // IPv6 (incl. zone-id) → [ipv6]
+  out = out.replace(IPV4_RE, '$1.x.x')               // IPv4 → a.b.x.x
+  out = out.replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer ***')
+  out = out.replace(/\bBasic\s+[A-Za-z0-9+/=]+/gi, 'Basic ***')
+  out = out.replace(/(authorization["']?\s*[:=]\s*)["']?[^\s"',}]+/gi, '$1***')
+  return out
+}
+
+/**
+ * Serializa un error (incl. AxiosError) a un string SEGURO para el log: sólo
+ * `code`/`message` sanitizados con `redactLog`. NUNCA loguear el objeto Error/Axios
+ * crudo — su `config.url`/`config.headers.Authorization`/`request` filtran host y
+ * credenciales.
+ */
+export function redactError(e: unknown): string {
+  if (e == null) return 'error'
+  const anyE = e as { code?: unknown; message?: unknown }
+  const parts: string[] = []
+  if (anyE.code != null) parts.push(String(anyE.code))
+  if (anyE.message != null) parts.push(String(anyE.message))
+  if (parts.length === 0) parts.push(typeof e === 'string' ? e : 'error')
+  return redactLog(parts.join(': ')) || 'error'
 }
