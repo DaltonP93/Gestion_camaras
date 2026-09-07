@@ -47,6 +47,18 @@ describe.skipIf(!HAVE_REDIS)('GrantStore · Redis REAL (redis-server efímero)',
     expect(stored!.expiresAt - stored!.issuedAt).toBe(30_000)
   })
 
+  it('issueGrant DEVUELVE los tiempos Redis-time (== almacenado; ignora el expiresAt=1 de Node)', async () => {
+    await store.registerSource('nvr_c_sub', 60_000)
+    const inst = await store.currentInstance('nvr_c_sub')
+    const ret = await store.issueGrant(grant({ grantId: 'gret', mediaInstanceId: inst!, secretHash: 'shr2', expiresAt: 1, issuedAt: 0 }), { viewId: 'v' }, 30_000)
+    const stored = await store.getGrant('gret')
+    // El valor DEVUELTO es el AUTORITATIVO (Redis-time), no el 1/0 que trajo el JSON.
+    expect(ret.expiresAt).toBe(stored!.expiresAt)
+    expect(ret.issuedAt).toBe(stored!.issuedAt)
+    expect(ret.expiresAt).toBeGreaterThan(Date.now())
+    expect(ret.expiresAt - ret.issuedAt).toBe(30_000)
+  })
+
   it('happy: grant vigente ⇒ OK; segundo consumo ⇒ REPLAYED (uso único atómico real)', async () => {
     await store.registerSource('nvr_c_sub', 60_000)
     const inst = await store.currentInstance('nvr_c_sub')

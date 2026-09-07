@@ -44,6 +44,32 @@ describe('helpers', () => {
   })
 })
 
+describe('expiresAt DEVUELTO == expiresAt ALMACENADO (autoritativo del store)', () => {
+  it.each([['memoria', false], ['redis-fake', true]])('issue() en %s alinea issued.expiresAt con lo almacenado', async (_n, useRedis) => {
+    const store = useRedis ? new RedisGrantStore(new FakeRedis()) : new MemoryGrantStore()
+    const mgr = new MediaGrantManager({ store, random: seqRandom() })
+    const p = base()
+    await mgr.registerSource(p.streamPath)
+    const r = await mgr.issue(p)
+    if (!r.ok) throw new Error(`issue: ${r.code}`)
+    const stored = await store.getGrant(r.issued.grantId)
+    expect(stored).not.toBeNull()
+    // El valor devuelto al cliente coincide EXACTAMENTE con el almacenado/validado.
+    expect(r.issued.expiresAt).toBe(stored!.expiresAt)
+  })
+
+  it('issueSession() también alinea issued.expiresAt con lo almacenado', async () => {
+    const store = new RedisGrantStore(new FakeRedis())
+    const mgr = new MediaGrantManager({ store, random: seqRandom() })
+    const p = base()
+    await mgr.registerSource(p.streamPath)
+    const r = await mgr.issueSession(p)
+    if (!r.ok) throw new Error(`issueSession: ${r.code}`)
+    const stored = await store.getGrant(r.issued.grantId)
+    expect(r.issued.expiresAt).toBe(stored!.expiresAt)
+  })
+})
+
 describe.each([['memoria', false], ['redis-fake', true]])('MediaGrantManager (%s)', (_n, useRedis) => {
   const mk = (o: any = {}) => mkManager({ redis: useRedis ? new FakeRedis() : undefined, ...o })
 

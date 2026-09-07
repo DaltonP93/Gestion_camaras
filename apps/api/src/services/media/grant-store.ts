@@ -108,8 +108,10 @@ export interface GrantStore {
   /** ¿El backend está operativo? (para readiness / fail-closed). */
   healthy(): Promise<boolean>
 
-  /** Emite grant + índices de forma atómica. */
-  issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<void>
+  /** Emite grant + índices de forma atómica. Devuelve los tiempos AUTORITATIVOS del
+   *  store (Redis-time en Redis; reloj del store en memoria) para que el valor que se
+   *  devuelve al cliente coincida EXACTAMENTE con el que la validación va a enforcar. */
+  issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<{ issuedAt: number; expiresAt: number }>
   getGrant(grantId: string): Promise<StoredMediaGrant | null>
 
   /** Transición atómica única: valida y reclama el uso. */
@@ -176,13 +178,16 @@ export class MemoryGrantStore implements GrantStore {
     return e.g
   }
 
-  async issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<void> {
+  async issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<{ issuedAt: number; expiresAt: number }> {
     if (!this.up) throw new Error('grant store unavailable')
     // Atómico: sin await entre estas escrituras.
     this.grants.set(grant.grantId, { g: grant, exp: this.clock() + ttlMs })
     this.addIdx('user', grant.userId, grant.grantId)
     this.addIdx('view', indices.viewId, grant.grantId)
     if (indices.sessionId) this.addIdx('session', indices.sessionId, grant.grantId)
+    // En memoria el reloj del store == el del manager ⇒ los tiempos del grant ya son
+    // autoritativos; se devuelven tal cual (coinciden con lo almacenado/validado).
+    return { issuedAt: grant.issuedAt, expiresAt: grant.expiresAt }
   }
   private addIdx(kind: IndexKind, key: string, grantId: string): void {
     let s = this.idx[kind].get(key)
@@ -401,7 +406,7 @@ export class RedisGrantStore implements GrantStore {
     try { await this.redis.ping(); return true } catch { return false }
   }
 
-  async issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<void> {
+  async issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<{ issuedAt: number; expiresAt: number }> {
     // Escrituras AGRUPADAS en una sola operación linealizable (EVAL): un crash no
     // puede dejar un grant sin índice. El epoch ya fue capturado en el grant.
     // `issuedAt`/`expiresAt` los FIJA el script con el reloj de Redis (Redis-time
@@ -415,6 +420,14 @@ export class RedisGrantStore implements GrantStore {
       gk(grant.grantId), ik('user', grant.userId), ik('view', indices.viewId), ik('session', indices.sessionId ?? '_'),
       JSON.stringify(grant), String(ttl), grant.grantId, indices.sessionId ? '1' : '', String(userExpire), String(keyPx),
     )
+    // Releer el grant ALMACENADO para devolver los tiempos AUTORITATIVOS que el
+    // script fijó con el reloj de Redis (no el Date.now() de Node de `buildGrant`):
+    // así el cliente ve exactamente el `expiresAt` que la validación enforcará. Si por
+    // una carrera el grant ya no está, se cae a los tiempos calculados en Node.
+    const stored = await this.getGrant(grant.grantId)
+    return stored
+      ? { issuedAt: stored.issuedAt, expiresAt: stored.expiresAt }
+      : { issuedAt: grant.issuedAt, expiresAt: grant.expiresAt }
   }
 
   async getGrant(grantId: string): Promise<StoredMediaGrant | null> {

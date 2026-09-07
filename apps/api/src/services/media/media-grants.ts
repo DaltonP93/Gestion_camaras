@@ -165,9 +165,16 @@ export class MediaGrantManager {
     } catch { return { ok: false, code: 'BACKEND_UNAVAILABLE' } }
 
     const { issued, stored } = buildGrant({ ...params, mediaInstanceId: instance, authorizationEpoch: epoch }, this.clock, this.random)
+    let authoritative: { issuedAt: number; expiresAt: number }
     try {
-      await this.store.issueGrant(stored, { viewId: params.viewId, sessionId: params.sessionId }, Math.max(1, Math.floor(params.ttlMs)))
+      authoritative = await this.store.issueGrant(stored, { viewId: params.viewId, sessionId: params.sessionId }, Math.max(1, Math.floor(params.ttlMs)))
     } catch { return { ok: false, code: 'BACKEND_UNAVAILABLE' } }
+    // Alinear el `expiresAt` DEVUELTO al cliente con el reloj AUTORITATIVO del store
+    // (Redis-time en Redis): el cliente ya no ve un vencimiento distinto del que
+    // enforcea la validación (cierra el NOT_VALIDATED de deriva Node vs Redis-time).
+    issued.expiresAt = authoritative.expiresAt
+    stored.issuedAt = authoritative.issuedAt
+    stored.expiresAt = authoritative.expiresAt
     this.audit({ event: 'grant_issued', grantId: stored.grantId, userId: stored.userId, cameraId: stored.cameraId, transport: stored.transport, at: stored.issuedAt })
     return { ok: true, issued }
   }
@@ -191,9 +198,15 @@ export class MediaGrantManager {
 
     const built = buildGrant({ ...params, mediaInstanceId: instance, authorizationEpoch: epoch }, this.clock, this.random)
     const stored: StoredMediaGrant = { ...built.stored, kind: 'relay_session' }
+    let authoritative: { issuedAt: number; expiresAt: number }
     try {
-      await this.store.issueGrant(stored, { viewId: params.viewId, sessionId: params.sessionId }, Math.max(1, Math.floor(params.ttlMs)))
+      authoritative = await this.store.issueGrant(stored, { viewId: params.viewId, sessionId: params.sessionId }, Math.max(1, Math.floor(params.ttlMs)))
     } catch { return { ok: false, code: 'BACKEND_UNAVAILABLE' } }
+    // Mismo alineamiento Redis-time que en issue(): el `expiresAt` devuelto coincide
+    // con el almacenado/validado.
+    built.issued.expiresAt = authoritative.expiresAt
+    stored.issuedAt = authoritative.issuedAt
+    stored.expiresAt = authoritative.expiresAt
     this.audit({ event: 'grant_issued', grantId: stored.grantId, userId: stored.userId, cameraId: stored.cameraId, transport: stored.transport, at: stored.issuedAt })
     return { ok: true, issued: built.issued }
   }
