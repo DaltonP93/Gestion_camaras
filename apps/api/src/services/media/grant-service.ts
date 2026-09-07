@@ -245,6 +245,18 @@ export function __pendingUserRevokeCount(): number {
   return o instanceof InMemoryMediaRevokeOutbox ? o.pendingCountSync() : 0
 }
 
+/** Retención de tombstones YA APLICADOS del outbox antes de la limpieza (higiene P3). */
+export const REVOKE_OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000  // 7 días
+
+/**
+ * HIGIENE (P3): borra del outbox las filas YA APLICADAS más antiguas que
+ * `retentionMs` (tombstones sin valor de seguridad). NUNCA toca filas pendientes
+ * (`appliedAt IS NULL`). No es una migración de schema; seguro en cada barrido.
+ */
+export async function pruneAppliedRevokes(server: FastifyInstance, retentionMs = REVOKE_OUTBOX_RETENTION_MS): Promise<number> {
+  return getMediaRevokeOutbox(server).pruneApplied(retentionMs)
+}
+
 export interface RevokeRecovery { stop(): void }
 
 /**
@@ -265,7 +277,15 @@ export function startRevokeRecovery(server: FastifyInstance, sweepIntervalMs = 6
   }
   const onReady = (): void => drain('redis_ready')
   if (redis && typeof redis.on === 'function') redis.on('ready', onReady)
-  const timer = setInterval(() => drain('sweep'), Math.max(1000, sweepIntervalMs))
+  // El barrido periódico drena pendientes Y hace HIGIENE (prune de tombstones
+  // aplicados y antiguos). El disparador 'ready' sólo drena (la limpieza no urge).
+  const sweep = (): void => {
+    drain('sweep')
+    void pruneAppliedRevokes(server)
+      .then((n) => { if (n > 0) server.log.info(`media_grant revoke_pruned n=${n}`) })
+      .catch(() => { /* se reintenta en el próximo barrido */ })
+  }
+  const timer = setInterval(sweep, Math.max(1000, sweepIntervalMs))
   if (typeof (timer as { unref?: () => void }).unref === 'function') (timer as { unref: () => void }).unref()
   return {
     stop() {

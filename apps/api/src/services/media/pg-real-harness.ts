@@ -91,6 +91,12 @@ function outboxAdapter(prisma: PrismaClient): PrismaOutboxClient {
         const rows = await prisma.$queryRaw<{ userId: string }[]>`SELECT DISTINCT "userId" FROM "media_revoke_outbox" WHERE "appliedAt" IS NULL`
         return rows
       },
+      async deleteMany({ where }) {
+        // where.appliedAt = { not: null, lt: Date } — borra sólo tombstones antiguos.
+        const cutoff = where.appliedAt.lt
+        const affected = await prisma.$executeRaw`DELETE FROM "media_revoke_outbox" WHERE "appliedAt" IS NOT NULL AND "appliedAt" < ${cutoff}`
+        return { count: Number(affected) }
+      },
     },
     $transaction<T>(fn: (tx: PrismaOutboxTx) => Promise<T>): Promise<T> {
       return prisma.$transaction((tx) => fn(tx as unknown as PrismaOutboxTx))

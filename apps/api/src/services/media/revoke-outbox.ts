@@ -51,6 +51,14 @@ export interface MediaRevokeOutboxRepo {
    * no aplican la misma fila. Devuelve cuántas filas se marcaron aplicadas.
    */
   drain(apply: (userId: string) => Promise<boolean>): Promise<number>
+  /**
+   * HIGIENE (P3): borra filas YA APLICADAS (`appliedAt != null`) cuyo `appliedAt`
+   * es más antiguo que `retentionMs`. Una fila aplicada es un tombstone SIN valor de
+   * seguridad (`hasPending` sólo mira `appliedAt IS NULL`); acumularlas sólo crece la
+   * tabla. NUNCA borra filas PENDIENTES (`appliedAt IS NULL`) ⇒ jamás pierde una
+   * revocación sin aplicar. Devuelve cuántas filas se borraron.
+   */
+  pruneApplied(retentionMs: number): Promise<number>
 }
 
 // ─── impl en memoria (única fuente en tests sin Postgres) ────────────
@@ -94,6 +102,14 @@ export class InMemoryMediaRevokeOutbox implements MediaRevokeOutboxRepo {
     }
     return applied
   }
+
+  async pruneApplied(retentionMs: number): Promise<number> {
+    const cutoff = Date.now() - Math.max(0, retentionMs)
+    const before = this.rows.length
+    // Sólo filas aplicadas y antiguas; las pendientes (appliedAt === null) se conservan.
+    this.rows = this.rows.filter((r) => r.appliedAt === null || r.appliedAt > cutoff)
+    return before - this.rows.length
+  }
 }
 
 // ─── impl Postgres (durable, real; SKIP LOCKED VALIDADO en test) ─
@@ -103,6 +119,7 @@ export interface PrismaOutboxClient {
     create(args: { data: { userId: string } }): Promise<unknown>
     count(args: { where: { userId?: string; appliedAt: null } }): Promise<number>
     findMany(args: { where: { appliedAt: null }; select: { userId: true }; distinct: ['userId'] }): Promise<{ userId: string }[]>
+    deleteMany(args: { where: { appliedAt: { not: null; lt: Date } } }): Promise<{ count: number }>
   }
   $transaction<T>(fn: (tx: PrismaOutboxTx) => Promise<T>): Promise<T>
 }
@@ -157,5 +174,13 @@ export class PrismaMediaRevokeOutbox implements MediaRevokeOutboxRepo {
       break  // 'empty' (nada pendiente) o 'failed' (backend caído): parar
     }
     return applied
+  }
+
+  async pruneApplied(retentionMs: number): Promise<number> {
+    // DELETE de tombstones aplicados y antiguos. `appliedAt: { not: null }` garantiza
+    // que jamás toca una intención PENDIENTE. No es una migración de schema.
+    const cutoff = new Date(Date.now() - Math.max(0, retentionMs))
+    const res = await this.prisma.mediaRevokeOutbox.deleteMany({ where: { appliedAt: { not: null, lt: cutoff } } })
+    return res.count
   }
 }

@@ -58,6 +58,23 @@ describe.skipIf(!HAVE_PG)('PrismaMediaRevokeOutbox · Postgres REAL', () => {
     })
   })
 
+  it('pruneApplied borra SÓLO tombstones aplicados y antiguos; conserva los pendientes (Postgres REAL)', async () => {
+    await withEphemeralOutboxDb(async ({ adapter }) => {
+      const outbox = new PrismaMediaRevokeOutbox(adapter)
+      await outbox.enqueue('u1')
+      await outbox.enqueue('u2')
+      expect(await outbox.drain(async () => true)).toBe(2)   // u1,u2 aplicados
+      await outbox.enqueue('u3')                              // pendiente
+
+      // Retención amplia ⇒ los aplicados son recientes ⇒ no se borra nada.
+      expect(await outbox.pruneApplied(60_000)).toBe(0)
+      // Retención 0 ⇒ se borran los 2 aplicados; el pendiente sobrevive.
+      expect(await outbox.pruneApplied(0)).toBe(2)
+      expect(await outbox.hasPending('u3')).toBe(true)
+      expect(await outbox.pendingUserIds()).toEqual(['u3'])
+    })
+  })
+
   it('SKIP LOCKED: dos drenajes CONCURRENTES toman filas distintas ⇒ cada fila una sola vez', async () => {
     await withEphemeralOutboxDb(async ({ adapter }) => {
       const outbox = new PrismaMediaRevokeOutbox(adapter)
