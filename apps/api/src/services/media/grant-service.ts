@@ -101,7 +101,14 @@ export function getMediaRevokeOutbox(server: FastifyInstance): MediaRevokeOutbox
  * primer logout / cambio de permisos. Idempotente (cachea el singleton).
  */
 export function assertRevokeOutboxAvailable(server: FastifyInstance): void {
-  getMediaRevokeOutbox(server)
+  const resolved = getMediaRevokeOutbox(server)
+  // Defensa en profundidad: rechaza en el ARRANQUE un outbox EN MEMORIA que no venga
+  // de una inyección de test explícita. Cierra el doble-misconfig "falta el delegate
+  // Prisma + NODE_ENV=test" en un proceso real, donde `getMediaRevokeOutbox` habría
+  // degradado a memoria (revocación NO durable ⇒ fail-open) sin abortar el boot.
+  if (resolved instanceof InMemoryMediaRevokeOutbox && !outboxOverride) {
+    throw new Error('C23·H2·P1: outbox de revocación EN MEMORIA en el arranque sin inyección de test (falta el delegate Prisma durable o NODE_ENV=test en un proceso real). Fail-closed: rehúso arrancar sin durabilidad de la intención de revocación.')
+  }
 }
 
 export function getMediaGrantManager(server: FastifyInstance): MediaGrantManager {
@@ -211,8 +218,17 @@ export async function revokeUserMediaGrantsAtomic(
     await mutate(tx)
     await outbox.enqueueInTx(tx, userId)
   })
-  // FASE B — commit OK ⇒ intención durable. Drenaje best-effort (fail-closed hasta él).
-  return drainRevokeAndStatus(server, userId, outbox)
+  // FASE B — commit OK ⇒ intención YA DURABLE. El drenaje/kick es best-effort y corre
+  // FUERA de la transacción: si lanza (p.ej. un blip de Redis/Postgres justo aquí) NO
+  // debe convertir un logout/cambio de permisos YA COMMITEADO en un 503 engañoso ni
+  // provocar un reintento que reaplique la mutación. Se reporta 'pending' (el barrido
+  // drena y el plano falla cerrado hasta entonces); nunca se propaga tras el commit.
+  try {
+    return await drainRevokeAndStatus(server, userId, outbox)
+  } catch {
+    server.log.warn(`media_grant revoke_postcommit_drain_failed userId=${userId.slice(0, 8)} — intención durable; se drena en el barrido`)
+    return 'pending'
+  }
 }
 
 /** Fase común post-intención-durable: drena el epoch y computa el estado real
