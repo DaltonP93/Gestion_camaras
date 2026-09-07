@@ -63,7 +63,7 @@ async function withPathLock<T>(streamPath: string, fn: () => Promise<T>): Promis
 // consumidores por path/tipo con leases TTL; removeStream lo consulta y no
 // borra un path que aún tenga consumidores vigentes.
 import { getStreamConsumerRegistry } from './stream-consumer-registry'
-import { maskIp } from '../lib/log-redact'
+import { maskIp, redactIps } from '../lib/log-redact'
 
 // Un solo consumidor analytics por path → id estable derivado del path.
 const analyticsConsumerId = (streamPath: string) => `analytics:${streamPath}`
@@ -131,9 +131,16 @@ const transcodeRtspMasked  = new Map<string, string>()
 // Wall-clock timestamp when the process was spawned — used to detect very early exits
 const transcodeSpawnTime   = new Map<string, number>()
 
-// Mask RTSP credentials in any string before writing to logs or API responses
-function sanitizeRtsp(s: string): string {
-  return s.replace(/rtsp:\/\/([^:@\s]+):([^@\s]+)@/gi, 'rtsp://$1:***@')
+// Enmascara credenciales Y host de cualquier URL rtsp:// antes de loguearla o
+// devolverla en un endpoint de diagnóstico. Invariante #6: no dejar en claro ni el
+// usuario/clave (userinfo) ni la IP interna del NVR/cámara. El userinfo se colapsa a
+// `***@` y el host a `a.b.x.x` (IPv4) / `***` (hostname o IPv6) vía maskIp.
+export function sanitizeRtsp(s: string): string {
+  if (!s) return s
+  return s.replace(
+    /rtsp:\/\/(?:([^/@\s]+)@)?([^/:@\s]+)(:\d+)?/gi,
+    (_m, userinfo, host, port) => `rtsp://${userinfo ? '***@' : ''}${maskIp(host)}${port || ''}`,
+  )
 }
 
 // ─── RTSP timeout option detection ──────────────────────────
@@ -172,7 +179,7 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
 
   const rtspInput = buildRtspUrl(nvr, camera.channel, false)  // main (HEVC) stream
   if (/:@/.test(rtspInput)) {
-    const masked = rtspInput.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+    const masked = sanitizeRtsp(rtspInput)
     console.error(`[transcode] spawn_abort path=${streamPath} reason=RTSP_EMPTY_CREDENTIALS url=${masked}`)
     return null  // empty password guard
   }
@@ -191,7 +198,7 @@ export function spawnTranscodeProcess(nvr: NVR, camera: Camera, streamPath: stri
   // Kill any stale process for this path before spawning a new one
   stopTranscodeProcess(streamPath)
 
-  const inputMasked = rtspInput.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+  const inputMasked = sanitizeRtsp(rtspInput)
   console.info(`[transcode] spawn_start path=${streamPath} source=${inputMasked}`)
   console.info(
     `[transcode] spawn_ffmpeg path=${streamPath} encoder=${cfg.encoder}` +
@@ -343,6 +350,10 @@ export function spawnTranscodeFromRtsp(
   opts?: { mode?: 'live' | 'recording' },
 ): ChildProcess | null {
   const mode = opts?.mode ?? 'live'
+  // Invariante #6: re-derivar el masked del rtspUrl con sanitizeRtsp (enmascara host
+  // + userinfo) en vez de confiar en el `maskedUrl` del caller, que sólo ocultaba la
+  // contraseña y dejaba la IP interna en claro en logs / endpoint de diagnóstico.
+  maskedUrl = sanitizeRtsp(rtspUrl)
   const rtspOutput = `rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${streamPath}`
 
   const fps         = Number(HEVC_TRANSCODE_FPS) || 15
@@ -948,7 +959,7 @@ export async function publishStream(nvr: NVR, camera: Camera, streamType: 'sub' 
   // Esto elimina el spam de "path already exists" y "reloading configuration".
   if (registeredPaths.get(streamPath) === fp) return true
 
-  const sourceMasked = rtspUrl.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+  const sourceMasked = sanitizeRtsp(rtspUrl)
   console.info(`[stream] publish path=${streamPath} type=${streamType} codec=${useSub ? (camera as any).subCodec || '?' : (camera as any).mainCodec || '?'} source=${sourceMasked}`)
 
   inFlightPaths.add(streamPath)
@@ -995,7 +1006,9 @@ export async function publishStream(nvr: NVR, camera: Camera, streamType: 'sub' 
         return false
       }
 
-      console.error(`[stream] failed to register path ${streamPath}:`, status, err.message)
+      // Invariante #6: el mensaje de error de MediaMTX/axios puede traer la IP:puerto
+      // del NVR o una URL rtsp con host; redactar host+credenciales antes de loguear.
+      console.error(`[stream] failed to register path ${streamPath}: status=${status ?? '?'} err=${redactIps(sanitizeRtsp(String(err?.message ?? err)))}`)
       return false
     }
   } finally {
@@ -1279,9 +1292,7 @@ export async function getStreamDetails(streamPath: string): Promise<{
   }
 
   const configSource: string = configPath?.source || ''
-  const sourceMasked = configSource
-    ? configSource.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
-    : undefined
+  const sourceMasked = configSource ? sanitizeRtsp(configSource) : undefined
 
   if (!livePath) {
     return {
