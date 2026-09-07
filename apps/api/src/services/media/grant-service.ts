@@ -9,6 +9,7 @@ import { createGrantStore, type RedisGrantClient } from './grant-store'
 import { NativeRelayReadiness } from './native-readiness'
 import { SingleActiveSessionPolicy } from './session-policy'
 import { connectionsToKick, performKick, noopKicker, type MediaMtxKicker } from './relay-kick'
+import { InMemoryMediaRevokeOutbox, PrismaMediaRevokeOutbox, type MediaRevokeOutboxRepo, type MediaRevokeOutboxTxClient, type PrismaOutboxClient } from './revoke-outbox'
 
 let singleton: MediaGrantManager | null = null
 let readiness: NativeRelayReadiness | null = null
@@ -48,16 +49,69 @@ export async function kickConnectionsForGrants(server: FastifyInstance, grantIds
     return await performKick(mediaKicker, ids)
   } catch { return 0 }
 }
-// Outbox en-proceso de revocaciones (epoch bump) que fallaron por backend caído.
-// Durante el outage el plano falla cerrado (readiness+validateAndClaim), así que
-// ningún grant es aceptable; al recuperar Redis se drena esta cola.
-const pendingUserRevokes = new Set<string>()
+// C23·H2·P2 — OUTBOX DURABLE de revocación. Sustituye al Set en-proceso como
+// ÚNICA fuente: la intención de revocar se persiste en Postgres (sobrevive a un
+// reinicio del API durante una caída de Redis). Con Postgres disponible se usa la
+// impl Prisma; si no (tests sin DB, o server sin prisma) se degrada a una impl en
+// memoria — la interfaz durable es la misma. `outboxOverride` permite inyectar una
+// impl durable en pruebas (simular reinicio: recrear singletons, misma outbox).
+let outboxOverride: MediaRevokeOutboxRepo | null = null
+let activeOutbox: MediaRevokeOutboxRepo | null = null
+
+export function setMediaRevokeOutboxForTest(repo: MediaRevokeOutboxRepo | null): void {
+  outboxOverride = repo
+  activeOutbox = null
+}
+
+/** ¿Estamos en un runtime de test (vitest)? Sólo entonces se tolera el outbox en
+ *  memoria SIN inyección explícita; en producción la ausencia del delegate durable
+ *  es un FAIL-CLOSED (ver abajo). */
+function isTestRuntime(): boolean {
+  return process.env.VITEST === 'true' || process.env.NODE_ENV === 'test'
+}
+
+/**
+ * Outbox durable de revocación. C23·H2·P1 — FAIL-CLOSED: en producción la intención
+ * de revocar DEBE persistir en Postgres; si falta el delegate Prisma
+ * (`mediaRevokeOutbox` + `$transaction`) NO degradamos a memoria en silencio (eso
+ * perdería la durabilidad y volvería fail-OPEN la revocación). La impl en memoria
+ * sólo se usa por INYECCIÓN EXPLÍCITA de test (`setMediaRevokeOutboxForTest`) o, como
+ * conveniencia, bajo runtime de test (vitest) cuando no hay ni inyección ni delegate.
+ */
+export function getMediaRevokeOutbox(server: FastifyInstance): MediaRevokeOutboxRepo {
+  if (activeOutbox) return activeOutbox
+  // 1) Inyección EXPLÍCITA de test: la vía canónica a una impl no-Postgres.
+  if (outboxOverride) { activeOutbox = outboxOverride; return activeOutbox }
+  // 2) Producción: EXIGE el delegate durable de Postgres.
+  const prisma = (server as any).prisma
+  if (prisma && prisma.mediaRevokeOutbox && typeof prisma.$transaction === 'function') {
+    activeOutbox = new PrismaMediaRevokeOutbox(prisma as PrismaOutboxClient)
+    return activeOutbox
+  }
+  // 3) Sólo en runtime de test sin inyección ni delegate: memoria (no exige Postgres
+  //    a cada unit test). NUNCA en producción.
+  if (isTestRuntime()) { activeOutbox = new InMemoryMediaRevokeOutbox(); return activeOutbox }
+  // 4) Producción sin outbox durable ⇒ FAIL-CLOSED (no se degrada en silencio).
+  throw new Error('C23·H2·P1: outbox de revocación de medios no disponible (falta el delegate Prisma `mediaRevokeOutbox` o `$transaction`). Fail-closed: no se emiten/validan grants sin durabilidad de la intención de revocación.')
+}
+
+/**
+ * FAIL-CLOSED en el ARRANQUE: fuerza la resolución del outbox durable para que un
+ * despliegue sin el delegate Prisma ABORTE el arranque en vez de diferir el fallo al
+ * primer logout / cambio de permisos. Idempotente (cachea el singleton).
+ */
+export function assertRevokeOutboxAvailable(server: FastifyInstance): void {
+  getMediaRevokeOutbox(server)
+}
 
 export function getMediaGrantManager(server: FastifyInstance): MediaGrantManager {
   if (singleton) return singleton
   const redis = ((server as any).redis ?? null) as RedisGrantClient | null
   singleton = new MediaGrantManager({
     store: createGrantStore(redis),
+    // Fail-closed del relay: mientras exista deuda de revocación DURABLE sin aplicar
+    // para el usuario, no se emiten ni validan grants de sesión de relay.
+    hasRevokeDebt: (userId) => getMediaRevokeOutbox(server).hasPending(userId),
     audit: (r) => server.log.info(
       `media_grant event=${r.event} grantId=${r.grantId} cam=${r.cameraId.slice(0, 8)} ` +
       `transport=${r.transport}${r.reason ? ` reason=${r.reason}` : ''}`,
@@ -111,36 +165,85 @@ export type RevokeStatus = 'applied' | 'pending' | 'failed'
  * No declara éxito si la revocación no se aplicó.
  */
 export async function revokeUserMediaGrants(server: FastifyInstance, userId: string): Promise<RevokeStatus> {
-  const outcome = await getMediaGrantManager(server).revokeAllForUser(userId)
-  if (outcome.status === 'applied') {
-    pendingUserRevokes.delete(userId)
-    // A1·F0: tras la revocación durable, expulsa conexiones de relay vivas del
-    // usuario (SOLO con la flag ON; OFF ⇒ no-op ⇒ idéntico a hoy).
-    await kickConnectionsForUser(server, userId)
-    return 'applied'
+  const outbox = getMediaRevokeOutbox(server)
+  // 1) Registrar DURABLEMENTE la intención ANTES/independiente de tocar Redis. Si
+  //    la durabilidad falla (Postgres caído), no podemos garantizar la revocación:
+  //    'failed' (el llamador deja constancia y NO declara éxito).
+  try {
+    await outbox.enqueue(userId)
+  } catch {
+    server.log.warn(`media_grant revoke_enqueue_failed userId=${userId.slice(0, 8)} — outbox durable no disponible`)
+    return 'failed'
   }
-  pendingUserRevokes.add(userId)
-  server.log.warn(`media_grant revoke_pending userId=${userId.slice(0, 8)} — backend caido, se reintentara`)
-  return 'pending'
+  // 2) Intención durable OK: drenar (epoch) y devolver el estado real.
+  return drainRevokeAndStatus(server, userId, outbox)
 }
 
-/** Reintenta las revocaciones pendientes (llamar al recuperar Redis). */
-export async function retryPendingUserRevokes(server: FastifyInstance): Promise<number> {
-  // Inerte si no hay nada pendiente: no construye el singleton ni toca Redis (con
-  // las flags OFF y sin outage previo, el barrido/reconexión no hace nada).
-  if (pendingUserRevokes.size === 0) return 0
+/**
+ * C23·H2·P1 — Revocación de grants de medios ATÓMICA con la mutación de sesión /
+ * permisos del caller. La mutación (`mutate(tx)`) y la INTENCIÓN de revocar
+ * (fila del outbox durable) se confirman en la MISMA transacción PostgreSQL:
+ *
+ *   - Si `mutate` o el INSERT del outbox fallan ⇒ ROLLBACK total: ni la sesión se
+ *     cierra, ni los permisos cambian, ni queda intención a medias. La excepción
+ *     PROPAGA para que la ruta responda no-2xx (JAMÁS "Sesión cerrada" /
+ *     "Permisos actualizados").
+ *   - Si el commit tiene éxito ⇒ la intención ya es DURABLE. Se intenta drenar el
+ *     epoch (best-effort). Si Redis está caído, devuelve 'pending' y el plano falla
+ *     cerrado hasta el drenaje (los grants viejos no re-validan). Nunca 'failed'
+ *     tras un commit exitoso (la durabilidad ya está garantizada).
+ *
+ * Exige `prisma.$transaction` real (fail-closed si no está): la atomicidad no puede
+ * emularse sin transacción.
+ */
+export async function revokeUserMediaGrantsAtomic(
+  server: FastifyInstance,
+  userId: string,
+  mutate: (tx: MediaRevokeOutboxTxClient) => Promise<void>,
+): Promise<RevokeStatus> {
+  const outbox = getMediaRevokeOutbox(server) // fail-closed si falta el delegate durable
+  const prisma = (server as any).prisma
+  if (!prisma || typeof prisma.$transaction !== 'function') {
+    throw new Error('C23·H2·P1: revokeUserMediaGrantsAtomic requiere prisma.$transaction (fail-closed): la mutación y la intención de revocar deben confirmarse atómicas.')
+  }
+  // FASE A — mutación + intención de revocar en UNA sola transacción PG.
+  await prisma.$transaction(async (tx: MediaRevokeOutboxTxClient) => {
+    await mutate(tx)
+    await outbox.enqueueInTx(tx, userId)
+  })
+  // FASE B — commit OK ⇒ intención durable. Drenaje best-effort (fail-closed hasta él).
+  return drainRevokeAndStatus(server, userId, outbox)
+}
+
+/** Fase común post-intención-durable: drena el epoch y computa el estado real
+ *  ('applied' | 'pending'). Expulsa conexiones de relay vivas tras aplicar. */
+async function drainRevokeAndStatus(server: FastifyInstance, userId: string, outbox: MediaRevokeOutboxRepo): Promise<RevokeStatus> {
   const mgr = getMediaGrantManager(server)
-  let ok = 0
-  for (const uid of [...pendingUserRevokes]) {
-    try {
-      const o = await mgr.revokeAllForUser(uid)
-      if (o.status === 'applied') { pendingUserRevokes.delete(uid); ok++ }
-    } catch { /* backend aún caído: sigue pendiente, se reintenta en el próximo barrido */ }
+  await outbox.drain((uid) => mgr.revokeAllForUser(uid).then((o) => o.status === 'applied'))
+  if (await outbox.hasPending(userId)) {
+    server.log.warn(`media_grant revoke_pending userId=${userId.slice(0, 8)} — backend caido, se reintentara`)
+    return 'pending'
   }
-  return ok
+  // A1·F0: tras la revocación durable, expulsa conexiones de relay vivas del
+  // usuario (SOLO con la flag ON; OFF ⇒ no-op ⇒ idéntico a hoy).
+  await kickConnectionsForUser(server, userId)
+  return 'applied'
 }
 
-export function __pendingUserRevokeCount(): number { return pendingUserRevokes.size }
+/** Reintenta (drena) el outbox durable de revocaciones (llamar al recuperar Redis). */
+export async function retryPendingUserRevokes(server: FastifyInstance): Promise<number> {
+  const outbox = getMediaRevokeOutbox(server)
+  // Inerte si no hay nada pendiente: no construye el manager ni toca Redis (con las
+  // flags OFF y sin outage previo, el barrido/reconexión no hace nada).
+  if ((await outbox.pendingUserIds()).length === 0) return 0
+  const mgr = getMediaGrantManager(server)
+  return outbox.drain((uid) => mgr.revokeAllForUser(uid).then((o) => o.status === 'applied'))
+}
+
+export function __pendingUserRevokeCount(): number {
+  const o = activeOutbox ?? outboxOverride
+  return o instanceof InMemoryMediaRevokeOutbox ? o.pendingCountSync() : 0
+}
 
 export interface RevokeRecovery { stop(): void }
 
@@ -177,6 +280,7 @@ export function __resetMediaGrantManagerForTest(): void {
   singleton = null
   readiness = null
   sessionPolicy = null
-  pendingUserRevokes.clear()
+  outboxOverride = null
+  activeOutbox = null
   mediaKicker = noopKicker
 }

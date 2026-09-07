@@ -16,12 +16,19 @@
 //     de MediaMTX. `issue` NO inventa una instancia: si no hay fuente vigente,
 //     se niega. Recrear la fuente rota la generación e invalida grants viejos.
 //
-// El backend Redis se ejecuta contra Redis real en producción (Lua). En este
-// entorno no hay Redis, pero la LÓGICA del script Lua real (LUA_VALIDATE_AND_CLAIM)
-// SÍ está validada: grant-store.lua.test.ts lo ejecuta en una VM Lua (wasmoon) y
-// cruza su resultado contra validateAndClaimReducer para cada motivo. Lo que sigue
-// NO VALIDADO en vivo es la ATOMICIDAD/linealizabilidad de EVAL en un Redis real
-// (garantía de Redis, no de nuestro código) — requiere un servidor Redis.
+// TIEMPO AUTORITATIVO (C23·H2·P1): del lado Redis el tiempo NO se captura en Node
+// antes del EVAL. Los scripts leen `redis.call('TIME')` en el MISMO punto de
+// linealización y comparan expiración / fijan el TTL del claim contra ese reloj.
+// La EMISIÓN también fija `issuedAt`/`expiresAt` con Redis-time dentro del script
+// ISSUE_GRANT, de modo que emisión, validación y TTL del claim viven en un dominio
+// temporal COHERENTE (todo Redis-time). Node ya no aporta el instante de decisión.
+// `MemoryGrantStore` conserva su reloj inyectable para las pruebas unitarias.
+//
+// El backend Redis se ejecuta contra Redis real. La LÓGICA del script Lua real
+// (LUA_VALIDATE_AND_CLAIM) se valida en una VM Lua (grant-store.lua.test.ts, wasmoon)
+// cruzando su resultado contra validateAndClaimReducer, y la ATOMICIDAD +
+// expiración por reloj de Redis se validan contra un `redis-server` REAL efímero
+// en grant-store.redis.int.test.ts.
 
 import type { StoredMediaGrant, GrantRejectReason, GrantScopeQuery, ConnectionBinding } from './contracts'
 
@@ -286,6 +293,10 @@ export const ik = (kind: IndexKind, key: string) => `${P}idx:${kind}:${key}`
 export const ekk = (userId: string) => `${P}epoch:user:${userId}`
 export const instk = (path: string) => `${P}inst:${path}`
 const INSTANCE_COUNTER = `${P}instctr`
+// Gracia de retención de la clave del grant más allá de su expiración lógica: la
+// clave sobrevive lo suficiente para que un grant recién vencido devuelva EXPIRED
+// (por el reloj de Redis) en vez de NOT_FOUND (desalojo del PX). Ver LUA_ISSUE_GRANT.
+export const GRANT_KEY_GRACE_MS = 10_000
 // A1 · F0 — claves del mapa conexión↔grant.
 export const connk = (connectionId: string) => `${P}conn:${connectionId}`
 export const connUserk = (userId: string) => `${P}idx:connuser:${userId}`
@@ -293,12 +304,18 @@ export const connGrantk = (grantId: string) => `${P}idx:conngrant:${grantId}`
 
 // Script Lua de validateAndClaim (linealizable en el servidor Redis). Relee el
 // grant, el epoch del usuario, la instancia de la fuente y el estado de uso, y
-// marca el uso en la misma operación. Marcado con VALIDATE_AND_CLAIM para el fake.
+// marca el uso en la misma operación. El instante de decisión se obtiene DENTRO
+// del script con `redis.call('TIME')` (reloj autoritativo de Redis), nunca de un
+// `Date.now()` capturado en Node: así la expiración se juzga y el TTL del claim se
+// fija en el mismo punto de linealización, sin ventana Node→EVAL ni deriva de
+// reloj entre el API y Redis. Marcado con VALIDATE_AND_CLAIM para el fake.
+//   ARGV[1..5]=scope(userId,cameraId,streamPath,transport,action) ARGV[6]=secretHash
 export const LUA_VALIDATE_AND_CLAIM = `-- VALIDATE_AND_CLAIM
 local g = redis.call('GET', KEYS[1])
 if not g then return cjson.encode({ok=false, reason='NOT_FOUND'}) end
 local grant = cjson.decode(g)
-local now = tonumber(ARGV[7])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 if grant.revokedAt ~= nil and grant.revokedAt ~= cjson.null then return cjson.encode({ok=false, reason='REVOKED'}) end
 if now >= grant.expiresAt then return cjson.encode({ok=false, reason='EXPIRED'}) end
 if grant.userId ~= ARGV[1] or grant.cameraId ~= ARGV[2] or grant.streamPath ~= ARGV[3] or grant.transport ~= ARGV[4] or grant.action ~= ARGV[5] then return cjson.encode({ok=false, reason='SCOPE_MISMATCH'}) end
@@ -309,7 +326,9 @@ if not inst then return cjson.encode({ok=false, reason='INSTANCE_REQUIRED'}) end
 if grant.mediaInstanceId ~= inst then return cjson.encode({ok=false, reason='INSTANCE_MISMATCH'}) end
 if grant.secretHash ~= ARGV[6] then return cjson.encode({ok=false, reason='SECRET_MISMATCH'}) end
 if redis.call('EXISTS', KEYS[4]) == 1 then return cjson.encode({ok=false, reason='REPLAYED'}) end
-redis.call('SET', KEYS[4], '1', 'PX', tonumber(ARGV[8]))
+local claimTtl = grant.expiresAt - now
+if claimTtl < 1 then claimTtl = 1 end
+redis.call('SET', KEYS[4], '1', 'PX', claimTtl)
 return cjson.encode({ok=true})`
 
 // B2 — Script Lua de emisión ATÓMICA (linealizable en el servidor Redis). Antes
@@ -317,11 +336,25 @@ return cjson.encode({ok=true})`
 // dejaba un grant sin índice (o un índice sin grant), y la revocación por-índice
 // (revokeByView/revokeBySession) podía no encontrarlo. EVAL agrupa todas las
 // escrituras en una sola operación indivisible. Marcado ISSUE_GRANT para el fake.
+//
+// TIEMPO COHERENTE (C23·H2·P1): `issuedAt`/`expiresAt` se FIJAN aquí con el reloj
+// de Redis (`redis.call('TIME')`), no con el `Date.now()` de Node que trae el JSON.
+// Así la expiración que juzga VALIDATE_AND_CLAIM (también Redis-time) vive en el
+// mismo dominio temporal que la emisión. La clave del grant sobrevive `keyPx`
+// (= ttl lógico + gracia) para que un grant recién vencido devuelva EXPIRED por el
+// reloj de Redis (no NOT_FOUND por desalojo del PX) en el punto de validación.
 //   KEYS[1]=grant  KEYS[2]=idx:user  KEYS[3]=idx:view  KEYS[4]=idx:session
-//   ARGV[1]=grantJSON ARGV[2]=grantTtlMs ARGV[3]=grantId(member)
-//   ARGV[4]=hasSession('1'|'') ARGV[5]=userIdxExpireMs
+//   ARGV[1]=grantJSON ARGV[2]=ttlLogicoMs ARGV[3]=grantId(member)
+//   ARGV[4]=hasSession('1'|'') ARGV[5]=userIdxExpireMs ARGV[6]=keyPxMs
 export const LUA_ISSUE_GRANT = `-- ISSUE_GRANT
-redis.call('SET', KEYS[1], ARGV[1], 'PX', tonumber(ARGV[2]))
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local ttl = tonumber(ARGV[2])
+local keyPx = tonumber(ARGV[6])
+local grant = cjson.decode(ARGV[1])
+grant.issuedAt = now
+grant.expiresAt = now + ttl
+redis.call('SET', KEYS[1], cjson.encode(grant), 'PX', keyPx)
 redis.call('SADD', KEYS[2], ARGV[3])
 redis.call('SADD', KEYS[3], ARGV[3])
 if ARGV[4] ~= '' then redis.call('SADD', KEYS[4], ARGV[3]) end
@@ -336,7 +369,8 @@ export const LUA_VALIDATE_SESSION = `-- VALIDATE_SESSION
 local g = redis.call('GET', KEYS[1])
 if not g then return cjson.encode({ok=false, reason='NOT_FOUND'}) end
 local grant = cjson.decode(g)
-local now = tonumber(ARGV[7])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 if grant.revokedAt ~= nil and grant.revokedAt ~= cjson.null then return cjson.encode({ok=false, reason='REVOKED'}) end
 if now >= grant.expiresAt then return cjson.encode({ok=false, reason='EXPIRED'}) end
 if grant.userId ~= ARGV[1] or grant.cameraId ~= ARGV[2] or grant.streamPath ~= ARGV[3] or grant.transport ~= ARGV[4] or grant.action ~= ARGV[5] then return cjson.encode({ok=false, reason='SCOPE_MISMATCH'}) end
@@ -370,12 +404,16 @@ export class RedisGrantStore implements GrantStore {
   async issueGrant(grant: StoredMediaGrant, indices: IssueIndices, ttlMs: number): Promise<void> {
     // Escrituras AGRUPADAS en una sola operación linealizable (EVAL): un crash no
     // puede dejar un grant sin índice. El epoch ya fue capturado en el grant.
-    const px = Math.max(1, ttlMs)
-    const userExpire = Math.max(ttlMs, 60_000)
+    // `issuedAt`/`expiresAt` los FIJA el script con el reloj de Redis (Redis-time
+    // coherente); el TTL de la CLAVE es el ttl lógico + gracia para que EXPIRED sea
+    // observable por el reloj de Redis y no lo enmascare el desalojo del PX.
+    const ttl = Math.max(1, Math.floor(ttlMs))
+    const keyPx = ttl + GRANT_KEY_GRACE_MS
+    const userExpire = Math.max(keyPx, 60_000)
     await this.redis.eval(
       LUA_ISSUE_GRANT, 4,
       gk(grant.grantId), ik('user', grant.userId), ik('view', indices.viewId), ik('session', indices.sessionId ?? '_'),
-      JSON.stringify(grant), String(px), grant.grantId, indices.sessionId ? '1' : '', String(userExpire),
+      JSON.stringify(grant), String(ttl), grant.grantId, indices.sessionId ? '1' : '', String(userExpire), String(keyPx),
     )
   }
 
@@ -393,7 +431,7 @@ export class RedisGrantStore implements GrantStore {
         LUA_VALIDATE_AND_CLAIM, 4,
         gk(input.grantId), epochKey, instKey, ck(input.grantId),
         input.scope.userId, input.scope.cameraId, input.scope.streamPath, input.scope.transport, input.scope.action,
-        input.presentedSecretHash, String(input.nowMs), String(Math.max(1, grant ? grant.expiresAt - input.nowMs : 1000)),
+        input.presentedSecretHash,
       )
       const parsed = JSON.parse(String(raw)) as { ok: boolean; reason?: GrantRejectReason }
       return parsed.ok ? { ok: true, grant: grant! } : { ok: false, reason: parsed.reason }
@@ -412,7 +450,7 @@ export class RedisGrantStore implements GrantStore {
         LUA_VALIDATE_SESSION, 3,
         gk(input.grantId), epochKey, instKey,
         input.scope.userId, input.scope.cameraId, input.scope.streamPath, input.scope.transport, input.scope.action,
-        input.presentedSecretHash, String(input.nowMs),
+        input.presentedSecretHash,
       )
       const parsed = JSON.parse(String(raw)) as { ok: boolean; reason?: GrantRejectReason }
       return parsed.ok ? { ok: true, grant: grant! } : { ok: false, reason: parsed.reason }

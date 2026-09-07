@@ -31,7 +31,7 @@ import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
 import { mediaGrantsRoutes } from './routes/mediaGrants'
-import { getMediaGrantManager, startRevokeRecovery } from './services/media/grant-service'
+import { getMediaGrantManager, startRevokeRecovery, assertRevokeOutboxAvailable } from './services/media/grant-service'
 import { SourceLifecycleController, startSourceLifecyclePoller, createMediaMtxPathLister } from './services/media/source-lifecycle'
 import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
@@ -320,6 +320,12 @@ async function main() {
   // ─── Jobs en background ───────────────────────────────────
   startHealthWorker(server)
   startSyncWorker(server)
+
+  // C23·H2·P1 — FAIL-CLOSED de arranque: exige el outbox durable de revocación
+  // (delegate Prisma `mediaRevokeOutbox` + `$transaction`). Si falta, ABORTA el
+  // arranque en vez de degradar en silencio a memoria (que volvería fail-OPEN la
+  // revocación de logout/permisos). No se difiere el fallo al primer logout.
+  assertRevokeOutboxAvailable(server)
 
   // B1 — Recuperación de la revocación durable de medios. Si Redis cae durante un
   // logout / cambio de permisos, `revokeUserMediaGrants` encola el usuario y el

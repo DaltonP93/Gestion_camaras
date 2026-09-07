@@ -44,8 +44,10 @@ describe('revokeUserMediaGrants (P0-3 · no se traga; fail-closed; retry)', () =
     const status = await revokeUserMediaGrants(server, 'userX')
     expect(status).toBe('pending')                 // NO declara revocación completa
     expect(__pendingUserRevokeCount()).toBe(1)
-    // El plano falla cerrado: el grant no valida mientras el backend está caído.
-    expect((await mgr.consume({ grantId: r.issued.grantId, secret: r.issued.secret }, scope)).reason).toBe('BACKEND_UNAVAILABLE')
+    // El plano falla cerrado en el CAMINO ACTIVO: consume() ahora rechaza por la
+    // DEUDA de revocación pendiente ANTES de tocar el backend (fail-closed más
+    // preciso que el viejo BACKEND_UNAVAILABLE). El grant sigue sin ser aceptable.
+    expect((await mgr.consume({ grantId: r.issued.grantId, secret: r.issued.secret }, scope)).reason).toBe('REVOKE_PENDING')
 
     // Redis se recupera y se drena el pending (epoch se incrementa).
     redis.down = false

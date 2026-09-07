@@ -54,9 +54,12 @@ async function runLua(state: ClaimState, inp: ValidateAndClaimInput): Promise<{ 
   if (state.alreadyClaimed) store.set(kC, '1')
 
   // redis.call con semántica de Redis: GET de clave ausente devuelve `false` (no nil).
+  // TIME es el reloj autoritativo que ahora usa el script (no un Date.now() de Node):
+  // se deriva de inp.nowMs para conservar la paridad con el reducer (que usa nowMs).
   lua.global.set('redis', {
     call: (cmd: string, ...args: unknown[]) => {
       const c = String(cmd).toUpperCase()
+      if (c === 'TIME') return [Math.floor(inp.nowMs / 1000), (inp.nowMs % 1000) * 1000]
       const key = String(args[0])
       if (c === 'GET') return store.has(key) ? store.get(key) : false
       if (c === 'EXISTS') return store.has(key) ? 1 : 0

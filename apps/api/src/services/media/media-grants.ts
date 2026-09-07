@@ -107,11 +107,18 @@ export interface MediaGrantManagerDeps {
   clock?: GrantClock
   random?: GrantRandom
   audit?: GrantAuditSink
+  /**
+   * C23·H2·P2 — Predicado de deuda de revocación DURABLE por usuario. Si está
+   * presente y resuelve true, el relay FALLA CERRADO: no se emiten ni validan
+   * grants de SESIÓN de relay para ese usuario (issueSession/validateSession).
+   * Ausente ⇒ los caminos de relay no consultan deuda (comportamiento previo).
+   */
+  hasRevokeDebt?: (userId: string) => Promise<boolean>
 }
 
 export type IssueResult =
   | { ok: true; issued: IssuedMediaGrant }
-  | { ok: false; code: 'NO_MEDIA_INSTANCE' | 'BACKEND_UNAVAILABLE' }
+  | { ok: false; code: 'NO_MEDIA_INSTANCE' | 'BACKEND_UNAVAILABLE' | 'REVOKE_PENDING' }
 
 export type RevokeAllOutcome = { status: 'applied'; epoch: number } | { status: 'failed' }
 
@@ -120,18 +127,34 @@ export class MediaGrantManager {
   private readonly clock: GrantClock
   private readonly random: GrantRandom
   private readonly audit: GrantAuditSink
+  private readonly hasRevokeDebt?: (userId: string) => Promise<boolean>
 
   constructor(deps: MediaGrantManagerDeps) {
     this.store = deps.store
     this.clock = deps.clock ?? systemClock
     this.random = deps.random ?? systemRandom
     this.audit = deps.audit ?? noopAudit
+    this.hasRevokeDebt = deps.hasRevokeDebt
+  }
+
+  /**
+   * C23·H2·P2 — Fail-closed del relay: ¿el usuario tiene deuda de revocación
+   * DURABLE sin aplicar? Ante un error consultando la deuda, DENIEGA (cerrado).
+   */
+  private async revokeDebtBlocks(userId: string): Promise<boolean> {
+    if (!this.hasRevokeDebt) return false
+    try { return await this.hasRevokeDebt(userId) } catch { return true }
   }
 
   get crossProcessAtomic(): boolean { return this.store.crossProcessAtomic }
   healthy(): Promise<boolean> { return this.store.healthy() }
 
   async issue(params: MintGrantParams): Promise<IssueResult> {
+    // Fail-closed (C23·H2·P2): las rutas activas usan issue()/consume(), no sólo
+    // issueSession/validateSession. Con deuda de revocación DURABLE pendiente para
+    // el usuario, NO se emite ningún grant — aunque el drenaje del epoch aún no
+    // haya corrido (Redis pudo estar caído al hacer logout/quitar permisos).
+    if (await this.revokeDebtBlocks(params.userId)) return { ok: false, code: 'REVOKE_PENDING' }
     // EXIGE una instancia de fuente real vigente: no se inventa por el path.
     let instance: string | null
     let epoch: number
@@ -155,6 +178,9 @@ export class MediaGrantManager {
    * el grant NO es de uso único: lo re-valida `validateSession` sin consumirse.
    */
   async issueSession(params: MintGrantParams): Promise<IssueResult> {
+    // Fail-closed: con deuda de revocación durable pendiente para el usuario, no
+    // se emite grant de sesión de relay (aunque el drenaje aún no haya corrido).
+    if (await this.revokeDebtBlocks(params.userId)) return { ok: false, code: 'REVOKE_PENDING' }
     let instance: string | null
     let epoch: number
     try {
@@ -178,6 +204,13 @@ export class MediaGrantManager {
    */
   async validateSession(presented: GrantPresentation, scope: GrantScopeQuery): Promise<GrantValidation> {
     const now = this.clock.now()
+    // Fail-closed: si hay deuda de revocación durable pendiente para el usuario del
+    // scope, se DENIEGA la validación de sesión aunque el epoch de Redis todavía no
+    // se haya bumpeado (Redis pudo haberse caído; el drenaje aún no aplicó).
+    if (await this.revokeDebtBlocks(scope.userId)) {
+      this.audit({ event: 'grant_rejected', grantId: presented.grantId, userId: scope.userId, cameraId: scope.cameraId, transport: scope.transport, reason: 'REVOKE_PENDING', at: now })
+      return { ok: false, reason: 'REVOKE_PENDING' }
+    }
     const result = await this.store.validateSession({
       grantId: presented.grantId,
       presentedSecretHash: sha256Hex(presented.secret),
@@ -202,6 +235,13 @@ export class MediaGrantManager {
   /** Consume atómicamente (una sola transición linealizable). */
   async consume(presented: GrantPresentation, scope: GrantScopeQuery): Promise<GrantValidation> {
     const now = this.clock.now()
+    // Fail-closed (C23·H2·P2): consume() es el camino activo de consumo de grants.
+    // Con deuda de revocación durable pendiente para el usuario del scope, se
+    // DENIEGA antes de reclamar (aunque el epoch de Redis todavía no se bumpeó).
+    if (await this.revokeDebtBlocks(scope.userId)) {
+      this.audit({ event: 'grant_rejected', grantId: presented.grantId, userId: scope.userId, cameraId: scope.cameraId, transport: scope.transport, reason: 'REVOKE_PENDING', at: now })
+      return { ok: false, reason: 'REVOKE_PENDING' }
+    }
     const result = await this.store.validateAndClaim({
       grantId: presented.grantId,
       presentedSecretHash: sha256Hex(presented.secret),
