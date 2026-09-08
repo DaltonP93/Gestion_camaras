@@ -11,6 +11,11 @@ apps/api/build/
 # Playwright (E2E) artifacts
 apps/web/test-results/
 apps/web/playwright-report/
+<<<<<<< HEAD
+=======
+apps/web/blob-report/
+apps/web/.playwright/
+>>>>>>> origin/fix/web-fullscreen-e2e-c23
 
 # Environment files — NEVER commit secrets
 .env

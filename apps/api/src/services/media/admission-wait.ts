@@ -1,9 +1,8 @@
 // apps/api/src/services/media/admission-wait.ts
 //
-// N2b — Espera CANCELABLE de cupo de transcode. Upgrade real del predicado puro
-// `decideAdmissionOrWait` (live-playback-decision.ts): en vez de un único
-// start/wait, espera activamente a que se libere un cupo, con timeout y
-// cancelación (AbortSignal).
+// N2b — Espera CANCELABLE de cupo de transcode: en vez de un único start/wait,
+// espera activamente a que se libere un cupo, con timeout y cancelación
+// (AbortSignal).
 //
 // HONESTIDAD / INVARIANTE: esto OBSERVA la disponibilidad; NO reserva el cupo. La
 // reserva atómica del límite de 2 transcodes sigue siendo del stream-manager
