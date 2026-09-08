@@ -112,3 +112,32 @@ roto (P1) invalida la red de seguridad que ambos asumen.
 Otros: healthchecks faltantes en MediaMTX/web/analytics (arranque frágil,
 502/HLS 404 transitorios); dependencia de GitHub en runtime para el modelo de
 analytics; tags `latest` no reproducibles; dos scripts de deploy divergentes.
+
+## Política de auditoría de dependencias (CI, c23 hito 7)
+
+El job `audit` de `ci.yml` corre `scripts/check-npm-audit.sh` sobre `apps/api` y
+`apps/web`:
+
+- `npm audit --omit=dev`: **sólo dependencias de PRODUCCIÓN**. Una vulnerabilidad
+  en devDependencies (build/test) **no** bloquea el pipeline.
+- **Umbral de severidad**: sólo `HIGH`/`CRITICAL` bloquean. `low`/`moderate` se
+  reportan pero no frenan.
+- **Allowlist de deuda conocida** (por nombre de paquete): `axios`, `form-data`.
+  Son HIGH prod transitivos **pre-existentes** en `apps/web` detectados el
+  2026-09-06; no rompen CI hoy pero deben remediarse (actualización planificada
+  del árbol de `apps/web`). Cualquier paquete de producción **nuevo** con
+  HIGH/CRITICAL, fuera del allowlist, **falla** el job.
+
+El allowlist vive en `scripts/check-npm-audit.sh` (variable `ALLOWLIST`) y es por
+nombre de paquete a propósito: los IDs GHSA rotan con cada advisory nuevo.
+
+## Verificación de integridad del modelo de analytics (c23 hito 7)
+
+`apps/analytics/app/providers/yolox_onnx.py` descargaba `yolox_s.onnx` de GitHub
+en runtime sin verificación. Ahora, tras la descarga, se verifica el **SHA-256**
+conocido (`app/model_verify.py`); si no coincide, se borra el archivo y la carga
+del provider falla en vez de ejecutar un binario no verificado. El hash esperado
+es la constante `EXPECTED_MODEL_SHA256` en `config.py`, override por env
+`MODEL_SHA256` (vacío = omitir verificación con warning explícito, sólo para
+modelos propios). Hash del `yolox_s.onnx` oficial (release 0.1.1rc0):
+`c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063`.

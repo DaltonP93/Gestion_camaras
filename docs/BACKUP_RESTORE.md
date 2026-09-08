@@ -1,79 +1,119 @@
-# Backup y restauración — VisionCore (estado real)
+# Backup y restore de PostgreSQL — VisionCore
 
-> Actualizado: 2026-09-06 (ciclo C23). Base: `main` = `0f9d1f5` (INTACTO). Fuente: AGENTE 2 (DevOps)
-> verificado contra código.
-> **Honestidad radical:** en `main` NO hay backup programado ni copia offsite. Este documento describe lo
-> que existe hoy en `main`, el procedimiento manual, y qué falta. Toca la evidencia de grabaciones
-> (invariante de negocio #1): tratar con máxima cautela.
->
-> **Ciclo C23 — #174 (`fe51727`, PR Draft, NO en `main`):** valida **backup/restore end-to-end contra un
-> Postgres efímero** y agrega `deploy.sh` fail-fast (aborta si el backup falla). Esto sube la prueba de
-> restauración de `NOT_TESTED` a **validado contra PG efímero real** — pero **solo dentro del PR Draft**;
-> `main` sigue sin esa validación, sin cron y sin offsite.
+> Alcance: procedimiento comprobado de respaldo/restauración de la base
+> `visioncore_db` (metadatos de cámaras, NVR, usuarios, roles y **evidencia de
+> grabaciones**). No autoriza acciones sobre producción: leer
+> `docs/AI_HANDOFF.md` (invariante 1: nunca perder evidencia sin respaldo).
 
----
+La base es un único contenedor con un único volumen (`postgres_data`) — punto
+único de fallo. Este procedimiento es la red de seguridad para migraciones,
+deploys y recuperación ante desastre.
 
-## 1. Estado real
+## Scripts
 
-| Aspecto | Estado | Evidencia |
+- `scripts/backup.sh` — `pg_dump -Fc` + checksum SHA-256 + cifrado opcional +
+  verificación (`pg_restore --list`) + retención.
+- `scripts/restore.sh` — verifica checksum, descifra si aplica, valida el dump y
+  restaura con `pg_restore --clean --if-exists` (idempotente).
+
+Ambos leen la configuración del entorno; **no hay secretos hardcodeados**.
+
+### Variables de entorno
+
+| Variable | Default | Descripción |
 |---|---|---|
-| Backup programado (cron) | NOT_PRESENT | No hay job en `apps/api/src/jobs/`; sin cron de backup |
-| Backup pre-deploy (manual) | PRESENTE | `scripts/deploy.sh:58-67` — `pg_dump -U visioncore visioncore_db` a `backups/*.sql`; **aborta el deploy si el dump falla** |
-| Copia offsite | NOT_PRESENT | `docker-compose.yml` no monta `backups/` como volumen externo; viven en el filesystem del host (mismo SPOF) |
-| Retención | NOT_PRESENT | Sin política de retención/rotación |
-| WAL / réplica / captura continua | NOT_PRESENT | Postgres es contenedor + volumen único (SPOF) |
-| Restauración | PRESENTE (manual, nunca ejercitada aquí) | `psql ... < backup.sql` (`DEPLOY.md:124-126`) |
-| Prueba de restauración | NOT_TESTED en `main` / **validado en #174 (Draft) contra Postgres efímero** | Nunca ejercitada en `main`; #174 la ejerce end-to-end contra PG efímero (NO en `main`) |
-| Backup de grabaciones (media) | Fuera del dump SQL | El dump cubre solo Postgres; la evidencia de video no está en este backup |
+| `BACKUP_DIR` | `backups` | Directorio destino de los artefactos. |
+| `PGHOST` / `PGPORT` | `127.0.0.1` / `5432` | Host y puerto de PostgreSQL. |
+| `PGUSER` / `PGDATABASE` | `visioncore` / `visioncore_db` | Usuario y base. |
+| `PGPASSWORD` | — | Password (del entorno; nunca versionar). |
+| `RETENTION_DAYS` | `14` | Borra backups con más de N días (`0` = no borrar). |
+| `BACKUP_ENCRYPT` | `0` | `1` cifra el artefacto con `gpg --symmetric` (AES-256). |
+| `BACKUP_PASSPHRASE` | — | Passphrase del cifrado (obligatoria si `ENCRYPT=1`). |
+| `DB_EXEC` | — | Prefijo para correr los clientes de PG dentro de un contenedor, p.ej. `DB_EXEC="docker compose exec -T postgres"`. Vacío = binarios del host. |
+| `RESTORE_FORCE` | `0` | `1` omite la confirmación interactiva de `restore.sh`. |
 
-> ⚠ El `deploy.sh` de la **raíz** (distinto de `scripts/deploy.sh`) NO hace backup. Usar siempre
-> `scripts/deploy.sh` (ver `docs/DEPLOYMENT.md §3`).
+## Uso
 
-## 2. RPO / RTO actuales
+### Backup
 
-- **RPO (Recovery Point Objective): INDEFINIDO.** El único backup ocurre al desplegar; entre despliegues
-  (días/semanas) no hay captura. La pérdida potencial = tiempo desde el último deploy.
-- **RTO (Recovery Time Objective): NO MEDIDO.** Restauración manual (rebuild + `up` + restore psql +
-  re-seed si aplica), sin runbook cronometrado.
-
-## 3. Procedimiento manual documentado
-
-### Backup manual (bajo demanda)
 ```bash
-docker compose exec -T postgres pg_dump -U visioncore visioncore_db \
-  > backups/db_backup_$(date +%Y%m%d_%H%M%S).sql
-```
-(Es lo que `scripts/deploy.sh` hace automáticamente antes de cada deploy.)
+# Contra el stack compose (postgres en el contenedor):
+DB_EXEC="docker compose exec -T postgres" PGPASSWORD="$POSTGRES_PASSWORD" \
+  bash scripts/backup.sh
 
-### Restauración
-```bash
-# 1) detener api para evitar escrituras concurrentes (según necesidad)
-docker compose stop api
-# 2) restaurar el dump elegido
-docker compose exec -T postgres psql -U visioncore visioncore_db \
-  < backups/db_backup_YYYYMMDD_HHMMSS.sql
-# 3) reanudar
-docker compose start api
+# Backup cifrado:
+BACKUP_ENCRYPT=1 BACKUP_PASSPHRASE="$BK_PASS" \
+DB_EXEC="docker compose exec -T postgres" PGPASSWORD="$POSTGRES_PASSWORD" \
+  bash scripts/backup.sh
 ```
 
-> Schema: migraciones **solo-hacia-adelante** (sin `down`); un rollback de código NO revierte la DB.
-> Si se restaura un dump más viejo que las migraciones aplicadas, validar consistencia antes de operar.
+Genera `backups/visioncore_db_<ts>.dump` (o `.dump.gpg`) y su `.sha256`. El
+script imprime la ruta del artefacto en la última línea (útil para cron/scripts).
 
-## 4. Qué falta (pendiente / decisión del propietario)
+> **Nota de granularidad**: el nombre usa timestamp a segundos. Dos backups en el
+> **mismo segundo** colisionan de nombre; para cron horario/diario no ocurre.
 
-| Ítem | Prioridad | Naturaleza |
+### Restore
+
+```bash
+# Restaura (pide confirmación 'RESTORE' salvo --force):
+BACKUP_PASSPHRASE="$BK_PASS" \
+DB_EXEC="docker compose exec -T postgres" PGPASSWORD="$POSTGRES_PASSWORD" \
+  bash scripts/restore.sh backups/visioncore_db_<ts>.dump.gpg
+```
+
+`restore.sh` **aborta** si el checksum no coincide, si el `.gpg` no se puede
+descifrar o si `pg_restore` falla (`--exit-on-error`).
+
+### Cron sugerido (offsite recomendado aparte)
+
+```cron
+# Backup diario 03:15, cifrado, retención 14 días.
+15 3 * * * cd /opt/visioncore && BACKUP_ENCRYPT=1 BACKUP_PASSPHRASE="$(cat /root/.bk_pass)" \
+  DB_EXEC="docker compose exec -T postgres" PGPASSWORD="$POSTGRES_PASSWORD" \
+  bash scripts/backup.sh >> /var/log/visioncore-backup.log 2>&1
+```
+
+Copiar los artefactos a almacenamiento **fuera del host** (S3/rsync) es
+responsabilidad de un paso adicional: un backup en el mismo disco no protege ante
+fallo de disco.
+
+## Simulacro comprobado (drill)
+
+Ejecutado el 2026-09-06 contra un **PostgreSQL 16.4 efímero en Docker**
+(`postgres:16.4-alpine`, base `visioncore_db`, usuario `visioncore`), replicable:
+
+```bash
+docker run --rm -d --name vc_backup_test -e POSTGRES_PASSWORD=test \
+  -e POSTGRES_DB=visioncore_db -e POSTGRES_USER=visioncore \
+  -p 55432:5432 postgres:16.4-alpine
+
+export PGHOST=127.0.0.1 PGPORT=55432 PGUSER=visioncore \
+       PGDATABASE=visioncore_db PGPASSWORD=test
+# 1) tabla + 3 filas → 2) backup plano y cifrado → 3) DROP TABLE →
+# 4) restore desde el .gpg → 5) verificar 3 filas idénticas
+```
+
+Resultado real:
+
+1. Backup plano y **cifrado** (AES-256) generados, cada uno con su `.sha256`.
+2. `pg_restore --list` valida ambos dumps.
+3. Tras `DROP TABLE evidencia` y `restore.sh <artefacto>.gpg --force`, las **3
+   filas volvieron idénticas**.
+4. Un artefacto con **checksum alterado** hace **abortar** el restore (exit ≠0).
+5. Un **segundo** restore sobre la tabla ya existente es idempotente
+   (`--clean --if-exists`), sin filas duplicadas.
+
+Contenedor efímero **apagado y removido** al terminar (`--rm`).
+
+## RPO / RTO propuestos
+
+| Métrica | Propuesta | Justificación |
 |---|---|---|
-| Script de backup+restore probado localmente | P1 | **Abordado por #174 (Draft): validado contra Postgres efímero** — pendiente de fusionar a `main` |
-| Documentar y cronometrar RTO (prueba de restauración real) | P1 | Verificación (RTO aún no cronometrado) |
-| Cron de backup programado | P1/P2 | **Decisión de infra** (frecuencia) |
-| Copia offsite (destino externo) | P1/P2 | **Decisión de infra/costo** |
-| Retención/rotación de backups | P2 | Configuración |
-| WAL / réplica (RPO continuo) | P2/P3 | **Decisión de arquitectura** |
-| Estrategia de backup de la evidencia de video (no solo SQL) | P2 | **Decisión** (invariante #1) |
-| Quitar el silenciado de migración del `deploy.sh` raíz | P1 | Seguro (Dev). #174 (Draft) agrega `deploy.sh` fail-fast |
+| **RPO** (pérdida máx. de datos) | **24 h** con backup diario; **≤1 h** si se pasa a backup horario o se activa WAL archiving / réplica. | El dump es puntual; entre dos dumps se pierde lo escrito. Para evidencia crítica se recomienda WAL archiving (PITR) como mejora futura. |
+| **RTO** (tiempo de recuperación) | **≤30 min** para la base (descifrar + `pg_restore`); el dump de este esquema restaura en segundos a pocos minutos. El RTO total del servicio suma el redeploy del stack. | Restore probado en segundos sobre dataset chico; escala con el tamaño real de la base. |
 
-## 5. Referencias
-
-- `scripts/deploy.sh` (backup pre-deploy correcto), `deploy.sh` raíz (footgun).
-- `scripts/rollback.sh` (reconoce que la DB requiere restauración manual).
-- `docs/DEPLOYMENT.md` (§5 migraciones, §9 rollback, §10 advertencias).
+Limitaciones conocidas: (a) sin offsite/WAL archiving no hay PITR — sólo puntos
+diarios; (b) las migraciones son sólo-hacia-adelante (no hay `down`), así que un
+rollback de esquema requiere restaurar un backup previo a la migración; correr
+`scripts/backup.sh` **antes** de cada `migrate deploy` es la mitigación.

@@ -15,6 +15,8 @@ import numpy as np
 import onnxruntime as ort
 
 from ..config import settings, CLASS_NAME_BY_ID
+# ModelChecksumError es subclase de RuntimeError → la captura el except de abajo.
+from ..model_verify import verify_sha256
 from .base import Detection, DetectionProvider, ProviderHealth, ProviderMetadata
 
 log = logging.getLogger("analytics.provider.yolox")
@@ -35,6 +37,14 @@ def _download_model(url: str, dest: str) -> None:
         size = os.path.getsize(tmp)
         if size < 1_000_000:
             raise RuntimeError(f"descarga incompleta ({size} bytes)")
+        # Verificar integridad ANTES de publicar el archivo final: un binario
+        # descargado de una fuente externa no se ejecuta sin verificar su SHA-256.
+        # Un mismatch borra el .part y aborta (no deja un modelo no confiable).
+        if settings.model_sha256:
+            verify_sha256(tmp, settings.model_sha256)
+            log.info("checksum del modelo verificado (sha256 OK)")
+        else:
+            log.warning("MODEL_SHA256 vacío — se OMITE la verificación de integridad del modelo")
         os.replace(tmp, dest)
         log.info("modelo descargado (%.1f MB)", size / 1e6)
     except (OSError, socket.timeout, RuntimeError):
