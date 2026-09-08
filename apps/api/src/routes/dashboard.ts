@@ -5,9 +5,20 @@
 // alertas y la serie temporal REAL de alertas por hora.
 import type { FastifyPluginAsync } from 'fastify'
 import { deriveAlertSummary, bucketAlertsByHour } from '../services/alert-summary'
+import { canViewDashboard } from '../services/dashboard-policy'
 
 export const dashboardRoutes: FastifyPluginAsync = async (server) => {
   server.get('/overview', { preHandler: [server.authenticate] }, async (request, reply) => {
+    // #171: ENFORCE `canViewDashboard` (antes abierto a cualquier autenticado). El
+    // resumen agrega conteos NVR/cámara/alerta (NVR-wide). ADMIN siempre pasa; el
+    // resto según el flag RESUELTO (default true ⇒ sólo bloquea override explícito).
+    const fp = await server.prisma.userFeaturePermissions.findUnique({
+      where: { userId: request.user.sub },
+    })
+    if (!canViewDashboard(request.user.role, fp as Record<string, boolean> | null)) {
+      return reply.status(403).send({ message: 'No autorizado para ver el panel' })
+    }
+
     const hoursRaw = (request.query as { hours?: string }).hours
     const hours = Math.min(72, Math.max(1, parseInt(hoursRaw ?? '24', 10) || 24))
     const now = Date.now()

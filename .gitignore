@@ -8,6 +8,10 @@ apps/web/dist/
 apps/api/dist/
 apps/api/build/
 
+# Playwright (E2E) artifacts
+apps/web/test-results/
+apps/web/playwright-report/
+
 # Environment files — NEVER commit secrets
 .env
 .env.local

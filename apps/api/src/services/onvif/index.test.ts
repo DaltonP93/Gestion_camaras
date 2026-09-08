@@ -99,6 +99,26 @@ describe('OnvifService — flujo con transporte inyectado', () => {
     expect(called).toBe(false)
   })
 
+  it('SSRF (ONVIF_ENABLED=true): AWS IMDS sobre IPv6 (toda forma) → SSRF_BLOCKED y el transporte NUNCA se invoca', async () => {
+    // Con el servicio HABILITADO, cada método valida SSRF antes de cualquier POST.
+    // fd00:ec2::254 cae en ULA (isPrivateIpv6 lo permitiría): sólo el bloqueo por
+    // valor canónico de metadatos lo detiene. Se prueba en varias operaciones y con
+    // formas comprimida/expandida/mayúsculas y allowPublic=true.
+    for (const url of [
+      'http://[fd00:ec2::254]/onvif',
+      'http://[fd00:0ec2:0000:0000:0000:0000:0000:0254]/onvif',
+      'http://[FD00:EC2::254]/onvif',
+    ]) {
+      let called = false
+      const transport: SoapTransport = { async post() { called = true; return { status: 200, body: '' } } }
+      const svc = new OnvifService({ enabled: true, transport, ...fixed, ssrfPolicy: { allowPublic: true } })
+      await expect(svc.getProfiles(url, CREDS)).rejects.toMatchObject({ code: 'SSRF_BLOCKED' })
+      await expect(svc.getDeviceInformation(url, CREDS)).rejects.toMatchObject({ code: 'SSRF_BLOCKED' })
+      await expect(svc.getStreamUri(url, CREDS, 'P1')).rejects.toMatchObject({ code: 'SSRF_BLOCKED' })
+      expect(called).toBe(false)  // el transporte NUNCA fue invocado
+    }
+  })
+
   it('rechaza argumentos vacíos con INVALID_ARG', async () => {
     const { transport } = recordingTransport('<ok/>')
     const svc = new OnvifService({ enabled: true, transport, ...fixed })
