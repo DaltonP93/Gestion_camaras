@@ -5,12 +5,34 @@ let ws: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectDelay = 2000
 
-export function connectWebSocket() {
-  const token = localStorage.getItem('accessToken')
+export async function connectWebSocket() {
+  const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
   if (!token) return
 
+  // Autenticación por TICKET: el JWT ya NO viaja en la URL del WebSocket (quedaba
+  // en logs/historial/Referer). Se pide un ticket efímero de un solo uso al backend
+  // (con el Bearer en el header) y se abre el WS con ese ticket opaco.
+  let ticket: string
+  try {
+    const res = await fetch(`${window.location.origin}/api/auth/ws-ticket`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    // 401 = sesión inválida/expirada: no reconectar en bucle (se reconectará tras
+    // el próximo login/refresh). Otro error: reintentar con backoff.
+    if (!res.ok) {
+      if (res.status !== 401) scheduleReconnect()
+      return
+    }
+    ticket = (await res.json())?.ticket
+    if (!ticket) { scheduleReconnect(); return }
+  } catch {
+    scheduleReconnect()
+    return
+  }
+
   const wsBase = window.location.origin.replace(/^http/, 'ws')
-  const url = `${wsBase}/ws/alerts?token=${encodeURIComponent(token)}`
+  const url = `${wsBase}/ws/alerts?ticket=${encodeURIComponent(ticket)}`
 
   try {
     ws = new WebSocket(url)

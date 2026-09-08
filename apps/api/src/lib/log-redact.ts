@@ -4,7 +4,7 @@
 // deben quedar en logs, monitoreo ni capturas.
 
 // Parámetros de query cuyo valor se enmascara.
-const SECRET_QUERY_PARAMS = ['token', 'access_token', 'accessToken', 'refreshToken', 'password', 'pass']
+const SECRET_QUERY_PARAMS = ['token', 'access_token', 'accessToken', 'refreshToken', 'password', 'pass', 'ticket']
 
 /** Enmascara valores de parámetros sensibles en una URL o query string. */
 export function redactUrlSecrets(url: string): string {

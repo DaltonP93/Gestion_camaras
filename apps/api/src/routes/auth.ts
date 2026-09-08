@@ -13,6 +13,7 @@ import {
 } from '../services/totp'
 import { getSecuritySettings } from '../services/security-settings'
 import { sessionsToPrune, accessTokenTtl, decideMfaGate } from '../services/security-policy'
+import { issueWsTicket, WS_TICKET_TTL_MS } from '../services/ws-ticket'
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
@@ -879,6 +880,22 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       server.log.error({ err, userId: request.user?.sub }, '[auth/me] error al consultar perfil — verifica que la migración 0012 fue aplicada (ALTER TABLE user_feature_permissions ADD COLUMN IF NOT EXISTS canDownloadRecordings ...)')
       return reply.status(500).send({ message: 'Error interno al cargar el perfil de usuario' })
     }
+  })
+
+  // ──────────────────────────────────────────────────────────
+  // POST /api/auth/ws-ticket
+  // Emite un ticket efímero de un solo uso para autenticar el WebSocket SIN pasar
+  // el JWT en la URL (el navegador no puede fijar headers en el handshake de WS).
+  // Requiere Bearer válido; el ticket dura segundos y se canjea una sola vez.
+  // ──────────────────────────────────────────────────────────
+  server.post('/ws-ticket', {
+    preHandler: [server.authenticate],
+  }, async (request, reply) => {
+    const ticket = await issueWsTicket(server.redis, {
+      userId: request.user.sub,
+      username: request.user.username,
+    })
+    return reply.send({ ticket, expiresInSeconds: Math.round(WS_TICKET_TTL_MS / 1000) })
   })
 }
 
