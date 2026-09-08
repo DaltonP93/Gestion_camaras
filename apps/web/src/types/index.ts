@@ -112,6 +112,12 @@ export interface AlertSettings {
   recipientEmails: string
   alertTypes: Record<string, boolean>
   minSeverity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  slackEnabled?: boolean
+  slackWebhookUrl?: string
+  teamsEnabled?: boolean
+  teamsWebhookUrl?: string
+  webhookEnabled?: boolean
+  webhookUrl?: string
   updatedAt: string
 }
 
