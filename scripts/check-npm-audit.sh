@@ -15,12 +15,12 @@
 # riesgo). La clasificación del JSON vive en scripts/audit_classify.py (pura,
 # testeable). Pruebas negativas: scripts/check-npm-audit.test.sh.
 #
-# ALLOWLIST — deuda conocida TEMPORAL, NO política definitiva. Por defecto
-# `axios form-data` (HIGH transitivos de apps/web que remedia el PR #172). Estas
-# entradas deben corresponder SIEMPRE a una remediación en curso; al fusionarse
-# #172 el allowlist debe vaciarse. Overridable con la env `AUDIT_ALLOWLIST` (no
-# se amplía a la ligera). Un paquete prod NUEVO con HIGH/CRITICAL fuera del
-# allowlist rompe CI.
+# ALLOWLIST — deuda conocida TEMPORAL, NO política definitiva. Ahora VACÍO por
+# defecto: el PR #172 (fusionado en main) remedió los HIGH transitivos de apps/web
+# (`axios`, `form-data`), así que ya no hay deuda que tolerar. Cualquier entrada
+# futura debe corresponder SIEMPRE a una remediación en curso y vaciarse al cerrarla.
+# Overridable con la env `AUDIT_ALLOWLIST` (no se amplía a la ligera). Un paquete
+# prod con HIGH/CRITICAL fuera del allowlist (ahora: cualquiera) rompe CI.
 #
 # Uso: scripts/check-npm-audit.sh [app_dir ...]   (default: apps/api apps/web)
 set -uo pipefail
@@ -31,7 +31,7 @@ CLASSIFY="$HERE/audit_classify.py"
 APPS=("$@")
 [ "${#APPS[@]}" -gt 0 ] || APPS=(apps/api apps/web)
 
-export ALLOWLIST="${AUDIT_ALLOWLIST:-axios form-data}"
+export ALLOWLIST="${AUDIT_ALLOWLIST:-}"
 
 fail() { echo "❌ $*" >&2; }
 

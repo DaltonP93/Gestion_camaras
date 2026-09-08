@@ -174,9 +174,8 @@ jobs:
           node-version: 22
       # Política (ver docs/audits/AUDIT_DEVOPS.md): `npm audit --omit=dev` sólo
       # sobre dependencias de PRODUCCIÓN (dev-only NO bloquea); low/moderate NO
-      # bloquean. Falla ante HIGH/CRITICAL prod en paquetes fuera del allowlist de
-      # deuda conocida (axios/form-data, pre-existentes). Un paquete prod NUEVO con
-      # HIGH/CRITICAL rompe CI.
+      # bloquean. Allowlist de deuda VACÍO (los HIGH transitivos axios/form-data
+      # fueron remediados por #172): cualquier HIGH/CRITICAL prod rompe CI.
       - name: Self-test fail-closed de la política de audit (pruebas negativas)
         run: bash scripts/check-npm-audit.test.sh
       - name: Auditar dependencias de producción (api + web)
