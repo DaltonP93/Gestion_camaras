@@ -33,11 +33,17 @@ const TICKET_RE = /^wst_[0-9a-f]{64}$/
 
 /** Emite un ticket de un solo uso para el usuario dado. Devuelve el ticket opaco. */
 export async function issueWsTicket(redis: WsTicketRedis, id: WsTicketIdentity): Promise<string> {
-  const ticket = `wst_${crypto.randomBytes(32).toString('hex')}`
-  // NX evita pisar un ticket homónimo (colisión imposible en la práctica, pero
-  // mantiene la semántica de "un ticket = una identidad").
-  await redis.set(PREFIX + ticket, JSON.stringify({ u: id.userId, n: id.username }), 'PX', WS_TICKET_TTL_MS, 'NX')
-  return ticket
+  const value = JSON.stringify({ u: id.userId, n: id.username })
+  // NX evita pisar un ticket homónimo. Ante una colisión (probabilidad ~2⁻¹²⁸, es
+  // decir nunca en la práctica) SET NX devuelve null y NO se almacena: en ese caso
+  // se regenera en vez de devolver un ticket muerto o de otra identidad. Se acota a
+  // pocos intentos para no colgar ante un Redis que niegue toda escritura.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ticket = `wst_${crypto.randomBytes(32).toString('hex')}`
+    const stored = await redis.set(PREFIX + ticket, value, 'PX', WS_TICKET_TTL_MS, 'NX')
+    if (stored) return ticket
+  }
+  throw new Error('no se pudo emitir el ticket de WebSocket')
 }
 
 /**
