@@ -3,7 +3,7 @@ import type { FastifyPluginAsync } from 'fastify'
 import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
-import { revokeUserMediaGrants } from '../services/media/grant-service'
+import { revokeUserMediaGrantsAtomic } from '../services/media/grant-service'
 import { checkPasswordPolicy, addToPasswordHistory, resolveFeaturePermissions } from '../services/totp'
 import { getSecuritySettings } from '../services/security-settings'
 
@@ -311,54 +311,58 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     const user = await server.prisma.user.findUnique({ where: { id }, select: { id: true } })
     if (!user) return reply.status(404).send({ message: 'Usuario no encontrado' })
 
-    const ops: Promise<any>[] = []
-
-    if (body.featurePermissions) {
-      ops.push(server.prisma.userFeaturePermissions.upsert({
-        where:  { userId: id },
-        create: { userId: id, ...body.featurePermissions },
-        update: body.featurePermissions,
-      }))
-    }
-
-    if (body.nvrPermissions) {
-      for (const p of body.nvrPermissions) {
-        const { nvrId, ...fields } = p
-        ops.push(server.prisma.userPermission.upsert({
-          where:  { userId_nvrId_cameraId: { userId: id, nvrId, cameraId: null as any } },
-          create: { userId: id, nvrId, cameraId: null, ...fields },
-          update: fields,
-        }))
-      }
-    }
-
+    // Resolución de nvrId por cámara: LECTURA fuera de la transacción de escritura.
+    let nvrByCamera = new Map<string, string | null>()
     if (body.cameraPermissions) {
-      // Resolve all nvrIds in one query instead of one findUnique per camera
       const camIds = body.cameraPermissions.map(p => p.cameraId)
       const cams = await server.prisma.camera.findMany({
         where: { id: { in: camIds } },
         select: { id: true, nvrId: true },
       })
-      const nvrByCamera = new Map(cams.map(c => [c.id, c.nvrId]))
-      for (const p of body.cameraPermissions) {
-        const { cameraId, ...fields } = p
-        const nvrId = nvrByCamera.get(cameraId)
-        if (!nvrId) continue
-        ops.push(server.prisma.userPermission.upsert({
-          where:  { userId_nvrId_cameraId: { userId: id, nvrId, cameraId } },
-          create: { userId: id, nvrId, cameraId, ...fields },
-          update: fields,
-        }))
-      }
+      nvrByCamera = new Map(cams.map(c => [c.id, c.nvrId]))
     }
 
-    await Promise.all(ops)
-
-    // C22.1 (P0-1/P0-2): un cambio de permisos revoca los grants de medios vivos
-    // del usuario afectado, para no seguir autorizando lo ya retirado.
-    // B1: no se descarta el estado — 'pending' se encola y se drena al recuperar
-    // Redis; queda registrado en la auditoría.
-    const mediaRevoke = await revokeUserMediaGrants(server, id)
+    // C23·H2·P1: la MUTACIÓN de permisos y la INTENCIÓN de revocar los grants de
+    // medios se confirman ATÓMICAS (misma transacción PG). Si la intención no puede
+    // persistirse ⇒ ROLLBACK completo (los permisos NO cambian) y respondemos no-2xx;
+    // JAMÁS "Permisos actualizados" con una revocación que no quedó durable.
+    let mediaRevoke
+    try {
+      mediaRevoke = await revokeUserMediaGrantsAtomic(server, id, async (tx: any) => {
+        if (body.featurePermissions) {
+          await tx.userFeaturePermissions.upsert({
+            where:  { userId: id },
+            create: { userId: id, ...body.featurePermissions },
+            update: body.featurePermissions,
+          })
+        }
+        if (body.nvrPermissions) {
+          for (const p of body.nvrPermissions) {
+            const { nvrId, ...fields } = p
+            await tx.userPermission.upsert({
+              where:  { userId_nvrId_cameraId: { userId: id, nvrId, cameraId: null as any } },
+              create: { userId: id, nvrId, cameraId: null, ...fields },
+              update: fields,
+            })
+          }
+        }
+        if (body.cameraPermissions) {
+          for (const p of body.cameraPermissions) {
+            const { cameraId, ...fields } = p
+            const nvrId = nvrByCamera.get(cameraId)
+            if (!nvrId) continue
+            await tx.userPermission.upsert({
+              where:  { userId_nvrId_cameraId: { userId: id, nvrId, cameraId } },
+              create: { userId: id, nvrId, cameraId, ...fields },
+              update: fields,
+            })
+          }
+        }
+      })
+    } catch {
+      server.log.error(`users permissions_revoke_atomic_failed userId=${id.slice(0, 8)} — rollback, permisos sin cambios`)
+      return reply.status(503).send({ message: 'No se pudieron actualizar los permisos de forma segura. Reintentá.' })
+    }
 
     await AuditAction(server.prisma, request.user.sub, 'PERMISSIONS_UPDATED', id, request, {
       nvrCount:    body.nvrPermissions?.length ?? 0,
@@ -431,24 +435,31 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     const { id } = request.params as { id: string }
     const permissions = z.array(permissionSchema).parse(request.body)
 
-    // Eliminar permisos existentes y recrear
-    await server.prisma.userPermission.deleteMany({ where: { userId: id } })
-
-    const created = await server.prisma.userPermission.createMany({
-      data: permissions.map((p) => ({
-        userId:         id,
-        nvrId:          p.nvrId || null,
-        cameraId:       p.cameraId || null,
-        canView:        p.canView,
-        canPlayback:    p.canPlayback,
-        canPtz:         p.canPtz,
-        canHighQuality: p.canHighQuality,
-      })),
-    })
-
-    // C22.1 (P0-1/P0-2): revoca grants de medios vivos del usuario afectado.
-    // B1: el estado no se descarta (pending → outbox → drenaje al recuperar Redis).
-    const mediaRevoke = await revokeUserMediaGrants(server, id)
+    // C23·H2·P1: reemplazo de permisos (deleteMany + createMany) e INTENCIÓN de
+    // revocar los grants de medios en la MISMA transacción PG. Si la intención no
+    // puede persistirse ⇒ ROLLBACK (los permisos quedan como estaban) y no-2xx;
+    // nunca "Permisos actualizados" sin revocación durable.
+    let created = { count: 0 }
+    let mediaRevoke
+    try {
+      mediaRevoke = await revokeUserMediaGrantsAtomic(server, id, async (tx: any) => {
+        await tx.userPermission.deleteMany({ where: { userId: id } })
+        created = await tx.userPermission.createMany({
+          data: permissions.map((p) => ({
+            userId:         id,
+            nvrId:          p.nvrId || null,
+            cameraId:       p.cameraId || null,
+            canView:        p.canView,
+            canPlayback:    p.canPlayback,
+            canPtz:         p.canPtz,
+            canHighQuality: p.canHighQuality,
+          })),
+        })
+      })
+    } catch {
+      server.log.error(`users permissions_revoke_atomic_failed userId=${id.slice(0, 8)} — rollback, permisos sin cambios`)
+      return reply.status(503).send({ message: 'No se pudieron actualizar los permisos de forma segura. Reintentá.' })
+    }
 
     await AuditAction(server.prisma, request.user.sub, 'PERMISSIONS_UPDATED', id, request, {
       permissionsCount: created.count,

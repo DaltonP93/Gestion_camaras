@@ -4,7 +4,7 @@ import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
-import { revokeUserMediaGrants, getSessionPolicy } from '../services/media/grant-service'
+import { revokeUserMediaGrantsAtomic, getSessionPolicy } from '../services/media/grant-service'
 import {
   generateTotpSecret, verifyTotpToken, getTotpQrCodeUri,
   generateBackupCodes, hashBackupCodes, verifyBackupCode,
@@ -678,13 +678,21 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
     const { refreshToken } = refreshSchema.parse(request.body)
-    await server.prisma.session.deleteMany({
-      where: { refreshToken: hashToken(refreshToken) },
-    })
-    // C22.1 (P0-1): el logout revoca los grants de medios vivos del usuario.
-    // B1: no se descarta el estado — 'pending' queda encolado (el plano falla
-    // cerrado) y se drena al recuperar Redis; se deja constancia en la auditoría.
-    const mediaRevoke = await revokeUserMediaGrants(server, request.user.sub)
+    // C23·H2·P1: el cierre de sesión y la INTENCIÓN de revocar los grants de medios
+    // se confirman ATÓMICOS (misma transacción PostgreSQL). Si la intención no puede
+    // persistirse, la transacción hace ROLLBACK: la sesión NO se borra y respondemos
+    // no-2xx. NUNCA declaramos "Sesión cerrada" con una revocación que no quedó durable.
+    // B1: 'pending' (Redis caído) sí es éxito — la intención ya es durable y el plano
+    // falla cerrado hasta el drenaje; se deja constancia en la auditoría.
+    let mediaRevoke
+    try {
+      mediaRevoke = await revokeUserMediaGrantsAtomic(server, request.user.sub, async (tx) => {
+        await (tx as any).session.deleteMany({ where: { refreshToken: hashToken(refreshToken) } })
+      })
+    } catch {
+      server.log.error(`auth logout revoke_atomic_failed userId=${request.user.sub.slice(0, 8)} — rollback, no se cerró sesión`)
+      return reply.status(503).send({ message: 'No se pudo cerrar la sesión de forma segura. Reintentá.' })
+    }
     // N2d (#9): limpiar el mapa en-proceso usuario→sesión de medios para no
     // dejarlo colgado tras el logout. Con SINGLE_ACTIVE_MEDIA_SESSION OFF es
     // no-op (el mapa nunca se pobló) ⇒ comportamiento idéntico.

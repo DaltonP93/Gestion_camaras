@@ -6,18 +6,11 @@ import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTran
 import { getFfmpegCapabilities, isTranscodingEnabled } from '../services/stream'
 import { negotiateLivePlaybackCapabilities } from '../services/live-playback-capabilities'
 import { decideLivePlayback } from '../services/live-playback-decision'
-import { getNativeReadiness } from '../services/media/grant-service'
-import { hasMediaAccess, deriveEffectiveType } from '../services/media/native-readiness'
+import { getNativeReadiness, getMediaGrantManager } from '../services/media/grant-service'
+import { deriveMediaRequest } from '../services/media/grant-derivation'
 
 // C22 · flags apagadas por defecto ⇒ la respuesta es idéntica a C21.
 const NATIVE_PLAYBACK_ENABLED = process.env.NATIVE_PLAYBACK_ENABLED === 'true'
-
-function normalizeCodec(raw: string | null | undefined): 'h264' | 'hevc' | 'unknown' {
-  if (!raw) return 'unknown'
-  if (/hevc|h\.?265|hvc1/i.test(raw)) return 'hevc'
-  if (/h\.?264|avc/i.test(raw)) return 'h264'
-  return 'unknown'
-}
 
 const heartbeatSchema = z.object({
   viewId:           z.string().min(1).max(128),
@@ -141,15 +134,18 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
     if (NATIVE_PLAYBACK_ENABLED && input.cameraId) {
       const user = request.user
       const cameraId = input.cameraId
-      const camera = await server.prisma.camera.findUnique({ where: { id: cameraId }, select: { mainCodec: true } })
-      const effectiveType = deriveEffectiveType(camera?.mainCodec)
-      // RBAC compartido con la EMISIÓN: live siempre; hd sólo si canHighQuality.
-      const perm = (user.role === 'ADMIN' || user.role === 'SUPERVISOR') ? null : await server.prisma.userPermission.findFirst({
-        where: { userId: user.sub, cameraId }, select: { canView: true, canHighQuality: true },
-      })
-      const access = {
-        live: hasMediaAccess({ role: user.role, effectiveType: 'sub', perm }),
-        hd: hasMediaAccess({ role: user.role, effectiveType: 'main', perm }),
+      // DERIVACIÓN COMPARTIDA con la emisión (/media-grant): misma cámara, tipo,
+      // codec, streamPath, RBAC y readiness POR PATH (mediaInstanceId vigente).
+      const manager = getMediaGrantManager(server)
+      const derived = await deriveMediaRequest(
+        { prisma: server.prisma as any, role: user.role, userId: user.sub, currentInstance: (p) => manager.currentInstance(p) },
+        cameraId,
+      )
+      // Camera desconocida ⇒ no puede haber nativo: acceso por rol y sin instancia.
+      const d = derived.ok ? derived.derived : {
+        mainCodec: 'unknown' as const,
+        access: { live: user.role === 'ADMIN' || user.role === 'SUPERVISOR', hd: user.role === 'ADMIN' || user.role === 'SUPERVISOR' },
+        hasInstance: false,
       }
       const slots = getTranscodeSlots()
       const availableTranscodeSlots = Math.max(0, slots.maxTranscodes - slots.activeProcessCount)
@@ -161,9 +157,12 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
         server: serverCaps,
         relayReady: ready.ready,
         nativePlaybackEnabled: NATIVE_PLAYBACK_ENABLED,
-        camera: { mainCodec: normalizeCodec(camera?.mainCodec) },
+        camera: { mainCodec: d.mainCodec },
         capacity: { availableTranscodeSlots },
-        access,
+        access: d.access,
+        // P3: sin instancia vigente para el path EXACTO, la emisión daría
+        // NO_MEDIA_INSTANCE ⇒ la negociación no elige nativo y explica el motivo.
+        mediaInstanceReady: d.hasInstance,
       })
       // P0-3 · COHERENCIA: nativeDirect.available refleja EXACTAMENTE la decisión.
       // Nunca se combina nativeDirect=false con una decisión nativa.

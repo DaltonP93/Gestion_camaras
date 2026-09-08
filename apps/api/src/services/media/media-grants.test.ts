@@ -44,6 +44,32 @@ describe('helpers', () => {
   })
 })
 
+describe('expiresAt DEVUELTO == expiresAt ALMACENADO (autoritativo del store)', () => {
+  it.each([['memoria', false], ['redis-fake', true]])('issue() en %s alinea issued.expiresAt con lo almacenado', async (_n, useRedis) => {
+    const store = useRedis ? new RedisGrantStore(new FakeRedis()) : new MemoryGrantStore()
+    const mgr = new MediaGrantManager({ store, random: seqRandom() })
+    const p = base()
+    await mgr.registerSource(p.streamPath)
+    const r = await mgr.issue(p)
+    if (!r.ok) throw new Error(`issue: ${r.code}`)
+    const stored = await store.getGrant(r.issued.grantId)
+    expect(stored).not.toBeNull()
+    // El valor devuelto al cliente coincide EXACTAMENTE con el almacenado/validado.
+    expect(r.issued.expiresAt).toBe(stored!.expiresAt)
+  })
+
+  it('issueSession() también alinea issued.expiresAt con lo almacenado', async () => {
+    const store = new RedisGrantStore(new FakeRedis())
+    const mgr = new MediaGrantManager({ store, random: seqRandom() })
+    const p = base()
+    await mgr.registerSource(p.streamPath)
+    const r = await mgr.issueSession(p)
+    if (!r.ok) throw new Error(`issueSession: ${r.code}`)
+    const stored = await store.getGrant(r.issued.grantId)
+    expect(r.issued.expiresAt).toBe(stored!.expiresAt)
+  })
+})
+
 describe.each([['memoria', false], ['redis-fake', true]])('MediaGrantManager (%s)', (_n, useRedis) => {
   const mk = (o: any = {}) => mkManager({ redis: useRedis ? new FakeRedis() : undefined, ...o })
 
@@ -68,11 +94,19 @@ describe.each([['memoria', false], ['redis-fake', true]])('MediaGrantManager (%s
   })
 
   it('P0-1(B) · vencimiento observado en el punto de linealización ⇒ EXPIRED', async () => {
+    // C23·H2·P1: la expiración del lado Redis se juzga con el RELOJ DE REDIS dentro
+    // del script (no con el Date.now() de Node). El fake toma su "reloj de Redis" del
+    // clock inyectado, así que para el store Redis avanzamos ESE reloj; para memoria
+    // sigue rigiendo el reloj lógico del manager (input.nowMs). En ambos, detener la
+    // operación hasta pasado el TTL ⇒ EXPIRED en el punto de linealización.
     const fc = fakeClock()
-    const mgr = mk({ clock: fc.clock })            // store con reloj real; manager con reloj lógico
-    const p = base({ ttlMs: 5_000 }); const issued = await issueOk(mgr, p)
+    const store = useRedis ? new RedisGrantStore(new FakeRedis(fc.clock.now)) : new MemoryGrantStore()
+    const mgr = new MediaGrantManager({ store, clock: fc.clock, random: seqRandom() })
+    const p = base({ ttlMs: 5_000 })
+    await mgr.registerSource(p.streamPath)
+    const r = await mgr.issue(p); if (!r.ok) throw new Error('issue')
     fc.advance(5_001)
-    expect((await mgr.consume({ grantId: issued.grantId, secret: issued.secret }, scopeFor(p))).reason).toBe('EXPIRED')
+    expect((await mgr.consume({ grantId: r.issued.grantId, secret: r.issued.secret }, scopeFor(p))).reason).toBe('EXPIRED')
   })
 
   it('P0-2/P0-5 · epoch avanzó (permiso/logout) ⇒ EPOCH_MISMATCH aunque el índice se escribiera tarde', async () => {
