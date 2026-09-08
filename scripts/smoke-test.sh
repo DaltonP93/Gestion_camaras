@@ -52,7 +52,10 @@ code=$(curl -sS -m 15 -o /tmp/smoke_login -w '%{http_code}' \
 
 TOKEN=""
 if [ "$code" = "200" ]; then
-  read -r flag TOKEN < <(python3 - <<'PY' < /tmp/smoke_login
+  # Nota: el programa va por -c y el JSON por stdin (< archivo). NO usar
+  # `python3 - <<'PY' < archivo`: las dos redirecciones de stdin chocan y el
+  # archivo gana, dejando a python sin su programa.
+  read -r flag TOKEN < <(python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: print("ERR",""); raise SystemExit
@@ -60,8 +63,7 @@ if d.get("requiresTwoFactor"): print("MFA","")
 elif d.get("requiresMfaEnrollment"): print("ENROLL","")
 elif d.get("accessToken"): print("OK", d["accessToken"])
 else: print("ERR","")
-PY
-)
+' < /tmp/smoke_login)
   case "$flag" in
     OK)     ok "login 200 (token recibido: ${TOKEN:0:6}…enmascarado)";;
     MFA)    info "login exige 2FA (política MFA activa) ⇒ omito pasos autenticados"; TOKEN="";;
