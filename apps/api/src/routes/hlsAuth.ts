@@ -55,6 +55,11 @@ export function parseStreamName(streamName: string): { nvrId: string; channel: n
 export function streamNameFromUri(uri: string | undefined): string | null {
   if (!uri) return null
   const path = uri.split('?')[0]
+  // Defensa en profundidad contra confusión de cámara por path-traversal: si la URI
+  // trae CUALQUIER segmento `..`, el primer segmento (que autorizamos) podría NO ser
+  // la cámara que MediaMTX termina sirviendo tras normalizar. nginx ya pasa el path
+  // normalizado ($uri), pero si por config llegara uno crudo con `..`, se rechaza.
+  if (path.split('/').some((seg) => seg === '..' || seg === '.')) return null
   const afterHls = path.replace(/^\/+/, '').replace(/^hls\//, '')
   const seg = afterHls.split('/')[0]?.trim()
   return seg && seg.length > 0 ? seg : null

@@ -125,6 +125,13 @@ bash scripts/restore.sh <archivo_de_backup>   # aborta si el checksum no coincid
   espectador vive en el borde. Rollback: comentar la línea `auth_request` en
   `infra/nginx/nginx.conf`. NOT_VALIDATED extremo-a-extremo sin el stack real
   (nginx+MediaMTX+navegador); el endpoint sí está validado por tests y en staging.
+  Notas (auditoría): (a) nginx pasa el path NORMALIZADO (`$uri`) al auth-hook para que
+  coincida con lo que sirve MediaMTX (evita confusión de cámara por `..`); el endpoint
+  además rechaza `..`. (b) UX: si la cookie de acceso expira MIENTRAS se ve en vivo, los
+  segmentos HLS dan 401 hasta que una llamada axios normal refresca la cookie (hls.js no
+  refresca solo); en la práctica el refresco ocurre pronto por el heartbeat/polling.
+  (c) Rendimiento: el auth-hook hace hasta 2 queries por segmento; con muchos
+  espectadores conviene un cache corto por (user,nvr,canal) como follow-up.
 - **Hardware:** la integración Hikvision (ISAPI/RTSP) es software real **sin validación con
   equipo** en entornos de desarrollo; el paso 7 es la primera validación real.
 - **Backup offsite / RPO-RTO** y **pin de imágenes por digest**: follow-ups de DevOps

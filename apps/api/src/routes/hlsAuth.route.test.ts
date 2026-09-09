@@ -28,6 +28,13 @@ describe('streamNameFromUri', () => {
     expect(streamNameFromUri('/hls/')).toBeNull()
     expect(streamNameFromUri(undefined)).toBeNull()
   })
+  it('rechaza path-traversal (`..`): no autorizar la 1a cámara si la URI evade a otra (P1)', () => {
+    // Con `..` el primer segmento (nvr_X_ch01) autorizaría, pero MediaMTX serviría
+    // nvr_X_ch02 tras normalizar ⇒ se rechaza de plano (defensa en profundidad).
+    expect(streamNameFromUri('/hls/nvr_X_ch01_sub/../nvr_X_ch02_sub/index.m3u8')).toBeNull()
+    expect(streamNameFromUri('/hls/../nvr_X_ch02_sub/index.m3u8')).toBeNull()
+    expect(streamNameFromUri('/hls/./nvr_X_ch01_sub/index.m3u8')).toBeNull()
+  })
 })
 
 // ── endpoint ──────────────────────────────────────────────────────────────
@@ -112,6 +119,17 @@ describe('GET /internal/hls-auth', () => {
       method: 'GET', url: '/internal/hls-auth',
       cookies: { access_token: tokenFor(app, 'admin1', 'ADMIN') },
       headers: { 'x-original-uri': '/hls/no-es-un-stream/index.m3u8' },
+    })
+    expect(res.statusCode).toBe(403)
+  })
+
+  it('P1: URI con path-traversal ⇒ 403 aunque el 1er segmento sea autorizable', async () => {
+    // OPERATOR con canView SOLO en ch03; intenta evadir a otra cámara vía `..`.
+    app = await buildApp(makePrisma([{ userId: 'op1', nvrId: 'n1', cameraId: 'cam-x', channel: 3 }]))
+    const res = await app.inject({
+      method: 'GET', url: '/internal/hls-auth',
+      cookies: { access_token: tokenFor(app, 'op1', 'OPERATOR') },
+      headers: { 'x-original-uri': '/hls/nvr_n1_ch03_sub/../nvr_n1_ch09_sub/index.m3u8' },
     })
     expect(res.statusCode).toBe(403)
   })
