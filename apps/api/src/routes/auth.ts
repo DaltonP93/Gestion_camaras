@@ -15,6 +15,7 @@ import { getSecuritySettings } from '../services/security-settings'
 import { sessionsToPrune, accessTokenTtl, decideMfaGate } from '../services/security-policy'
 import { issueWsTicket, WS_TICKET_TTL_MS } from '../services/ws-ticket'
 import { setAuthCookies, clearAuthCookies, REFRESH_COOKIE } from '../lib/auth-cookies'
+import { revokeUserWs } from '../services/ws-revoke-bus'
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
@@ -738,6 +739,9 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     // no-op (el mapa nunca se pobló) ⇒ comportamiento idéntico.
     getSessionPolicy(server).forgetUser(request.user.sub)
     await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request, { mediaRevoke })
+    // Cerrar los WS del usuario (en todos los procesos): al desloguear no debe seguir
+    // recibiendo alertas por una conexión viva.
+    await revokeUserWs(server, request.user.sub)
     return reply.send({ message: 'Sesión cerrada' })
   })
 
@@ -930,6 +934,23 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   server.post('/ws-ticket', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
+    // Re-verificar LIVENESS al emitir el ticket (el access JWT es stateless y vive su
+    // TTL completo): así, tras desactivar al usuario o revocarle todas sus sesiones,
+    // el WS cerrado con 4003 NO se puede re-abrir aunque el navegador reintente.
+    const now = new Date()
+    const user = await server.prisma.user.findUnique({
+      where: { id: request.user.sub }, select: { active: true },
+    })
+    if (!user || !user.active) {
+      return reply.status(403).send({ statusCode: 403, error: 'Forbidden', message: 'Usuario inactivo' })
+    }
+    const liveSession = await server.prisma.session.findFirst({
+      where: { userId: request.user.sub, expiresAt: { gt: now } }, select: { id: true },
+    })
+    if (!liveSession) {
+      return reply.status(401).send({ statusCode: 401, error: 'Unauthorized', message: 'Sin sesión activa' })
+    }
+
     const ticket = await issueWsTicket(server.redis, {
       userId: request.user.sub,
       username: request.user.username,

@@ -45,6 +45,7 @@ import { onvifRoutes } from './routes/onvif'
 import { hikConnectRoutes } from './routes/hikConnect'
 import { mediamtxAuthRoutes } from './routes/mediamtxAuth'
 import { hlsAuthRoutes } from './routes/hlsAuth'
+import { startWsRevokeSubscriber } from './services/ws-revoke-bus'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
@@ -294,6 +295,11 @@ async function main() {
   await server.register(hlsAuthRoutes)
   await server.register(metricsRoutes)  // /metrics (Prometheus), sin prefijo /api
   await server.register(wsHandler, { prefix: '/ws' })
+
+  // P3 — suscriptor de revocación de WS cross-worker: al revocar permisos/logout/
+  // desactivar un usuario en CUALQUIER proceso, se cierran sus WS en TODOS (Redis
+  // pub/sub). Sin Redis, el cierre queda local (mono-proceso). No bloquea el arranque.
+  startWsRevokeSubscriber(server)
 
   const COMMIT_SHA = process.env.COMMIT_SHA || 'development'
 

@@ -75,8 +75,10 @@ export async function connectWebSocket() {
     }
 
     ws.onclose = (event) => {
-      // 4001 = unauthorized — no reconectar
-      if (event.code === 4001) return
+      // 4001 = unauthorized · 4003 = revocado (permisos/logout/desactivación):
+      // no reconectar — el reintento sólo re-crearía el socket hasta que expire el
+      // JWT. La reconexión legítima ocurre tras un nuevo login/refresh.
+      if (event.code === 4001 || event.code === 4003) return
       scheduleReconnect()
     }
 
