@@ -934,6 +934,23 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   server.post('/ws-ticket', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
+    // Re-verificar LIVENESS al emitir el ticket (el access JWT es stateless y vive su
+    // TTL completo): así, tras desactivar al usuario o revocarle todas sus sesiones,
+    // el WS cerrado con 4003 NO se puede re-abrir aunque el navegador reintente.
+    const now = new Date()
+    const user = await server.prisma.user.findUnique({
+      where: { id: request.user.sub }, select: { active: true },
+    })
+    if (!user || !user.active) {
+      return reply.status(403).send({ statusCode: 403, error: 'Forbidden', message: 'Usuario inactivo' })
+    }
+    const liveSession = await server.prisma.session.findFirst({
+      where: { userId: request.user.sub, expiresAt: { gt: now } }, select: { id: true },
+    })
+    if (!liveSession) {
+      return reply.status(401).send({ statusCode: 401, error: 'Unauthorized', message: 'Sin sesión activa' })
+    }
+
     const ticket = await issueWsTicket(server.redis, {
       userId: request.user.sub,
       username: request.user.username,
