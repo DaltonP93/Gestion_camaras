@@ -116,8 +116,22 @@ bash scripts/restore.sh <archivo_de_backup>   # aborta si el checksum no coincid
 
 ## Pendientes conocidos (NO bloquean el deploy, pero decidir antes de exponer al público)
 
-- **MediaMTX `user: any`** (P1): el aislamiento del live view depende de la frontera de red.
-  Si `/hls/` se expone fuera de la LAN, resolver la autenticación por path antes.
+- **MediaMTX `user: any`** (P1) — **mitigado en el borde**: nginx ahora exige
+  `auth_request` en `/hls/` (valida la cookie de sesión + `canView` de la cámara vía
+  `GET /internal/hls-auth`) antes de proxyear a MediaMTX. **Requisito operativo:
+  MediaMTX debe quedar SOLO-INTERNO** (no publicar los puertos 8888/8889 al exterior;
+  el único camino público es nginx). `authInternalUsers: user: any` se mantiene porque
+  la creación de paths (API :9997) y el publish de FFmpeg lo necesitan; el control por
+  espectador vive en el borde. Rollback: comentar la línea `auth_request` en
+  `infra/nginx/nginx.conf`. NOT_VALIDATED extremo-a-extremo sin el stack real
+  (nginx+MediaMTX+navegador); el endpoint sí está validado por tests y en staging.
+  Notas (auditoría): (a) nginx pasa el path NORMALIZADO (`$uri`) al auth-hook para que
+  coincida con lo que sirve MediaMTX (evita confusión de cámara por `..`); el endpoint
+  además rechaza `..`. (b) UX: si la cookie de acceso expira MIENTRAS se ve en vivo, los
+  segmentos HLS dan 401 hasta que una llamada axios normal refresca la cookie (hls.js no
+  refresca solo); en la práctica el refresco ocurre pronto por el heartbeat/polling.
+  (c) Rendimiento: el auth-hook hace hasta 2 queries por segmento; con muchos
+  espectadores conviene un cache corto por (user,nvr,canal) como follow-up.
 - **Hardware:** la integración Hikvision (ISAPI/RTSP) es software real **sin validación con
   equipo** en entornos de desarrollo; el paso 7 es la primera validación real.
 - **Backup offsite / RPO-RTO** y **pin de imágenes por digest**: follow-ups de DevOps
