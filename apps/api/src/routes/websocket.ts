@@ -80,6 +80,24 @@ export function broadcastToUser(userId: string, payload: object) {
   })
 }
 
+/**
+ * Cierra TODAS las conexiones WebSocket de un usuario EN ESTE PROCESO (revocación
+ * de permisos / logout / desactivación). Idempotente: elimina la entrada de
+ * wsClients. Código 4003 = "revoked" (el cliente no debe reconectar sin re-login).
+ * El cierre cross-proceso lo coordina ws-revoke-bus vía Redis pub/sub.
+ * Devuelve cuántos sockets se cerraron (para logs/tests).
+ */
+export function closeUserConnections(userId: string, code = 4003, reason = 'revoked'): number {
+  const clients = wsClients.get(userId)
+  if (!clients) return 0
+  let n = 0
+  clients.forEach((ws) => {
+    try { ws.close(code, reason); n++ } catch { /* noop */ }
+  })
+  wsClients.delete(userId)
+  return n
+}
+
 export const wsHandler: FastifyPluginAsync = async (server) => {
   server.get('/alerts', {
     websocket: true,

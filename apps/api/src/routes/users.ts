@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 import { revokeUserMediaGrantsAtomic } from '../services/media/grant-service'
+import { revokeUserWs } from '../services/ws-revoke-bus'
 import { checkPasswordPolicy, addToPasswordHistory, resolveFeaturePermissions } from '../services/totp'
 import { getSecuritySettings } from '../services/security-settings'
 
@@ -250,6 +251,9 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
 
     await AuditAction(server.prisma, request.user.sub, 'USER_UPDATED', id, request)
 
+    // Desactivar un usuario debe cortar sus WS vivos (en todos los procesos).
+    if (data.active === false) await revokeUserWs(server, id)
+
     return reply.send(user)
   })
 
@@ -265,6 +269,7 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
 
     await server.prisma.user.delete({ where: { id } })
     await AuditAction(server.prisma, request.user.sub, 'USER_DELETED', id, request)
+    await revokeUserWs(server, id)
 
     return reply.send({ message: 'Usuario eliminado' })
   })
@@ -370,6 +375,9 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
       mediaRevoke,
     })
 
+    // Cambio de permisos ⇒ cerrar sus WS vivos (fuerza reconexión con el nuevo scope).
+    await revokeUserWs(server, id)
+
     return reply.send({ message: 'Permisos actualizados' })
   })
 
@@ -466,6 +474,8 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
       mediaRevoke,
     })
 
+    await revokeUserWs(server, id)
+
     return reply.send({ message: 'Permisos actualizados', count: created.count })
   })
 
@@ -558,6 +568,7 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
     const { id } = request.params as { id: string }
     const { count } = await server.prisma.session.deleteMany({ where: { userId: id } })
     await AuditAction(server.prisma, request.user.sub, 'USER_SESSIONS_REVOKED', id, request, { count })
+    await revokeUserWs(server, id)
     return reply.send({ message: `${count} sesiones revocadas` })
   })
 
