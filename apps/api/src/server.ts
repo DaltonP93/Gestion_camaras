@@ -44,6 +44,7 @@ import { integrationsRoutes } from './routes/integrations'
 import { onvifRoutes } from './routes/onvif'
 import { hikConnectRoutes } from './routes/hikConnect'
 import { mediamtxAuthRoutes } from './routes/mediamtxAuth'
+import { hlsAuthRoutes } from './routes/hlsAuth'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
@@ -286,6 +287,10 @@ async function main() {
   if (process.env.NATIVE_MEDIA_RELAY_ENABLED === 'true') {
     await server.register(mediamtxAuthRoutes, { prefix: '/internal/mediamtx' })
   }
+  // P1 — auth_request del HLS web por espectador (cookie → canView por cámara).
+  // SIEMPRE registrado (inerte hasta que nginx lo invoque con auth_request; interno).
+  // Define su ruta exacta /internal/hls-auth (sin prefijo).
+  await server.register(hlsAuthRoutes)
   await server.register(metricsRoutes)  // /metrics (Prometheus), sin prefijo /api
   await server.register(wsHandler, { prefix: '/ws' })
 
