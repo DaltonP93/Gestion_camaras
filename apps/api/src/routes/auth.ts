@@ -598,7 +598,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   // POST /api/auth/refresh
   // ──────────────────────────────────────────────────────────
   server.post('/refresh', async (request, reply) => {
-    // El refresh token llega por cookie HttpOnly (Path=/api/auth/refresh); se acepta
+    // El refresh token llega por cookie HttpOnly (Path=/api/auth); se acepta
     // el body como compatibilidad. Ausencia ⇒ 401 explícito (antes lo lanzaba zod).
     const body = refreshSchema.parse(request.body ?? {})
     const refreshToken = request.cookies?.[REFRESH_COOKIE] ?? body.refreshToken
