@@ -115,6 +115,24 @@ jobs:
           path: apps/web/playwright-report/
           retention-days: 7
 
+  lint:
+    name: Lint (ESLint — errores bloquean)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # ESLint bloquea sólo ERRORES (reglas de bug reales: no-unused-expressions,
+      # rules-of-hooks, recommended de js/tseslint, etc.). Los warnings (unused-vars,
+      # exhaustive-deps) se muestran pero NO rompen CI (rollout escalonado).
+      - name: Lint API
+        working-directory: apps/api
+        run: npm ci --ignore-scripts && npm run lint
+      - name: Lint Web
+        working-directory: apps/web
+        run: npm ci --ignore-scripts && npm run lint
+
   analytics:
     name: Analytics (syntax + tests)
     runs-on: ubuntu-latest

@@ -111,7 +111,7 @@ export function normalizeIpv6(host: string): string {
  */
 export function expandIpv6(raw: string): string | null {
   if (raw == null) return null
-  let h = raw.trim().replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
+  const h = raw.trim().replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
   // Zone-id (scope-id, `%eth0`): NO es un destino remoto válido. Se RECHAZA (null),
   // no se elimina en silencio — eliminarlo cambiaría el host que se valida vs. el
   // que se conecta.
