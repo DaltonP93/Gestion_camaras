@@ -14,6 +14,7 @@ import {
 import { getSecuritySettings } from '../services/security-settings'
 import { sessionsToPrune, accessTokenTtl, decideMfaGate } from '../services/security-policy'
 import { issueWsTicket, WS_TICKET_TTL_MS } from '../services/ws-ticket'
+import { setAuthCookies, clearAuthCookies, REFRESH_COOKIE } from '../lib/auth-cookies'
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
@@ -25,15 +26,21 @@ const REFRESH_REUSE_GRACE_MS = 30 * 1000               // 30 segundos
 const loginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
+  // "recordarme": controla si la cookie de refresh persiste tras cerrar el navegador.
+  rememberMe: z.boolean().optional(),
 })
 
 const twoFaVerifySchema = z.object({
   tempToken: z.string().min(1),
   code:      z.string().min(6).max(8),
+  rememberMe: z.boolean().optional(),
 })
 
+// El refresh token ahora llega por cookie HttpOnly; se acepta el body como
+// compatibilidad (integraciones/tests). Ambos opcionales: la ausencia se maneja
+// en el handler devolviendo 401.
 const refreshSchema = z.object({
-  refreshToken: z.string().min(1),
+  refreshToken: z.string().min(1).optional(),
 })
 
 const changePasswordSchema = z.object({
@@ -537,10 +544,12 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         refreshToken: true, previousRefreshToken: true,
       },
     })
-    // Marca la sesión ACTUAL comparando (opcionalmente) el refresh token del cliente,
-    // enviado en el header x-refresh-token. Cubre también el token recién rotado.
+    // Marca la sesión ACTUAL con el refresh token vigente: ahora llega por la cookie
+    // HttpOnly (Path=/api/auth cubre /api/auth/sessions); se acepta el header
+    // x-refresh-token como compatibilidad. Cubre también el token recién rotado.
     const raw = request.headers['x-refresh-token']
-    const rawToken = Array.isArray(raw) ? raw[0] : raw
+    const headerToken = Array.isArray(raw) ? raw[0] : raw
+    const rawToken = request.cookies?.[REFRESH_COOKIE] ?? headerToken
     const currentHash = rawToken ? hashToken(rawToken) : null
     return reply.send(sessions.map(({ refreshToken, previousRefreshToken, ...s }) => ({
       ...s,
@@ -572,7 +581,9 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   server.delete('/sessions', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
-    const { refreshToken } = z.object({ refreshToken: z.string().optional() }).parse(request.body ?? {})
+    const body = z.object({ refreshToken: z.string().optional() }).parse(request.body ?? {})
+    // Preserva la sesión ACTUAL (la del refresh token vigente): ahora llega por cookie.
+    const refreshToken = request.cookies?.[REFRESH_COOKIE] ?? body.refreshToken
     const currentHash = refreshToken ? hashToken(refreshToken) : null
 
     const where: any = { userId: request.user.sub }
@@ -587,7 +598,20 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   // POST /api/auth/refresh
   // ──────────────────────────────────────────────────────────
   server.post('/refresh', async (request, reply) => {
-    const { refreshToken } = refreshSchema.parse(request.body)
+    // El refresh token llega por cookie HttpOnly (Path=/api/auth/refresh); se acepta
+    // el body como compatibilidad. Ausencia ⇒ 401 explícito (antes lo lanzaba zod).
+    const body = refreshSchema.parse(request.body ?? {})
+    const refreshToken = request.cookies?.[REFRESH_COOKIE] ?? body.refreshToken
+    if (!refreshToken) {
+      return reply.status(401).send({
+        statusCode: 401, error: 'Unauthorized', message: 'Refresh token ausente',
+      })
+    }
+    // Persistencia de "recordarme": se lee del claim del refresh presentado y se
+    // propaga a la nueva cookie en cada rotación. Firma inválida ⇒ el lookup por
+    // hash fallará más abajo; default persistente para no degradar la sesión.
+    let persist = true
+    try { persist = ((server.jwt.verify(refreshToken) as any)?.rememberMe) !== false } catch { /* hash lookup decide */ }
     const presentedHash = hashToken(refreshToken)
     const now = new Date()
 
@@ -606,7 +630,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
       const payload = { sub: session.user.id, username: session.user.username, role: session.user.role }
       const newRefreshToken = (server.jwt as any).sign(
-        { ...payload, jti: crypto.randomUUID() },
+        { ...payload, jti: crypto.randomUUID(), rememberMe: persist },
         { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
       )
       const newExpiry = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS)
@@ -634,7 +658,13 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       if (won) {
         const sec = await getSecuritySettings(server.prisma)
         const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
-        return reply.send({ accessToken: newAccessToken, refreshToken: newRefreshToken })
+        setAuthCookies(reply, {
+          accessToken: newAccessToken,
+          refreshToken: newRefreshToken,
+          persist,
+          refreshMaxAgeMs: REFRESH_TOKEN_TTL_MS,
+        })
+        return reply.send({ ok: true })
       }
       // Perdimos la carrera contra un refresh concurrente del MISMO token (multi-pestaña):
       // se trata como benigno más abajo por la ventana de gracia.
@@ -678,7 +708,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   server.post('/logout', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
-    const { refreshToken } = refreshSchema.parse(request.body)
+    // El refresh token que identifica ESTA sesión llega por la cookie HttpOnly
+    // (Path=/api/auth ⇒ también se envía al logout); se acepta el body como
+    // compatibilidad. Si no viene, se limpian las cookies igual (logout idempotente).
+    const body = refreshSchema.parse(request.body ?? {})
+    const refreshToken = request.cookies?.[REFRESH_COOKIE] ?? body.refreshToken
     // C23·H2·P1: el cierre de sesión y la INTENCIÓN de revocar los grants de medios
     // se confirman ATÓMICOS (misma transacción PostgreSQL). Si la intención no puede
     // persistirse, la transacción hace ROLLBACK: la sesión NO se borra y respondemos
@@ -688,12 +722,17 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     let mediaRevoke
     try {
       mediaRevoke = await revokeUserMediaGrantsAtomic(server, request.user.sub, async (tx) => {
-        await (tx as any).session.deleteMany({ where: { refreshToken: hashToken(refreshToken) } })
+        // Sólo borra la fila de sesión si tenemos el refresh token; si no, la sesión
+        // quedará huérfana hasta expirar, pero las cookies se limpian igual.
+        if (refreshToken) {
+          await (tx as any).session.deleteMany({ where: { refreshToken: hashToken(refreshToken) } })
+        }
       })
     } catch {
       server.log.error(`auth logout revoke_atomic_failed userId=${request.user.sub.slice(0, 8)} — rollback, no se cerró sesión`)
       return reply.status(503).send({ message: 'No se pudo cerrar la sesión de forma segura. Reintentá.' })
     }
+    clearAuthCookies(reply)
     // N2d (#9): limpiar el mapa en-proceso usuario→sesión de medios para no
     // dejarlo colgado tras el logout. Con SINGLE_ACTIVE_MEDIA_SESSION OFF es
     // no-op (el mapa nunca se pobló) ⇒ comportamiento idéntico.
@@ -904,12 +943,16 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 async function completeLogin(server: any, request: any, reply: any, user: any, extra: Record<string, unknown> = {}) {
   const payload = { sub: user.id, username: user.username, role: user.role }
   const sec = await getSecuritySettings(server.prisma)
+  // "recordarme" viaja en el body de la petición que emite los tokens (login /
+  // 2FA / enrolamiento). Por defecto true (comportamiento histórico). Se guarda
+  // como claim del refresh JWT para propagar la persistencia en cada rotación.
+  const rememberMe = ((request.body as any)?.rememberMe ?? true) === true
 
   // TTL del access token = timeout de sesión configurado (hace REAL el ajuste que
   // antes sólo vivía en la UI). El refresh conserva su ventana larga.
   const accessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
   const refreshToken = (server.jwt as any).sign(
-    { ...payload, jti: crypto.randomUUID() },
+    { ...payload, jti: crypto.randomUUID(), rememberMe },
     { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
   )
 
@@ -938,9 +981,15 @@ async function completeLogin(server: any, request: any, reply: any, user: any, e
 
   await AuditAction(server.prisma, user.id, 'LOGIN', null, request)
 
-  return reply.send({
+  // Tokens en cookies HttpOnly (NO en el body): el JWT deja de ser legible por JS.
+  setAuthCookies(reply, {
     accessToken,
     refreshToken,
+    persist: rememberMe,
+    refreshMaxAgeMs: REFRESH_TOKEN_TTL_MS,
+  })
+
+  return reply.send({
     user: {
       id: user.id, username: user.username,
       fullName: user.fullName, email: user.email, role: user.role,

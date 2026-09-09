@@ -1,7 +1,7 @@
 // src/stores/authStore.ts
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { api, apiGet, apiPost } from '@/lib/api'
+import { apiGet, apiPost } from '@/lib/api'
 import { connectWebSocket, disconnectWebSocket } from '@/lib/websocket'
 import type { User, LoginResponse, UserFeaturePermissions } from '@/types'
 
@@ -46,17 +46,9 @@ interface AuthState {
   canConfigureNVR:   () => boolean
 }
 
-// Guarda los tokens en el almacenamiento elegido y fija el header Authorization.
-function persistTokens(data: { accessToken: string; refreshToken: string }, rememberMe: boolean) {
-  const storage = rememberMe ? localStorage : sessionStorage
-  storage.setItem('accessToken', data.accessToken)
-  storage.setItem('refreshToken', data.refreshToken)
-  if (!rememberMe) {
-    localStorage.removeItem('accessToken')
-    localStorage.removeItem('refreshToken')
-  }
-  api.defaults.headers.common.Authorization = `Bearer ${data.accessToken}`
-}
+// Auth por cookies HttpOnly: el servidor setea access_token/refresh_token en el
+// login. El cliente ya NO guarda tokens (JS no puede leerlos). `rememberMe` viaja
+// en el body del login/2FA/enrolamiento y define si la cookie de refresh persiste.
 
 export const useAuthStore = create<AuthState>()(
   persist(
@@ -72,7 +64,7 @@ export const useAuthStore = create<AuthState>()(
       login: async (username, password, rememberMe = true) => {
         set({ isLoading: true })
         try {
-          const data = await apiPost<any>('/auth/login', { username, password })
+          const data = await apiPost<any>('/auth/login', { username, password, rememberMe })
 
           if (data.requiresTwoFactor) {
             // Store rememberMe preference for the 2FA step
@@ -88,7 +80,7 @@ export const useAuthStore = create<AuthState>()(
             return
           }
 
-          persistTokens(data, rememberMe)
+          // Cookies ya seteadas por el servidor; sólo promovemos el usuario en memoria.
           set({
             user: data.user, isAuthenticated: true, isLoading: false, twoFactorChallenge: null,
             mfaGraceRemaining: data.mustEnrollMfa ? (data.mfaGraceRemaining ?? 0) : null,
@@ -106,13 +98,13 @@ export const useAuthStore = create<AuthState>()(
 
         set({ isLoading: true })
         try {
+          const rememberMe = sessionStorage.getItem('pendingRememberMe') !== '0'
           const data = await apiPost<LoginResponse>('/auth/2fa/verify', {
             tempToken: twoFactorChallenge.tempToken,
             code,
+            rememberMe,
           })
-          const rememberMe = sessionStorage.getItem('pendingRememberMe') !== '0'
           sessionStorage.removeItem('pendingRememberMe')
-          persistTokens(data, rememberMe)
           set({ user: data.user, isAuthenticated: true, isLoading: false, twoFactorChallenge: null })
           connectWebSocket()
         } catch (err) {
@@ -141,13 +133,13 @@ export const useAuthStore = create<AuthState>()(
         if (!mfaEnrollment) throw new Error('Sin enrolamiento MFA activo')
         set({ isLoading: true })
         try {
+          const rememberMe = sessionStorage.getItem('pendingRememberMe') !== '0'
           const data = await apiPost<any>('/auth/mfa/enroll/complete', {
             enrollToken: mfaEnrollment.enrollToken,
             code,
+            rememberMe,
           })
-          const rememberMe = sessionStorage.getItem('pendingRememberMe') !== '0'
           sessionStorage.removeItem('pendingRememberMe')
-          persistTokens(data, rememberMe)
           set({ isLoading: false, pendingUser: data.user })
           return (data.backupCodes ?? []) as string[]
         } catch (err) {
@@ -166,40 +158,30 @@ export const useAuthStore = create<AuthState>()(
       cancelMfaEnroll: () => set({ mfaEnrollment: null, pendingUser: null }),
 
       logout: async () => {
-        const refreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')
         try {
-          if (refreshToken) await apiPost('/auth/logout', { refreshToken })
+          // La cookie refresh_token (Path=/api/auth) identifica la sesión; el
+          // servidor la revoca y limpia ambas cookies. No hay nada que borrar en JS.
+          await apiPost('/auth/logout')
+        } catch {
+          // Aun si el servidor falla, cerramos sesión localmente.
         } finally {
-          localStorage.removeItem('accessToken')
-          localStorage.removeItem('refreshToken')
-          sessionStorage.removeItem('accessToken')
-          sessionStorage.removeItem('refreshToken')
-          delete api.defaults.headers.common.Authorization
           disconnectWebSocket()
           set({ user: null, isAuthenticated: false, twoFactorChallenge: null })
         }
       },
 
       loadUser: async () => {
-        // Check localStorage first (rememberMe=true), then sessionStorage (rememberMe=false)
-        const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
-        if (!token) {
-          set({ user: null, isAuthenticated: false })
-          return
-        }
-        api.defaults.headers.common.Authorization = `Bearer ${token}`
+        // Sin token en JS: la sesión se decide por la cookie. Se consulta /auth/me;
+        // si la cookie de acceso caducó, el interceptor intenta /auth/refresh antes
+        // de dar un 401 real. 200 ⇒ hay sesión; 401 ⇒ no.
         try {
           const user = await apiGet<User>('/auth/me')
           set({ user, isAuthenticated: true })
           connectWebSocket()
         } catch (err: any) {
-          // Only clear session on explicit 401 — not on network errors or 5xx
-          // to avoid logout on temporary connectivity issues during page load.
+          // Sólo cerrar sesión ante 401 explícito — no ante errores de red/5xx,
+          // para no desloguear por problemas transitorios en la carga de página.
           if (err?.response?.status === 401) {
-            localStorage.removeItem('accessToken')
-            localStorage.removeItem('refreshToken')
-            sessionStorage.removeItem('accessToken')
-            sessionStorage.removeItem('refreshToken')
             set({ user: null, isAuthenticated: false })
           }
         }

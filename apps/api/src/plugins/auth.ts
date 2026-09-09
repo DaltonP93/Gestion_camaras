@@ -1,7 +1,9 @@
 // apps/api/src/plugins/auth.ts
 import fp from 'fastify-plugin'
 import fastifyJwt from '@fastify/jwt'
+import fastifyCookie from '@fastify/cookie'
 import { redactUrlSecrets } from '../lib/log-redact'
+import { ACCESS_COOKIE } from '../lib/auth-cookies'
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
 import type { Role } from '@prisma/client'
 import type { RequestTicket } from '../services/stream-manager'
@@ -54,10 +56,21 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
     )
   }
 
+  // @fastify/cookie debe registrarse ANTES de jwt: habilita request.cookies, de
+  // donde @fastify/jwt extrae el access_token cuando no viene en el header.
+  await server.register(fastifyCookie)
+
   await server.register(fastifyJwt, {
     secret: jwtSecret,
     sign: {
       expiresIn: process.env.JWT_EXPIRES_IN || '60m',
+    },
+    // request.jwtVerify() busca el token en el header Authorization y, si no está,
+    // en la cookie HttpOnly access_token. Así conviven el flujo por cookie (navegador)
+    // y el Bearer (integraciones/tests) sin cambiar la lógica de verificación.
+    cookie: {
+      cookieName: ACCESS_COOKIE,
+      signed: false,
     },
   })
 

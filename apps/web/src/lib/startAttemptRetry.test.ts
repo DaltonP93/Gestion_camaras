@@ -67,10 +67,11 @@ beforeEach(() => {
     }
   }
 
-  // El refresh usa la instancia GLOBAL de axios, no la de la app.
+  // El refresh usa la instancia GLOBAL de axios, no la de la app. Con auth por
+  // cookies el servidor NO devuelve tokens en el body (sólo rota las cookies).
   axios.defaults.adapter = async (config: any) => ({
     status: 200, statusText: 'OK', headers: {}, config,
-    data: { accessToken: 'nuevo', refreshToken: 'r2' },
+    data: { ok: true },
   })
 })
 
@@ -89,13 +90,16 @@ describe('reintento por 401', () => {
     expect(res.startAttemptId).toBe(startAttemptId)
   })
 
-  it('lo que SÍ cambia entre los dos envíos es el token', async () => {
+  it('ningún envío lleva Authorization (auth por cookie): el token no viaja en un header legible por JS', async () => {
     await apiPost('/cameras/c1/start-stream', {
       streamType: 'main', viewId: 'v1', startAttemptId: newStartAttemptId(),
     })
 
-    expect(enviados[0].auth).toBe('Bearer viejo')
-    expect(enviados[1].auth).toBe('Bearer nuevo')
+    // Hubo reintento (2 envíos) pero la credencial va en la cookie HttpOnly:
+    // el interceptor ya no inyecta ni rota ningún header Authorization.
+    expect(enviados).toHaveLength(2)
+    expect(enviados[0].auth).toBeUndefined()
+    expect(enviados[1].auth).toBeUndefined()
   })
 
   it('sin 401 hay un solo envío, con su intento', async () => {

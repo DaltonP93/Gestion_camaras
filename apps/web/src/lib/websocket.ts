@@ -14,18 +14,16 @@ export async function connectWebSocket() {
   // Ya hay un socket vivo o en curso ⇒ no abrir otro.
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return
 
-  const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
-  if (!token) return
-
   // Autenticación por TICKET: el JWT ya NO viaja en la URL del WebSocket (quedaba
   // en logs/historial/Referer). Se pide un ticket efímero de un solo uso al backend
-  // (con el Bearer en el header) y se abre el WS con ese ticket opaco.
+  // (autenticado por la cookie HttpOnly, vía credentials:'include') y se abre el WS
+  // con ese ticket opaco. Sin token en JS: si no hay sesión, el POST responde 401.
   connecting = true
   let ticket: string
   try {
     const res = await fetch(`${window.location.origin}/api/auth/ws-ticket`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      credentials: 'include',
     })
     // 401 = sesión inválida/expirada: no reconectar en bucle (se reconectará tras
     // el próximo login/refresh). Otro error: reintentar con backoff.

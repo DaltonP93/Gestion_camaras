@@ -52,22 +52,18 @@ function PasswordStrength({ password }: { password: string }) {
 function SessionsPanel() {
   const [sessions, setSessions] = useState<UserSession[]>([])
   const [loading, setLoading] = useState(true)
-  const currentRefreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      // Enviar el refresh token actual para que el backend marque la sesión de ESTE
-      // dispositivo (s.current), en vez de adivinar por orden.
-      const data = await apiGet<UserSession[]>(
-        '/auth/sessions', undefined,
-        currentRefreshToken ? { 'x-refresh-token': currentRefreshToken } : undefined,
-      )
+      // El backend marca la sesión de ESTE dispositivo (s.current) leyendo la cookie
+      // HttpOnly refresh_token; el cliente ya no puede (ni necesita) enviar el token.
+      const data = await apiGet<UserSession[]>('/auth/sessions')
       setSessions(data)
     } finally {
       setLoading(false)
     }
-  }, [currentRefreshToken])
+  }, [])
 
   useEffect(() => { load() }, [load])
 
@@ -83,7 +79,7 @@ function SessionsPanel() {
 
   const revokeAll = async () => {
     try {
-      await apiDelete('/auth/sessions', { refreshToken: currentRefreshToken ?? undefined })
+      await apiDelete('/auth/sessions')
       await load()
       toast.success('Todas las otras sesiones cerradas')
     } catch {

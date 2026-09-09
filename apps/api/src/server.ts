@@ -12,6 +12,7 @@ import path from 'path'
 import fs from 'fs'
 import { redactUrlSecrets } from './lib/log-redact'
 import { resolveCorsOptions } from './lib/cors-config'
+import { isCsrfSafe, requestHasAuthCookie } from './lib/csrf'
 import { cspDirectives } from './lib/security-headers'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
@@ -200,6 +201,26 @@ async function main() {
   await server.register(prismaPlugin)
   await server.register(redisPlugin)
   await server.register(authPlugin)
+
+  // ─── CSRF (defensa en profundidad para auth por cookie) ───
+  // Registrado DESPUÉS de authPlugin (que registra @fastify/cookie): así
+  // request.cookies ya está poblado. Sólo afecta a mutaciones autenticadas por
+  // cookie; las llamadas Bearer/servicio→servicio no llevan estas cookies.
+  server.addHook('onRequest', async (request, reply) => {
+    if (isCsrfSafe({
+      method: request.method,
+      origin: request.headers.origin,
+      referer: request.headers.referer,
+      host: request.headers.host,
+      hasAuthCookie: requestHasAuthCookie(request.cookies),
+      corsOriginsEnv: process.env.CORS_ORIGINS,
+    })) return
+    server.log.warn(`[csrf] 403 ${request.method} ${redactUrlSecrets(request.url)} origin=${request.headers.origin ?? '(none)'}`)
+    return reply.status(403).send({
+      statusCode: 403, error: 'Forbidden', message: 'Origen no permitido (CSRF)', code: 'CSRF_BLOCKED',
+    })
+  })
+
   await server.register(websocket)
 
   // ─── Plugins de archivos estáticos y multipart ───────────

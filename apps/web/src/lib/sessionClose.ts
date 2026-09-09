@@ -8,25 +8,16 @@
 // servidor hasta vencer el TTL. Mientras tanto contaba como demanda real para
 // el monitor de pipeline.
 //
-// POR QUÉ NO `navigator.sendBeacon`: sendBeacon no permite fijar encabezados,
-// así que no puede enviar `Authorization: Bearer …`. Las alternativas serían
-// poner el token en la URL (queda en logs de nginx y en el historial) o montar
-// una cookie ad-hoc: ambas empeoran la seguridad para resolver un problema que
-// `fetch(..., { keepalive: true })` resuelve sin ceder nada.
+// AUTENTICACIÓN POR COOKIE: la cookie HttpOnly access_token viaja sola con
+// `credentials: 'include'`, incluso en un `fetch(..., { keepalive: true })` durante
+// la descarga de la página. Ya no se lee ningún token de JS (no es accesible) ni se
+// pone en la URL. Se usa `fetch keepalive` (no `sendBeacon`) para poder LEER la
+// respuesta del servidor (desenlace del cierre), cosa que sendBeacon no permite.
 //
 // El TTL del servidor sigue siendo la GARANTÍA FINAL: esto es una optimización
 // para liberar antes, nunca la única vía de cierre.
 
 const BASE_URL = import.meta.env.VITE_API_URL || ''
-
-/** Mismo origen del token que usa el interceptor de axios. */
-function readAccessToken(): string | null {
-  try {
-    return localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
-  } catch {
-    return null   // storage bloqueado (modo privado estricto)
-  }
-}
 
 /**
  * Desenlace del cierre TAL COMO LO DECLARA EL SERVIDOR.
@@ -39,7 +30,7 @@ function readAccessToken(): string | null {
 export type CloseOutcome = 'ignored' | 'attempt_released' | 'session_closed'
 
 export interface CloseResult {
-  /** La petición se pudo emitir (hubo token y `fetch` no lanzó). */
+  /** La petición se pudo emitir (`fetch` no lanzó). */
   emitted: boolean
   /** Código HTTP, si llegó respuesta. */
   status?: number
@@ -74,14 +65,13 @@ export async function closeWithKeepalive(
   path: string,
   body?: Record<string, unknown>,
 ): Promise<CloseResult> {
-  const token = readAccessToken()
-  if (!token) return { emitted: false }
   try {
-    const headers: Record<string, string> = { Authorization: `Bearer ${token}` }
+    const headers: Record<string, string> = {}
     if (body) headers['Content-Type'] = 'application/json'
     const res = await fetch(`${BASE_URL}/api${path}`, {
       method: 'DELETE',
       keepalive: true,
+      credentials: 'include',   // envía la cookie HttpOnly de sesión
       headers,
       body: body ? JSON.stringify(body) : undefined,
     })
