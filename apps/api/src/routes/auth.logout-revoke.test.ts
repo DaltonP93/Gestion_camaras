@@ -7,6 +7,7 @@
 //     NO se borra y el grant previo sigue igual (nada cambió).
 import { describe, it, expect, beforeEach } from 'vitest'
 import Fastify, { type FastifyInstance } from 'fastify'
+import fastifyCookie from '@fastify/cookie'
 import { authRoutes } from './auth'
 import {
   getMediaGrantManager, setMediaRevokeOutboxForTest, __resetMediaGrantManagerForTest,
@@ -54,6 +55,7 @@ class TxOutbox implements MediaRevokeOutboxRepo {
 
 async function buildApp(prisma: any, redis: FakeRedis): Promise<FastifyInstance> {
   const app = Fastify()
+  await app.register(fastifyCookie)   // habilita reply.setCookie/clearCookie (auth por cookies)
   app.decorate('authenticate', async (req: any) => { req.user = { sub: 'victim', username: 'v', role: 'OPERATOR' } })
   app.decorate('prisma', prisma)
   app.decorate('redis', redis as any)

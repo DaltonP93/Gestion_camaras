@@ -446,8 +446,10 @@ export interface AuditLog {
 }
 
 export interface LoginResponse {
-  accessToken: string
-  refreshToken: string
+  // Con auth por cookies HttpOnly el servidor ya NO devuelve tokens en el body;
+  // sólo el usuario. Se conservan opcionales por compatibilidad de tipos.
+  accessToken?: string
+  refreshToken?: string
   user: User
 }
 
