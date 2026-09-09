@@ -599,7 +599,7 @@ export function startHealthWorker(server: FastifyInstance) {
 
   cron.schedule('30 3 * * *', async () => {
     try {
-      let purged = { alerts: 0, deliveries: 0, audit: 0 }
+      const purged = { alerts: 0, deliveries: 0, audit: 0 }
       if (ALERTS_RETENTION_DAYS > 0) {
         // Solo alertas ya resueltas — las activas nunca se purgan
         const r = await server.prisma.alert.deleteMany({
