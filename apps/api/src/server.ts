@@ -83,9 +83,10 @@ async function main() {
     server.log.error('[startup] FATAL: JWT_SECRET no está definido. La autenticación no funcionará. Define JWT_SECRET en .env')
     process.exit(1)
   }
-  if (!process.env.JWT_REFRESH_SECRET) {
-    server.log.warn('[startup] JWT_REFRESH_SECRET no definido — se usará JWT_SECRET como fallback. Define JWT_REFRESH_SECRET en .env para mayor seguridad.')
-  }
+  // (P3) Se eliminó el aviso de JWT_REFRESH_SECRET: era engañoso. No existe tal
+  // "fallback" — los refresh tokens SIEMPRE se firman/verifican con JWT_SECRET
+  // (@fastify/jwt), y la variable no estaba cableada a nada. Definirla no cambiaba
+  // nada, así que el aviso sugería una protección inexistente.
   try {
     const nvrKeyWarning = validateNvrCredentialKey()
     if (nvrKeyWarning) server.log.warn(nvrKeyWarning)
