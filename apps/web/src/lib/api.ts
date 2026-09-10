@@ -9,13 +9,10 @@ export const api = axios.create({
   baseURL: `${BASE_URL}/api`,
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' },
-})
-
-// ─── Request interceptor: inyectar token desde localStorage/sessionStorage ──
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
-  if (token) config.headers.Authorization = `Bearer ${token}`
-  return config
+  // Auth por cookies HttpOnly: el navegador adjunta access_token/refresh_token
+  // automáticamente. Ya NO se inyecta `Authorization: Bearer` ni se lee ningún
+  // token desde localStorage/sessionStorage (JS no puede leer las cookies).
+  withCredentials: true,
 })
 
 // ─── Refresh mutex: evita múltiples refreshes en paralelo ────
@@ -24,26 +21,14 @@ let refreshPromise: Promise<void> | null = null
 async function refreshAccessToken(): Promise<void> {
   if (refreshPromise) return refreshPromise
   refreshPromise = (async () => {
-    const refreshToken = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken')
-    if (!refreshToken) throw new Error('No refresh token')
     try {
-      const res = await axios.post<{ accessToken: string; refreshToken?: string }>(
-        `${BASE_URL}/api/auth/refresh`,
-        { refreshToken }
-      )
-      // Preserve whichever storage the refresh token came from. El backend ahora ROTA el
-      // refresh token en cada refresh (fase 4c): hay que persistir el nuevo, o el próximo
-      // refresh presentaría un token ya rotado y se detectaría como reutilización.
-      const store = localStorage.getItem('refreshToken') ? localStorage : sessionStorage
-      store.setItem('accessToken', res.data.accessToken)
-      if (res.data.refreshToken) store.setItem('refreshToken', res.data.refreshToken)
+      // La cookie refresh_token (Path=/api/auth) viaja sola; el servidor rota y
+      // reescribe las cookies. No hay tokens en el body ni nada que guardar en JS.
+      await axios.post(`${BASE_URL}/api/auth/refresh`, {}, { withCredentials: true })
     } catch (err: any) {
-      // TOKEN_ROTATED: otra pestaña refrescó concurrentemente y ya dejó un accessToken
-      // fresco en el storage compartido. No cerramos sesión: reutilizamos ese token.
-      if (err?.response?.data?.code === 'TOKEN_ROTATED') {
-        const fresh = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
-        if (fresh) return
-      }
+      // TOKEN_ROTATED: otra pestaña refrescó concurrentemente; las cookies (compartidas
+      // por origen) ya están frescas ⇒ no es error, se reintenta la petición original.
+      if (err?.response?.data?.code === 'TOKEN_ROTATED') return
       throw err
     }
   })().finally(() => { refreshPromise = null })
@@ -106,15 +91,11 @@ api.interceptors.response.use(
     if (error.response?.status === 401 && !originalRequest._retry && !isAuthEndpoint && !isSilentEndpoint) {
       originalRequest._retry = true
       try {
+        // Renueva la cookie access_token vía /auth/refresh y reintenta con la cookie
+        // ya fresca (el navegador la adjunta sola; no hay header que reinyectar).
         await refreshAccessToken()
-        const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken')
-        if (token) originalRequest.headers.Authorization = `Bearer ${token}`
         return api(originalRequest)
       } catch {
-        localStorage.removeItem('accessToken')
-        localStorage.removeItem('refreshToken')
-        sessionStorage.removeItem('accessToken')
-        sessionStorage.removeItem('refreshToken')
         dispatchAuthExpired()
         return Promise.reject(error)
       }

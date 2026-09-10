@@ -1,7 +1,7 @@
 // apps/api/src/routes/websocket.ts
 import type { FastifyPluginAsync } from 'fastify'
 import type { WebSocket } from 'ws'
-import type { JWTPayload } from '../plugins/auth'
+import { consumeWsTicket } from '../services/ws-ticket'
 
 // Mapa global de conexiones WebSocket por userId
 export const wsClients = new Map<string, Set<WebSocket>>()
@@ -80,30 +80,50 @@ export function broadcastToUser(userId: string, payload: object) {
   })
 }
 
+/**
+ * Cierra TODAS las conexiones WebSocket de un usuario EN ESTE PROCESO (revocación
+ * de permisos / logout / desactivación). Idempotente: elimina la entrada de
+ * wsClients. Código 4003 = "revoked" (el cliente no debe reconectar sin re-login).
+ * El cierre cross-proceso lo coordina ws-revoke-bus vía Redis pub/sub.
+ * Devuelve cuántos sockets se cerraron (para logs/tests).
+ */
+export function closeUserConnections(userId: string, code = 4003, reason = 'revoked'): number {
+  const clients = wsClients.get(userId)
+  if (!clients) return 0
+  let n = 0
+  clients.forEach((ws) => {
+    try { ws.close(code, reason); n++ } catch { /* noop */ }
+  })
+  wsClients.delete(userId)
+  return n
+}
+
 export const wsHandler: FastifyPluginAsync = async (server) => {
   server.get('/alerts', {
     websocket: true,
-  }, (socket: WebSocket, request) => {
+  }, async (socket: WebSocket, request) => {
     const ws = socket
 
-    const { token: rawToken = '' } = request.query as { token?: string }
+    // Autenticación por TICKET de un solo uso (no por JWT en la URL): el cliente
+    // obtiene el ticket vía POST /api/auth/ws-ticket (Bearer) y lo canjea aquí.
+    // El JWT nunca viaja en la URL del WebSocket (invariante #6: nada sensible en
+    // logs/URL). El ticket se consume atómicamente (getdel) ⇒ un solo uso.
+    const { ticket } = request.query as { ticket?: string }
 
-    let userPayload: JWTPayload
-    try {
-      userPayload = server.jwt.verify<JWTPayload>(rawToken)
-    } catch {
+    const identity = await consumeWsTicket(server.redis, ticket)
+    if (!identity) {
       ws.close(4001, 'Unauthorized')
       return
     }
 
-    const userId = userPayload.sub
+    const userId = identity.userId
 
     if (!wsClients.has(userId)) {
       wsClients.set(userId, new Set())
     }
     wsClients.get(userId)!.add(ws)
 
-    server.log.info(`WS conectado: usuario ${userPayload.username}`)
+    server.log.info(`WS conectado: usuario ${identity.username}`)
 
     const pingInterval = setInterval(() => {
       if (ws.readyState === 1) {
@@ -129,7 +149,7 @@ export const wsHandler: FastifyPluginAsync = async (server) => {
       if (wsClients.get(userId)?.size === 0) {
         wsClients.delete(userId)
       }
-      server.log.info(`WS desconectado: usuario ${userPayload.username}`)
+      server.log.info(`WS desconectado: usuario ${identity.username}`)
     })
 
     ws.on('error', (err: Error) => {

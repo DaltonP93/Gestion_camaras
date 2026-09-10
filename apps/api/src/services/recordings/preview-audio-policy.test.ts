@@ -297,7 +297,7 @@ describe('máquina de stderr simulada (HEVC + Audio: none) — un único fallbac
     let audioSeen = false
     let detectedAudioCodec: string | null = null
     let attemptVideoOnly = false
-    let firstByteSent = false
+    const firstByteSent = false
     let audioFallbackTried = false
     let restarts = 0
 
@@ -323,7 +323,7 @@ describe('máquina de stderr simulada (HEVC + Audio: none) — un único fallbac
   })
 
   it('H.264 + Audio: none ⇒ un restart (video-only reproduce)', () => {
-    let tail = 'Input #0\nStream #0:0: Video: h264, 1280x720\nStream #0:1: Audio: none\n'
+    const tail = 'Input #0\nStream #0:0: Video: h264, 1280x720\nStream #0:1: Audio: none\n'
     const r = decideReactiveAudioRestart({
       configuredMode: 'auto', detectedAudioCodec: 'none', audioStreamSeen: true,
       stderrText: tail, attemptVideoOnly: false, firstByteSent: false, audioFallbackTried: false,
@@ -348,7 +348,7 @@ import { makeStderrLineBuffer } from './preview-audio-policy'
 // Simula el consumo por chunks del handler real usando el MISMO buffer que la ruta.
 function runStderrChunks(chunks: string[], configuredMode: 'auto' | 'enabled' | 'disabled' = 'auto') {
   const buf = makeStderrLineBuffer()
-  let tail: string[] = []
+  const tail: string[] = []
   let audioSeen = false
   let detectedAudioCodec: string | null = null
   let attemptVideoOnly = false

@@ -649,7 +649,35 @@ model AlertSettings {
   recipientEmails String   @default("")
   alertTypes      Json     @default("{\"CAMERA_OFFLINE\":true,\"NVR_OFFLINE\":true,\"HDD_FULL\":true,\"HDD_ERROR\":true,\"MOTION_DETECTED\":false,\"RECORDING_ERROR\":true,\"AUTH_FAILED\":false}")
   minSeverity     String   @default("HIGH")
+  // Canales de webhook salientes (además del email). URLs configuradas por ADMIN;
+  // se validan contra SSRF y NUNCA se registran completas en el historial (llevan token).
+  slackEnabled    Boolean  @default(false)
+  slackWebhookUrl String   @default("")
+  teamsEnabled    Boolean  @default(false)
+  teamsWebhookUrl String   @default("")
+  webhookEnabled  Boolean  @default(false)
+  webhookUrl      String   @default("")
   updatedAt       DateTime @updatedAt
 
   @@map("alert_settings")
+}
+
+// ─── Outbox durable de revocación de medios (C23·H2·P2) ──────────────
+// Registro DURABLE de la intención de revocar los grants de medios de un usuario
+// (logout / cambio de permisos). Sobrevive a un reinicio del API durante una
+// caída de Redis: la fila se escribe en Postgres ANTES/independiente de tocar
+// Redis, y un worker idempotente aplica el bump de epoch y marca `appliedAt`.
+// Mientras exista una fila sin aplicar para un usuario, el relay falla CERRADO.
+// NUNCA almacena grants, secretos ni tokens: sólo userId + timestamps + intentos.
+model MediaRevokeOutbox {
+  id          String    @id @default(cuid())
+  userId      String
+  requestedAt DateTime  @default(now())
+  appliedAt   DateTime?
+  attempts    Int       @default(0)
+
+  // Consulta caliente del fail-closed y del drenaje: pendientes por usuario.
+  @@index([userId, appliedAt])
+  @@index([appliedAt])
+  @@map("media_revoke_outbox")
 }

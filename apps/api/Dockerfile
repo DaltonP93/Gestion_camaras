@@ -7,7 +7,8 @@ RUN apk add --no-cache openssl
 
 # Install dependencies
 COPY apps/api/package*.json ./
-RUN npm install
+# npm ci: instala exactamente lo fijado en package-lock.json (build reproducible).
+RUN npm ci
 
 # Copy source and prisma schema (from root context)
 COPY apps/api/src ./src
@@ -27,7 +28,8 @@ RUN apk add --no-cache dumb-init openssl ffmpeg
 
 COPY apps/api/package*.json ./
 # prisma moved to dependencies so the CLI is present in production too
-RUN npm install --only=production
+# npm ci --omit=dev: build reproducible, solo dependencias de producción.
+RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma

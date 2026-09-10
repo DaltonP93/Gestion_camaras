@@ -1,9 +1,9 @@
 // src/components/UserPermissionsModal.tsx
 import { useEffect, useState, useCallback } from 'react'
 import {
-  X, Check, Shield, Server, Video, Download, Zap,
-  Radio, RefreshCw, Settings, Bell, Eye, Film, AlertTriangle,
-  Database, Star, UserCheck, Monitor, Layout, ToggleLeft,
+  X, Check, Shield, Server, Video, Download,
+  Radio, RefreshCw, Settings, Bell, Eye, Film,
+  Database, Star, UserCheck, Layout, ToggleLeft,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import toast from 'react-hot-toast'
@@ -24,10 +24,11 @@ const FEATURE_DEFS: { section: string; items: FeatDef[] }[] = [
   {
     section: 'Módulos',
     items: [
+      // #171: se retiran los flags de feature UI_ONLY (evadibles, el backend no los
+      // leía): `canViewLive` (vivo ya gateado por `canView` de cámara) y `canViewAlerts`
+      // (alertas ya filtradas por `canView` de recurso). No prometemos controles inexistentes.
       { key: 'canViewDashboard',    label: 'Ver Dashboard',          icon: <Layout size={12} /> },
-      { key: 'canViewLive',         label: 'Ver en vivo',            icon: <Monitor size={12} /> },
       { key: 'canViewRecordings',   label: 'Ver grabaciones',        icon: <Film size={12} /> },
-      { key: 'canViewAlerts',       label: 'Ver alertas',            icon: <AlertTriangle size={12} /> },
       { key: 'canViewDiagnostics',  label: 'Ver diagnósticos',       icon: <Database size={12} /> },
     ],
   },
@@ -45,7 +46,8 @@ const FEATURE_DEFS: { section: string; items: FeatDef[] }[] = [
     items: [
       { key: 'canResolveAlerts',    label: 'Resolver alertas',           icon: <Check size={12} /> },
       { key: 'canRestartStreams',    label: 'Reiniciar streams',          icon: <RefreshCw size={12} /> },
-      { key: 'canTranscode',        label: 'Transcodificar',             icon: <Zap size={12} /> },
+      // #171: `canTranscode` retirado (UI_ONLY): sin gate backend; el HD/main lo
+      // gobierna `canHighQuality` (ENFORCED). No se promete un control inexistente.
       { key: 'canDownloadRecordings', label: 'Descargar grabaciones',    icon: <Download size={12} /> },
       { key: 'canManageViews',      label: 'Gestionar vistas',           icon: <ToggleLeft size={12} /> },
       { key: 'canManageSettings',   label: 'Gestionar ajustes',          icon: <Settings size={12} /> },
@@ -79,7 +81,8 @@ const CAM_FIELDS: { field: CamField; label: string }[] = [
   { field: 'canDownload',      label: 'Descargar' },
   { field: 'canHighQuality',   label: 'Alta calidad' },
   { field: 'canUseMainStream', label: 'Main stream' },
-  { field: 'canUseTranscode',  label: 'Transcode' },
+  // #171: `canUseTranscode` (por cámara) retirado — UI_ONLY: no hay gate de transcode
+  // por cámara; el acceso HD ya lo gobierna `canHighQuality` (ENFORCED).
   { field: 'canAddToViews',    label: 'Agregar a vistas' },
   { field: 'canReceiveAlerts', label: 'Alertas' },
 ]

@@ -37,7 +37,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('closeWithKeepalive', () => {
-  it('emite DELETE con keepalive y el token en Authorization', async () => {
+  it('emite DELETE con keepalive y la cookie de sesión (credentials:include), sin Authorization', async () => {
     const ok = await closeWithKeepalive('/cameras/cam1/stream?streamType=sub')
 
     expect(ok).toMatchObject({ emitted: true })
@@ -46,27 +46,24 @@ describe('closeWithKeepalive', () => {
     expect(url).toBe('/api/cameras/cam1/stream?streamType=sub')
     expect(init.method).toBe('DELETE')
     expect(init.keepalive).toBe(true)
-    expect(init.headers.Authorization).toBe('Bearer tok-abc')
+    expect(init.credentials).toBe('include')
+    // El JWT ya NO viaja en un header legible por JS: la cookie HttpOnly lo lleva.
+    expect(init.headers?.Authorization).toBeUndefined()
   })
 
-  it('nunca pone el token en la URL', async () => {
+  it('nunca pone credenciales en la URL', async () => {
     await closeWithKeepalive('/cameras/cam1/stream')
     const [url] = fetchMock.mock.calls[0]
-    expect(String(url)).not.toContain('tok-abc')
+    expect(String(url)).not.toContain('token')
   })
 
-  it('acepta el token desde sessionStorage', async () => {
+  it('emite aunque no haya ningún token en JS (la cookie la adjunta el navegador)', async () => {
     localStorage.clear()
-    sessionStorage.setItem('accessToken', 'tok-session')
-    await closeWithKeepalive('/cameras/cam1/stream')
-    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe('Bearer tok-session')
-  })
-
-  it('sin token no emite la petición (evita un 401 inútil al descargar)', async () => {
-    localStorage.clear()
+    sessionStorage.clear()
     const ok = await closeWithKeepalive('/cameras/cam1/stream')
-    expect(ok).toEqual({ emitted: false })
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(ok).toMatchObject({ emitted: true })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][1].credentials).toBe('include')
   })
 
   it('un fetch que rechaza NO lanza: informa que no se emitió', async () => {

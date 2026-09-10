@@ -12,6 +12,7 @@ import path from 'path'
 import fs from 'fs'
 import { redactUrlSecrets } from './lib/log-redact'
 import { resolveCorsOptions } from './lib/cors-config'
+import { isCsrfSafe, requestHasAuthCookie } from './lib/csrf'
 import { cspDirectives } from './lib/security-headers'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
@@ -31,7 +32,7 @@ import profileRoutes from './routes/profile'
 import alertSettingsRoutes from './routes/alertSettings'
 import { liveViewRoutes } from './routes/liveView'
 import { mediaGrantsRoutes } from './routes/mediaGrants'
-import { getMediaGrantManager, startRevokeRecovery } from './services/media/grant-service'
+import { getMediaGrantManager, startRevokeRecovery, assertRevokeOutboxAvailable } from './services/media/grant-service'
 import { SourceLifecycleController, startSourceLifecyclePoller, createMediaMtxPathLister } from './services/media/source-lifecycle'
 import { searchRoutes } from './routes/search'
 import { nvrConfigRoutes } from './routes/nvrConfig'
@@ -43,6 +44,8 @@ import { integrationsRoutes } from './routes/integrations'
 import { onvifRoutes } from './routes/onvif'
 import { hikConnectRoutes } from './routes/hikConnect'
 import { mediamtxAuthRoutes } from './routes/mediamtxAuth'
+import { hlsAuthRoutes } from './routes/hlsAuth'
+import { startWsRevokeSubscriber } from './services/ws-revoke-bus'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
@@ -81,9 +84,10 @@ async function main() {
     server.log.error('[startup] FATAL: JWT_SECRET no está definido. La autenticación no funcionará. Define JWT_SECRET en .env')
     process.exit(1)
   }
-  if (!process.env.JWT_REFRESH_SECRET) {
-    server.log.warn('[startup] JWT_REFRESH_SECRET no definido — se usará JWT_SECRET como fallback. Define JWT_REFRESH_SECRET en .env para mayor seguridad.')
-  }
+  // (P3) Se eliminó el aviso de JWT_REFRESH_SECRET: era engañoso. No existe tal
+  // "fallback" — los refresh tokens SIEMPRE se firman/verifican con JWT_SECRET
+  // (@fastify/jwt), y la variable no estaba cableada a nada. Definirla no cambiaba
+  // nada, así que el aviso sugería una protección inexistente.
   try {
     const nvrKeyWarning = validateNvrCredentialKey()
     if (nvrKeyWarning) server.log.warn(nvrKeyWarning)
@@ -200,6 +204,26 @@ async function main() {
   await server.register(prismaPlugin)
   await server.register(redisPlugin)
   await server.register(authPlugin)
+
+  // ─── CSRF (defensa en profundidad para auth por cookie) ───
+  // Registrado DESPUÉS de authPlugin (que registra @fastify/cookie): así
+  // request.cookies ya está poblado. Sólo afecta a mutaciones autenticadas por
+  // cookie; las llamadas Bearer/servicio→servicio no llevan estas cookies.
+  server.addHook('onRequest', async (request, reply) => {
+    if (isCsrfSafe({
+      method: request.method,
+      origin: request.headers.origin,
+      referer: request.headers.referer,
+      host: request.headers.host,
+      hasAuthCookie: requestHasAuthCookie(request.cookies),
+      corsOriginsEnv: process.env.CORS_ORIGINS,
+    })) return
+    server.log.warn(`[csrf] 403 ${request.method} ${redactUrlSecrets(request.url)} origin=${request.headers.origin ?? '(none)'}`)
+    return reply.status(403).send({
+      statusCode: 403, error: 'Forbidden', message: 'Origen no permitido (CSRF)', code: 'CSRF_BLOCKED',
+    })
+  })
+
   await server.register(websocket)
 
   // ─── Plugins de archivos estáticos y multipart ───────────
@@ -265,8 +289,17 @@ async function main() {
   if (process.env.NATIVE_MEDIA_RELAY_ENABLED === 'true') {
     await server.register(mediamtxAuthRoutes, { prefix: '/internal/mediamtx' })
   }
+  // P1 — auth_request del HLS web por espectador (cookie → canView por cámara).
+  // SIEMPRE registrado (inerte hasta que nginx lo invoque con auth_request; interno).
+  // Define su ruta exacta /internal/hls-auth (sin prefijo).
+  await server.register(hlsAuthRoutes)
   await server.register(metricsRoutes)  // /metrics (Prometheus), sin prefijo /api
   await server.register(wsHandler, { prefix: '/ws' })
+
+  // P3 — suscriptor de revocación de WS cross-worker: al revocar permisos/logout/
+  // desactivar un usuario en CUALQUIER proceso, se cierran sus WS en TODOS (Redis
+  // pub/sub). Sin Redis, el cierre queda local (mono-proceso). No bloquea el arranque.
+  startWsRevokeSubscriber(server)
 
   const COMMIT_SHA = process.env.COMMIT_SHA || 'development'
 
@@ -320,6 +353,12 @@ async function main() {
   // ─── Jobs en background ───────────────────────────────────
   startHealthWorker(server)
   startSyncWorker(server)
+
+  // C23·H2·P1 — FAIL-CLOSED de arranque: exige el outbox durable de revocación
+  // (delegate Prisma `mediaRevokeOutbox` + `$transaction`). Si falta, ABORTA el
+  // arranque en vez de degradar en silencio a memoria (que volvería fail-OPEN la
+  // revocación de logout/permisos). No se difiere el fallo al primer logout.
+  assertRevokeOutboxAvailable(server)
 
   // B1 — Recuperación de la revocación durable de medios. Si Redis cae durante un
   // logout / cambio de permisos, `revokeUserMediaGrants` encola el usuario y el

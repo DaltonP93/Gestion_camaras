@@ -5,7 +5,9 @@ import {
   getMediaGrantManager, revokeUserMediaGrants, retryPendingUserRevokes,
   startRevokeRecovery, __pendingUserRevokeCount, __resetMediaGrantManagerForTest,
   setMediaKicker, kickConnectionsForGrants,
+  revokeUserMediaGrantsAtomic, setMediaRevokeOutboxForTest, assertRevokeOutboxAvailable,
 } from './grant-service'
+import { InMemoryMediaRevokeOutbox, type MediaRevokeOutboxRepo } from './revoke-outbox'
 import type { MediaMtxKicker } from './relay-kick'
 
 function fakeServer(redis: FakeRedis) {
@@ -44,8 +46,10 @@ describe('revokeUserMediaGrants (P0-3 · no se traga; fail-closed; retry)', () =
     const status = await revokeUserMediaGrants(server, 'userX')
     expect(status).toBe('pending')                 // NO declara revocación completa
     expect(__pendingUserRevokeCount()).toBe(1)
-    // El plano falla cerrado: el grant no valida mientras el backend está caído.
-    expect((await mgr.consume({ grantId: r.issued.grantId, secret: r.issued.secret }, scope)).reason).toBe('BACKEND_UNAVAILABLE')
+    // El plano falla cerrado en el CAMINO ACTIVO: consume() ahora rechaza por la
+    // DEUDA de revocación pendiente ANTES de tocar el backend (fail-closed más
+    // preciso que el viejo BACKEND_UNAVAILABLE). El grant sigue sin ser aceptable.
+    expect((await mgr.consume({ grantId: r.issued.grantId, secret: r.issued.secret }, scope)).reason).toBe('REVOKE_PENDING')
 
     // Redis se recupera y se drena el pending (epoch se incrementa).
     redis.down = false
@@ -60,6 +64,38 @@ describe('revokeUserMediaGrants (P0-3 · no se traga; fail-closed; retry)', () =
     const server = fakeServer(redis)
     expect(await revokeUserMediaGrants(server, 'userY')).toBe('applied')
     expect(__pendingUserRevokeCount()).toBe(0)
+  })
+})
+
+describe('assertRevokeOutboxAvailable · fail-closed de arranque', () => {
+  it('RECHAZA un outbox en memoria sin inyección explícita (delegate ausente + runtime test)', () => {
+    const server = { log: { info() {}, warn() {} }, redis: new FakeRedis() } as any // sin prisma.mediaRevokeOutbox
+    expect(() => assertRevokeOutboxAvailable(server)).toThrow(/EN MEMORIA/)
+  })
+
+  it('ACEPTA InMemory cuando fue inyectado explícitamente por un test', () => {
+    const server = { log: { info() {}, warn() {} }, redis: new FakeRedis() } as any
+    setMediaRevokeOutboxForTest(new InMemoryMediaRevokeOutbox())
+    expect(() => assertRevokeOutboxAvailable(server)).not.toThrow()
+  })
+})
+
+describe('revokeUserMediaGrantsAtomic · robustez post-commit', () => {
+  it('si el drenaje LANZA tras el commit, devuelve pending (no propaga ⇒ la ruta no responde 503)', async () => {
+    const redis = new FakeRedis()
+    // $transaction real-ish: ejecuta el callback (commit implícito al resolver).
+    const prisma = { $transaction: async (fn: any) => fn({ mediaRevokeOutbox: { create: async () => ({}) } }) }
+    const server = { log: { info() {}, warn() {} }, redis, prisma } as any
+    // Outbox cuya intención se persiste OK (enqueueInTx) pero cuyo DRENAJE post-commit
+    // lanza (simula un blip de backend justo después del commit atómico).
+    const outbox: MediaRevokeOutboxRepo = {
+      async enqueue() {}, async enqueueInTx() {}, async hasPending() { return false },
+      async pendingUserIds() { return [] }, async pruneApplied() { return 0 },
+      async drain() { throw new Error('blip post-commit') },
+    }
+    setMediaRevokeOutboxForTest(outbox)
+    // No debe rechazar: la intención ya es durable ⇒ 'pending' (se drena en el barrido).
+    await expect(revokeUserMediaGrantsAtomic(server, 'userX', async () => {})).resolves.toBe('pending')
   })
 })
 

@@ -15,7 +15,25 @@ const settingsSchema = z.object({
   recipientEmails: z.string().optional(),
   alertTypes: z.record(z.boolean()).optional(),
   minSeverity: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).optional(),
+  // Canales de webhook salientes (Slack / Teams / genérico).
+  slackEnabled: z.boolean().optional(),
+  slackWebhookUrl: z.string().optional(),
+  teamsEnabled: z.boolean().optional(),
+  teamsWebhookUrl: z.string().optional(),
+  webhookEnabled: z.boolean().optional(),
+  webhookUrl: z.string().optional(),
 })
+
+// Las URLs de webhook (Slack/Teams incluyen un token secreto en la ruta) se
+// enmascaran en las respuestas igual que la contraseña SMTP: se muestra un
+// placeholder si hay valor y NO se sobrescribe si el cliente reenvía el placeholder.
+const MASK = '••••••••'
+const WEBHOOK_URL_FIELDS = ['slackWebhookUrl', 'teamsWebhookUrl', 'webhookUrl'] as const
+function maskSettings<T extends Record<string, any>>(s: T): T {
+  const out: Record<string, any> = { ...s, smtpPassword: s.smtpPassword ? MASK : '' }
+  for (const f of WEBHOOK_URL_FIELDS) out[f] = s[f] ? MASK : ''
+  return out as T
+}
 
 const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
   // GET /api/alerts/settings/deliveries
@@ -51,8 +69,8 @@ const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
     if (!settings) {
       return reply.status(404).send({ message: 'Configuración no encontrada' })
     }
-    // Hide password in response
-    return reply.send({ ...settings, smtpPassword: settings.smtpPassword ? '••••••••' : '' })
+    // Ocultar contraseña SMTP y URLs de webhook (llevan token) en la respuesta.
+    return reply.send(maskSettings(settings))
   })
 
   // PUT /api/alerts/settings
@@ -61,10 +79,11 @@ const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
   }, async (request, reply) => {
     const data = settingsSchema.parse(request.body)
 
-    // If smtpPassword is the masked placeholder, don't overwrite
+    // No sobrescribir secretos si el cliente reenvía el placeholder enmascarado.
     const updateData: Record<string, unknown> = { ...data }
-    if (data.smtpPassword === '••••••••') {
-      delete updateData.smtpPassword
+    if (data.smtpPassword === MASK) delete updateData.smtpPassword
+    for (const f of WEBHOOK_URL_FIELDS) {
+      if ((data as Record<string, unknown>)[f] === MASK) delete updateData[f]
     }
 
     const settings = await server.prisma.alertSettings.upsert({
@@ -73,7 +92,7 @@ const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
       create: { id: 'singleton', ...updateData } as any,
     })
 
-    return reply.send({ ...settings, smtpPassword: settings.smtpPassword ? '••••••••' : '' })
+    return reply.send(maskSettings(settings))
   })
 
   // POST /api/alerts/settings/test-email

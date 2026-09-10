@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { decideLivePlayback, decideAdmissionOrWait, type LivePlaybackDecisionInput } from './live-playback-decision'
+import { decideLivePlayback, type LivePlaybackDecisionInput } from './live-playback-decision'
 
 const serverCaps = { ffmpegAvailable: true, transcodingEnabled: true, maxTranscodeSessions: 2 }
 
@@ -53,16 +53,5 @@ describe('decideLivePlayback', () => {
   })
   it('playback OFF ⇒ sin nativeBlockedReason', () => {
     expect(decideLivePlayback(input({ nativePlaybackEnabled: false, relayReady: false })).nativeBlockedReason).toBeUndefined()
-  })
-})
-
-describe('decideAdmissionOrWait (helper puro)', () => {
-  it('cupo libre ⇒ start; sin cupo ⇒ wait; cancel ⇒ cancelled', () => {
-    expect(decideAdmissionOrWait({ maxSlots: 2, activeSlots: 1, cancelRequested: false }).action).toBe('start')
-    expect(decideAdmissionOrWait({ maxSlots: 2, activeSlots: 2, cancelRequested: false }).action).toBe('wait')
-    expect(decideAdmissionOrWait({ maxSlots: 2, activeSlots: 0, cancelRequested: true }).action).toBe('cancelled')
-  })
-  it('INVARIANTE: jamás start con activeSlots >= maxSlots', () => {
-    for (let a = 2; a <= 6; a++) expect(decideAdmissionOrWait({ maxSlots: 2, activeSlots: a, cancelRequested: false }).action).not.toBe('start')
   })
 })

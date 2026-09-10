@@ -25,6 +25,13 @@ export interface LivePlaybackDecisionInput {
   capacity: { availableTranscodeSlots: number }
   /** RBAC del usuario para esta cámara (mismo predicado que la emisión). */
   access: { live: boolean; hd: boolean }
+  /**
+   * C23·H2·P3 — ¿El path EXACTO tiene una mediaInstanceId vigente? (misma
+   * verificación que exige la emisión). `false` ⇒ la emisión respondería
+   * NO_MEDIA_INSTANCE, así que NO se elige nativo. Opcional: `undefined` ≡ listo,
+   * para no romper llamadores/tests previos que no conocen esta señal.
+   */
+  mediaInstanceReady?: boolean
 }
 
 export interface LivePlaybackDecisionResult {
@@ -59,13 +66,18 @@ function nativeBlockedReason(input: LivePlaybackDecisionInput): LivePlaybackReas
   const eff = nativeEffective(input)
   if (!deviceNativeCapable(input, eff.codec)) return 'CLIENT_CAPABILITY_MISSING'
   if (!input.relayReady) return 'RELAY_BACKEND_NOT_READY'
+  // El path exacto sin instancia ⇒ la emisión daría NO_MEDIA_INSTANCE.
+  if (input.mediaInstanceReady === false) return 'NO_MEDIA_INSTANCE'
   if (eff.type === 'main' && !input.access.hd) return 'HD_PERMISSION_MISSING'
   return 'CLIENT_CAPABILITY_MISSING'
 }
 
-/** ¿Es elegible el nativo directo? (readiness + dispositivo + RBAC del tipo efectivo). */
+/** ¿Es elegible el nativo directo? (readiness + dispositivo + RBAC del tipo efectivo + instancia por path). */
 function nativeTransportIfEligible(input: LivePlaybackDecisionInput): LiveClientTransport | null {
   if (!input.nativePlaybackEnabled || !input.relayReady) return null
+  // Sin instancia vigente para el path EXACTO no puede haber nativo (la emisión se
+  // negaría con NO_MEDIA_INSTANCE). `undefined` ≡ listo (compatibilidad).
+  if (input.mediaInstanceReady === false) return null
   const eff = nativeEffective(input)
   if (!deviceNativeCapable(input, eff.codec)) return null
   // RBAC: el usuario debe poder obtener el grant del tipo efectivo.
@@ -107,19 +119,4 @@ export function decideLivePlayback(input: LivePlaybackDecisionInput): LivePlayba
     return { decision: 'server_h264', reason: 'SERVER_H264_DIRECT', transport: 'hls', consumesServerTranscodeSlot: false, waiting: false, nativeBlockedReason: blocked }
   }
   return { ...serverFallback(input), nativeBlockedReason: blocked }
-}
-
-// ─── admisión / espera de cupo (helper PURO, no cableado al flujo real) ──
-export interface AdmissionInput { maxSlots: number; activeSlots: number; cancelRequested: boolean }
-export interface AdmissionResult { action: 'start' | 'wait' | 'cancelled'; retriable: boolean }
-
-/**
- * NOTA (honestidad): predicado PURO probado. La aplicación real del límite de 2
- * transcodes sigue en el lifecycle de stream-manager (invariante C1–C21); esto
- * NO es un flujo nuevo cableado.
- */
-export function decideAdmissionOrWait(i: AdmissionInput): AdmissionResult {
-  if (i.cancelRequested) return { action: 'cancelled', retriable: false }
-  if (i.activeSlots < i.maxSlots) return { action: 'start', retriable: false }
-  return { action: 'wait', retriable: true }
 }

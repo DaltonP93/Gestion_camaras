@@ -61,6 +61,36 @@ describe('assertSafeDeviceUrl — bloqueados', () => {
   })
 })
 
+describe('assertSafeDeviceUrl — metadatos cloud sobre IPv6 (AWS IMDS fd00:ec2::254)', () => {
+  it.each([
+    ['comprimido',           'http://[fd00:ec2::254]/latest/meta-data/'],
+    ['expandido',            'http://[fd00:0ec2:0000:0000:0000:0000:0000:0254]/latest/meta-data/'],
+    ['mayúsculas',           'http://[FD00:EC2::254]/latest/meta-data/'],
+    ['expandido+mayúsculas', 'http://[FD00:0EC2:0000:0000:0000:0000:0000:0254]/'],
+  ])('bloquea la forma %s del endpoint IMDS IPv6', (_label, url) => {
+    expect(code(() => assertSafeDeviceUrl(url))).toBe('SSRF_BLOCKED')
+  })
+
+  it('allowPublic NO puede desbloquear el endpoint IMDS IPv6 (ninguna forma)', () => {
+    expect(code(() => assertSafeDeviceUrl('http://[fd00:ec2::254]/', { allowPublic: true }))).toBe('SSRF_BLOCKED')
+    expect(code(() => assertSafeDeviceUrl('http://[FD00:0EC2:0000:0000:0000:0000:0000:0254]/', { allowPublic: true }))).toBe('SSRF_BLOCKED')
+  })
+
+  it('allowedHosts NO puede desbloquear el endpoint IMDS IPv6', () => {
+    expect(code(() => assertSafeDeviceUrl('http://[fd00:ec2::254]/', { allowedHosts: ['[fd00:ec2::254]', 'fd00:ec2::254'] }))).toBe('SSRF_BLOCKED')
+  })
+
+  it('sigue permitiendo una ULA legítima que NO es metadatos', () => {
+    expect(() => assertSafeDeviceUrl('http://[fd12::1]/onvif')).not.toThrow()
+  })
+})
+
+describe('assertSafeDeviceUrl — IPv4 no canónica (parser-differential)', () => {
+  it('rechaza octal por ceros a la izquierda (010.0.0.1 ≠ 10.0.0.1)', () => {
+    expect(code(() => assertSafeDeviceUrl('http://010.0.0.1/onvif'))).toBe('SSRF_BLOCKED')
+  })
+})
+
 describe('assertSafeDeviceUrl — política', () => {
   it('allowPublic permite una IP pública', () => {
     expect(() => assertSafeDeviceUrl('http://8.8.8.8/onvif', { allowPublic: true })).not.toThrow()

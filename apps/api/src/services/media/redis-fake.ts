@@ -18,11 +18,17 @@ export class FakeRedis implements RedisGrantClient {
   /** Simula backend caído: toda operación lanza. */
   down = false
 
+  // Reloj "de Redis" del fake (inyectable): es el instante autoritativo que usan
+  // los scripts (TIME) y el desalojo de KV. Los scripts reales leen redis.call('TIME');
+  // aquí el equivalente controlable es este reloj, de modo que las pruebas de
+  // expiración por reloj de Redis puedan avanzarlo sin depender de Date.now().
+  constructor(private readonly clock: () => number = () => Date.now()) {}
+
   private guard(): void { if (this.down) throw new Error('redis down') }
   private live(k: string): { v: string; exp: number | null } | null {
     const e = this.kv.get(k)
     if (!e) return null
-    if (e.exp !== null && Date.now() > e.exp) { this.kv.delete(k); return null }
+    if (e.exp !== null && this.clock() > e.exp) { this.kv.delete(k); return null }
     return e
   }
 
@@ -31,7 +37,7 @@ export class FakeRedis implements RedisGrantClient {
   async set(k: string, v: string, _m: 'PX', ttl: number, nx?: 'NX'): Promise<unknown> {
     this.guard()
     if (nx === 'NX' && this.live(k)) return null
-    this.kv.set(k, { v, exp: ttl ? Date.now() + ttl : null })
+    this.kv.set(k, { v, exp: ttl ? this.clock() + ttl : null })
     return 'OK'
   }
   async del(k: string): Promise<unknown> { this.guard(); this.kv.delete(k); return 1 }
@@ -49,8 +55,14 @@ export class FakeRedis implements RedisGrantClient {
       const keys = args.slice(0, numKeys).map(String)
       const argv = args.slice(numKeys).map(String)
       const [grantKey, userIdx, viewIdx, sessionIdx] = keys
-      const [grantJson, pxStr, member, hasSession] = argv
-      this.kv.set(grantKey, { v: grantJson, exp: Date.now() + Number(pxStr) })
+      const [grantJson, ttlStr, member, hasSession, , keyPxStr] = argv
+      // Redis-time: el fake FIJA issuedAt/expiresAt con su reloj (equivalente a TIME);
+      // la clave sobrevive keyPx (ttl lógico + gracia), igual que el script real.
+      const now = this.clock()
+      const grant = JSON.parse(grantJson) as StoredMediaGrant
+      grant.issuedAt = now
+      grant.expiresAt = now + Number(ttlStr)
+      this.kv.set(grantKey, { v: JSON.stringify(grant), exp: now + Number(keyPxStr) })
       const addSet = (k: string, m: string): void => { let s = this.sets.get(k); if (!s) { s = new Set(); this.sets.set(k, s) } s.add(m) }
       addSet(userIdx, member)
       addSet(viewIdx, member)
@@ -75,15 +87,16 @@ export class FakeRedis implements RedisGrantClient {
       const keys = args.slice(0, numKeys).map(String)
       const argv = args.slice(numKeys).map(String)
       const [grantKey, epochKey, instKey] = keys
-      const [userId, cameraId, streamPath, transport, action, secretHash, nowStr] = argv
+      const [userId, cameraId, streamPath, transport, action, secretHash] = argv
       const rawGrant = this.live(grantKey)?.v
       const grant = rawGrant ? (JSON.parse(rawGrant) as StoredMediaGrant) : null
       const userEpoch = parseInt(this.live(epochKey)?.v ?? '0', 10)
       const currentInstance = this.live(instKey)?.v ?? null
+      // Redis-time: el instante de decisión sale del reloj del fake (equivalente a TIME).
       const input: ValidateAndClaimInput = {
         grantId: grantKey, presentedSecretHash: secretHash,
         scope: { userId, cameraId, streamPath, transport: transport as MediaTransport, action: action as MediaAction },
-        nowMs: Number(nowStr),
+        nowMs: this.clock(),
       }
       const { result } = validateSessionReducer({ grant, userEpoch, currentInstance }, input)
       return JSON.stringify({ ok: result.ok, reason: result.reason })
@@ -92,19 +105,21 @@ export class FakeRedis implements RedisGrantClient {
     const keys = args.slice(0, numKeys).map(String)
     const argv = args.slice(numKeys).map(String)
     const [grantKey, epochKey, instKey, claimKey] = keys
-    const [userId, cameraId, streamPath, transport, action, secretHash, nowStr, claimTtlStr] = argv
+    const [userId, cameraId, streamPath, transport, action, secretHash] = argv
     const rawGrant = this.live(grantKey)?.v
     const grant = rawGrant ? (JSON.parse(rawGrant) as StoredMediaGrant) : null
     const userEpoch = parseInt(this.live(epochKey)?.v ?? '0', 10)
     const currentInstance = this.live(instKey)?.v ?? null
     const alreadyClaimed = !!this.live(claimKey)
+    // Redis-time: instante de decisión y TTL del claim se derivan del reloj del fake.
+    const now = this.clock()
     const input: ValidateAndClaimInput = {
       grantId: grantKey, presentedSecretHash: secretHash,
       scope: { userId, cameraId, streamPath, transport: transport as MediaTransport, action: action as MediaAction },
-      nowMs: Number(nowStr),
+      nowMs: now,
     }
     const { result, claim } = validateAndClaimReducer({ grant, userEpoch, currentInstance, alreadyClaimed }, input)
-    if (claim) this.kv.set(claimKey, { v: '1', exp: Date.now() + Number(claimTtlStr) })
+    if (claim) this.kv.set(claimKey, { v: '1', exp: now + Math.max(1, (grant ? grant.expiresAt : now + 1000) - now) })
     return JSON.stringify({ ok: result.ok, reason: result.reason })
   }
 }

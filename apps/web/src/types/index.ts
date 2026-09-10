@@ -112,6 +112,12 @@ export interface AlertSettings {
   recipientEmails: string
   alertTypes: Record<string, boolean>
   minSeverity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  slackEnabled?: boolean
+  slackWebhookUrl?: string
+  teamsEnabled?: boolean
+  teamsWebhookUrl?: string
+  webhookEnabled?: boolean
+  webhookUrl?: string
   updatedAt: string
 }
 
@@ -440,8 +446,10 @@ export interface AuditLog {
 }
 
 export interface LoginResponse {
-  accessToken: string
-  refreshToken: string
+  // Con auth por cookies HttpOnly el servidor ya NO devuelve tokens en el body;
+  // sólo el usuario. Se conservan opcionales por compatibilidad de tipos.
+  accessToken?: string
+  refreshToken?: string
   user: User
 }
 
