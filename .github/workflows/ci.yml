@@ -182,6 +182,11 @@ jobs:
           bash -n infra/certbot/init-ssl.sh
           bash -n infra/certbot/upgrade-to-https.sh
           bash -n scripts/check-cert-lineage.sh
+          bash -n infra/certbot/init-ssl.test.sh
+      # Ejercita el FLUJO de bootstrap de init-ssl.sh con Docker mockeado (estado
+      # vacío, dummy interrumpido y linaje administrado). Sin red ni contenedores.
+      - name: Bootstrap init-ssl.sh (docker mockeado)
+        run: bash infra/certbot/init-ssl.test.sh
 
   analytics-image:
     name: Analytics image (native deps smoke test)

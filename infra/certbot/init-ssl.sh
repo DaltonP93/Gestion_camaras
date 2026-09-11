@@ -1,40 +1,62 @@
 #!/bin/bash
-# init-ssl.sh — Obtener certificado Let's Encrypt por primera vez
+# init-ssl.sh — Obtener el certificado Let's Encrypt del linaje canónico por 1ª vez.
 # Ejecutar desde el directorio raíz del proyecto: bash infra/certbot/init-ssl.sh
+#
+# Idempotente y recuperable ante interrupción:
+#   - "Linaje ya emitido" se decide por la RENEWAL CONFIG de certbot
+#     (/etc/letsencrypt/renewal/<CERT_NAME>.conf), NO por `test -f live/*.pem`
+#     (un dummy de un run interrumpido tiene los .pem pero NO es un linaje real).
+#   - El cert dummy de arranque se marca con `.dummy` y se ELIMINA antes de emitir,
+#     pero SÓLO si NO existe un linaje administrado (nunca se borra uno válido).
+#   - La emisión usa `--entrypoint certbot` para NO heredar el loop de `renew` que
+#     el servicio define como entrypoint (si no, `run certbot certonly` ejecutaría
+#     el loop e ignoraría `certonly`).
 set -e
 
-# DOMAIN = SAN del certificado (lo que va en `-d`). CERT_NAME = nombre del LINAJE
-# en /etc/letsencrypt/live/<CERT_NAME> (lo que sirve nginx). Se mantienen SEPARADOS
-# a propósito: el linaje canónico es `camaras-le`. El linaje viejo llamado igual que
-# el dominio (`camaras.saa.com.py`) quedó con un cert de CA privada y renewal config
-# inválida; NO se reutiliza. Emitir con `--cert-name camaras-le` fija el linaje.
+# DOMAIN = SAN del certificado (lo que va en `-d`). CERT_NAME = nombre del LINAJE en
+# /etc/letsencrypt/live/<CERT_NAME> (lo que sirve nginx). SEPARADOS a propósito: el
+# linaje canónico es `camaras-le`. El linaje viejo homónimo del dominio
+# (`camaras.saa.com.py`) quedó con un cert de CA privada y renewal config inválida;
+# NO se reutiliza. Emitir con `--cert-name camaras-le` fija el linaje.
 DOMAIN="camaras.saa.com.py"
 CERT_NAME="camaras-le"
 EMAIL="${LETS_ENCRYPT_EMAIL:-sistemas@saa.com.py}"
+
+LE_LIVE="/etc/letsencrypt/live/${CERT_NAME}"
+LE_RENEWAL="/etc/letsencrypt/renewal/${CERT_NAME}.conf"
+DUMMY_MARKER="${LE_LIVE}/.dummy"
+
+# Helpers: `cb` corre un comando en el contenedor certbot SIN su entrypoint (loop de
+# renew); `cb_certbot` corre el BINARIO certbot (entrypoint explícito) para `certonly`.
+cb()         { docker compose run --rm --entrypoint "" certbot "$@"; }
+cb_certbot() { docker compose run --rm --entrypoint certbot certbot "$@"; }
 
 CERT_PATH="$(docker volume inspect visioncore_certbot_conf --format '{{.Mountpoint}}' 2>/dev/null || echo '')"
 if [ -z "$CERT_PATH" ]; then
   echo "⚠️  Corriendo docker compose para crear volúmenes..."
   docker compose up --no-start nginx certbot 2>/dev/null || true
-  CERT_PATH="$(docker volume inspect visioncore_certbot_conf --format '{{.Mountpoint}}' 2>/dev/null || echo '')"
 fi
 
-# Si ya existe un certificado real en el linaje canónico, salir
-if docker compose run --rm --entrypoint "" certbot \
-    test -f "/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem" 2>/dev/null; then
-  echo "✅ El certificado ya existe para el linaje ${CERT_NAME} (${DOMAIN})"
-  echo "   Para renovar: docker compose exec certbot certbot renew --cert-name ${CERT_NAME}"
+# 1) ¿Ya existe un LINAJE ADMINISTRADO por certbot? La renewal config es la fuente de
+#    verdad (un dummy interrumpido NO la tiene). Si existe, no re-emitimos.
+if cb test -f "${LE_RENEWAL}"; then
+  echo "✅ Linaje administrado ${CERT_NAME} ya existe (${DOMAIN}); no se re-emite."
+  echo "   Renovar: docker compose exec certbot certbot renew --cert-name ${CERT_NAME}"
   exit 0
 fi
 
-echo "📦 Creando certificado temporal (dummy) para arrancar nginx..."
-docker compose run --rm --entrypoint "" certbot sh -c "
-  mkdir -p /etc/letsencrypt/live/${CERT_NAME}
+# 2) Sin linaje administrado: crear un cert DUMMY (marcado) para que nginx pueda
+#    levantar el server{} en 443 y responder el ACME HTTP-01 por /var/www/certbot.
+echo "📦 Creando certificado temporal (dummy, marcado) para arrancar nginx..."
+cb sh -c "
+  set -e
+  mkdir -p '${LE_LIVE}'
   openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
-    -keyout /etc/letsencrypt/live/${CERT_NAME}/privkey.pem \
-    -out    /etc/letsencrypt/live/${CERT_NAME}/fullchain.pem \
+    -keyout '${LE_LIVE}/privkey.pem' \
+    -out    '${LE_LIVE}/fullchain.pem' \
     -subj '/CN=${DOMAIN}' 2>/dev/null
-  cp /etc/letsencrypt/live/${CERT_NAME}/fullchain.pem /etc/letsencrypt/live/${CERT_NAME}/chain.pem
+  cp '${LE_LIVE}/fullchain.pem' '${LE_LIVE}/chain.pem'
+  touch '${DUMMY_MARKER}'
 "
 
 echo "🚀 Arrancando nginx con certificado dummy..."
@@ -43,8 +65,25 @@ docker compose up -d nginx
 echo "⏳ Esperando que nginx esté listo..."
 sleep 5
 
+# 3) Antes de emitir: si el live dir es un DUMMY (marcado) y NO hay linaje
+#    administrado, eliminarlo para que certbot cree el linaje limpio. NUNCA se borra
+#    un linaje administrado válido (guardado por la renewal config).
+echo "🧹 Preparando el linaje para la emisión real..."
+cb sh -c "
+  set -e
+  if [ -f '${LE_RENEWAL}' ]; then
+    echo '   linaje administrado presente: NO se toca el live dir.'
+  elif [ -f '${DUMMY_MARKER}' ]; then
+    echo '   removiendo dummy de bootstrap antes de emitir.'
+    rm -rf '${LE_LIVE}'
+  fi
+"
+
+# 4) Emitir el certificado real. `--entrypoint certbot` es OBLIGATORIO: sin él,
+#    `docker compose run certbot certonly …` heredaría el loop de `renew` del
+#    servicio y NO ejecutaría certonly. `--cert-name` fija el linaje canónico.
 echo "🔐 Obteniendo certificado real de Let's Encrypt para ${DOMAIN} (linaje ${CERT_NAME})..."
-docker compose run --rm certbot certonly \
+cb_certbot certonly \
   --webroot \
   --webroot-path=/var/www/certbot \
   --cert-name "${CERT_NAME}" \
