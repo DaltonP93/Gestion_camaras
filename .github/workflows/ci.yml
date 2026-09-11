@@ -167,6 +167,22 @@ jobs:
       - name: Verificar prefijos de migración
         run: bash scripts/check-migration-prefixes.sh
 
+  cert-lineage:
+    name: Linaje de certificado TLS (camaras-le consistente)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Falla si se reintroduce la ruta del linaje viejo/inválido o si nginx,
+      # los scripts de certbot y el compose dejan de coincidir en `camaras-le`.
+      # También impide comitear certificados/llaves reales (ver el script).
+      - name: Verificar linaje de certificado
+        run: bash scripts/check-cert-lineage.sh
+      - name: Sintaxis de scripts de certbot (bash -n)
+        run: |
+          bash -n infra/certbot/init-ssl.sh
+          bash -n infra/certbot/upgrade-to-https.sh
+          bash -n scripts/check-cert-lineage.sh
+
   analytics-image:
     name: Analytics image (native deps smoke test)
     runs-on: ubuntu-latest

@@ -88,9 +88,15 @@ docker compose exec nginx nginx -s reload
 docker compose restart api
 ```
 
-La renovación automática está configurada en el servicio `certbot` del compose (cada 12 horas).
+La renovación automática está configurada en el servicio `certbot` del compose (cada 12 horas),
+acotada al **linaje canónico `camaras-le`** (`certbot renew --cert-name camaras-le`). nginx recarga
+solo cada ~6h y toma el cert renovado del volumen compartido (sin `docker.sock`).
 
-Dominio configurado: `camaras.saa.com.py`. Para cambiarlo, editar `infra/certbot/init-ssl.sh` y `upgrade-to-https.sh`.
+Dominio (SAN): `camaras.saa.com.py`. **Linaje del certificado (lo que sirve nginx): `camaras-le`**
+— `init-ssl.sh` emite con `--cert-name camaras-le`, por lo que el cert vive en
+`/etc/letsencrypt/live/camaras-le/`. Para cambiar dominio o linaje, editar `DOMAIN`/`CERT_NAME` en
+`infra/certbot/init-ssl.sh` y `upgrade-to-https.sh` y las rutas `ssl_certificate(_key)` de
+`infra/nginx/nginx.conf` (el guard `scripts/check-cert-lineage.sh` verifica que sigan coincidiendo).
 
 ---
 

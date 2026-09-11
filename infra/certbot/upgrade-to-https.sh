@@ -18,13 +18,16 @@
 # versionada — el bloque TLS proviene de la nginx.conf endurecida, no de un template.
 set -e
 
+# CERT_NAME = linaje canónico servido por nginx (ver init-ssl.sh). El linaje viejo
+# homónimo del dominio quedó inválido; se verifica y sirve SIEMPRE `camaras-le`.
 DOMAIN="camaras.saa.com.py"
+CERT_NAME="camaras-le"
 NGINX_CONF="infra/nginx/nginx.conf"
 
-# 1) Verificar que el certificado existe.
+# 1) Verificar que el certificado del linaje canónico existe.
 if ! docker compose run --rm --entrypoint "" certbot \
-    test -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" 2>/dev/null; then
-  echo "❌ No existe el certificado. Primero ejecutar: bash infra/certbot/init-ssl.sh"
+    test -f "/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem" 2>/dev/null; then
+  echo "❌ No existe el certificado del linaje ${CERT_NAME}. Primero ejecutar: bash infra/certbot/init-ssl.sh"
   exit 1
 fi
 
@@ -46,7 +49,7 @@ echo "🔄 Recargando nginx con la config HTTPS endurecida versionada..."
 docker compose exec nginx nginx -s reload
 
 echo ""
-echo "✅ HTTPS activo para https://${DOMAIN} usando infra/nginx/nginx.conf (endurecida)."
+echo "✅ HTTPS activo para https://${DOMAIN} (linaje ${CERT_NAME}) usando infra/nginx/nginx.conf (endurecida)."
 echo "   La renovación de certificados corre en el contenedor certbot; nginx además"
 echo "   recarga solo cada 6h para tomar el cert renovado (ver 'command' de nginx en"
 echo "   docker-compose.yml), por lo que no hace falta un reload manual tras renovar."
