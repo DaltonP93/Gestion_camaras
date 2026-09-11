@@ -66,7 +66,11 @@ bash infra/certbot/upgrade-to-https.sh  # ya NO regenera nginx: solo valida + re
 docker compose exec nginx nginx -s reload
 # luego: COOKIE_SECURE=true en .env + docker compose restart api
 ```
-nginx recarga sola cada ~6h para tomar certs renovados (`docker-compose.yml:342`).
+Linaje canónico del certificado: **`camaras-le`** (`init-ssl.sh` emite con `--cert-name camaras-le`;
+nginx sirve `/etc/letsencrypt/live/camaras-le/`). El contenedor certbot renueva **sólo** ese linaje
+(`certbot renew --cert-name camaras-le`), ignorando configs residuales del linaje viejo. nginx recarga
+sola cada ~6h y toma el cert renovado del volumen compartido, sin `docker.sock`. El guard
+`scripts/check-cert-lineage.sh` (job CI `cert-lineage`) impide reintroducir rutas inconsistentes.
 
 ## 5. Migraciones
 

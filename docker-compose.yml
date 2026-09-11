@@ -346,7 +346,12 @@ services:
     volumes:
       - certbot_conf:/etc/letsencrypt
       - certbot_www:/var/www/certbot
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --quiet; sleep 12h & wait $${!}; done;'"
+    # Renovar SÓLO el linaje canónico `camaras-le` (`--cert-name`). Sin esto,
+    # `certbot renew` procesa TODO /etc/letsencrypt/renewal/*.conf, incluida la
+    # config residual e inválida del linaje viejo `camaras.saa.com.py`, que hace
+    # ruido/errores en cada ciclo. nginx (servicio de arriba) recarga solo cada 6h
+    # y toma el cert renovado del volumen compartido; no se usa docker.sock.
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --cert-name camaras-le --quiet; sleep 12h & wait $${!}; done;'"
 
 volumes:
   postgres_data:
