@@ -37,12 +37,26 @@ if [ -z "$CERT_PATH" ]; then
   docker compose up --no-start nginx certbot 2>/dev/null || true
 fi
 
-# 1) ¿Ya existe un LINAJE ADMINISTRADO por certbot? La renewal config es la fuente de
-#    verdad (un dummy interrumpido NO la tiene). Si existe, no re-emitimos.
+# 1) ¿Ya existe un LINAJE ADMINISTRADO por certbot? La renewal config es la señal de
+#    que certbot administra el linaje (un dummy interrumpido NO la tiene). Pero la
+#    renewal config sola NO alcanza: el linaje se considera VÁLIDO sólo si además
+#    fullchain.pem y privkey.pem existen y NO están vacíos/rotos.
+#      - renewal + cert + key OK        → early exit (no re-emitir).
+#      - renewal presente pero cert/key ausentes o rotos → ABORTAR fail-closed
+#        (NO borrar, NO re-emitir automáticamente: requiere intervención manual).
+#      - sin renewal                    → continuar con el bootstrap.
 if cb test -f "${LE_RENEWAL}"; then
-  echo "✅ Linaje administrado ${CERT_NAME} ya existe (${DOMAIN}); no se re-emite."
-  echo "   Renovar: docker compose exec certbot certbot renew --cert-name ${CERT_NAME}"
-  exit 0
+  if cb sh -c "test -s '${LE_LIVE}/fullchain.pem' && test -s '${LE_LIVE}/privkey.pem'"; then
+    echo "✅ Linaje administrado ${CERT_NAME} válido (${DOMAIN}); no se re-emite."
+    echo "   Renovar: docker compose exec certbot certbot renew --cert-name ${CERT_NAME}"
+    exit 0
+  fi
+  echo "❌ Linaje ${CERT_NAME} ADMINISTRADO pero ROTO: existe ${LE_RENEWAL} pero"
+  echo "   falta o está vacío ${LE_LIVE}/fullchain.pem y/o privkey.pem."
+  echo "   NO se borra ni se re-emite automáticamente (fail-closed). Revisá a mano:"
+  echo "     /etc/letsencrypt/{renewal/${CERT_NAME}.conf,live/${CERT_NAME},archive/${CERT_NAME}}"
+  echo "   (p.ej. 'certbot certificates' dentro del contenedor certbot para diagnosticar)."
+  exit 1
 fi
 
 # 2) Sin linaje administrado: crear un cert DUMMY (marcado) para que nginx pueda

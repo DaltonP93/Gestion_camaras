@@ -89,8 +89,14 @@ case "$sub" in
         while [ $# -gt 0 ]; do case "$1" in --cert-name) name="${2:-}"; shift 2;; *) shift;; esac; done
         [ -n "$name" ] || { echo "MOCK: certonly SIN --cert-name" >&2; exit 90; }
         [ "$entrypoint" = "certbot" ] || { echo "MOCK: certonly SIN --entrypoint certbot (heredaría el loop de renew)" >&2; exit 91; }
+        # El mock NO borra live/$name: init-ssl.sh DEBE haber retirado el dummy ANTES
+        # de invocar certbot. Si el dir todavía existe, el certbot real fallaría/actuaría
+        # distinto → fallamos aquí para demostrar que el dummy se retiró de verdad.
+        if [ -e "$LE/live/$name" ]; then
+          echo "MOCK: live/$name AÚN existe al emitir (init-ssl no retiró el dummy)" >&2
+          exit 92
+        fi
         # Simular linaje ADMINISTRADO por certbot: archive + live(symlinks) + renewal.conf
-        rm -rf "$LE/live/$name"
         mkdir -p "$LE/archive/$name" "$LE/live/$name" "$LE/renewal"
         printf 'REAL-CERT\n' > "$LE/archive/$name/fullchain1.pem"
         printf 'REAL-KEY\n'  > "$LE/archive/$name/privkey1.pem"
@@ -156,7 +162,21 @@ grep -q "ISSUE" "$CALLS_LOG" && bad "C: se re-emitió sobre un linaje administra
   || bad "C: se modificó/borró el linaje administrado"
 [ ! -f "$FAKE_LE/live/camaras-le/.dummy" ] && ok "C: no se creó dummy sobre el linaje administrado" || bad "C: se creó un dummy sobre un linaje válido"
 
+# ── Caso D: renewal.conf presente pero certs AUSENTES → fail-closed sin tocar nada ──
+rm -rf "$FAKE_LE"; mkdir -p "$FAKE_LE/renewal" "$FAKE_LE/live/camaras-le"
+printf 'ORIGINAL-MANAGED\n' > "$FAKE_LE/renewal/camaras-le.conf"   # renewal.conf presente…
+# …pero SIN fullchain.pem/privkey.pem en live (linaje administrado ROTO).
+rcD="$(run_case D)"
+[ "$rcD" != "0" ] && ok "D(roto): init-ssl.sh aborta con exit != 0 (fail-closed, rc=$rcD)" \
+  || bad "D(roto): init-ssl.sh NO abortó (rc=$rcD) — debía fallar cerrado"
+grep -q "ISSUE" "$CALLS_LOG" && bad "D: se ejecutó certonly sobre un linaje roto (no debía)" \
+  || ok "D: NO se ejecutó certonly (no re-emite un linaje roto)"
+[ -f "$FAKE_LE/renewal/camaras-le.conf" ] && [ "$(cat "$FAKE_LE/renewal/camaras-le.conf")" = "ORIGINAL-MANAGED" ] \
+  && ok "D: renewal.conf NO se borró ni modificó (sin auto-reparación)" \
+  || bad "D: se borró/modificó la config del linaje roto"
+[ ! -f "$FAKE_LE/live/camaras-le/.dummy" ] && ok "D: no se creó dummy sobre el linaje roto" || bad "D: se creó un dummy sobre el linaje roto"
+
 echo ""
 echo "== Resultado: ${pass} ok, ${fail} fail"
 [ "$fail" -eq 0 ] || exit 1
-echo "✅ Bootstrap de init-ssl.sh correcto en los 3 estados."
+echo "✅ Bootstrap de init-ssl.sh correcto en los 4 estados."
