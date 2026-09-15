@@ -17,32 +17,96 @@ docker/curl/systemctl/hostname/cp mockeados) en `scripts/deploy-hls-auth-parent-
 (job CI `compose`): compuertas, target inmóvil, **rollback por fases con contadores**,
 honestidad multi-archivo, y el **bootstrap desde un checkout sin los scripts**.
 
-## Por qué hace falta un bootstrap
+## Por qué hace falta un Stage 0 copiable (y no un script de archivo)
 
-Producción está en `ed3e0cc`. Los scripts `deploy-hls-auth-parent-uri.sh` y
-`check-hls-auth-nginx.sh` son **nuevos del PR #177**: no existen en el checkout productivo
-antes del fast-forward, así que `bash scripts/deploy-hls-auth-parent-uri.sh` no puede correr
-todavía. El bootstrap resuelve esto **sin descargar nada por URL**:
+Producción está en `ed3e0cc`. Los **tres** archivos del runbook —
+`deploy-hls-auth-bootstrap.sh`, `deploy-hls-auth-parent-uri.sh` y
+`check-hls-auth-nginx.sh` — son **nuevos del PR #177**: **ninguno existe** en el checkout
+productivo antes del fast-forward. Por eso `bash scripts/deploy-hls-auth-bootstrap.sh`
+(igual que el deploy o el guard) **no puede ejecutarse desde `ed3e0cc`** — sería el mismo
+problema de recursión.
 
-1. `set -Eeuo pipefail`.
-2. Confirma `hostname` exacto `camaras`.
-3. Confirma rama `main` y `EXPECT_HEAD` exacto.
-4. Valida los tres SHA de 40 hex.
-5. `git fetch origin main`.
-6. Exige `origin/main == EXPECT_TARGET_SHA` (target inmovilizado; aborta si hubo carrera).
-7. Exige `EXPECT_MERGE_SHA` ancestro de `EXPECT_TARGET_SHA`.
-8. Crea un directorio privado con `mktemp -d` bajo `/root`, modo `700`.
-9. Extrae **del objeto Git inmóvil** (nunca por URL/curl/GitHub raw):
-   `git show "${EXPECT_TARGET_SHA}:scripts/deploy-hls-auth-parent-uri.sh"` y
-   `git show "${EXPECT_TARGET_SHA}:scripts/check-hls-auth-nginx.sh"`.
-10. Los guarda **juntos** en el directorio privado, modo `700`.
-11. Registra el **SHA-256** de ambos en `EVIDENCE.txt` (ruta de evidencia para auditoría).
-12. Corre `bash -n` sobre ambos.
-13. Ejecuta el deploy **desde ese directorio**; el deploy resuelve su guard **adyacente**
-    (mismo directorio, vía `SELF_DIR`/`CHECK_SCRIPT`), sin depender del checkout viejo.
+El **punto de entrada** es el bloque **Stage 0** de la sección siguiente: un fragmento Bash
+**autocontenido** que el operador **copia y pega** en la terminal del servidor. Stage 0 no
+depende de ningún archivo del working tree ni de la red: hace todas las compuertas, inmoviliza
+el target, y sólo entonces **extrae los tres scripts del objeto Git inmóvil** (`git show
+${EXPECT_TARGET_SHA}:…`) a un directorio privado, registra su SHA-256, corre `bash -n`, y
+ejecuta **directamente el deploy con su guard adyacente**. **Nunca** usa URL, `curl`,
+`raw.githubusercontent.com` ni scripts del working tree, y **nunca** ejecuta código antes de
+validar que proviene del target exacto aprobado.
 
-Nunca ejecuta código antes de validar que proviene del target exacto aprobado (pasos 6–12
-preceden a cualquier ejecución).
+## Stage 0 — punto de entrada (copiar/pegar desde el checkout productivo)
+
+Exportar antes las 4 variables reales (`EXPECT_HEAD`, `EXPECT_TARGET_SHA`, `EXPECT_MERGE_SHA`,
+`HLS_PROBE_PATH`) y pegar tal cual:
+
+```bash
+# >>> STAGE 0 BEGIN
+set -Eeuo pipefail
+umask 077
+fail(){ echo "NO_GO: $*" >&2; exit 1; }
+is40(){ [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]]; }
+
+: "${EXPECT_HEAD:?EXPECT_HEAD requerido (40 hex)}"
+: "${EXPECT_TARGET_SHA:?EXPECT_TARGET_SHA requerido (40 hex)}"
+: "${EXPECT_MERGE_SHA:?EXPECT_MERGE_SHA requerido (40 hex)}"
+: "${HLS_PROBE_PATH:?HLS_PROBE_PATH requerido (/hls/nvr_<id>_ch<NN>_<tipo>/<archivo>)}"
+: "${DEPLOY_ROOT:=/home/sistemas/Gestion_camaras}"
+
+# host / rama / base privada: forzados en producción; sólo overrideables con
+# ALLOW_TEST_OVERRIDES=1 (modo explícito de las pruebas herméticas).
+if [ "${ALLOW_TEST_OVERRIDES:-0}" = "1" ]; then
+  : "${EXPECT_HOST:=camaras}"; : "${EXPECT_BRANCH:=main}"; : "${PRIVATE_BASE:=/root}"
+else
+  EXPECT_HOST=camaras; EXPECT_BRANCH=main; PRIVATE_BASE=/root
+fi
+
+is40 "$EXPECT_HEAD"       || fail "EXPECT_HEAD no es 40 hex"
+is40 "$EXPECT_TARGET_SHA" || fail "EXPECT_TARGET_SHA no es 40 hex"
+is40 "$EXPECT_MERGE_SHA"  || fail "EXPECT_MERGE_SHA no es 40 hex"
+[ "$(hostname)" = "$EXPECT_HOST" ] || fail "hostname '$(hostname)' != '$EXPECT_HOST'"
+
+cd "$DEPLOY_ROOT" || fail "no se puede entrar a $DEPLOY_ROOT"
+[ "$(git rev-parse --abbrev-ref HEAD)" = "$EXPECT_BRANCH" ] || fail "rama != $EXPECT_BRANCH"
+[ "$(git rev-parse HEAD)" = "$EXPECT_HEAD" ] || fail "HEAD productivo != EXPECT_HEAD"
+
+git fetch origin main --quiet || fail "git fetch origin main falló"
+[ "$(git rev-parse origin/main)" = "$EXPECT_TARGET_SHA" ] \
+  || fail "origin/main != EXPECT_TARGET_SHA (target no inmovilizado / carrera)"
+git merge-base --is-ancestor "$EXPECT_MERGE_SHA" "$EXPECT_TARGET_SHA" \
+  || fail "EXPECT_TARGET_SHA no contiene EXPECT_MERGE_SHA"
+
+[ -d "$PRIVATE_BASE" ] || fail "PRIVATE_BASE no existe: $PRIVATE_BASE"
+STAGE0_PRIV="$(mktemp -d "${PRIVATE_BASE%/}/hls-deploy.XXXXXX")" || fail "no se pudo crear el dir privado"
+chmod 700 "$STAGE0_PRIV"
+
+# Extraer los TRES scripts SÓLO del objeto Git inmóvil (nunca URL/curl/raw ni working tree).
+for f in scripts/deploy-hls-auth-bootstrap.sh scripts/deploy-hls-auth-parent-uri.sh scripts/check-hls-auth-nginx.sh; do
+  git cat-file -e "${EXPECT_TARGET_SHA}:$f" 2>/dev/null || fail "no existe ${EXPECT_TARGET_SHA}:$f"
+  git show "${EXPECT_TARGET_SHA}:$f" > "$STAGE0_PRIV/$(basename "$f")" || fail "no se pudo extraer $f"
+  [ -s "$STAGE0_PRIV/$(basename "$f")" ] || fail "extracción vacía de $f"
+done
+chmod 700 "$STAGE0_PRIV"/*.sh
+
+# Registrar SHA-256 de los TRES y validar sintaxis ANTES de ejecutar nada.
+( cd "$STAGE0_PRIV" && sha256sum deploy-hls-auth-bootstrap.sh deploy-hls-auth-parent-uri.sh check-hls-auth-nginx.sh | tee EVIDENCE.sha256 )
+for s in deploy-hls-auth-bootstrap.sh deploy-hls-auth-parent-uri.sh check-hls-auth-nginx.sh; do
+  bash -n "$STAGE0_PRIV/$s" || fail "bash -n falló en $s"
+done
+echo "STAGE0_OK priv=$STAGE0_PRIV"
+
+# Ejecutar DIRECTAMENTE el deploy desde el dir privado, con su guard adyacente extraído.
+# (Alternativa equivalente: bash "$STAGE0_PRIV/deploy-hls-auth-bootstrap.sh".)
+CHECK_SCRIPT="$STAGE0_PRIV/check-hls-auth-nginx.sh" \
+  bash "$STAGE0_PRIV/deploy-hls-auth-parent-uri.sh"
+# <<< STAGE 0 END
+```
+
+`STAGE0_OK …` seguido de `GO: …` = éxito. Cualquier `NO_GO: …` = abortó antes de mutar
+(o revirtió). El deploy ya versionado (`scripts/deploy-hls-auth-parent-uri.sh`) y el
+bootstrap (`scripts/deploy-hls-auth-bootstrap.sh`) sólo son utilizables **una vez que el
+checkout está en el target**; desde `ed3e0cc` el único punto de entrada válido es este
+Stage 0.
 
 ## Variables requeridas (valores reales; abortan si faltan o no son válidas)
 
@@ -68,20 +132,21 @@ de las pruebas herméticas). **No** hay override del host productivo fuera de es
 
 ## Uso (cuando esté autorizado)
 
+Desde `ed3e0cc`, **el único punto de entrada es el bloque Stage 0 de arriba** (copiar/pegar).
+Exportar antes las 4 variables:
+
 ```bash
 cd /home/sistemas/Gestion_camaras   # checkout productivo actual (ed3e0cc)
-EXPECT_HEAD=<sha40_head_productivo> \
-EXPECT_TARGET_SHA=<sha40_de_origin_main_ya_fusionado> \
-EXPECT_MERGE_SHA=<sha40_del_merge_de_#177> \
-HLS_PROBE_PATH=/hls/nvr_<id_real>_ch<NN>_sub/index.m3u8 \
-  bash scripts/deploy-hls-auth-bootstrap.sh
+export EXPECT_HEAD=<sha40_head_productivo>
+export EXPECT_TARGET_SHA=<sha40_de_origin_main_ya_fusionado>
+export EXPECT_MERGE_SHA=<sha40_del_merge_de_#177>
+export HLS_PROBE_PATH=/hls/nvr_<id_real>_ch<NN>_sub/index.m3u8
+# …luego pegar el bloque Stage 0 completo de la sección anterior.
 ```
 
-`GO: …` = éxito. Cualquier `NO_GO: …` = abortó antes de mutar (o revirtió). El bootstrap
-imprime `BOOTSTRAP_OK priv=<dir>` con la ruta de evidencia antes de delegar en el deploy.
-
-> Si el checkout productivo ya está en el target, el deploy puede correrse directo:
-> `bash scripts/deploy-hls-auth-parent-uri.sh` (mismas variables).
+> **No** ejecutar `bash scripts/deploy-hls-auth-bootstrap.sh` (ni el deploy/guard) desde
+> `ed3e0cc`: esos archivos **no existen** en el checkout productivo hasta el fast-forward.
+> Sólo son utilizables una vez que el checkout está en el target.
 
 ## Compuertas del deploy — aborta ANTES de mutar si
 

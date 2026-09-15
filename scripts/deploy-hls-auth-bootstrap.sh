@@ -25,6 +25,7 @@
 # Sourcear con BOOTSTRAP_LIB=1 define funciones SIN ejecutar main().
 
 set -Eeuo pipefail
+umask 077
 fail() { echo "NO_GO: $*" >&2; exit 1; }
 is_sha40() { [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]]; }
 
@@ -33,17 +34,16 @@ REL_CHECK='scripts/check-hls-auth-nginx.sh'
 
 main() {
   : "${DEPLOY_ROOT:=/home/sistemas/Gestion_camaras}"
-  : "${EXPECT_BRANCH:=main}"
   : "${EXPECT_HEAD:?EXPECT_HEAD requerido (40 hex)}"
   : "${EXPECT_TARGET_SHA:?EXPECT_TARGET_SHA requerido (40 hex)}"
   : "${EXPECT_MERGE_SHA:?EXPECT_MERGE_SHA requerido (40 hex)}"
   : "${HLS_PROBE_PATH:?HLS_PROBE_PATH requerido (/hls/nvr_<id>_ch<NN>_<tipo>/<archivo>)}"
 
-  # Host y base privada: forzados en producción; sólo overrideables en modo de pruebas.
+  # Host, rama y base privada: forzados en producción; sólo overrideables en pruebas.
   if [ "${ALLOW_TEST_OVERRIDES:-0}" = "1" ]; then
-    : "${EXPECT_HOST:=camaras}"; : "${PRIVATE_BASE:=/root}"
+    : "${EXPECT_HOST:=camaras}"; : "${EXPECT_BRANCH:=main}"; : "${PRIVATE_BASE:=/root}"
   else
-    EXPECT_HOST=camaras; PRIVATE_BASE=/root
+    EXPECT_HOST=camaras; EXPECT_BRANCH=main; PRIVATE_BASE=/root
   fi
 
   echo "== BOOTSTRAP (sin mutar nada; extrae y valida antes de ejecutar) =="

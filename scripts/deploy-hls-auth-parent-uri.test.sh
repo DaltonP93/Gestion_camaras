@@ -345,8 +345,16 @@ S="$TMP/rb7"; mkstate "$S"; setup_rb; call_rb
   && ok "R7 sano: PASS (cp=1 nt=1 reload=1)" || { bad "R7 (cp=$(cnt cp_count) nt=$(cnt nt_count) rl=$(cnt reload_count))"; cat "$TMP/rbout"; }
 
 echo ""
-echo "== D) BOOTSTRAP desde checkout SIN los scripts (extracción del target Git inmóvil)"
-run_bootstrap() {  # $1 = PRIVATE_BASE
+echo "== D) STAGE 0 (punto de entrada copiable) + bootstrap, desde checkout SIN los 3 scripts"
+DOC="$ROOT/docs/runbooks/hls-auth-parent-uri-deploy.md"
+STAGE0="$TMP/stage0.sh"
+awk '/# >>> STAGE 0 BEGIN/{f=1;next} /# <<< STAGE 0 END/{exit} f' "$DOC" > "$STAGE0"
+{ [ -s "$STAGE0" ] && bash -n "$STAGE0"; } && ok "Stage 0 extraído del runbook y bash -n OK" || { bad "Stage 0 ausente/erróneo en el runbook"; }
+# Sobre líneas ACTIVAS (sin comentarios): no debe invocar curl/wget ni URLs.
+sed -E 's/[[:space:]]*#.*$//' "$STAGE0" | grep -qiE 'curl|wget|https?://|raw\.githubusercontent' \
+  && bad "Stage 0 referencia URL/curl/wget en línea activa (debe usar sólo git show)" || ok "Stage 0 NO usa URL/curl/wget en líneas activas (sólo git show)"
+
+run_stage0() {  # $1 = PRIVATE_BASE; ejecuta EXACTAMENTE el bloque Stage 0 del doc
   ( cd "$RROOT"
     PATH="$MB:$PATH" MOCK_STATE="$S" ALLOW_TEST_OVERRIDES=1 PRIVATE_BASE="$1" \
     DEPLOY_ROOT="$RROOT" NGINX_CTR=ngx NGINX_SVC=nginx \
@@ -355,40 +363,56 @@ run_bootstrap() {  # $1 = PRIVATE_BASE
     SITE_BASE="https://camaras.saa.com.py" \
     EXPECT_HEAD="$C1" EXPECT_TARGET_SHA="$CTARGET" EXPECT_MERGE_SHA="$CMERGE" \
     HLS_PROBE_PATH="/hls/nvr_abc123_ch01_sub/index.m3u8" \
-    bash "$BOOT" ) > "$TMP/bout" 2>&1
+    bash "$STAGE0" ) > "$TMP/bout" 2>&1
   echo $?
 }
 
-# --- D1: éxito end-to-end (C1 no tiene scripts; se extraen del target y se ejecutan) ---
+# --- D1: Stage 0 end-to-end desde C1 SIN ninguno de los TRES scripts ---
 setup_repo; S="$TMP/d1"; mkstate "$S"; rm -rf "$TMP/bkdir" "$TMP/privD1"; mkdir -p "$TMP/privD1"
-[ ! -f "$RROOT/scripts/deploy-hls-auth-parent-uri.sh" ] && [ ! -f "$RROOT/scripts/check-hls-auth-nginx.sh" ] \
-  && ok "D1 precondición: el checkout C1 NO contiene los scripts" || bad "D1: el checkout ya tenía los scripts"
-rc=$(run_bootstrap "$TMP/privD1")
-if [ "$rc" = 0 ] && grep -q 'BOOTSTRAP_OK' "$TMP/bout" && grep -q '^GO:' "$TMP/bout"; then
-  ok "D1: bootstrap extrae y el deploy delegado llega a GO (rc=0)"; else bad "D1: rc=$rc"; cat "$TMP/bout"; fi
+{ [ ! -f "$RROOT/scripts/deploy-hls-auth-bootstrap.sh" ] && [ ! -f "$RROOT/scripts/deploy-hls-auth-parent-uri.sh" ] && [ ! -f "$RROOT/scripts/check-hls-auth-nginx.sh" ]; } \
+  && ok "D1 precondición: C1 NO contiene bootstrap/deploy/guard" || bad "D1: el checkout ya tenía alguno de los 3 scripts"
+rc=$(run_stage0 "$TMP/privD1")
+{ [ "$rc" = 0 ] && grep -q 'STAGE0_OK' "$TMP/bout" && grep -q '^GO:' "$TMP/bout"; } \
+  && ok "D1: Stage 0 extrae del target y el deploy llega a GO (rc=0)" || { bad "D1: rc=$rc"; cat "$TMP/bout"; }
 priv="$(find "$TMP/privD1" -maxdepth 1 -type d -name 'hls-deploy.*' | head -1)"
-{ [ -n "$priv" ] && [ -f "$priv/deploy-hls-auth-parent-uri.sh" ] && [ -f "$priv/check-hls-auth-nginx.sh" ]; } \
-  && ok "D1: dir privado con AMBOS scripts extraídos (guard adyacente)" || bad "D1: faltan scripts en el dir privado"
-{ [ -n "$priv" ] && [ -f "$priv/EVIDENCE.txt" ] && grep -q 'deploy-hls-auth-parent-uri.sh' "$priv/EVIDENCE.txt" \
-  && grep -qE '^[0-9a-f]{64}  ' "$priv/EVIDENCE.txt"; } \
-  && ok "D1: evidencia con sha256 de ambos scripts" || bad "D1: evidencia/sha256 ausente"
+{ [ -n "$priv" ] && [ -f "$priv/deploy-hls-auth-bootstrap.sh" ] && [ -f "$priv/deploy-hls-auth-parent-uri.sh" ] && [ -f "$priv/check-hls-auth-nginx.sh" ]; } \
+  && ok "D1: dir privado con los TRES scripts extraídos del target" || bad "D1: faltan scripts en el dir privado"
+{ [ -n "$priv" ] && [ -f "$priv/EVIDENCE.sha256" ] && [ "$(grep -cE '^[0-9a-f]{64}  ' "$priv/EVIDENCE.sha256")" = 3 ]; } \
+  && ok "D1: EVIDENCE.sha256 con los 3 sha256" || bad "D1: evidencia sha256 incompleta"
 [ -n "$priv" ] && [ "$(stat -c '%a' "$priv")" = "700" ] && ok "D1: dir privado modo 700" || bad "D1: dir privado no es 700"
 [ "$(cd "$RROOT" && git rev-parse HEAD)" = "$CTARGET" ] && ok "D1: el deploy avanzó HEAD al target" || bad "D1: HEAD != target"
-grep -q ' -k' "$S/curl.log" && bad "D1: curl usó -k" || ok "D1: TLS estricto en el flujo bootstrap→deploy"
+grep -q ' -k' "$S/curl.log" && bad "D1: curl usó -k" || ok "D1: TLS estricto en Stage 0→deploy"
 
-# --- D2: target avanzado/incorrecto ⇒ aborta ANTES de extraer/ejecutar ---
+# --- D2: target avanzado ⇒ Stage 0 aborta ANTES de extraer/ejecutar cualquiera de los 3 ---
 setup_repo; S="$TMP/d2"; mkstate "$S"; rm -rf "$TMP/bkdir" "$TMP/privD2"; mkdir -p "$TMP/privD2"
 rm -rf "$TMP/adv2"
 ( git clone -q "$BARE" "$TMP/adv2"; cd "$TMP/adv2"; git config user.email t@t; git config user.name t
   git checkout -q main; echo "    # commit extra" >> infra/nginx/nginx.conf; git add -A; git commit -qm extra
   git push -q origin main ) 2>/dev/null
-rc=$(run_bootstrap "$TMP/privD2")
-[ "$rc" != 0 ] && grep -q 'NO_GO' "$TMP/bout" && grep -q 'target no inmovilizado' "$TMP/bout" \
-  && ok "D2: origin avanzó ⇒ aborta con NO_GO (target no inmovilizado)" || { bad "D2: no abortó como se espera (rc=$rc)"; cat "$TMP/bout"; }
+rc=$(run_stage0 "$TMP/privD2")
+{ [ "$rc" != 0 ] && grep -q 'NO_GO' "$TMP/bout" && grep -q 'target no inmovilizado' "$TMP/bout"; } \
+  && ok "D2: origin avanzó ⇒ NO_GO (target no inmovilizado)" || { bad "D2: no abortó (rc=$rc)"; cat "$TMP/bout"; }
 [ -z "$(find "$TMP/privD2" -maxdepth 1 -type d -name 'hls-deploy.*')" ] \
-  && ok "D2: NO se creó dir privado (aborta antes de extraer)" || bad "D2: creó dir privado pese al abort"
-[ ! -f "$S/reloaded" ] && ok "D2: sin reload (no ejecutó el deploy)" || bad "D2: hubo reload pese al target incorrecto"
-grep -q 'BOOTSTRAP_OK' "$TMP/bout" && bad "D2: imprimió BOOTSTRAP_OK pese al abort" || ok "D2: no imprimió BOOTSTRAP_OK"
+  && ok "D2: sin dir privado (aborta antes de extraer)" || bad "D2: creó dir privado pese al abort"
+[ ! -f "$S/reloaded" ] && ok "D2: sin reload (no ejecutó ninguno de los 3 scripts)" || bad "D2: hubo reload pese al target incorrecto"
+{ ! grep -q 'STAGE0_OK' "$TMP/bout"; } && ok "D2: no imprimió STAGE0_OK" || bad "D2: imprimió STAGE0_OK pese al abort"
+
+# --- D3: el bootstrap EXTRAÍDO del target (no desde ROOT) también corre el deploy ---
+setup_repo; S="$TMP/d3"; mkstate "$S"; rm -rf "$TMP/bkdir" "$TMP/privD3" "$TMP/exD3"; mkdir -p "$TMP/privD3" "$TMP/exD3"
+( cd "$RROOT"
+  git show "$CTARGET:scripts/deploy-hls-auth-bootstrap.sh" > "$TMP/exD3/deploy-hls-auth-bootstrap.sh"
+  git show "$CTARGET:scripts/deploy-hls-auth-parent-uri.sh" > "$TMP/exD3/deploy-hls-auth-parent-uri.sh"
+  git show "$CTARGET:scripts/check-hls-auth-nginx.sh"       > "$TMP/exD3/check-hls-auth-nginx.sh" )
+chmod +x "$TMP/exD3"/*.sh
+rc=$( cd "$RROOT"; PATH="$MB:$PATH" MOCK_STATE="$S" ALLOW_TEST_OVERRIDES=1 PRIVATE_BASE="$TMP/privD3" \
+  DEPLOY_ROOT="$RROOT" NGINX_CTR=ngx NGINX_SVC=nginx BACKUP_DIR="$TMP/bkdir" BACKUP_TIMER_UNIT=visioncore-backup.timer \
+  API_HEALTH_URL="https://camaras.saa.com.py/api/health" SITE_BASE="https://camaras.saa.com.py" \
+  EXPECT_HEAD="$C1" EXPECT_TARGET_SHA="$CTARGET" EXPECT_MERGE_SHA="$CMERGE" \
+  HLS_PROBE_PATH="/hls/nvr_abc123_ch01_sub/index.m3u8" \
+  bash "$TMP/exD3/deploy-hls-auth-bootstrap.sh" >"$TMP/bout" 2>&1; echo $? )
+{ [ "$rc" = 0 ] && grep -q 'BOOTSTRAP_OK' "$TMP/bout" && grep -q '^GO:' "$TMP/bout"; } \
+  && ok "D3: bootstrap extraído del target (no ROOT) llega a GO" || { bad "D3: rc=$rc"; cat "$TMP/bout"; }
+[ "$(cd "$RROOT" && git rev-parse HEAD)" = "$CTARGET" ] && ok "D3: HEAD avanzó al target vía bootstrap extraído" || bad "D3: HEAD != target"
 
 echo ""
 echo "== Resultado: ${pass} ok, ${fail} fail"

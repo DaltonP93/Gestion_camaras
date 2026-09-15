@@ -171,12 +171,11 @@ trap 'on_exit $?' EXIT
 
 main() {
   : "${DEPLOY_ROOT:=/home/sistemas/Gestion_camaras}"
-  : "${EXPECT_BRANCH:=main}"
-  # EXPECT_HOST forzado a camaras salvo modo explícito de pruebas.
+  # EXPECT_HOST y EXPECT_BRANCH forzados en producción; sólo overrideables en pruebas.
   if [ "${ALLOW_TEST_OVERRIDES:-0}" = "1" ]; then
-    : "${EXPECT_HOST:=camaras}"
+    : "${EXPECT_HOST:=camaras}"; : "${EXPECT_BRANCH:=main}"
   else
-    EXPECT_HOST=camaras
+    EXPECT_HOST=camaras; EXPECT_BRANCH=main
   fi
   NGINX_SVC="${NGINX_SVC:-nginx}"
   NGINX_CTR="${NGINX_CTR:-visioncore_nginx}"
