@@ -166,9 +166,10 @@ jobs:
       # (cada compuerta crítica debe abortar con exit != 0). No toca producción.
       - name: Sintaxis runbook deploy HLS (bash -n)
         run: |
+          bash -n scripts/deploy-hls-auth-bootstrap.sh
           bash -n scripts/deploy-hls-auth-parent-uri.sh
           bash -n scripts/deploy-hls-auth-parent-uri.test.sh
-      - name: Pruebas negativas del runbook de deploy HLS
+      - name: Pruebas negativas del runbook + bootstrap de deploy HLS
         run: bash scripts/deploy-hls-auth-parent-uri.test.sh
 
   migrations:

@@ -6,9 +6,14 @@
 # tiene `M infra/nginx/nginx.conf` (hotfix operativo no versionado): el script lo
 # respalda, valida TODO con compuertas que abortan (exit != 0), retira sólo ese cambio
 # respaldado, hace fast-forward al SHA objetivo INMÓVIL y recarga sólo nginx, con
-# rollback automático real si algo falla DESPUÉS de mutar.
+# rollback automático real (POR FASES) si algo falla DESPUÉS de mutar.
 #
 # NUNCA desactiva `auth_request` ni vuelve a `X-Original-URI $uri`.
+#
+# NOTA: este script NO existe en el checkout productivo viejo (ed3e0cc). Se ejecuta
+# vía scripts/deploy-hls-auth-bootstrap.sh, que lo extrae del objeto Git inmóvil del
+# target aprobado y lo corre junto a su guard adyacente. También corre directo cuando
+# el checkout ya está en el target.
 #
 # Variables REQUERIDAS (reales; aborta si faltan):
 #   EXPECT_HEAD        HEAD productivo esperado ANTES del deploy (40 hex)
@@ -20,6 +25,9 @@
 #   NGINX_SVC=nginx  NGINX_CTR=visioncore_nginx  BACKUP_DIR=/var/backups/visioncore
 #   BACKUP_TIMER_UNIT=visioncore-backup.timer (OBLIGATORIO: se exige activo antes y después)
 #   API_HEALTH_URL=https://camaras.saa.com.py/api/health  SITE_BASE=https://camaras.saa.com.py
+#
+# EXPECT_HOST se FUERZA a `camaras` en producción; sólo se acepta un valor distinto
+# con ALLOW_TEST_OVERRIDES=1 (modo explícito de pruebas herméticas).
 #
 # TLS: curl SIN `-k` (un certificado inválido debe fallar).
 #
@@ -55,6 +63,9 @@ gate_origin_is_target() { [ "${1:-}" = "${2:-}" ] || fail "origin/main '${1:-}' 
 gate_target_has_merge() {  # $1 = target, $2 = merge aprobado; merge debe ser ancestro de target
   git merge-base --is-ancestor "$2" "$1" || fail "EXPECT_TARGET_SHA ($1) no contiene el merge aprobado ($2)"
 }
+gate_container_running() {  # $1 = valor de {{.State.Running}}
+  [ "${1:-}" = "true" ] || fail "el contenedor nginx no está corriendo (Running='${1:-}')"
+}
 gate_single_local_change() {  # $1 = git status --porcelain
   local st="$1" n; n="$(printf '%s' "$st" | grep -c . || true)"
   [ "$n" -eq 1 ] || fail "hay $n cambios locales (se espera EXACTAMENTE 1: $CONF_REL)"
@@ -82,37 +93,68 @@ gate_backup_ok() {  # existe, no vacío, checksum verifica, cableado activo vál
   validate_wiring "$bk" || fail "el backup no tiene el cableado auth_request correcto"
 }
 
-# ── Rollback automático real (sólo tras mutación). Verifica CADA paso. ─────────
+# ── Rollback automático real (sólo tras mutación), POR FASES con CORTE. ─────────
+# Imprime EXACTAMENTE una línea de resultado: `AUTOMATIC_ROLLBACK=PASS` sólo si TODAS
+# las fases pasan; en cualquier fallo `AUTOMATIC_ROLLBACK=FAILED (faseN: ...)` y CORTA
+# de inmediato (no ejecuta las fases posteriores: p.ej. checksum roto ⇒ NO cp, NO
+# nginx -t, NO reload). Devuelve 0 sólo en PASS.
 MUTATED=0
 BACKUP_FILE=""
 BACKUP_SUMS=""
-do_rollback() {  # devuelve 0 sólo si TODOS los pasos pasan
+do_rollback() {
   set +e
-  local ok=1 want have act
-  # (1) backup + checksum revalidan
-  [ -s "$BACKUP_FILE" ] && [ -s "$BACKUP_SUMS" ] || ok=0
-  ( cd "$(dirname "$BACKUP_SUMS")" && sha256sum -c "$(basename "$BACKUP_SUMS")" >/dev/null 2>&1 ) || ok=0
-  # (2) cp termina en 0
-  cp -f "$BACKUP_FILE" "$CONF_REL" || ok=0
-  # (3) archivo restaurado coincide con el SHA-256 respaldado
+  local want have act
+  # FASE 1 — precondiciones del backup. Falla ⇒ NO cp, NO nginx -t, NO reload.
+  if ! { [ -s "$BACKUP_FILE" ] && [ -s "$BACKUP_SUMS" ]; }; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase1: backup o checksum ausente)" >&2; return 1
+  fi
+  if ! ( cd "$(dirname "$BACKUP_SUMS")" && sha256sum -c "$(basename "$BACKUP_SUMS")" >/dev/null 2>&1 ); then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase1: checksum del backup NO verifica)" >&2; return 1
+  fi
+  if ! validate_wiring "$BACKUP_FILE"; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase1: cableado del backup inválido)" >&2; return 1
+  fi
+  # FASE 2 — restaurar (cp). Falla ⇒ NO nginx -t, NO reload.
+  if ! cp -f "$BACKUP_FILE" "$CONF_REL"; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase2: cp del backup falló)" >&2; return 1
+  fi
+  # FASE 3 — integridad del restaurado. Falla ⇒ NO reload.
   want="$(cut -d' ' -f1 "$BACKUP_SUMS" 2>/dev/null)"
   have="$(sha256sum "$CONF_REL" 2>/dev/null | cut -d' ' -f1)"
-  [ -n "$want" ] && [ "$want" = "$have" ] || ok=0
-  # (4) nginx -t == 0
-  docker compose exec -T "$NGINX_SVC" nginx -t >/dev/null 2>&1 || ok=0
-  # (5) nginx -s reload == 0
-  docker compose exec -T "$NGINX_SVC" nginx -s reload >/dev/null 2>&1 || ok=0
-  # (6)(7) config ACTIVA con 3 directivas y sin variante rota
+  if ! { [ -n "$want" ] && [ "$want" = "$have" ]; }; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase3: SHA-256 restaurado != backup)" >&2; return 1
+  fi
+  if ! validate_wiring "$CONF_REL"; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase3: cableado del archivo restaurado inválido)" >&2; return 1
+  fi
+  # FASE 4 — nginx -t. Falla ⇒ NO reload.
+  if ! docker compose exec -T "$NGINX_SVC" nginx -t >/dev/null 2>&1; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase4: nginx -t falló)" >&2; return 1
+  fi
+  # FASE 5 — reload.
+  if ! docker compose exec -T "$NGINX_SVC" nginx -s reload >/dev/null 2>&1; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase5: nginx -s reload falló)" >&2; return 1
+  fi
+  # FASE 6 — verificación posterior: config activa + API + HLS + timer.
   act="$(mktemp)"
-  if docker compose exec -T "$NGINX_SVC" nginx -T > "$act" 2>/dev/null; then
-    validate_wiring "$act" || ok=0
-  else ok=0; fi
+  if ! docker compose exec -T "$NGINX_SVC" nginx -T > "$act" 2>/dev/null; then
+    rm -f "$act"; echo "AUTOMATIC_ROLLBACK=FAILED (fase6: nginx -T falló)" >&2; return 1
+  fi
+  if ! validate_wiring "$act"; then
+    rm -f "$act"; echo "AUTOMATIC_ROLLBACK=FAILED (fase6: la config activa no cumple el cableado)" >&2; return 1
+  fi
   rm -f "$act"
-  # (8) API 200
-  [ "$(http_code "$API_HEALTH_URL")" = "200" ] || ok=0
-  # (9) HLS anónimo 401
-  [ "$(http_code "${SITE_BASE}${HLS_PROBE_PATH}")" = "401" ] || ok=0
-  [ "$ok" -eq 1 ]
+  if [ "$(http_code "$API_HEALTH_URL")" != "200" ]; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase6: API != 200)" >&2; return 1
+  fi
+  if [ "$(http_code "${SITE_BASE}${HLS_PROBE_PATH}")" != "401" ]; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase6: HLS anónimo != 401)" >&2; return 1
+  fi
+  if ! systemctl is-active --quiet "$BACKUP_TIMER_UNIT"; then
+    echo "AUTOMATIC_ROLLBACK=FAILED (fase6: timer de backup inactivo)" >&2; return 1
+  fi
+  echo "AUTOMATIC_ROLLBACK=PASS" >&2
+  return 0
 }
 on_exit() {
   local rc="$1"
@@ -122,19 +164,20 @@ on_exit() {
     return 0
   fi
   echo "AUTOMATIC_ROLLBACK: iniciando (restaurando backup operativo)..." >&2
-  if do_rollback; then
-    echo "AUTOMATIC_ROLLBACK=PASS" >&2
-  else
-    echo "AUTOMATIC_ROLLBACK=FAILED — INTERVENCIÓN MANUAL (nunca se desactiva auth_request ni se vuelve a \$uri)" >&2
-  fi
+  do_rollback || echo "AUTOMATIC_ROLLBACK requiere INTERVENCIÓN MANUAL (nunca se desactiva auth_request ni se vuelve a \$uri)" >&2
   # el exit code sigue siendo != 0 (rc): el deploy falló aunque el rollback pase.
 }
 trap 'on_exit $?' EXIT
 
 main() {
   : "${DEPLOY_ROOT:=/home/sistemas/Gestion_camaras}"
-  : "${EXPECT_HOST:=camaras}"
   : "${EXPECT_BRANCH:=main}"
+  # EXPECT_HOST forzado a camaras salvo modo explícito de pruebas.
+  if [ "${ALLOW_TEST_OVERRIDES:-0}" = "1" ]; then
+    : "${EXPECT_HOST:=camaras}"
+  else
+    EXPECT_HOST=camaras
+  fi
   NGINX_SVC="${NGINX_SVC:-nginx}"
   NGINX_CTR="${NGINX_CTR:-visioncore_nginx}"
   BACKUP_DIR="${BACKUP_DIR:-/var/backups/visioncore}"
@@ -165,8 +208,19 @@ main() {
   gate_origin_is_target "$ORIGIN_MAIN" "$EXPECT_TARGET_SHA"     # target INMÓVIL
   gate_target_has_merge "$EXPECT_TARGET_SHA" "$EXPECT_MERGE_SHA"
 
+  gate_container_running "$(docker inspect -f '{{.State.Running}}' "$NGINX_CTR" 2>/dev/null)"
   NGINX_ID_BEFORE="$(docker inspect -f '{{.Id}}' "$NGINX_CTR")" || fail "no se pudo inspeccionar $NGINX_CTR"
   NGINX_STARTED_BEFORE="$(docker inspect -f '{{.State.StartedAt}}' "$NGINX_CTR")" || fail "no se pudo leer StartedAt"
+
+  # Baseline PREVIO: la config ACTIVA ya corre el hotfix operativo — debe estar sana
+  # (mismo cableado, API 200, HLS anónimo 401) ANTES de tocar nada.
+  local base; base="$(mktemp)"
+  docker compose exec -T "$NGINX_SVC" nginx -T > "$base" 2>/dev/null || { rm -f "$base"; fail "baseline: no se pudo volcar la config activa (nginx -T)"; }
+  validate_wiring "$base" || { rm -f "$base"; fail "baseline: la config ACTIVA no cumple el cableado"; }
+  rm -f "$base"
+  [ "$(http_code "$API_HEALTH_URL")" = "200" ]               || fail "baseline: API != 200"
+  [ "$(http_code "${SITE_BASE}${HLS_PROBE_PATH}")" = "401" ] || fail "baseline: HLS anónimo != 401"
+
   TREE_STATUS="$(git status --porcelain)"
   gate_single_local_change "$TREE_STATUS"
 
