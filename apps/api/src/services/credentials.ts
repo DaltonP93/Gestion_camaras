@@ -19,6 +19,11 @@ import CryptoJS from 'crypto-js'
 const GCM_PREFIX = 'gcm.v1.'
 // Literal legacy: SOLO se usa para descifrar valores viejos, NUNCA para cifrar.
 const LEGACY_DEFAULT_KEY = 'visioncore_key'
+const OPENSSL_SALTED_MAGIC = Buffer.from('Salted__', 'ascii')
+const OPENSSL_HEADER_BYTES = 16 // magic (8) + salt (8)
+const AES_BLOCK_BYTES = 16
+const CANONICAL_BASE64_RE =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 
 /**
  * Valida la política de clave de cifrado de credenciales NVR.
@@ -128,7 +133,36 @@ function decryptGcm(enc: string): string | null {
   }
 }
 
+/**
+ * Los valores crypto-js creados con una passphrase usan el formatter OpenSSL:
+ * Base64("Salted__" + salt[8] + ciphertext AES-CBC por bloques de 16 bytes).
+ *
+ * CryptoJS acepta strings arbitrarios en AES.decrypt(). Para entradas que no
+ * tienen este contenedor puede derivar material con estado aleatorio y, de forma
+ * ocasional, devolver basura UTF-8 no vacía. Validar la envoltura antes de llamar
+ * a CryptoJS vuelve fail-closed y determinista el manejo de datos malformados sin
+ * modificar ningún ciphertext legacy válido generado por el sistema.
+ * Esto valida estructura, no autenticidad: AES-CBC legacy no tiene tag/MAC; las
+ * credenciales se autentican criptográficamente al re-guardarse en formato GCM.
+ */
+function isLegacyOpenSslCiphertext(enc: string): boolean {
+  if (!CANONICAL_BASE64_RE.test(enc)) return false
+
+  const payload = Buffer.from(enc, 'base64')
+  if (payload.length < OPENSSL_HEADER_BYTES + AES_BLOCK_BYTES) return false
+  if (!payload.subarray(0, OPENSSL_SALTED_MAGIC.length).equals(OPENSSL_SALTED_MAGIC)) {
+    return false
+  }
+  if ((payload.length - OPENSSL_HEADER_BYTES) % AES_BLOCK_BYTES !== 0) return false
+
+  // Buffer.from(base64) es permisivo; exigir la representación canónica evita
+  // aceptar caracteres ignorados, padding extraño o bytes descartados.
+  return payload.toString('base64') === enc
+}
+
 function decryptLegacy(enc: string): string | null {
+  if (!isLegacyOpenSslCiphertext(enc)) return null
+
   for (const key of legacyKeyChain()) {
     try {
       const plain = CryptoJS.AES.decrypt(enc, key).toString(CryptoJS.enc.Utf8)
