@@ -123,6 +123,53 @@ describe('GET /internal/hls-auth', () => {
     expect(res.statusCode).toBe(403)
   })
 
+  it('incidente HLS: X-Original-URI = la URI del subrequest (/internal/hls-auth) ⇒ 403', async () => {
+    // Regresión del incidente: si nginx pasa `$uri` DENTRO del subrequest de
+    // auth_request, el header vale `/internal/hls-auth` (no el path HLS padre). El
+    // API debe fallar CERRADO (BAD_PATH ⇒ 403), nunca autorizar. El fix real vive en
+    // nginx (set $hls_original_uri $uri en /hls/); esta prueba fija el contrato del
+    // API: una URI que no es un stream nunca autoriza, ni siquiera para ADMIN.
+    app = await buildApp(makePrisma([]))
+    for (const bad of ['/internal/hls-auth', '/internal/hls-auth?x=1', 'internal/hls-auth']) {
+      const res = await app.inject({
+        method: 'GET', url: '/internal/hls-auth',
+        cookies: { access_token: tokenFor(app, 'admin1', 'ADMIN') },
+        headers: { 'x-original-uri': bad },
+      })
+      expect(res.statusCode, bad).toBe(403)
+    }
+  })
+
+  it('X-Original-URI ausente/vacío (variable nginx sin setear) ⇒ 403 fail-closed', async () => {
+    // Si `$hls_original_uri` no se seteó en algún contexto, nginx omite el header ⇒
+    // el API lo recibe ausente. Debe fallar cerrado, nunca autorizar por defecto.
+    app = await buildApp(makePrisma([]))
+    const resAusente = await app.inject({
+      method: 'GET', url: '/internal/hls-auth',
+      cookies: { access_token: tokenFor(app, 'admin1', 'ADMIN') },
+    })
+    expect(resAusente.statusCode).toBe(403)
+    const resVacio = await app.inject({
+      method: 'GET', url: '/internal/hls-auth',
+      cookies: { access_token: tokenFor(app, 'admin1', 'ADMIN') },
+      headers: { 'x-original-uri': '' },
+    })
+    expect(resVacio.statusCode).toBe(403)
+  })
+
+  it('sesión autorizada CONSERVA el path HLS original (nvrId+canal correctos) ⇒ 200', async () => {
+    // El contrato inverso del incidente: con el path HLS PADRE correcto, un usuario
+    // con canView sobre esa cámara es autorizado (200). Prueba que el parseo del path
+    // original produce el nvrId/canal esperados.
+    app = await buildApp(makePrisma([{ userId: 'op1', nvrId: 'n7', cameraId: 'cam-z', channel: 12 }]))
+    const res = await app.inject({
+      method: 'GET', url: '/internal/hls-auth',
+      cookies: { access_token: tokenFor(app, 'op1', 'OPERATOR') },
+      headers: { 'x-original-uri': '/hls/nvr_n7_ch12_main/index.m3u8' },
+    })
+    expect(res.statusCode).toBe(200)
+  })
+
   it('P1: URI con path-traversal ⇒ 403 aunque el 1er segmento sea autorizable', async () => {
     // OPERATOR con canView SOLO en ch03; intenta evadir a otra cámara vía `..`.
     app = await buildApp(makePrisma([{ userId: 'op1', nvrId: 'n1', cameraId: 'cam-x', channel: 3 }]))
