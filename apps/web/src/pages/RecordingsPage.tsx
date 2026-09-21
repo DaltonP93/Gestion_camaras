@@ -32,6 +32,7 @@ import {
 } from '@/components/recordings/utils'
 import {
   decideContinuity, canClaimTransition, clockReachedNextStart,
+  playbackCapacityPollDelayMs, shouldPreservePreviousFrame,
 } from '@/components/recordings/continuity'
 
 // ─── Local interfaces ─────────────────────────────────────────────────────────
@@ -219,16 +220,16 @@ export function RecordingsPage() {
   }
 
   const waitForPlaybackCapacity = async (
-    slotIndex: number, sessionId: string, myKey: string,
+    slotIndex: number, sessionId: string, myKey: string, continuityHandoff = false,
   ): Promise<string | null> => {
     const MAX_WAIT_MS = 10 * 60 * 1000
     // Backoff acotado con jitter. Un fallo transitorio del status NO puede
     // abandonar la cola: el lease seguiría tomado en el backend y el usuario
     // vería el slot colgado. El backend devuelve 'ready' idempotentemente, así
     // que reintentar es seguro y nunca crea otra sesión.
-    const BACKOFF_MS = [2_500, 3_000, 5_000, 8_000, 10_000]
     const started = Date.now()
     let failures = 0
+    let polls = 0
     let retryAfterMs: number | null = null
 
     const isRecoverable = (status: number | undefined): boolean =>
@@ -236,10 +237,14 @@ export function RecordingsPage() {
       status === 429 || status === 500 || status === 502 || status === 503 || status === 504
 
     while (Date.now() - started < MAX_WAIT_MS) {
-      const base = retryAfterMs ?? BACKOFF_MS[Math.min(failures, BACKOFF_MS.length - 1)]
+      const base = retryAfterMs ?? playbackCapacityPollDelayMs(
+        continuityHandoff ? polls : failures,
+        continuityHandoff,
+      )
       retryAfterMs = null
-      const jitter = Math.floor(Math.random() * 400)
+      const jitter = Math.floor(Math.random() * (continuityHandoff ? 100 : 400))
       await new Promise(r => setTimeout(r, base + jitter))
+      polls++
 
       // GENERACIÓN: si el usuario cambió cámara, playhead, búsqueda o layout, se
       // aborta. Una respuesta tardía nunca debe reproducir en el slot nuevo.
@@ -1549,13 +1554,21 @@ export function RecordingsPage() {
       deleteSessionOnce(existing.sessionType, existing.sessionId)
     }
     const vid0 = videoRefs.current[slotIndex]
-    if (vid0) { vid0.src = ''; vid0.load() }
+    const preservePreviousFrame = shouldPreservePreviousFrame({
+      continuityJump: opts?.continuityJump === true,
+      sameCamera: existing?.cameraId === rec.cameraId,
+      hasPlaybackUrl: Boolean(existing?.playbackUrl && vid0?.src),
+    })
+    if (vid0 && !preservePreviousFrame) { vid0.src = ''; vid0.load() }
+    if (preservePreviousFrame) {
+      console.info(`[recordings-ui] continuity_previous_frame_held slot=${slotIndex} recId=${rec.id}`)
+    }
 
     setSlots(prev => prev.map((s, i) => i === slotIndex ? {
       ...s,
       recording: rec,
       status: 'loading',
-      playbackUrl: null,
+      playbackUrl: preservePreviousFrame ? s.playbackUrl : null,
       sessionId: null,
       sessionType: null,
       downloadUrl: null,
@@ -1563,6 +1576,7 @@ export function RecordingsPage() {
       vodProgress: null,
       mimeType: null,
       noAudio: false,
+      preservePreviousFrame,
     } : s))
 
     try {
@@ -1629,7 +1643,9 @@ export function RecordingsPage() {
           },
         } : s))
 
-        const promotedUrl = await waitForPlaybackCapacity(slotIndex, sessionId, myKey)
+        const promotedUrl = await waitForPlaybackCapacity(
+          slotIndex, sessionId, myKey, opts?.continuityJump === true,
+        )
         if (!promotedUrl) return          // cancelada, reemplazada o expirada
         streamUrl = promotedUrl
       }
@@ -1823,6 +1839,7 @@ export function RecordingsPage() {
         sessionType: 'preview',
         downloadUrl: null,
         vodProgress: null,
+        preservePreviousFrame: false,
       } : s))
       console.info(`[recordings-ui] preview_ready slot=${slotIndex} sessionId=${sessionId} (session created — awaiting real playback)`)
 
@@ -1873,7 +1890,7 @@ export function RecordingsPage() {
       const detail = err?.response?.data?.message ?? 'No se pudo iniciar el stream de preview'
       console.error(`[recordings-ui] preview_error slot=${slotIndex} err=${detail}`)
       setSlots(prev => prev.map((s, i) => i === slotIndex ? {
-        ...s, status: 'error', errorMsg: detail,
+        ...s, status: 'error', errorMsg: detail, preservePreviousFrame: false,
       } : s))
     }
   }
@@ -2558,7 +2575,9 @@ export function RecordingsPage() {
                       controlsList="nodownload"
                       className={clsx(
                         'absolute inset-0 w-full h-full bg-black',
-                        isLiveSlot(slot.status) ? 'block' : 'hidden'
+                        (isLiveSlot(slot.status) ||
+                          (slot.preservePreviousFrame && (slot.status === 'loading' || slot.status === 'queued')))
+                          ? 'block' : 'hidden'
                       )}
                     />
 
@@ -2611,7 +2630,10 @@ export function RecordingsPage() {
                     )}
 
                     {slot.status === 'loading' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black">
+                      <div className={clsx(
+                        'absolute inset-0 flex flex-col items-center justify-center gap-2',
+                        slot.preservePreviousFrame ? 'bg-black/40' : 'bg-black',
+                      )}>
                         <Loader2 size={20} className="text-brand-400 animate-spin" />
                         <p className="text-[10px] text-surface-300">{loadLabel}</p>
                         {vodPct !== null && (

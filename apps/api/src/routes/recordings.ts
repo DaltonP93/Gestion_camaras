@@ -36,6 +36,7 @@ import { getTerminationTiming } from '../services/recordings/termination-timing'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
 import { PreviewProcessRegistry, type AttemptRecord } from '../services/recordings/preview-process-registry'
+import { buildPreviewInputArgs, resolvePreviewProbeOptions } from '../services/recordings/preview-input-options'
 import { getNvrSystemTime } from '../services/hikvision'
 
 // ─── VOD configuration ────────────────────────────────────────────
@@ -2340,6 +2341,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const { rtspUrl, rtspMasked, strategy } = session
     const rtspTimeoutOpt = getRtspTimeoutOption()
     const rtspTimeoutUs  = 60_000_000 // 60s for NVR seek + locate
+    const previewProbe   = resolvePreviewProbeOptions()
 
     // TASK 5 — transporte aprendido por el diagnóstico (sólo se setea cuando una
     // combinación funcionó). No cambia el transporte GLOBAL: es por-NVR y verificado.
@@ -2350,11 +2352,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // confirmada). La MISMA URI RTSP se reintenta sin audio; el video-only produce
     // fMP4 en ~5,5s. La descarga MP4 (VOD) NO se ve afectada.
     const buildFfmpegArgs = (inputUrl: string, videoOnly: boolean) => [
-      '-rtsp_transport', previewTransport,
-      '-fflags', '+genpts+discardcorrupt',
-      ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
-      '-reorder_queue_size', '0',
-      '-i', inputUrl,
+      ...buildPreviewInputArgs({
+        transport: previewTransport,
+        inputUrl,
+        rtspTimeoutOption: rtspTimeoutOpt,
+        rtspTimeoutUs,
+        ...previewProbe,
+      }),
       ...buildPreviewCodecArgs(strategy, videoOnly),
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
@@ -2630,7 +2634,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       server.log.info(
         `[recordings-preview] stream_start sessionId=${sessionId}` +
         ` slotIndex=${session.slotIndex} cameraId=${session.cameraId}` +
-        ` strategy=${strategy} codec=${session.detectedCodec} baseStrategy=${variant} track=${track} url=${maskedUrl.slice(0, 160)}`
+        ` strategy=${strategy} codec=${session.detectedCodec} baseStrategy=${variant} track=${track}` +
+        ` analyzeDurationUs=${previewProbe.analyzeDurationUs} probeSizeBytes=${previewProbe.probeSizeBytes}` +
+        ` url=${maskedUrl.slice(0, 160)}`
       )
 
       // stdio: [ignore, stdout(mp4), stderr, progress(pipe:3)] — el 4º fd es -progress.

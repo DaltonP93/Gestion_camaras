@@ -50,6 +50,9 @@ export interface PlaybackSlot {
   // El preview se está reproduciendo sin audio (fallback video-only del backend):
   // badge discreto "Sin audio". No es un error.
   noAudio?: boolean
+  // Mantiene visible el último fotograma mientras el mismo canal releva un
+  // bloque por el siguiente. Sólo aplica a loading/queued de continuidad.
+  preservePreviousFrame?: boolean
   // Espera de capacidad del NVR (status 'queued'): posición y ocupación actual.
   queue?: {
     position: number
@@ -75,5 +78,6 @@ export function emptySlot(slotIndex: number): PlaybackSlot {
     errorMsg: null,
     vodProgress: null,
     mimeType: null,
+    preservePreviousFrame: false,
   }
 }

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   decideContinuity, transitionKey, clockReachedNextStart, canClaimTransition,
+  playbackCapacityPollDelayMs, shouldPreservePreviousFrame,
   type NextBlock,
 } from './continuity'
 
@@ -119,5 +120,29 @@ describe('clockReachedNextStart', () => {
     expect(clockReachedNextStart(999_999, 1_000_000)).toBe(false)
     expect(clockReachedNextStart(1_000_000, 1_000_000)).toBe(true)
     expect(clockReachedNextStart(1_000_500, 1_000_000)).toBe(true)
+  })
+})
+
+describe('handoff de capacidad entre bloques', () => {
+  it('sondea rápido sólo durante continuidad', () => {
+    expect(playbackCapacityPollDelayMs(0, true)).toBe(250)
+    expect(playbackCapacityPollDelayMs(1, true)).toBe(500)
+    expect(playbackCapacityPollDelayMs(4, true)).toBe(1_500)
+    expect(playbackCapacityPollDelayMs(99, true)).toBe(5_000)
+  })
+
+  it('conserva el backoff normal para una reproducción inicialmente encolada', () => {
+    expect(playbackCapacityPollDelayMs(0, false)).toBe(2_500)
+    expect(playbackCapacityPollDelayMs(1, false)).toBe(3_000)
+    expect(playbackCapacityPollDelayMs(99, false)).toBe(10_000)
+  })
+})
+
+describe('último fotograma durante el relevo', () => {
+  it('se conserva únicamente para continuidad de la misma cámara con media previa', () => {
+    expect(shouldPreservePreviousFrame({ continuityJump: true, sameCamera: true, hasPlaybackUrl: true })).toBe(true)
+    expect(shouldPreservePreviousFrame({ continuityJump: false, sameCamera: true, hasPlaybackUrl: true })).toBe(false)
+    expect(shouldPreservePreviousFrame({ continuityJump: true, sameCamera: false, hasPlaybackUrl: true })).toBe(false)
+    expect(shouldPreservePreviousFrame({ continuityJump: true, sameCamera: true, hasPlaybackUrl: false })).toBe(false)
   })
 })
