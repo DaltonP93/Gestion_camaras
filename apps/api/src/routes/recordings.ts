@@ -871,6 +871,7 @@ export function releasePlaybackLease(nvrId: string, sessionId: string, reason: s
     releaseLeaseLogger?.(
       `[recordings-preview] nvr_playback_queue_promoted nvrId=${nvrId} sessionId=${p.sessionId}` +
       ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${Date.now() - p.queuedAt}` +
+      ` queueClass=${p.queueClass}` +
       ` activeCount=${admission.activeCount(nvrId)} queuedCount=${admission.queuedCount(nvrId)}`
     )
   }
@@ -964,7 +965,8 @@ setInterval(() => {
     for (const p of exp.promoted) {
       console.info(
         `[recordings-preview] nvr_playback_queue_promoted nvrId=${exp.nvrId} sessionId=${p.sessionId}` +
-        ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${now - p.queuedAt} reason=reservation_expired`
+        ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${now - p.queuedAt}` +
+        ` queueClass=${p.queueClass} reason=reservation_expired`
       )
     }
   }
@@ -1336,6 +1338,9 @@ const previewStartSchema = z.object({
   playbackURI:    z.string().startsWith('/').optional(),
   forceTranscode: z.boolean().optional(),
   canPlayHevcMp4: z.boolean().optional(),
+  // Sólo habilita prioridad si el admission controller verifica que esta sesión
+  // pertenece al mismo usuario/cámara/slot y ya consumió su lease.
+  continuityOfSessionId: z.string().regex(/^[a-f0-9]{16}$/).optional(),
   // Instrumentación de zona horaria (opcional, retrocompatible): lo que el
   // navegador tenía en pantalla y su offset UTC, para auditar el desfase de punta
   // a punta SIN asumir todavía cuál es el correcto. No afecta la conversión.
@@ -2231,6 +2236,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       cameraId: body.cameraId,
       cameraName: camera.name,
       slotIndex: body.slotIndex,
+      continuityOfSessionId: body.continuityOfSessionId ?? null,
     })
 
     const streamUrl = `/api/recordings/preview/${sessionId}/stream?token=${streamToken}`
@@ -2248,13 +2254,15 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         `[recordings-preview] nvr_playback_request_queued nvrId=${camera.nvr.id} sessionId=${sessionId}` +
         ` cameraId=${body.cameraId} userId=${user.sub} queuePosition=${decision.position}` +
         ` activeCount=${decision.activeCount} queuedCount=${decision.queuedCount}` +
-        ` configuredLimit=${decision.configuredLimit ?? 'auto'} effectiveLimit=${decision.effectiveLimit}`
+        ` configuredLimit=${decision.configuredLimit ?? 'auto'} effectiveLimit=${decision.effectiveLimit}` +
+        ` queueClass=${decision.queueClass ?? 'normal'}`
       )
       return reply.send({
         status: 'queued',
         sessionId,
         expiresAt: new Date(expiresAt).toISOString(),
         queuePosition: decision.position,
+        queueClass: decision.queueClass,
         estimatedRetryAfterSec: decision.estimatedRetryAfterSec,
         capacity,
       })
@@ -3242,6 +3250,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           ok: true,
           status: 'queued',
           queuePosition,
+          queueClass: admission.queueClassOf(session.nvrId, sessionId),
           capacity: {
             nvrId: session.nvrId,
             activeCount: admission.activeCount(session.nvrId),

@@ -32,7 +32,7 @@ import {
 } from '@/components/recordings/utils'
 import {
   decideContinuity, canClaimTransition, clockReachedNextStart,
-  playbackCapacityPollDelayMs, shouldPreservePreviousFrame,
+  playbackCapacityPollDelayMs, playbackQueueCopy, shouldPreservePreviousFrame,
 } from '@/components/recordings/continuity'
 
 // ─── Local interfaces ─────────────────────────────────────────────────────────
@@ -257,6 +257,7 @@ export function RecordingsPage() {
       try {
         const st = await apiGet<{
           status?: string; streamUrl?: string; queuePosition?: number | null
+          queueClass?: 'continuity' | 'normal' | null
           capacity?: { activeCount: number; effectiveLimit: number }
         }>(`/recordings/preview/${sessionId}/status`, {})
         failures = 0
@@ -274,6 +275,7 @@ export function RecordingsPage() {
               nvrName: s.queue?.nvrName ?? s.nvrName ?? null,
               activeCount: st.capacity?.activeCount ?? s.queue?.activeCount ?? 0,
               effectiveLimit: st.capacity?.effectiveLimit ?? s.queue?.effectiveLimit ?? 1,
+              queueClass: st.queueClass ?? s.queue?.queueClass ?? 'normal',
             },
           } : s))
           continue
@@ -1550,8 +1552,19 @@ export function RecordingsPage() {
       videoCleanupRef.current[slotIndex] = null
     }
     const existing = slotsRef.current[slotIndex]
-    if (existing?.sessionId) {
+    const continuityOfSessionId = (
+      opts?.continuityJump === true &&
+      existing?.sessionType === 'preview' &&
+      existing.cameraId === rec.cameraId
+    ) ? existing.sessionId : null
+    // En continuidad, registrar primero el sucesor para que el backend pueda
+    // validarlo y ordenarlo antes que aperturas nuevas; luego se cierra el lease
+    // anterior. En seek/cambio manual se conserva el cierre inmediato.
+    if (existing?.sessionId && !continuityOfSessionId) {
       deleteSessionOnce(existing.sessionType, existing.sessionId)
+    }
+    const releaseContinuityPredecessor = () => {
+      if (continuityOfSessionId) deleteSessionOnce('preview', continuityOfSessionId)
     }
     const vid0 = videoRefs.current[slotIndex]
     const preservePreviousFrame = shouldPreservePreviousFrame({
@@ -1585,6 +1598,7 @@ export function RecordingsPage() {
         streamUrl?: string
         status?: 'ready' | 'queued'
         queuePosition?: number | null
+        queueClass?: 'continuity' | 'normal' | null
         capacity?: { nvrName?: string | null; activeCount: number; effectiveLimit: number }
       }>(
         '/recordings/preview/start',
@@ -1598,12 +1612,16 @@ export function RecordingsPage() {
           playbackURI:    (rec as any).playbackURI,
           forceTranscode,
           canPlayHevcMp4,
+          continuityOfSessionId: continuityOfSessionId ?? undefined,
           // Instrumentación de zona horaria (P1): lo que el navegador ve en local
           // + su offset UTC, para auditar el desfase de punta a punta en el backend.
           browserLocal:          formatBrowserLocal(new Date(effectiveStart)),
           browserTimezoneOffset: new Date().getTimezoneOffset(),
         }
       )
+      // El sucesor ya quedó concedido o encolado; ahora sí iniciar el cierre del
+      // predecesor. deleteSessionOnce es idempotente ante ended/disconnect.
+      releaseContinuityPredecessor()
 
       if (slotKeysRef.current[slotIndex] !== myKey) {
         // Generación obsoleta: otra llamada reemplazó este slot mientras
@@ -1640,6 +1658,7 @@ export function RecordingsPage() {
             nvrName: result.capacity?.nvrName ?? s.nvrName ?? null,
             activeCount: result.capacity?.activeCount ?? 0,
             effectiveLimit: result.capacity?.effectiveLimit ?? 1,
+            queueClass: result.queueClass ?? 'normal',
           },
         } : s))
 
@@ -1885,6 +1904,7 @@ export function RecordingsPage() {
       if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
 
     } catch (err: any) {
+      releaseContinuityPredecessor()
       if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
       if (slotKeysRef.current[slotIndex] !== myKey) return
       const detail = err?.response?.data?.message ?? 'No se pudo iniciar el stream de preview'
@@ -2551,7 +2571,9 @@ export function RecordingsPage() {
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-brand-800/60 text-brand-300">Esperando…</span>
                       )}
                       {slot.status === 'queued' && (
-                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-amber-800/60 text-amber-300">En espera</span>
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-amber-800/60 text-amber-300">
+                          {playbackQueueCopy(slot.queue?.queueClass).badge}
+                        </span>
                       )}
                       <span className="flex-1" />
                       {slot.cameraId && (
@@ -2657,24 +2679,27 @@ export function RecordingsPage() {
                     {/* Espera de capacidad del NVR. NO es un error: el dispositivo
                         limita cuántas reproducciones concede a la vez y la cámara
                         arranca sola cuando se libera una. */}
-                    {slot.status === 'queued' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/70 px-3">
-                        <Loader2 size={18} className="text-amber-400 animate-spin flex-shrink-0" />
-                        <p className="text-[10px] text-surface-200 text-center">
-                          Esperando una sesión de reproducción disponible
-                          {slot.queue?.nvrName ? ` en ${slot.queue.nvrName}` : ''}.
-                        </p>
-                        <p className="text-[9px] text-surface-400 text-center">
-                          Posición {slot.queue?.position ?? 1} · {slot.queue?.activeCount ?? 0}/{slot.queue?.effectiveLimit ?? 1} en uso
-                        </p>
-                        <button
-                          onClick={e => { e.stopPropagation(); stopSlot(idx) }}
-                          className="mt-0.5 text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300 transition-colors"
-                        >
-                          Cancelar espera
-                        </button>
-                      </div>
-                    )}
+                    {slot.status === 'queued' && (() => {
+                      const queueCopy = playbackQueueCopy(slot.queue?.queueClass)
+                      return (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/70 px-3">
+                          <Loader2 size={18} className="text-amber-400 animate-spin flex-shrink-0" />
+                          <p className="text-[10px] text-surface-200 text-center">
+                            {queueCopy.title}{slot.queue?.nvrName ? ` en ${slot.queue.nvrName}` : ''}.
+                          </p>
+                          <p className="text-[9px] text-surface-400 text-center">{queueCopy.detail}</p>
+                          <p className="text-[9px] text-surface-400 text-center">
+                            Posición {slot.queue?.position ?? 1} · {slot.queue?.activeCount ?? 0}/{slot.queue?.effectiveLimit ?? 1} en uso
+                          </p>
+                          <button
+                            onClick={e => { e.stopPropagation(); stopSlot(idx) }}
+                            className="mt-0.5 text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300 transition-colors"
+                          >
+                            Cancelar espera
+                          </button>
+                        </div>
+                      )
+                    })()}
 
                     {slot.status === 'stalled' && (
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/70 px-3">

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   decideContinuity, transitionKey, clockReachedNextStart, canClaimTransition,
-  playbackCapacityPollDelayMs, shouldPreservePreviousFrame,
+  playbackCapacityPollDelayMs, playbackQueueCopy, shouldPreservePreviousFrame,
   type NextBlock,
 } from './continuity'
 
@@ -144,5 +144,21 @@ describe('último fotograma durante el relevo', () => {
     expect(shouldPreservePreviousFrame({ continuityJump: false, sameCamera: true, hasPlaybackUrl: true })).toBe(false)
     expect(shouldPreservePreviousFrame({ continuityJump: true, sameCamera: false, hasPlaybackUrl: true })).toBe(false)
     expect(shouldPreservePreviousFrame({ continuityJump: true, sameCamera: true, hasPlaybackUrl: false })).toBe(false)
+  })
+})
+
+
+describe('texto de espera por capacidad', () => {
+  it('distingue relevo de bloque de una cámara nueva en cola 1/1', () => {
+    expect(playbackQueueCopy('continuity')).toEqual({
+      badge: 'Relevo…',
+      title: 'Preparando el siguiente bloque',
+      detail: 'La reproducción anterior está liberando la sesión del NVR.',
+    })
+    expect(playbackQueueCopy('normal')).toEqual({
+      badge: 'En cola',
+      title: 'En cola por límite del NVR',
+      detail: 'La cámara iniciará automáticamente cuando se libere una sesión.',
+    })
   })
 })

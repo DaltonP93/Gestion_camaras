@@ -117,3 +117,23 @@ export function shouldPreservePreviousFrame(opts: {
 }): boolean {
   return opts.continuityJump && opts.sameCamera && opts.hasPlaybackUrl
 }
+
+
+export function playbackQueueCopy(queueClass: 'continuity' | 'normal' | null | undefined): {
+  badge: string
+  title: string
+  detail: string
+} {
+  if (queueClass === 'continuity') {
+    return {
+      badge: 'Relevo…',
+      title: 'Preparando el siguiente bloque',
+      detail: 'La reproducción anterior está liberando la sesión del NVR.',
+    }
+  }
+  return {
+    badge: 'En cola',
+    title: 'En cola por límite del NVR',
+    detail: 'La cámara iniciará automáticamente cuando se libere una sesión.',
+  }
+}

@@ -59,6 +59,7 @@ export interface PlaybackSlot {
     nvrName: string | null
     activeCount: number
     effectiveLimit: number
+    queueClass: 'continuity' | 'normal'
   } | null
 }
 
