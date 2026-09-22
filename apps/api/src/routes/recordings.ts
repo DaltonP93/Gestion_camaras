@@ -36,6 +36,7 @@ import { getTerminationTiming } from '../services/recordings/termination-timing'
 import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../services/recordings/staged-diagnostics'
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
 import { PreviewProcessRegistry, type AttemptRecord } from '../services/recordings/preview-process-registry'
+import { buildPreviewInputArgs, resolvePreviewProbeOptions } from '../services/recordings/preview-input-options'
 import { getNvrSystemTime } from '../services/hikvision'
 
 // ─── VOD configuration ────────────────────────────────────────────
@@ -870,6 +871,7 @@ export function releasePlaybackLease(nvrId: string, sessionId: string, reason: s
     releaseLeaseLogger?.(
       `[recordings-preview] nvr_playback_queue_promoted nvrId=${nvrId} sessionId=${p.sessionId}` +
       ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${Date.now() - p.queuedAt}` +
+      ` queueClass=${p.queueClass}` +
       ` activeCount=${admission.activeCount(nvrId)} queuedCount=${admission.queuedCount(nvrId)}`
     )
   }
@@ -963,7 +965,8 @@ setInterval(() => {
     for (const p of exp.promoted) {
       console.info(
         `[recordings-preview] nvr_playback_queue_promoted nvrId=${exp.nvrId} sessionId=${p.sessionId}` +
-        ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${now - p.queuedAt} reason=reservation_expired`
+        ` cameraId=${p.cameraId} userId=${p.userId} waitedMs=${now - p.queuedAt}` +
+        ` queueClass=${p.queueClass} reason=reservation_expired`
       )
     }
   }
@@ -1335,6 +1338,9 @@ const previewStartSchema = z.object({
   playbackURI:    z.string().startsWith('/').optional(),
   forceTranscode: z.boolean().optional(),
   canPlayHevcMp4: z.boolean().optional(),
+  // Sólo habilita prioridad si el admission controller verifica que esta sesión
+  // pertenece al mismo usuario/cámara/slot y ya consumió su lease.
+  continuityOfSessionId: z.string().regex(/^[a-f0-9]{16}$/).optional(),
   // Instrumentación de zona horaria (opcional, retrocompatible): lo que el
   // navegador tenía en pantalla y su offset UTC, para auditar el desfase de punta
   // a punta SIN asumir todavía cuál es el correcto. No afecta la conversión.
@@ -2230,6 +2236,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       cameraId: body.cameraId,
       cameraName: camera.name,
       slotIndex: body.slotIndex,
+      continuityOfSessionId: body.continuityOfSessionId ?? null,
     })
 
     const streamUrl = `/api/recordings/preview/${sessionId}/stream?token=${streamToken}`
@@ -2247,13 +2254,15 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         `[recordings-preview] nvr_playback_request_queued nvrId=${camera.nvr.id} sessionId=${sessionId}` +
         ` cameraId=${body.cameraId} userId=${user.sub} queuePosition=${decision.position}` +
         ` activeCount=${decision.activeCount} queuedCount=${decision.queuedCount}` +
-        ` configuredLimit=${decision.configuredLimit ?? 'auto'} effectiveLimit=${decision.effectiveLimit}`
+        ` configuredLimit=${decision.configuredLimit ?? 'auto'} effectiveLimit=${decision.effectiveLimit}` +
+        ` queueClass=${decision.queueClass ?? 'normal'}`
       )
       return reply.send({
         status: 'queued',
         sessionId,
         expiresAt: new Date(expiresAt).toISOString(),
         queuePosition: decision.position,
+        queueClass: decision.queueClass,
         estimatedRetryAfterSec: decision.estimatedRetryAfterSec,
         capacity,
       })
@@ -2340,6 +2349,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const { rtspUrl, rtspMasked, strategy } = session
     const rtspTimeoutOpt = getRtspTimeoutOption()
     const rtspTimeoutUs  = 60_000_000 // 60s for NVR seek + locate
+    const previewProbe   = resolvePreviewProbeOptions()
 
     // TASK 5 — transporte aprendido por el diagnóstico (sólo se setea cuando una
     // combinación funcionó). No cambia el transporte GLOBAL: es por-NVR y verificado.
@@ -2350,11 +2360,13 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     // confirmada). La MISMA URI RTSP se reintenta sin audio; el video-only produce
     // fMP4 en ~5,5s. La descarga MP4 (VOD) NO se ve afectada.
     const buildFfmpegArgs = (inputUrl: string, videoOnly: boolean) => [
-      '-rtsp_transport', previewTransport,
-      '-fflags', '+genpts+discardcorrupt',
-      ...(rtspTimeoutOpt ? [rtspTimeoutOpt, String(rtspTimeoutUs)] : []),
-      '-reorder_queue_size', '0',
-      '-i', inputUrl,
+      ...buildPreviewInputArgs({
+        transport: previewTransport,
+        inputUrl,
+        rtspTimeoutOption: rtspTimeoutOpt,
+        rtspTimeoutUs,
+        ...previewProbe,
+      }),
       ...buildPreviewCodecArgs(strategy, videoOnly),
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
@@ -2630,7 +2642,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       server.log.info(
         `[recordings-preview] stream_start sessionId=${sessionId}` +
         ` slotIndex=${session.slotIndex} cameraId=${session.cameraId}` +
-        ` strategy=${strategy} codec=${session.detectedCodec} baseStrategy=${variant} track=${track} url=${maskedUrl.slice(0, 160)}`
+        ` strategy=${strategy} codec=${session.detectedCodec} baseStrategy=${variant} track=${track}` +
+        ` analyzeDurationUs=${previewProbe.analyzeDurationUs} probeSizeBytes=${previewProbe.probeSizeBytes}` +
+        ` url=${maskedUrl.slice(0, 160)}`
       )
 
       // stdio: [ignore, stdout(mp4), stderr, progress(pipe:3)] — el 4º fd es -progress.
@@ -3236,6 +3250,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           ok: true,
           status: 'queued',
           queuePosition,
+          queueClass: admission.queueClassOf(session.nvrId, sessionId),
           capacity: {
             nvrId: session.nvrId,
             activeCount: admission.activeCount(session.nvrId),

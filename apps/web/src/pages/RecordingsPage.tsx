@@ -32,6 +32,7 @@ import {
 } from '@/components/recordings/utils'
 import {
   decideContinuity, canClaimTransition, clockReachedNextStart,
+  playbackCapacityPollDelayMs, playbackQueueCopy, shouldPreservePreviousFrame,
 } from '@/components/recordings/continuity'
 
 // ─── Local interfaces ─────────────────────────────────────────────────────────
@@ -219,16 +220,16 @@ export function RecordingsPage() {
   }
 
   const waitForPlaybackCapacity = async (
-    slotIndex: number, sessionId: string, myKey: string,
+    slotIndex: number, sessionId: string, myKey: string, continuityHandoff = false,
   ): Promise<string | null> => {
     const MAX_WAIT_MS = 10 * 60 * 1000
     // Backoff acotado con jitter. Un fallo transitorio del status NO puede
     // abandonar la cola: el lease seguiría tomado en el backend y el usuario
     // vería el slot colgado. El backend devuelve 'ready' idempotentemente, así
     // que reintentar es seguro y nunca crea otra sesión.
-    const BACKOFF_MS = [2_500, 3_000, 5_000, 8_000, 10_000]
     const started = Date.now()
     let failures = 0
+    let polls = 0
     let retryAfterMs: number | null = null
 
     const isRecoverable = (status: number | undefined): boolean =>
@@ -236,10 +237,14 @@ export function RecordingsPage() {
       status === 429 || status === 500 || status === 502 || status === 503 || status === 504
 
     while (Date.now() - started < MAX_WAIT_MS) {
-      const base = retryAfterMs ?? BACKOFF_MS[Math.min(failures, BACKOFF_MS.length - 1)]
+      const base = retryAfterMs ?? playbackCapacityPollDelayMs(
+        continuityHandoff ? polls : failures,
+        continuityHandoff,
+      )
       retryAfterMs = null
-      const jitter = Math.floor(Math.random() * 400)
+      const jitter = Math.floor(Math.random() * (continuityHandoff ? 100 : 400))
       await new Promise(r => setTimeout(r, base + jitter))
+      polls++
 
       // GENERACIÓN: si el usuario cambió cámara, playhead, búsqueda o layout, se
       // aborta. Una respuesta tardía nunca debe reproducir en el slot nuevo.
@@ -252,6 +257,7 @@ export function RecordingsPage() {
       try {
         const st = await apiGet<{
           status?: string; streamUrl?: string; queuePosition?: number | null
+          queueClass?: 'continuity' | 'normal' | null
           capacity?: { activeCount: number; effectiveLimit: number }
         }>(`/recordings/preview/${sessionId}/status`, {})
         failures = 0
@@ -269,6 +275,7 @@ export function RecordingsPage() {
               nvrName: s.queue?.nvrName ?? s.nvrName ?? null,
               activeCount: st.capacity?.activeCount ?? s.queue?.activeCount ?? 0,
               effectiveLimit: st.capacity?.effectiveLimit ?? s.queue?.effectiveLimit ?? 1,
+              queueClass: st.queueClass ?? s.queue?.queueClass ?? 'normal',
             },
           } : s))
           continue
@@ -1545,17 +1552,36 @@ export function RecordingsPage() {
       videoCleanupRef.current[slotIndex] = null
     }
     const existing = slotsRef.current[slotIndex]
-    if (existing?.sessionId) {
+    const continuityOfSessionId = (
+      opts?.continuityJump === true &&
+      existing?.sessionType === 'preview' &&
+      existing.cameraId === rec.cameraId
+    ) ? existing.sessionId : null
+    // En continuidad, registrar primero el sucesor para que el backend pueda
+    // validarlo y ordenarlo antes que aperturas nuevas; luego se cierra el lease
+    // anterior. En seek/cambio manual se conserva el cierre inmediato.
+    if (existing?.sessionId && !continuityOfSessionId) {
       deleteSessionOnce(existing.sessionType, existing.sessionId)
     }
+    const releaseContinuityPredecessor = () => {
+      if (continuityOfSessionId) deleteSessionOnce('preview', continuityOfSessionId)
+    }
     const vid0 = videoRefs.current[slotIndex]
-    if (vid0) { vid0.src = ''; vid0.load() }
+    const preservePreviousFrame = shouldPreservePreviousFrame({
+      continuityJump: opts?.continuityJump === true,
+      sameCamera: existing?.cameraId === rec.cameraId,
+      hasPlaybackUrl: Boolean(existing?.playbackUrl && vid0?.src),
+    })
+    if (vid0 && !preservePreviousFrame) { vid0.src = ''; vid0.load() }
+    if (preservePreviousFrame) {
+      console.info(`[recordings-ui] continuity_previous_frame_held slot=${slotIndex} recId=${rec.id}`)
+    }
 
     setSlots(prev => prev.map((s, i) => i === slotIndex ? {
       ...s,
       recording: rec,
       status: 'loading',
-      playbackUrl: null,
+      playbackUrl: preservePreviousFrame ? s.playbackUrl : null,
       sessionId: null,
       sessionType: null,
       downloadUrl: null,
@@ -1563,6 +1589,7 @@ export function RecordingsPage() {
       vodProgress: null,
       mimeType: null,
       noAudio: false,
+      preservePreviousFrame,
     } : s))
 
     try {
@@ -1571,6 +1598,7 @@ export function RecordingsPage() {
         streamUrl?: string
         status?: 'ready' | 'queued'
         queuePosition?: number | null
+        queueClass?: 'continuity' | 'normal' | null
         capacity?: { nvrName?: string | null; activeCount: number; effectiveLimit: number }
       }>(
         '/recordings/preview/start',
@@ -1584,12 +1612,16 @@ export function RecordingsPage() {
           playbackURI:    (rec as any).playbackURI,
           forceTranscode,
           canPlayHevcMp4,
+          continuityOfSessionId: continuityOfSessionId ?? undefined,
           // Instrumentación de zona horaria (P1): lo que el navegador ve en local
           // + su offset UTC, para auditar el desfase de punta a punta en el backend.
           browserLocal:          formatBrowserLocal(new Date(effectiveStart)),
           browserTimezoneOffset: new Date().getTimezoneOffset(),
         }
       )
+      // El sucesor ya quedó concedido o encolado; ahora sí iniciar el cierre del
+      // predecesor. deleteSessionOnce es idempotente ante ended/disconnect.
+      releaseContinuityPredecessor()
 
       if (slotKeysRef.current[slotIndex] !== myKey) {
         // Generación obsoleta: otra llamada reemplazó este slot mientras
@@ -1626,10 +1658,13 @@ export function RecordingsPage() {
             nvrName: result.capacity?.nvrName ?? s.nvrName ?? null,
             activeCount: result.capacity?.activeCount ?? 0,
             effectiveLimit: result.capacity?.effectiveLimit ?? 1,
+            queueClass: result.queueClass ?? 'normal',
           },
         } : s))
 
-        const promotedUrl = await waitForPlaybackCapacity(slotIndex, sessionId, myKey)
+        const promotedUrl = await waitForPlaybackCapacity(
+          slotIndex, sessionId, myKey, opts?.continuityJump === true,
+        )
         if (!promotedUrl) return          // cancelada, reemplazada o expirada
         streamUrl = promotedUrl
       }
@@ -1823,6 +1858,7 @@ export function RecordingsPage() {
         sessionType: 'preview',
         downloadUrl: null,
         vodProgress: null,
+        preservePreviousFrame: false,
       } : s))
       console.info(`[recordings-ui] preview_ready slot=${slotIndex} sessionId=${sessionId} (session created — awaiting real playback)`)
 
@@ -1868,12 +1904,13 @@ export function RecordingsPage() {
       if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
 
     } catch (err: any) {
+      releaseContinuityPredecessor()
       if (startingSlotsRef.current[slotIndex] === effKey) startingSlotsRef.current[slotIndex] = null
       if (slotKeysRef.current[slotIndex] !== myKey) return
       const detail = err?.response?.data?.message ?? 'No se pudo iniciar el stream de preview'
       console.error(`[recordings-ui] preview_error slot=${slotIndex} err=${detail}`)
       setSlots(prev => prev.map((s, i) => i === slotIndex ? {
-        ...s, status: 'error', errorMsg: detail,
+        ...s, status: 'error', errorMsg: detail, preservePreviousFrame: false,
       } : s))
     }
   }
@@ -2534,7 +2571,9 @@ export function RecordingsPage() {
                         <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-brand-800/60 text-brand-300">Esperando…</span>
                       )}
                       {slot.status === 'queued' && (
-                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-amber-800/60 text-amber-300">En espera</span>
+                        <span className="flex-shrink-0 text-[8px] px-1 py-0.5 rounded bg-amber-800/60 text-amber-300">
+                          {playbackQueueCopy(slot.queue?.queueClass).badge}
+                        </span>
                       )}
                       <span className="flex-1" />
                       {slot.cameraId && (
@@ -2558,7 +2597,9 @@ export function RecordingsPage() {
                       controlsList="nodownload"
                       className={clsx(
                         'absolute inset-0 w-full h-full bg-black',
-                        isLiveSlot(slot.status) ? 'block' : 'hidden'
+                        (isLiveSlot(slot.status) ||
+                          (slot.preservePreviousFrame && (slot.status === 'loading' || slot.status === 'queued')))
+                          ? 'block' : 'hidden'
                       )}
                     />
 
@@ -2611,7 +2652,10 @@ export function RecordingsPage() {
                     )}
 
                     {slot.status === 'loading' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black">
+                      <div className={clsx(
+                        'absolute inset-0 flex flex-col items-center justify-center gap-2',
+                        slot.preservePreviousFrame ? 'bg-black/40' : 'bg-black',
+                      )}>
                         <Loader2 size={20} className="text-brand-400 animate-spin" />
                         <p className="text-[10px] text-surface-300">{loadLabel}</p>
                         {vodPct !== null && (
@@ -2635,24 +2679,27 @@ export function RecordingsPage() {
                     {/* Espera de capacidad del NVR. NO es un error: el dispositivo
                         limita cuántas reproducciones concede a la vez y la cámara
                         arranca sola cuando se libera una. */}
-                    {slot.status === 'queued' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/70 px-3">
-                        <Loader2 size={18} className="text-amber-400 animate-spin flex-shrink-0" />
-                        <p className="text-[10px] text-surface-200 text-center">
-                          Esperando una sesión de reproducción disponible
-                          {slot.queue?.nvrName ? ` en ${slot.queue.nvrName}` : ''}.
-                        </p>
-                        <p className="text-[9px] text-surface-400 text-center">
-                          Posición {slot.queue?.position ?? 1} · {slot.queue?.activeCount ?? 0}/{slot.queue?.effectiveLimit ?? 1} en uso
-                        </p>
-                        <button
-                          onClick={e => { e.stopPropagation(); stopSlot(idx) }}
-                          className="mt-0.5 text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300 transition-colors"
-                        >
-                          Cancelar espera
-                        </button>
-                      </div>
-                    )}
+                    {slot.status === 'queued' && (() => {
+                      const queueCopy = playbackQueueCopy(slot.queue?.queueClass)
+                      return (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/70 px-3">
+                          <Loader2 size={18} className="text-amber-400 animate-spin flex-shrink-0" />
+                          <p className="text-[10px] text-surface-200 text-center">
+                            {queueCopy.title}{slot.queue?.nvrName ? ` en ${slot.queue.nvrName}` : ''}.
+                          </p>
+                          <p className="text-[9px] text-surface-400 text-center">{queueCopy.detail}</p>
+                          <p className="text-[9px] text-surface-400 text-center">
+                            Posición {slot.queue?.position ?? 1} · {slot.queue?.activeCount ?? 0}/{slot.queue?.effectiveLimit ?? 1} en uso
+                          </p>
+                          <button
+                            onClick={e => { e.stopPropagation(); stopSlot(idx) }}
+                            className="mt-0.5 text-[9px] px-2 py-0.5 rounded bg-surface-700 hover:bg-surface-600 text-surface-300 transition-colors"
+                          >
+                            Cancelar espera
+                          </button>
+                        </div>
+                      )
+                    })()}
 
                     {slot.status === 'stalled' && (
                       <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/70 px-3">

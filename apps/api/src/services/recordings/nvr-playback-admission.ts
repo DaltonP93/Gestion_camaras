@@ -27,6 +27,11 @@ export interface AdmissionRequest {
   slotIndex: number
   requestedAt?: number
   leaseType?: LeaseType
+  /**
+   * Sesión previa del mismo usuario/cámara/slot. Sólo concede prioridad si el
+   * controlador puede verificar que ese lease ya fue consumido.
+   */
+  continuityOfSessionId?: string | null
 }
 
 /**
@@ -59,6 +64,8 @@ export interface PlaybackLease {
   leaseType: LeaseType
 }
 
+export type PlaybackQueueClass = 'continuity' | 'normal'
+
 export interface QueuedRequest {
   nvrId: string
   sessionId: string
@@ -67,6 +74,8 @@ export interface QueuedRequest {
   cameraName: string | null
   slotIndex: number
   queuedAt: number
+  queueClass: PlaybackQueueClass
+  continuityOfSessionId: string | null
 }
 
 export interface AdmissionDecision {
@@ -74,6 +83,8 @@ export interface AdmissionDecision {
   queued: boolean
   /** Posición 1-based en la cola (sólo si queued). */
   position: number | null
+  /** Continuidad validada o solicitud normal; null cuando fue concedida. */
+  queueClass: PlaybackQueueClass | null
   activeCount: number
   queuedCount: number
   configuredLimit: number | null
@@ -113,6 +124,8 @@ export interface NvrCapacitySnapshot {
     userId: string
     position: number
     queuedAt: number
+    queueClass: PlaybackQueueClass
+    continuityOfSessionId: string | null
   }>
 }
 
@@ -201,8 +214,10 @@ export class NvrPlaybackAdmissionController {
 
   /**
    * Pide capacidad para una sesión. Si hay cupo concede el lease; si no, encola
-   * la solicitud (FIFO) y devuelve la posición. Es idempotente por sessionId:
-   * volver a pedir con la misma sesión no duplica lease ni entrada en cola.
+   * la solicitud y devuelve la posición. Las continuidades verificadas del
+   * lease que ya ocupa el mismo usuario/cámara/slot se ordenan antes que las
+   * aperturas nuevas; dentro de cada clase se conserva FIFO. Es idempotente por
+   * sessionId: volver a pedir no duplica lease ni entrada en cola.
    */
   acquire(req: AdmissionRequest): AdmissionDecision {
     const st = this.stateOf(req.nvrId)
@@ -213,11 +228,13 @@ export class NvrPlaybackAdmissionController {
     this.reconcile(req.nvrId)
 
     // Idempotencia: ya tiene lease.
-    if (st.leases.has(req.sessionId)) return this.decision(req.nvrId, true, null)
+    if (st.leases.has(req.sessionId)) return this.decision(req.nvrId, true, null, null)
 
-    // Idempotencia: ya está en cola → devolver su posición actual.
+    // Idempotencia: ya está en cola → devolver su posición y clase actuales.
     const existingIdx = st.queue.findIndex(q => q.sessionId === req.sessionId)
-    if (existingIdx >= 0) return this.decision(req.nvrId, false, existingIdx + 1)
+    if (existingIdx >= 0) {
+      return this.decision(req.nvrId, false, existingIdx + 1, st.queue[existingIdx].queueClass)
+    }
 
     const limit = this.effectiveLimitFor(req.nvrId)
     if (st.leases.size < limit) {
@@ -236,10 +253,11 @@ export class NvrPlaybackAdmissionController {
         state: 'reserved',
         leaseType: req.leaseType ?? 'preview',
       })
-      return this.decision(req.nvrId, true, null)
+      return this.decision(req.nvrId, true, null, null)
     }
 
-    st.queue.push({
+    const queueClass = this.queueClassFor(st, req)
+    const queued: QueuedRequest = {
       nvrId: req.nvrId,
       sessionId: req.sessionId,
       userId: req.userId,
@@ -247,8 +265,20 @@ export class NvrPlaybackAdmissionController {
       cameraName: req.cameraName ?? null,
       slotIndex: req.slotIndex,
       queuedAt: now,
-    })
-    return this.decision(req.nvrId, false, st.queue.length)
+      queueClass,
+      continuityOfSessionId: queueClass === 'continuity'
+        ? req.continuityOfSessionId ?? null
+        : null,
+    }
+    if (queueClass === 'continuity') {
+      const firstNormal = st.queue.findIndex(q => q.queueClass === 'normal')
+      if (firstNormal >= 0) st.queue.splice(firstNormal, 0, queued)
+      else st.queue.push(queued)
+    } else {
+      st.queue.push(queued)
+    }
+    const position = st.queue.findIndex(q => q.sessionId === req.sessionId) + 1
+    return this.decision(req.nvrId, false, position, queueClass)
   }
 
   /**
@@ -434,6 +464,10 @@ export class NvrPlaybackAdmissionController {
     return idx >= 0 ? idx + 1 : null
   }
 
+  queueClassOf(nvrId: string, sessionId: string): PlaybackQueueClass | null {
+    return this.stateOf(nvrId).queue.find(q => q.sessionId === sessionId)?.queueClass ?? null
+  }
+
   // ─── Diagnóstico ───────────────────────────────────────────────────────────
 
   snapshot(nvrNames: Map<string, string> = new Map()): NvrCapacitySnapshot[] {
@@ -472,6 +506,8 @@ export class NvrPlaybackAdmissionController {
           userId: q.userId,
           position: i + 1,
           queuedAt: q.queuedAt,
+          queueClass: q.queueClass,
+          continuityOfSessionId: q.continuityOfSessionId,
         })),
       })
     }
@@ -500,7 +536,31 @@ export class NvrPlaybackAdmissionController {
     st.cooldownUntil = null
   }
 
-  /** Promueve de la cola mientras haya cupo. FIFO determinista. */
+  /**
+   * Sólo el lease anterior consumido del mismo usuario/cámara/slot habilita la
+   * prioridad. Un cliente no puede adelantar la cola enviando un id arbitrario.
+   */
+  private queueClassFor(st: NvrState, req: AdmissionRequest): PlaybackQueueClass {
+    const predecessorId = req.continuityOfSessionId
+    if (!predecessorId || predecessorId === req.sessionId) return 'normal'
+    const predecessor = st.leases.get(predecessorId)
+    if (!predecessor || predecessor.leaseType !== 'preview') return 'normal'
+    if (predecessor.state === 'reserved' || !predecessor.consumed) return 'normal'
+    if (predecessor.userId !== req.userId) return 'normal'
+    if (predecessor.cameraId !== req.cameraId) return 'normal'
+    if (predecessor.slotIndex !== req.slotIndex) return 'normal'
+    // Un único sucesor puede reclamar el relevo de un predecesor. Sin esta
+    // compuerta, un cliente defectuoso podría encolar varias prioridades con el
+    // mismo lease consumido y desplazar indefinidamente las aperturas normales.
+    const alreadyClaimed = st.queue.some(q =>
+      q.queueClass === 'continuity' &&
+      q.continuityOfSessionId === predecessorId
+    )
+    if (alreadyClaimed) return 'normal'
+    return 'continuity'
+  }
+
+  /** Promueve por clase (continuidad antes que apertura nueva) y FIFO interno. */
   private promote(nvrId: string, st: NvrState): QueuedRequest[] {
     const promoted: QueuedRequest[] = []
     const limit = this.effectiveLimitFor(nvrId)
@@ -533,12 +593,18 @@ export class NvrPlaybackAdmissionController {
     return true
   }
 
-  private decision(nvrId: string, granted: boolean, position: number | null): AdmissionDecision {
+  private decision(
+    nvrId: string,
+    granted: boolean,
+    position: number | null,
+    queueClass: PlaybackQueueClass | null,
+  ): AdmissionDecision {
     const st = this.stateOf(nvrId)
     return {
       granted,
       queued: !granted,
       position,
+      queueClass,
       activeCount: st.leases.size,
       queuedCount: st.queue.length,
       configuredLimit: st.configuredLimit,

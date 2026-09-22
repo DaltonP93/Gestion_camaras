@@ -587,3 +587,95 @@ describe('P1 — el cupo no se suelta mientras el proceso siga vivo, venga de do
     expect(c.activeCount('nvr-A')).toBe(1)   // sólo sB
   })
 })
+
+
+describe('continuidad prioritaria validada — video de producción 2026-09-18', () => {
+  it('promueve el siguiente bloque antes que una cámara nueva ya en cola', () => {
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sActual', cameraId: 'camA', slotIndex: 0 }))
+    c.markConsumed({ nvrId: 'nvr-A', sessionId: 'sActual' })
+
+    const nueva = c.acquire(req({ sessionId: 'sNueva', cameraId: 'camB', slotIndex: 1 }))
+    expect(nueva.queueClass).toBe('normal')
+    expect(nueva.position).toBe(1)
+
+    const continuidad = c.acquire(req({
+      sessionId: 'sSiguiente',
+      cameraId: 'camA',
+      slotIndex: 0,
+      continuityOfSessionId: 'sActual',
+    }))
+    expect(continuidad.queueClass).toBe('continuity')
+    expect(continuidad.position).toBe(1)
+    expect(c.queuePositionOf('nvr-A', 'sNueva')).toBe(2)
+
+    const released = c.release({ nvrId: 'nvr-A', sessionId: 'sActual', reason: 'exit_confirmed' })
+    expect(released.promoted.map(p => p.sessionId)).toEqual(['sSiguiente'])
+    expect(c.hasLease('nvr-A', 'sNueva')).toBe(false)
+  })
+
+  it('no acepta prioridad con predecesor inexistente, reservado o de otra identidad', () => {
+    const cases = [
+      { name: 'inexistente', predecessor: 'missing', cameraId: 'camA', slotIndex: 0, userId: 'u1' },
+      { name: 'otra cámara', predecessor: 'sActual', cameraId: 'camB', slotIndex: 0, userId: 'u1' },
+      { name: 'otro slot', predecessor: 'sActual', cameraId: 'camA', slotIndex: 2, userId: 'u1' },
+      { name: 'otro usuario', predecessor: 'sActual', cameraId: 'camA', slotIndex: 0, userId: 'u2' },
+    ]
+    for (const tc of cases) {
+      const { c } = ctl({ globalDefault: 1 })
+      c.acquire(req({ sessionId: 'sActual', cameraId: 'camA', slotIndex: 0 }))
+      if (tc.name !== 'inexistente') {
+        c.markConsumed({ nvrId: 'nvr-A', sessionId: 'sActual' })
+      }
+      c.acquire(req({ sessionId: 'sNormal', cameraId: 'camZ', slotIndex: 3 }))
+      const d = c.acquire(req({
+        sessionId: 'sIntento',
+        userId: tc.userId,
+        cameraId: tc.cameraId,
+        slotIndex: tc.slotIndex,
+        continuityOfSessionId: tc.predecessor,
+      }))
+      expect(d.queueClass, tc.name).toBe('normal')
+      expect(d.position, tc.name).toBe(2)
+    }
+
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sReservada', cameraId: 'camA', slotIndex: 0 }))
+    c.acquire(req({ sessionId: 'sNormal', cameraId: 'camZ', slotIndex: 3 }))
+    const reserved = c.acquire(req({
+      sessionId: 'sIntento',
+      cameraId: 'camA',
+      slotIndex: 0,
+      continuityOfSessionId: 'sReservada',
+    }))
+    expect(reserved.queueClass).toBe('normal')
+    expect(reserved.position).toBe(2)
+  })
+
+  it('concede una sola prioridad por predecesor y no desplaza la cola con duplicados', () => {
+    const { c } = ctl({ globalDefault: 1 })
+    c.acquire(req({ sessionId: 'sActual', cameraId: 'camA', slotIndex: 0 }))
+    c.markFirstByte({ nvrId: 'nvr-A', sessionId: 'sActual' })
+    c.acquire(req({ sessionId: 'sNormal', cameraId: 'camZ', slotIndex: 3 }))
+
+    const first = c.acquire(req({
+      sessionId: 'sNext1',
+      cameraId: 'camA',
+      slotIndex: 0,
+      continuityOfSessionId: 'sActual',
+    }))
+    const duplicate = c.acquire(req({
+      sessionId: 'sNext2',
+      cameraId: 'camA',
+      slotIndex: 0,
+      continuityOfSessionId: 'sActual',
+    }))
+
+    expect(first.queueClass).toBe('continuity')
+    expect(duplicate.queueClass).toBe('normal')
+    const q = c.snapshot()[0].queue
+    expect(q.map(x => x.sessionId)).toEqual(['sNext1', 'sNormal', 'sNext2'])
+    expect(q.map(x => x.queueClass)).toEqual(['continuity', 'normal', 'normal'])
+    expect(q.map(x => x.continuityOfSessionId)).toEqual(['sActual', null, null])
+  })
+})

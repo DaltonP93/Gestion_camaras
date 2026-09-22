@@ -93,3 +93,47 @@ export function clockReachedNextStart(clockMs: number, nextEffectiveStartMs: num
 export function canClaimTransition(currentClaimedKey: string | null | undefined, newKey: string): boolean {
   return currentClaimedKey !== newKey
 }
+
+const NORMAL_CAPACITY_POLL_MS = [2_500, 3_000, 5_000, 8_000, 10_000] as const
+const HANDOFF_CAPACITY_POLL_MS = [250, 500, 750, 1_000, 1_500, 2_500, 5_000] as const
+
+/**
+ * During a block-to-block handoff the old lease is already terminating. Polling
+ * first at 2.5 s adds avoidable dead time after FFmpeg has actually exited. A
+ * short, bounded ramp is used only for continuity; ordinary queued playbacks
+ * keep the low-frequency schedule.
+ */
+export function playbackCapacityPollDelayMs(failures: number, continuityHandoff: boolean): number {
+  const schedule = continuityHandoff ? HANDOFF_CAPACITY_POLL_MS : NORMAL_CAPACITY_POLL_MS
+  const index = Math.min(Math.max(0, Math.trunc(failures)), schedule.length - 1)
+  return schedule[index]
+}
+
+/** Keep the last decoded frame visible while the same camera changes blocks. */
+export function shouldPreservePreviousFrame(opts: {
+  continuityJump: boolean
+  sameCamera: boolean
+  hasPlaybackUrl: boolean
+}): boolean {
+  return opts.continuityJump && opts.sameCamera && opts.hasPlaybackUrl
+}
+
+
+export function playbackQueueCopy(queueClass: 'continuity' | 'normal' | null | undefined): {
+  badge: string
+  title: string
+  detail: string
+} {
+  if (queueClass === 'continuity') {
+    return {
+      badge: 'Relevo…',
+      title: 'Preparando el siguiente bloque',
+      detail: 'La reproducción anterior está liberando la sesión del NVR.',
+    }
+  }
+  return {
+    badge: 'En cola',
+    title: 'En cola por límite del NVR',
+    detail: 'La cámara iniciará automáticamente cuando se libere una sesión.',
+  }
+}
