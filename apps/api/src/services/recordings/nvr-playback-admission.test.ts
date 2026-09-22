@@ -652,22 +652,30 @@ describe('continuidad prioritaria validada — video de producción 2026-09-18',
     expect(reserved.position).toBe(2)
   })
 
-  it('conserva FIFO entre dos continuidades válidas y expone la clase sin secretos', () => {
+  it('concede una sola prioridad por predecesor y no desplaza la cola con duplicados', () => {
     const { c } = ctl({ globalDefault: 1 })
     c.acquire(req({ sessionId: 'sActual', cameraId: 'camA', slotIndex: 0 }))
     c.markFirstByte({ nvrId: 'nvr-A', sessionId: 'sActual' })
+    c.acquire(req({ sessionId: 'sNormal', cameraId: 'camZ', slotIndex: 3 }))
 
-    for (const sessionId of ['sNext1', 'sNext2']) {
-      c.acquire(req({
-        sessionId,
-        cameraId: 'camA',
-        slotIndex: 0,
-        continuityOfSessionId: 'sActual',
-      }))
-    }
+    const first = c.acquire(req({
+      sessionId: 'sNext1',
+      cameraId: 'camA',
+      slotIndex: 0,
+      continuityOfSessionId: 'sActual',
+    }))
+    const duplicate = c.acquire(req({
+      sessionId: 'sNext2',
+      cameraId: 'camA',
+      slotIndex: 0,
+      continuityOfSessionId: 'sActual',
+    }))
+
+    expect(first.queueClass).toBe('continuity')
+    expect(duplicate.queueClass).toBe('normal')
     const q = c.snapshot()[0].queue
-    expect(q.map(x => x.sessionId)).toEqual(['sNext1', 'sNext2'])
-    expect(q.map(x => x.queueClass)).toEqual(['continuity', 'continuity'])
-    expect(q.map(x => x.continuityOfSessionId)).toEqual(['sActual', 'sActual'])
+    expect(q.map(x => x.sessionId)).toEqual(['sNext1', 'sNormal', 'sNext2'])
+    expect(q.map(x => x.queueClass)).toEqual(['continuity', 'normal', 'normal'])
+    expect(q.map(x => x.continuityOfSessionId)).toEqual(['sActual', null, null])
   })
 })

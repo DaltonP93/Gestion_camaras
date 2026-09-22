@@ -549,6 +549,14 @@ export class NvrPlaybackAdmissionController {
     if (predecessor.userId !== req.userId) return 'normal'
     if (predecessor.cameraId !== req.cameraId) return 'normal'
     if (predecessor.slotIndex !== req.slotIndex) return 'normal'
+    // Un único sucesor puede reclamar el relevo de un predecesor. Sin esta
+    // compuerta, un cliente defectuoso podría encolar varias prioridades con el
+    // mismo lease consumido y desplazar indefinidamente las aperturas normales.
+    const alreadyClaimed = st.queue.some(q =>
+      q.queueClass === 'continuity' &&
+      q.continuityOfSessionId === predecessorId
+    )
+    if (alreadyClaimed) return 'normal'
     return 'continuity'
   }
 
