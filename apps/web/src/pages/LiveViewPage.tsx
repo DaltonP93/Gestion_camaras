@@ -34,6 +34,7 @@ import {
   restartStreamFlow, exitFocusFlow, hdReacquireFlow, limitHitFlow,
   type EnterFocusOutcome,
 } from '@/lib/liveViewFlows'
+import { planLiveLayoutChange as planLayout } from '@/lib/liveLayoutQuality'
 
 function isHevcCodec(codec?: string): boolean {
   if (!codec) return false
@@ -353,6 +354,7 @@ export function LiveViewPage() {
   const allFiltered = cameras.filter((c) =>
     selectedNVR === 'all' ? true : c.nvrId === selectedNVR
   )
+  const liveLayoutCameraIds = allFiltered.map(camera => camera.id)
   const totalPages      = Math.max(1, Math.ceil(allFiltered.length / gridLayout))
   const safePage        = Math.min(page, totalPages - 1)
   const filteredCameras = allFiltered.slice(safePage * gridLayout, (safePage + 1) * gridLayout)
@@ -1274,15 +1276,6 @@ export function LiveViewPage() {
   // cadencia, tira el trabajo anterior, espera el cierre, publica, espera a que
   // los IDs nuevos estén publicados, rearma y late una sola vez. Sólo la
   // transición más reciente llega a publicar.
-  const handleLayoutChange = useCallback(async (layout: GridLayout) => {
-    await transition.run('layout_change', () => {
-      prevVisibleIds.current = []
-      appliedCameraQuery.current = null  // permite renavegar a la cámara con el layout nuevo
-      setGridLayout(layout)
-      setPage(0)
-    })
-  }, [])
-
   const handleNVRChange = useCallback(async (nvrId: string) => {
     await transition.run('nvr_change', () => {
       prevVisibleIds.current = []
@@ -1480,6 +1473,7 @@ export function LiveViewPage() {
     // misma función, así que ambas quedan cubiertas por la misma guarda.
     const token = transition.current()
     console.info(`[live-ui] fullscreen_requested cameraId=${camera.id} streamType=main`)
+    focusCameraRef.current = camera.id
     setFocusCamera(camera.id)
     setFocusStreamInfo(null)
     setFocusStreamError(null)
@@ -1785,7 +1779,7 @@ export function LiveViewPage() {
   // On return from fullscreen, stop the focus camera and restart the grid cameras.
   // We do NOT restart cameras that weren't affected by the fullscreen.
   const handleExitFocus = useCallback(async () => {
-    const prevFocusId = focusCamera
+    const prevFocusId = focusCameraRef.current
     // Las dos esperas de esta secuencia eran `new Promise(r => setTimeout(...))`
     // sueltas: sobrevivían a un cambio de NVR y remontaban y arrancaban la
     // grilla del viewport nuevo con la intención del viejo. Ahora la operación
@@ -1796,6 +1790,7 @@ export function LiveViewPage() {
       settleMs: 100,
       remountMs: 300,
       clearFocus: () => {
+        focusCameraRef.current = null
         setFocusCamera(null)
         setFocusStreamInfo(null)
         setFocusStreamError(null)
@@ -1819,6 +1814,34 @@ export function LiveViewPage() {
       },
     })
   }, [focusCamera, bumpPlayerKeys, startVisibleStreams, viewId])
+
+  // 1×1 es una intención de calidad, no sólo una grilla de una celda. Reutiliza
+  // el mismo foco real que el doble clic: solicita `main` y conserva el fallback
+  // probado a `main_h264`. Los demás layouts salen del foco y vuelven a sub.
+  const handleLayoutChange = useCallback(async (layout: GridLayout) => {
+    const plan = planLayout({ requestedLayout: layout, currentLayout: gridLayout, currentPage: safePage, orderedCameraIds: liveLayoutCameraIds, visibleCameraId: filteredCamerasRef.current[0]?.id, focusCameraId: focusCameraRef.current })
+    if (plan.viewportChanged) {
+      const outcome = await transition.run('layout_change', () => {
+        prevVisibleIds.current = []
+        appliedCameraQuery.current = null
+        setGridLayout(layout)
+        setPage(plan.targetPage)
+      })
+      // Sólo la transición más reciente puede iniciar/cerrar el foco. Así un
+      // doble clic rápido 1×1→2×2 no aplica tarde el HD del primer clic.
+      if (outcome !== 'committed') return
+    }
+
+    if (plan.focusAction === 'exit_focus') {
+      await handleExitFocus()
+      return
+    }
+
+    if (plan.focusAction === 'enter_focus' && plan.targetCameraId) {
+      const targetCamera = cameras.find(camera => camera.id === plan.targetCameraId)
+      if (targetCamera) await handleEnterFocus(targetCamera)
+    }
+  }, [cameras, liveLayoutCameraIds, gridLayout, safePage, handleEnterFocus, handleExitFocus])
 
   const currentGrid    = GRID_OPTIONS.find(g => g.value === gridLayout) || GRID_OPTIONS[2]
   const totalForFilter = allFiltered.length
