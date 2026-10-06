@@ -1,6 +1,7 @@
 # VisionCore: experiencia de video, Frigate y clientes instalables
 
-Estado: primera entrega de continuidad propuesta para revisión, **sin despliegue**.
+Estado: continuidad y proveedor NVR propuestos en entregas separadas para revisión,
+**sin despliegue**. La corrección de dependencias del API es una base independiente.
 Base inspeccionada: `94305f32ddba17b697b8f28b5fe3ef5108b0bc2c` (2026-10-06).
 El PR #180 de alta calidad automática en 1×1 permanece separado.
 
@@ -65,7 +66,8 @@ Una futura activación mantiene flags OFF por defecto y requiere validación pro
    video. Prueba de página real en Chromium con tres bloques, cola, 403, respuesta
    tardía, pausa, velocidad y hueco; registrar frames presentados. No cambia API,
    capacidad por NVR, autenticación, almacenamiento ni contenedores.
-2. **Proveedor NVR y medición de campo.** Contrato tipado separado de la página;
+2. **Proveedor NVR y medición de campo.** Contrato tipado separado de la página
+   implementado en la segunda entrega (ver detalle debajo); medición de campo pendiente:
    medir clic→primer frame, último frame→primer frame siguiente, tiempo en cola,
    buffering, CPU/RAM y frames descartados. Probar 1 cámara y multicámara en un
    NVR y en dos NVR, con clientes/codec identificados. Definir objetivos sobre esa
@@ -101,3 +103,29 @@ Una futura activación mantiene flags OFF por defecto y requiere validación pro
   esta corrección evita el salto por timeout, no reemplaza el reloj compartido.
 - Merge, despliegue, cambios operativos y activación de funciones se revisan por
   separado. Ninguna etapa justifica exponer credenciales de NVR al cliente.
+
+## Segunda entrega: frontera del proveedor NVR
+
+`apps/web/src/services/recordings/nvrRecordingProvider.ts` concentra las llamadas
+de `RecordingsPage`: búsqueda por cámara/rango, comprobación de capacidades,
+apertura/estado/cierre de preview y apertura/estado/cierre de MP4. Usa el cliente
+autenticado de VisionCore; conserva cookies HttpOnly, refresh y errores HTTP.
+No conecta el navegador al RTSP del NVR ni incorpora endpoints de Frigate.
+
+El contrato declara el archivo de origen NVR y conserva sin reinterpretar las
+fechas ya convertidas por la UI, los huecos, la URI opaca de reproducción, la cola
+y el identificador del predecesor. `ready` sólo indica disponibilidad de URL;
+`hadFirstByte` sólo indica llegada al servidor. Ninguno representa un fotograma
+decodificado. La UI sigue controlando generaciones, polling, medio y cancelación;
+el API sigue controlando permisos, admisión y salida real de FFmpeg.
+
+Las pruebas de contrato usan el cliente HTTP real con un adaptador de red simulado:
+cookies activas, fechas/huecos intactos, sucesor en cola sin cierres implícitos,
+errores 403/404/410/429/503 y Retry-After conservados, exportación separada de preview,
+cierre fallido sin éxito falso e identificadores confinados a su segmento de URL.
+El banco Chromium de la primera entrega comprueba que el refactor conserva el
+relevo, las generaciones y la reproducción de video sintético.
+
+No se incorpora caché, retención, detector, cambio visual, código de Frigate ni
+instalador en este tramo. El siguiente port de interfaz utilizará esta frontera.
+La prueba en equipos reales y el reloj global multicámara siguen pendientes.
