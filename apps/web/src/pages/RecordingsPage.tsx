@@ -756,8 +756,6 @@ export function RecordingsPage() {
       ` endedAt=${new Date(endedAtMs).toISOString()}`
     )
 
-    if (slot.sessionId) deleteSessionOnce(slot.sessionType, slot.sessionId)
-
     const currentEndMs = new Date(rec.endTime).getTime()
     // La continuidad NO debe pasar de searchEnd: buscar el siguiente bloque DENTRO
     // del rango activo, con el playhead recortado (P1). Se toma como playhead el fin
@@ -794,6 +792,7 @@ export function RecordingsPage() {
 
     // Sin siguiente bloque en el rango → detener (no hay nada que continuar).
     if (decision.action === 'none') {
+      if (slot.sessionId) deleteSessionOnce(slot.sessionType, slot.sessionId)
       console.info(
         `[recordings-ui] continuity_no_next_clip slot=${slotIndex}` +
         ` playhead=${new Date(endedAtMs).toISOString()}`
@@ -825,6 +824,7 @@ export function RecordingsPage() {
     )
 
     if (decision.action === 'wait_clock') {
+      if (slot.sessionId) deleteSessionOnce(slot.sessionType, slot.sessionId)
       // Multicámara: NO adelantar el reloj (otras cámaras lo manejan). Guardar el
       // siguiente bloque y esperar: el watcher del reloj (único dueño) lo arranca
       // UNA vez al alcanzar effectiveStart. UI: "Esperando siguiente bloque…".
@@ -842,7 +842,10 @@ export function RecordingsPage() {
       return
     }
 
-    // start_now: 1x1 adelanta el reloj al siguiente bloque (advanceClock) o solape
+    // start_now conserva el predecesor hasta registrar el sucesor en
+    // startPreviewInSlot. Cerrarlo aquí perdería la prioridad de continuidad
+    // antes de que el API pueda comprobar el lease anterior.
+    // 1x1 adelanta el reloj al siguiente bloque (advanceClock) o solape
     // multicámara inmediato. Un ÚNICO startPreviewInSlot / session_init.
     waitingNextBySlotRef.current[slotIndex] = null
     nextRecBySlotRef.current[slotIndex] = null
@@ -865,7 +868,7 @@ export function RecordingsPage() {
   }
 
   // (Re)programs the continuity timer for a slot from the REMAINING clip time,
-  // adjusted by playback rate. Called on preview start, resume, rate change and
+  // adjusted by playback rate. Called on actual playback, resume, rate change and
   // manual seeks — pause clears it so a paused clip never advances.
   const scheduleContinuityTimer = (slotIndex: number, sessionId: string) => {
     if (continuityTimerRef.current[slotIndex]) {
@@ -876,7 +879,8 @@ export function RecordingsPage() {
     const previewStart = previewStartTimesRef.current[slotIndex]
     if (!clip || previewStart == null) return
     const vid = videoRefs.current[slotIndex]
-    const playedMs = (vid?.currentTime ?? 0) * 1000
+    if (!vid || vid.paused || vid.seeking || vid.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
+    const playedMs = vid.currentTime * 1000
     // Usar el fin EFECTIVO (recortado a searchEnd), no el fin real del bloque:
     // la reproducción debe detenerse en searchEnd (P1).
     const remainingMs = clip.effectiveEndMs - (previewStart + playedMs)
@@ -886,6 +890,16 @@ export function RecordingsPage() {
       continuityTimerRef.current[slotIndex] = null
       const currentSlot = slotsRef.current[slotIndex]
       if (currentSlot?.sessionId === sessionId && globalPlayingRef.current) {
+        const currentVideo = videoRefs.current[slotIndex]
+        if (!currentVideo || currentVideo.paused || currentVideo.seeking ||
+            currentVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
+        // El tiempo de pared incluye esperas de red/decodificación. Nunca saltar
+        // un bloque basándose sólo en el timeout: el video debe haber consumido
+        // su ventana efectiva. `playing` rearma tras buffering o seek.
+        if (previewStart + currentVideo.currentTime * 1000 < clip.effectiveEndMs) {
+          scheduleContinuityTimer(slotIndex, sessionId)
+          return
+        }
         continueSlotToNextRecording(slotIndex, 'expected_timer')
       }
     }, fireInMs)
@@ -1806,6 +1820,7 @@ export function RecordingsPage() {
         clearStall()
         console.info(`[recordings-ui] preview_playing slot=${slotIndex} sessionId=${sessionId}`)
         setSlotStatusIfCurrent('playing')
+        if (globalPlayingRef.current) scheduleContinuityTimer(slotIndex, sessionId)
         // Fetch único: ¿el backend cayó a video-only? → badge discreto "Sin audio"
         // (el video reproduce normalmente; NO es un error).
         if (!noAudioChecked) {
@@ -1821,7 +1836,24 @@ export function RecordingsPage() {
         }
       }
       const onTimeUpdate = () => {
-        if (vid.currentTime > 0) { clearStall(); setSlotStatusIfCurrent('playing') }
+        if (!vid.paused && !vid.seeking && vid.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA && vid.currentTime > 0) {
+          clearStall(); setSlotStatusIfCurrent('playing')
+        }
+      }
+      const clearContinuityTimer = () => {
+        if (continuityTimerRef.current[slotIndex]) {
+          clearTimeout(continuityTimerRef.current[slotIndex]!)
+          continuityTimerRef.current[slotIndex] = null
+        }
+      }
+      const onWaiting = () => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        clearContinuityTimer()
+        setSlotStatusIfCurrent('buffering')
+      }
+      const onPause = () => {
+        if (slotKeysRef.current[slotIndex] !== myKey) return
+        clearContinuityTimer()
       }
       const onCanPlay = () => {
         // Media lista. Si NO hay intención de reproducir (pausado), queda 'ready';
@@ -1838,6 +1870,9 @@ export function RecordingsPage() {
       vid.addEventListener('playing', onPlaying)
       vid.addEventListener('timeupdate', onTimeUpdate)
       vid.addEventListener('canplay', onCanPlay)
+      vid.addEventListener('waiting', onWaiting)
+      vid.addEventListener('seeking', onWaiting)
+      vid.addEventListener('pause', onPause)
       videoCleanupRef.current[slotIndex] = () => {
         vid.removeEventListener('error', handleError)
         vid.removeEventListener('ended', handleEnded)
@@ -1845,6 +1880,10 @@ export function RecordingsPage() {
         vid.removeEventListener('playing', onPlaying)
         vid.removeEventListener('timeupdate', onTimeUpdate)
         vid.removeEventListener('canplay', onCanPlay)
+        vid.removeEventListener('waiting', onWaiting)
+        vid.removeEventListener('seeking', onWaiting)
+        vid.removeEventListener('pause', onPause)
+        clearContinuityTimer()
         clearStall()
       }
 
@@ -1895,7 +1934,7 @@ export function RecordingsPage() {
         // sin esto el slot podría quedar en 'buffering' sin watchdog. onMetadata/
         // onCanPlay lo REEMPLAZAN por el detector corto (5 s) ya con media adjunto.
         armStallTimer(slotIndex, sessionId, 30_000)
-        scheduleContinuityTimer(slotIndex, sessionId)
+        // `playing` arma la continuidad cuando realmente empieza el video.
       } else {
         // Sin intención de reproducir: cargar metadatos para poder mostrar frame.
         vid.load()

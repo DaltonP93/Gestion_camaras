@@ -8,8 +8,11 @@
 // determinista el conteo de llamadas de red del test. La build de producción no
 // hace ese doble montaje, así que el harness refleja producción.
 import ReactDOM from 'react-dom/client'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, Link } from 'react-router-dom'
 import { ViewPlayerPage } from '@/pages/ViewPlayerPage'
+import { RecordingsPage } from '@/pages/RecordingsPage'
+
+const recordingsHarness = window.location.pathname === '/recordings'
 
 // `sessionClose.closeWithKeepalive` devuelve {emitted:false} si NO hay token en
 // storage (mismo origen que lee el interceptor de axios). Sin esto, ningún DELETE
@@ -18,8 +21,13 @@ import { ViewPlayerPage } from '@/pages/ViewPlayerPage'
 try { localStorage.setItem('accessToken', 'e2e-token') } catch { /* storage bloqueado */ }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <MemoryRouter initialEntries={['/views/v1']}>
+  <MemoryRouter initialEntries={[recordingsHarness ? window.location.pathname + window.location.search : '/views/v1']}>
     <Routes>
+      <Route path="/recordings" element={<>
+        <Link to="/away">Salir del banco de reproducción</Link>
+        <RecordingsPage />
+      </>} />
+      <Route path="/away" element={<div>Reproducción desmontada</div>} />
       <Route path="/views/:id" element={<ViewPlayerPage />} />
       <Route path="/views" element={<div data-testid="views-index">views index</div>} />
     </Routes>
