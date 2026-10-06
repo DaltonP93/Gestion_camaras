@@ -7,10 +7,10 @@ import {
 } from 'lucide-react'
 // Clock kept for slot overlays
 import { useCameraStore } from '@/stores/cameraStore'
-import { apiPost, apiGet, apiDelete } from '@/lib/api'
+import { nvrRecordingProvider, type PlaybackStatusResponse } from '@/services/recordings/nvrRecordingProvider'
 import { subHours } from 'date-fns'
 import { clsx } from 'clsx'
-import type { Recording } from '@/types'
+import type { RecordingCapabilities } from '@/types'
 import toast from 'react-hot-toast'
 import { RecordingPlaybackControls } from '@/components/RecordingPlaybackControls'
 import { RecordingCameraTree }  from '@/components/recordings/RecordingCameraTree'
@@ -36,27 +36,6 @@ import {
 } from '@/components/recordings/continuity'
 
 // ─── Local interfaces ─────────────────────────────────────────────────────────
-
-interface PlaybackStatusResponse {
-  status:               'starting' | 'ready' | 'error'
-  url?:                 string
-  mimeType?:            string
-  transcoded?:          boolean
-  errorCode?:           string
-  error?:               string
-  downloadUrl?:         string
-  outTimeSec?:          number
-  expectedDurationSec?: number
-  progressPercent?:     number
-}
-
-interface RecordingCapabilities {
-  nvrId: string
-  recordingProvider: string
-  supportsIsapiRecording: boolean | null
-  playbackWebUrl: string | null
-  recordingCapabilityError: string | null
-}
 
 interface DownloadJob {
   sessionId: string
@@ -188,14 +167,11 @@ export function RecordingsPage() {
   // continuidad → mostrar "Cargando siguiente bloque…" en vez de "Conectando…".
   const continuityJumpBySlotRef = useRef<{ [k: number]: boolean }>({})
 
-  const deleteSessionOnce = (sessionType: string | null, sessionId: string | null | undefined) => {
+  const deleteSessionOnce = (sessionType: PlaybackSlot['sessionType'], sessionId: string | null | undefined) => {
     if (!sessionId) return
     if (deletedSessionsRef.current.has(sessionId)) return
     deletedSessionsRef.current.add(sessionId)
-    const ep = sessionType === 'preview'
-      ? `/recordings/preview/${sessionId}`
-      : `/recordings/playback/${sessionId}`
-    apiDelete(ep).catch(() => {})
+    nvrRecordingProvider.close({ type: sessionType ?? 'mp4', id: sessionId }).catch(() => {})
   }
 
   /**
@@ -255,11 +231,7 @@ export function RecordingsPage() {
       }
 
       try {
-        const st = await apiGet<{
-          status?: string; streamUrl?: string; queuePosition?: number | null
-          queueClass?: 'continuity' | 'normal' | null
-          capacity?: { activeCount: number; effectiveLimit: number }
-        }>(`/recordings/preview/${sessionId}/status`, {})
+        const st = await nvrRecordingProvider.previewStatus(sessionId)
         failures = 0
 
         if (st.status === 'ready' && st.streamUrl) {
@@ -614,7 +586,7 @@ export function RecordingsPage() {
     searchedKeysRef.current.add(key)
     console.info(`[recordings-ui] incremental_search_start cameraId=${cameraId} from=${range.start} to=${range.end}`)
     const cam = cameras.find(c => c.id === cameraId)
-    apiGet<{ recordings: Recording[] }>('/recordings/search', {
+    nvrRecordingProvider.search({
       cameraId, startTime: range.start, endTime: range.end,
     })
       .then(res => {
@@ -1031,7 +1003,7 @@ export function RecordingsPage() {
 
     const results = await Promise.allSettled(
       cameraIds.map(cameraId =>
-        apiGet<{ recordings: Recording[] }>('/recordings/search', {
+        nvrRecordingProvider.search({
           cameraId,
           startTime: startIso,
           endTime:   endIso,
@@ -1152,7 +1124,7 @@ export function RecordingsPage() {
   const handleRevalidate = async (nvrId: string) => {
     setRevalidating(prev => new Set([...prev, nvrId]))
     try {
-      const caps = await apiPost<RecordingCapabilities>(`/nvrs/${nvrId}/recording-capabilities/check`, {})
+      const caps = await nvrRecordingProvider.checkCapabilities(nvrId)
       setNvrCaps(prev => new Map([...prev, [nvrId, caps]]))
       if (caps.supportsIsapiRecording) {
         toast.success('NVR ahora soporta ISAPI. Vuelve a buscar para obtener resultados.')
@@ -1207,7 +1179,7 @@ export function RecordingsPage() {
       ` recStart_raw=${rec.startTime} recEnd_raw=${rec.endTime}` +
       ` displayedStart_utc=${displayedStart} displayedEnd_utc=${displayedEnd}` +
       ` browserTz=${browserTz}` +
-      ` playbackURI=${(rec as any).playbackURI ?? 'none'}`
+      ` hasPlaybackURI=${Boolean(rec.playbackURI)}`
     )
 
     const myKey = `${Date.now()}-${Math.random()}`
@@ -1305,14 +1277,7 @@ export function RecordingsPage() {
     }
 
     try {
-      const result = await apiPost<{
-        status: string
-        sessionId: string
-        expectedDurationSec?: number
-        url?: string
-        mimeType?: string
-        downloadUrl?: string
-      }>('/recordings/playback', {
+      const result = await nvrRecordingProvider.startPlayback({
         cameraId:    rec.cameraId,
         startTime:   rec.startTime,
         endTime:     rec.endTime,
@@ -1344,7 +1309,7 @@ export function RecordingsPage() {
 
         let statusRes: PlaybackStatusResponse
         try {
-          statusRes = await apiGet<PlaybackStatusResponse>(`/recordings/playback/${sessionId}/status`, {})
+          statusRes = await nvrRecordingProvider.playbackStatus(sessionId)
         } catch (pollErr: any) {
           if (slotKeysRef.current[slotIndex] !== myKey) return
           const httpStatus = pollErr?.response?.status
@@ -1607,15 +1572,7 @@ export function RecordingsPage() {
     } : s))
 
     try {
-      const result = await apiPost<{
-        sessionId: string
-        streamUrl?: string
-        status?: 'ready' | 'queued'
-        queuePosition?: number | null
-        queueClass?: 'continuity' | 'normal' | null
-        capacity?: { nvrName?: string | null; activeCount: number; effectiveLimit: number }
-      }>(
-        '/recordings/preview/start',
+      const result = await nvrRecordingProvider.startPreview(
         {
           cameraId:       rec.cameraId,
           slotIndex,
@@ -1623,7 +1580,7 @@ export function RecordingsPage() {
           // endTime EFECTIVO recortado a searchEnd — NO rec.endTime cuando el bloque
           // excede el rango buscado (P1: el video debe detenerse en searchEnd).
           endTime:        effectiveEnd,
-          playbackURI:    (rec as any).playbackURI,
+          playbackURI:    rec.playbackURI,
           forceTranscode,
           canPlayHevcMp4,
           continuityOfSessionId: continuityOfSessionId ?? undefined,
@@ -1732,10 +1689,7 @@ export function RecordingsPage() {
         let detail:   string | null = null
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
-            const st = await apiGet<{
-              category?: string | null; detail?: string | null
-              errorCategory?: string | null; errorDetail?: string | null
-            }>(`/recordings/preview/${sessionId}/status`, {})
+            const st = await nvrRecordingProvider.previewStatus(sessionId)
             category = st.category ?? st.errorCategory ?? null
             detail   = st.detail ?? st.errorDetail ?? null
             console.info(`[recordings-ui] preview_status_loaded slot=${slotIndex} sessionId=${sessionId} category=${category ?? 'none'}`)
@@ -1825,7 +1779,7 @@ export function RecordingsPage() {
         // (el video reproduce normalmente; NO es un error).
         if (!noAudioChecked) {
           noAudioChecked = true
-          apiGet<{ videoOnly?: boolean | null }>(`/recordings/preview/${sessionId}/status`, {})
+          nvrRecordingProvider.previewStatus(sessionId)
             .then((st) => {
               if (slotKeysRef.current[slotIndex] !== myKey) return
               if (st.videoOnly) {
@@ -1968,14 +1922,11 @@ export function RecordingsPage() {
     )
 
     try {
-      const result = await apiPost<{
-        status: string; sessionId: string;
-        expectedDurationSec?: number; url?: string; downloadUrl?: string; mimeType?: string;
-      }>('/recordings/playback', {
+      const result = await nvrRecordingProvider.startPlayback({
         cameraId:    rec.cameraId,
         startTime:   rec.startTime,
         endTime:     rec.endTime,
-        playbackURI: (rec as any).playbackURI,
+        playbackURI: rec.playbackURI,
         canPlayHevcMp4: false,
         forceTranscode: false,
       })
@@ -2000,7 +1951,7 @@ export function RecordingsPage() {
 
         let statusRes: PlaybackStatusResponse
         try {
-          statusRes = await apiGet<PlaybackStatusResponse>(`/recordings/playback/${sessionId}/status`, {})
+          statusRes = await nvrRecordingProvider.playbackStatus(sessionId)
         } catch { break }
 
         if (downloadJobKeyRef.current !== jobKey) return
