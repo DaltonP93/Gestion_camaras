@@ -12,6 +12,7 @@ import fs from 'fs'
 import path from 'path'
 
 import { decryptNvrPassword as decryptPass } from '../services/credentials'
+import { validatePlaybackUriForChannel, playbackUriErrorResponse } from '../services/recordings/playback-uri-policy'
 import { MemorySessionStore, RedisSessionStore, type SessionStore } from '../services/session-store'
 import { shouldAcceptFirstByte, errorStatusForCategory, isCancellation, resolveStreamTakeover } from './recordings-preview-state'
 import {
@@ -1605,6 +1606,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       if (!perm) return reply.status(403).send({ message: 'Sin permiso de reproducción' })
     }
 
+    // La playbackURI la reenvía el navegador: debe ser la pista del canal de ESTA
+    // cámara. Se valida antes de descifrar credenciales, contactar el NVR o
+    // iniciar FFmpeg (acceso cruzado entre canales del mismo NVR).
+    if (body.playbackURI !== undefined) {
+      const uriCheck = validatePlaybackUriForChannel(body.playbackURI, camera.channel)
+      if (!uriCheck.ok) {
+        server.log.warn(`[recordings] playback_uri_rejected route=playback cameraId=${body.cameraId} reason=${uriCheck.reason} user=${user.sub}`)
+        const err = playbackUriErrorResponse(uriCheck.reason)
+        return reply.status(err.status).send(err.body)
+      }
+    }
+
     const plainPass = decryptPass(camera.nvr.password)
     if (!plainPass) {
       return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
@@ -2016,6 +2029,18 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         where: { userId: user.sub, cameraId: body.cameraId, canPlayback: true },
       })
       if (!perm) return reply.status(403).send({ message: 'Sin permiso de reproducción' })
+    }
+
+    // La playbackURI la reenvía el navegador: debe ser la pista del canal de ESTA
+    // cámara. Se valida antes de descifrar credenciales, contactar el NVR o
+    // iniciar FFmpeg (acceso cruzado entre canales del mismo NVR).
+    if (body.playbackURI !== undefined) {
+      const uriCheck = validatePlaybackUriForChannel(body.playbackURI, camera.channel)
+      if (!uriCheck.ok) {
+        server.log.warn(`[recordings] playback_uri_rejected route=preview_start cameraId=${body.cameraId} reason=${uriCheck.reason} user=${user.sub}`)
+        const err = playbackUriErrorResponse(uriCheck.reason)
+        return reply.status(err.status).send(err.body)
+      }
     }
 
     const plainPass = decryptPass(camera.nvr.password)
@@ -3358,6 +3383,17 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
 
     const camera = await server.prisma.camera.findUnique({ where: { id: body.cameraId }, include: { nvr: true } })
     if (!camera?.nvr) return reply.status(404).send({ message: 'Cámara no encontrada' })
+    // La playbackURI la reenvía el navegador: debe ser la pista del canal de ESTA
+    // cámara. Se valida antes de descifrar credenciales, contactar el NVR o
+    // iniciar FFmpeg (acceso cruzado entre canales del mismo NVR).
+    if (body.playbackURI !== undefined) {
+      const uriCheck = validatePlaybackUriForChannel(body.playbackURI, camera.channel)
+      if (!uriCheck.ok) {
+        server.log.warn(`[recordings] playback_uri_rejected route=diagnostics cameraId=${body.cameraId} reason=${uriCheck.reason} user=${user.sub}`)
+        const err = playbackUriErrorResponse(uriCheck.reason)
+        return reply.status(err.status).send(err.body)
+      }
+    }
     const plainPass = decryptPass(camera.nvr.password)
     if (!plainPass) return reply.status(422).send({ message: 'No se pueden descifrar las credenciales del NVR' })
 
