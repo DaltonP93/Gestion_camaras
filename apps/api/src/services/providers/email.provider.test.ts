@@ -13,9 +13,12 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))))
 })
 
-async function smtp(rejectRecipient = false) {
+interface SmtpAuth { user: string; pass: string }
+
+async function smtp(rejectRecipient = false, auth?: SmtpAuth) {
   const messages: string[] = []
   const recipients: string[] = []
+  const logins: Array<{ user: string; pass: string; accepted: boolean }> = []
   const server = createServer(socket => {
     sockets.add(socket)
     socket.on('close', () => sockets.delete(socket))
@@ -35,7 +38,17 @@ async function smtp(rejectRecipient = false) {
             data = null
             socket.write('250 accepted\r\n')
           } else data.push(line)
-        } else if (/^EHLO|^HELO/i.test(line)) socket.write('250 localhost\r\n')
+        } else if (/^EHLO/i.test(line)) socket.write(auth ? '250-localhost\r\n250 AUTH PLAIN\r\n' : '250 localhost\r\n')
+        else if (/^HELO/i.test(line)) socket.write('250 localhost\r\n')
+        else if (/^AUTH PLAIN /i.test(line)) {
+          // RFC 4616: base64("authzid\0user\0pass")
+          const [, user = '', pass = ''] = Buffer.from(line.slice('AUTH PLAIN '.length), 'base64').toString('utf8').split('\0')
+          const accepted = !!auth && user === auth.user && pass === auth.pass
+          logins.push({ user, pass, accepted })
+          socket.write(accepted ? '235 authenticated\r\n' : '535 5.7.8 authentication failed\r\n')
+        } else if (/^MAIL FROM:/i.test(line) && auth && !logins.some(l => l.accepted)) {
+          socket.write('530 5.7.0 authentication required\r\n')
+        }
         else if (/^RCPT TO:/i.test(line)) {
           recipients.push(line)
           socket.write(rejectRecipient ? '550 recipient rejected\r\n' : '250 recipient OK\r\n')
@@ -51,14 +64,14 @@ async function smtp(rejectRecipient = false) {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('Missing test port')
-  return { port: address.port, messages, recipients }
+  return { port: address.port, messages, recipients, logins }
 }
 
-function database(port: number, emailEnabled = true) {
+function database(port: number, emailEnabled = true, credentials?: SmtpAuth) {
   return {
     alertSettings: { findUnique: async () => ({
       emailEnabled, smtpHost: '127.0.0.1', smtpPort: port, smtpSecure: false,
-      smtpUser: null, smtpPassword: null,
+      smtpUser: credentials?.user ?? null, smtpPassword: credentials?.pass ?? null,
       smtpFromName: 'VisionCore', smtpFromEmail: 'alerts@example.test',
       recipientEmails: 'one@example.test, two@example.test',
     }) },
@@ -104,5 +117,26 @@ describe('email provider with the installed SMTP transport', () => {
     expect(test.recipients).toEqual([])
     expect(test.messages).toEqual([])
     expect(sockets.size).toBe(0)
+  })
+
+  it('authenticates with the configured SMTP credentials before sending', async () => {
+    const credentials = { user: 'alerts-user', pass: 'correct horse battery staple' }
+    const test = await smtp(false, credentials)
+    const result = await sendAlertEmail(database(test.port, true, credentials), { subject: 'Auth', html: 'Auth' })
+    expect(result.success).toBe(true)
+    expect(test.logins).toEqual([{ ...credentials, accepted: true }])
+    expect(test.messages).toHaveLength(1)
+  })
+
+  it('reports rejected credentials as EAUTH, sends no DATA and never echoes the password', async () => {
+    const test = await smtp(false, { user: 'alerts-user', pass: 'the-right-secret' })
+    const wrong = { user: 'alerts-user', pass: 'a-wrong-secret-value' }
+    const result = await sendAlertEmail(database(test.port, true, wrong), { subject: 'Auth', html: 'Auth' })
+    expect(result.success).toBe(false)
+    expect(result.errorCode).toBe('EAUTH')
+    expect(test.logins).toEqual([{ ...wrong, accepted: false }])
+    expect(test.recipients).toEqual([])
+    expect(test.messages).toEqual([])
+    expect(result.error).not.toContain(wrong.pass)
   })
 })
