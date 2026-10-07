@@ -4,10 +4,15 @@
 import cron from 'node-cron'
 import type { FastifyInstance } from 'fastify'
 import { syncNvrCameraMetadata } from '../services/nvrSync'
+import { resolveIsolationConfig, type IsolationConfig } from '../services/staging-isolation'
 
 const SYNC_INTERVAL_MINUTES = Number(process.env.NVR_SYNC_INTERVAL_MINUTES || 5)
 
-export function startSyncWorker(server: FastifyInstance): void {
+export function startSyncWorker(server: FastifyInstance, isolation: IsolationConfig = resolveIsolationConfig()): void {
+  if (!isolation.nvrSync) {
+    server.log.info('[syncWorker] desactivado (NVR_SYNC_ENABLED=false o STAGING_ISOLATION=true)')
+    return
+  }
   // Build cron expression: every N minutes
   const cronExpr = SYNC_INTERVAL_MINUTES <= 1
     ? '* * * * *'
