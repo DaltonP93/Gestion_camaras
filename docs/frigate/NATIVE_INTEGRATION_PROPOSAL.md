@@ -1,20 +1,27 @@
-# Propuesta técnica — detección de eventos con Frigate dentro de VisionCore
+# Propuesta técnica — adaptación nativa de Frigate dentro de VisionCore
 
-> Estado: **PROPUESTA** (planificación). No autoriza portar código, desplegar ni activar flags.
-> Fecha: 2026-10-07. Base del repo: `main` = `94305f32ddba17b697b8f28b5fe3ef5108b0bc2c`.
+> Estado: **PROPUESTA** (planificación). No autoriza portar código, desplegar, instalar ni activar flags.
+> Revisión 2 — 2026-10-07. Base del repo: `main` = `94305f32ddba17b697b8f28b5fe3ef5108b0bc2c`.
+> Plan de pruebas: `docs/frigate/PLAYER_TEST_PLAN.md`. Migración: `docs/runbooks/migration-dell-pro-slim.md`.
 
-## 0. Resumen de la decisión propuesta
+## 0. Alcance pedido
 
-VisionCore sigue siendo **el producto**: login, roles, permisos por cámara, NVR, alertas, visores en
-vivo y archivo. Frigate se usa como **motor interno de detección** (servicio aislado, sin acceso de
-usuarios) y VisionCore consume sus eventos. La "integración nativa" es de **experiencia y datos**
-(los eventos aparecen en la UI, el timeline y las alertas de VisionCore con sus permisos), **no** un
-port del código de Frigate.
+Adaptar **de forma nativa dentro de VisionCore** la experiencia de Frigate en cinco áreas:
 
-Se propone **no portar código** en las primeras etapas. Correr la imagen oficial fijada por digest
-como servicio interno da las actualizaciones y correcciones de upstream sin mantener un fork en Python
-grande. Portar un componente concreto (por ejemplo la lógica de *review*) se evaluaría recién después
-de medir con NVR reales (E6), y sólo si hay una razón medible.
+1. **Vivo**;
+2. **reproductor**;
+3. **timeline**;
+4. **eventos** (revisión, snapshots y clips);
+5. **configuración de detección**.
+
+Se mantienen sin cambios de dueño:
+
+- **Login, roles y permisos por cámara de VisionCore.** Nada de la UI ni de la autenticación de Frigate queda expuesto al usuario.
+- **NVR y visores de VisionCore.**
+- **El archivo completo existe exclusivamente en los NVR.** Vivo, búsqueda y reproducción del archivo salen siempre del NVR.
+- **Almacenamiento local limitado a los eventos configurados**: metadatos, snapshots y clips de la ventana de cada evento, con cuota y retención. Sin grabación continua en el servidor.
+
+Frigate se usa como **motor de detección** en un servicio interno, sin acceso de usuarios. Lo que se adapta a VisionCore es su **experiencia**: componentes de UI y modelos de datos. El motor de detección en Python **no se porta**.
 
 ## 1. Referencia oficial fijada
 
@@ -23,181 +30,215 @@ de medir con NVR reales (E6), y sólo si hay una razón medible.
 | Repositorio | <https://github.com/blakeblackshear/frigate> |
 | Tag | `v0.18.0` (última estable al 2026-10-07; posteriores sólo `-beta`/`-rc`) |
 | Commit | `77a66e75c61862b048a07c1295877f4b31343504` |
-| Imagen a usar | `ghcr.io/blakeblackshear/frigate:0.18.0` **fijada por digest `@sha256:`** al preparar E5 (el digest se registra entonces, verificado con `docker buildx imagetools inspect`). |
 | Licencia del código | MIT (`LICENSE`, "Copyright (c) 2026 Frigate, Inc.") |
-| Marca | `TRADEMARK.md`: "Frigate™", "Frigate NVR™", "Frigate+™" y el logo **no** están cubiertos por MIT |
+| Marca | `TRADEMARK.md`: "Frigate™", "Frigate NVR™", "Frigate+™" y el logo **no** se licencian con MIT |
+| Imagen del motor | `ghcr.io/blakeblackshear/frigate:0.18.0`, fijada por digest `@sha256:` al preparar la etapa E7 |
 | En el repo hoy | `docker-compose.yml` fija `frigate:0.14.1` bajo el profile `frigate` (no corre en producción) |
 
-**Atribución y marca:**
-- Si se copia código, el aviso MIT va **íntegro** junto al código copiado y en
-  `THIRD_PARTY_NOTICES.md` (nuevo), con el tag y el SHA de origen.
-- Sólo **uso referencial**: "detección con Frigate", "compatible con Frigate". No se usa "Frigate" en el
-  nombre de una función o módulo de cara al usuario, no se usa el logo y no se sugiere afiliación.
-- Usar la imagen oficial sin modificar no es un fork. Un fork modificado **debe renombrarse y quitar el
-  logo** (§4 de su política de marca).
+**Atribución y marca para todo componente portado:**
+- Cabecera en cada archivo portado: `Adaptado de Frigate v0.18.0 (77a66e7), <ruta original>, MIT`.
+- Aviso MIT íntegro en `THIRD_PARTY_NOTICES.md` (nuevo).
+- Nombres propios en la UI ("Detección", "Eventos", "Zonas"). "Frigate" sólo aparece como referencia técnica ("motor de detección: Frigate"), sin logo y sin sugerir afiliación.
+- Un componente adaptado no es un fork distribuido. Si algún día se distribuyera una imagen modificada del motor, habría que renombrarla y quitar el logo (§4 de su política de marca).
 
-## 2. Requisitos que se mantienen (no negociables)
+## 2. Inventario: reutilizable, a adaptar o no reutilizable
 
-1. **Login, roles y permisos.** Toda lectura de eventos, snapshots y clips pasa por la API de
-   VisionCore con `canView`/`canPlayback` por cámara. La UI (8971) y la API (5000) de Frigate nunca se
-   exponen: red docker interna, sin puertos publicados, sin enlaces desde el navegador.
-2. **NVR como única fuente del archivo completo.** Vivo y búsqueda/reproducción del archivo siguen
-   saliendo de los NVR mediante el proveedor de grabaciones (#184). **El almacenamiento local de
-   Frigate no es el archivo del NVR**: un clip de evento es evidencia derivada, corta y con retención
-   propia.
-3. **Sólo metadatos, snapshots y clips de eventos configurados** se guardan en el servidor, con cuota
-   y retención explícitas. Sin grabación continua en el servidor.
-4. **Credenciales**: el RTSP se arma en el servidor. El navegador nunca recibe credenciales ni abre
-   RTSP.
-5. **Alertas y notificaciones** se generan desde VisionCore (reglas por cámara/zona/clase con
-   cooldown), no desde las notificaciones propias de Frigate (desactivadas).
+Todas las rutas son de Frigate `v0.18.0`. Las diferencias de stack condicionan la estrategia de reutilización.
+
+| | Frigate `v0.18.0` | VisionCore |
+|---|---|---|
+| UI | React **19** | React **18.3** |
+| Estado y datos | SWR + API propia | Zustand + `@/lib/api` (cookie + CSRF) |
+| Textos | i18next | Textos en español, sin i18n |
+| Editor de zonas | `react-konva` 19 (requiere React 19) | — |
+| Vivo | go2rtc (MSE, WebRTC, JSMpeg) | MediaMTX (HLS; WebRTC no expuesto) |
+| Grabaciones | HLS VOD de su propio almacenamiento | NVR vía ISAPI/RTSP → FFmpeg → fMP4/MP4 (`nvrRecordingProvider`, #184) |
+
+### 2.1 Web (`web/src/…`)
+
+**Timeline** (`components/timeline/`): `ReviewTimeline.tsx`, `EventReviewTimeline.tsx`, `MotionReviewTimeline.tsx`, `EventSegment.tsx`, `SummaryTimeline.tsx`, `VirtualizedEventSegments.tsx`, y los hooks `use-timeline-utils` y `use-draggable-element`.
+- **Decisión: portar con adaptación.** Es el componente de mayor valor. Hoy dependen de Radix tooltip, `react-device-detect`, `react-i18next` y los tipos `@/types/review`.
+- **Adaptaciones:**
+  - la fuente de datos pasa de SWR/API de Frigate a un **proveedor de timeline** que combina bloques de grabación del NVR (`nvrRecordingProvider.search`) con eventos del almacén de VisionCore;
+  - los textos se reemplazan por textos en español;
+  - el eje se alinea con el **reloj del NVR** (offset por NVR, §6);
+  - los huecos del NVR se pintan como huecos aunque exista un clip local.
+
+**Controles de reproducción** (`components/player/VideoControls.tsx`).
+- **Decisión: portar con adaptación.**
+- **Adaptaciones:**
+  - quitar `FrigatePlusIcon` y la marca;
+  - conectar la pausa, el seek y la velocidad al **controlador de reproducción NVR** (§5), no directo al elemento `<video>`. El seek dentro del archivo NVR implica una nueva sesión en el backend; no es un `currentTime` local.
+
+**Reproductor HLS** (`components/player/HlsVideoPlayer.tsx`).
+- **Decisión: usarlo de referencia, no portarlo.** Está acoplado a SWR, `axios`, la configuración de Frigate, `ObjectTrackOverlay` y la persistencia de usuario.
+- El reproductor de grabaciones de VisionCore consume sesiones fMP4/MP4 del NVR, no HLS VOD de Frigate. Se toma su manejo de buffering y de errores de `hls.js` para el **vivo**.
+
+**Vivo** (`LivePlayer.tsx`, `MsePlayer.tsx`, `WebRTCPlayer.tsx`, `JSMpegPlayer.tsx`).
+- **Decisión: no reutilizable tal cual.** Hablan el protocolo y la API de go2rtc.
+- El vivo de VisionCore sigue con MediaMTX (HLS detrás de `auth_request`). Se adopta la UX de Frigate (indicadores de actividad, chips de objetos detectados), alimentada por eventos de VisionCore.
+
+**Editor de zonas y máscaras** (`components/settings/ZoneEditPane.tsx`, `MotionMaskEditPane.tsx`, `ObjectMaskEditPane.tsx`, `PolygonCanvas.tsx`, `PolygonDrawer.tsx`, `utils/canvasUtil`).
+- **Decisión: portar con adaptación.** Bloqueo: `react-konva` 19 requiere React 19.
+- **Opciones** (decisión pendiente, ver §9):
+  - (a) `react-konva` 18.x en VisionCore;
+  - (b) subir VisionCore a React 19 en un PR propio, antes;
+  - (c) reescribir el canvas en SVG.
+- **Adaptaciones:**
+  - persistir en `CameraAnalyticsConfig.zones`/`lines` (ya existen) en lugar del `config.yml` de Frigate;
+  - validar con zod en la API.
+
+**Formulario de configuración** (`components/config-form/*`, `sectionConfigs.ts`).
+- **Decisión: tomar sólo el modelo de secciones.** Es genérico sobre todo el esquema de Frigate.
+- VisionCore expone un **subconjunto curado**: objetos, umbrales, zonas, máscaras, ventana pre/post del evento y retención. Se generan formularios propios.
+
+**Vistas de eventos y exploración** (`views/events`, `views/explore`, `views/search`).
+- **Decisión: portar la estructura de vista**: lista y filtros por cámara, clase, zona y fecha.
+- Los datos salen de la API de eventos de VisionCore, con RBAC. La búsqueda semántica queda fuera (§10).
+
+### 2.2 Backend (`frigate/…`)
+
+| Módulo | Decisión | Motivo |
+|---|---|---|
+| `frigate/config/*` (modelos pydantic) | Consumir, no portar | Se usa como **contrato** para generar y validar el `config.yml` que produce VisionCore (validación en CI contra el esquema de `v0.18.0`) |
+| `frigate/review/*`, `frigate/events/*` | Usar de referencia | Semántica de *review segments* y de eventos (alert/detection, `start_time`/`end_time`) para el modelo de VisionCore |
+| `frigate/record/*` | Usar de referencia | Lógica de retención y de limpieza de emergencia; VisionCore aplica cuota propia (§7) |
+| `frigate/motion`, `frigate/track`, `frigate/detectors`, `frigate/object_detection` | **No portar** | Es el motor. Corre en el contenedor oficial |
+| `frigate/api/*` | No portar | VisionCore expone su propia API con RBAC; la API de Frigate queda interna |
 
 ## 3. Arquitectura
 
 ```
-                 ┌──────────────────────── servidor VisionCore ────────────────────────┐
-NVR Hikvision ──►│ MediaMTX (único puller RTSP por cámara analizada, substream)         │
-  (RTSP)         │   │  rtsp interno, usuario de lectura por path (sin exponer)          │
-                 │   ├──► Frigate (detector OpenVINO NPU/GPU, record = sólo eventos)     │
-                 │   │       │ MQTT frigate/events, frigate/reviews (red interna)        │
-                 │   │       ▼                                                           │
-                 │   │   apps/analytics (ingestor existente, endurecido)                 │
-                 │   │       │ POST /api/analytics/internal/events (secreto interno)      │
-                 │   │       ▼                                                           │
-                 │   └──► apps/api ── PostgreSQL (eventos, medios, retención)            │
-                 │            │  ── almacén de medios de eventos (volumen con cuota)     │
-                 │            ▼                                                          │
-                 │        apps/web: lista de eventos + overlay en el timeline del NVR    │
-                 └──────────────────────────────────────────────────────────────────────┘
+NVR Hikvision ──RTSP──► MediaMTX ──RTSP (lector "detección")──► motor Frigate (interno)
+     │                     │  ▲                                     │ MQTT/API interna
+     │                     │  └─ FFmpeg transcode HEVC→H264 (publica, usuario "api")
+     │                     └──HLS──► nginx /hls/ (auth_request) ──► navegador (vivo)
+     │                                                              │
+     └──ISAPI/RTSP──► API VisionCore (búsqueda, preview, playback, FFmpeg) ◄── eventos ┘
+                          │  RBAC, sesiones, revocación, cuota y retención de eventos
+                          └──► PostgreSQL (eventos, medios) + volumen dedicado de medios
 ```
 
-**Decisiones clave:**
+Decisiones:
+- **Fuente única por cámara:** el motor lee de MediaMTX, nunca directo del NVR, para no sumar sesiones RTSP.
+- **VisionCore es la fuente de verdad de la configuración.** La API genera el `config.yml` del motor desde la base (cámaras con detección habilitada, zonas, objetos, retención) y lo valida contra el esquema de `v0.18.0`. Se aplica sólo en staging, y en producción con autorización. Ningún usuario edita el `config.yml` a mano.
+- **Ingesta de eventos:** el ingestor existente (`apps/analytics/app/frigate/`) se endurece:
+  - idempotencia por id de evento;
+  - mapeo por `cameraId` (el `name` de la cámara en el motor = `cameraId`), no por nombre libre como hoy (`FRIGATE_CAMERA_MAP`).
 
-- **Una sola conexión RTSP por cámara analizada.** Los NVR limitan las sesiones remotas y el ancho de
-  banda. Frigate **no** se conecta directo a los NVR: lee de MediaMTX (`rtsp://mediamtx:8554/...`),
-  que ya es el puller de vivo. Hay que medir el impacto sobre las sesiones de vivo/playback (ver E6).
-- **Prerrequisito de seguridad (bloqueante para E5).** En `main` (`94305f3`)
-  `infra/mediamtx/mediamtx.yml` sigue con `authInternalUsers: - user: any` y permisos `api`, `read`,
-  `publish` y `playback` **sin credenciales**: el aislamiento depende sólo de la frontera de red y del
-  `auth_request` de nginx para `/hls/`. Antes de sumar un lector nuevo (Frigate) hay que crear
-  usuarios internos por rol (lector de detección sólo con `read`, backend con `api`, sin `publish`
-  anónimo), con credenciales desde el entorno y una prueba de CI que impida volver a `user: any`. Va
-  como PR propio (E0.5).
-- **Substream para detección** (Frigate no necesita el main). Ni el vivo ni el playback del usuario
-  dependen de Frigate.
-- **Grabación de Frigate en modo "sólo alertas"**: `continuous.days: 0`, `motion.days: 0`, y
-  alertas/detecciones con `retain.mode: active_objects` y días acotados. Así sólo quedan clips de
-  eventos, con pre/post-roll.
-- **Los medios se copian a VisionCore.** El ingestor descarga snapshot y clip del evento por la API
-  interna de Frigate y los guarda en el almacén de VisionCore, que los sirve con RBAC. La retención la
-  controla VisionCore; el almacén de Frigate queda como caché efímera.
-- **Mapeo de cámaras por id, no por nombre.** Hoy `FRIGATE_CAMERA_MAP` es nombre→`cameraId`. Se pasa
-  a generar la config de Frigate desde la base (cámaras con detección habilitada) con
-  `name = cameraId` estable, para que un renombre no rompa el mapeo.
+## 4. MediaMTX según sus consumidores reales (prerrequisito de seguridad)
 
-## 4. Modelo de datos (propuesto)
+Hoy `infra/mediamtx/mediamtx.yml` tiene `authInternalUsers: - user: any` con `api`, `read`, `publish` y `playback` **sin credenciales**. El aislamiento depende de la red docker, del loopback del host y del `auth_request` de nginx.
 
-Se reutiliza `AnalyticsEvent` (ya existe y tiene consumidores) con dos agregados, en lugar de crear
-una tabla paralela:
+| Consumidor real (código actual) | Acción en MediaMTX | Origen | Usuario propuesto |
+|---|---|---|---|
+| Navegador → nginx `/hls/` → `mediamtx:8888` | `read` (HLS) de `nvr_*` | contenedor nginx | `nginx-hls`: `read` sólo `~^nvr_`. nginx agrega `Authorization` hacia el upstream **después** de `auth_request`; la credencial se inyecta por entorno en la plantilla de nginx, nunca versionada |
+| API: control `:9997` (`publishStream`, `listRegisteredConfigPaths`, paths/list, `source-lifecycle`) | `api` | contenedor api | `api-control`: `api` (y `metrics` si se usa) |
+| API: FFmpeg de transcode HEVC→H264 → `rtsp://mediamtx:8554/<path>` | `publish` | contenedor api | `api-publish`: `publish` sólo sobre paths de transcode (`~_h264$`) |
+| API: sondas HLS internas (`probeHlsManifest`, `waitForHlsReady`) | `read` | contenedor api | `api-probe`: `read` |
+| Servicio `analytics` → `ANALYTICS_MEDIAMTX_RTSP` (`rtsp://mediamtx:8554`) | `read` | contenedor analytics | `analytics`: `read` |
+| Motor de detección (futuro, E7) | `read` de substreams | contenedor del motor | `detector`: `read` sólo substreams |
+| Puerto `127.0.0.1:8554` publicado en el host | `read` | host | Decidir: quitarlo o dejarlo `read` con usuario propio de diagnóstico |
+| Comentario "WebRTC por nginx `/webrtc/` → `:8889`" (`stream.ts`) | — | — | **Sin `location` en nginx hoy:** documentar como no expuesto; el guard de CI ya impide exponer `8889` |
 
-- `source` (`'native' | 'frigate'`) y `externalId` (id de evento de Frigate), con
-  `@@unique([source, externalId])` → **ingesta idempotente** (MQTT entrega *at-least-once*).
-- `startedAt` / `endedAt` (ventana del evento) además de `occurredAt`.
+**Requisitos de la etapa E0.5:**
+- Las credenciales vienen del entorno; donde MediaMTX lo soporte, se restringen además por IP de la red docker (`ips`).
+- Guard de CI que rechace `user: any` y `publish` anónimo.
+- Pruebas: lectura anónima rechazada; vivo, transcode, sondas y analítica funcionando con sus usuarios.
+- Rollback: volver al archivo anterior.
 
-Tabla nueva `EventMedia`: `eventId`, `kind` (`snapshot | clip`), `storageKey`, `bytes`, `sha256`,
-`createdAt`, `expiresAt`, `deletedAt`. Así la cuota se calcula con `SUM(bytes)` y la retención borra
-por `expiresAt`, registrando qué se borró (invariante 1: nunca perder evidencia sin registro).
+## 5. Reproductor y controlador de reproducción NVR
 
-**Reloj.** El timeline del NVR está en la hora de pared del NVR y los eventos de Frigate en UTC del
-servidor. Se guarda el **offset medido por NVR** (ISAPI `/System/time` contra el reloj del servidor)
-para alinear los overlays. Si el desvío supera un umbral, el timeline muestra que la alineación no es
-fiable.
+Un **controlador de reproducción** único (nuevo, sobre el `nvrRecordingProvider` de #184) es dueño de:
 
-## 5. Timeline y reproductor
+- **Sesiones:**
+  - crear preview o playback;
+  - relevo de continuidad: cierra el predecesor **sólo después** de registrar el sucesor (criterio tomado de #181);
+  - cierre explícito al cambiar de cámara, de layout o de página.
+- **Seek:**
+  - dentro del bloque ya cargado → `currentTime`;
+  - fuera del bloque → nueva sesión desde la nueva posición, invalidando respuestas viejas (invariante 4).
+- **Pausa y velocidad:**
+  - el timer de continuidad se basa en el **video realmente consumido** (`currentTime`), no en tiempo de pared (criterio de #181);
+  - la pausa y el buffering no avanzan el timer;
+  - las velocidades cambian el ritmo del reloj del timeline.
+- **Calidad automática:** 1×1 en alta calidad (main), grilla en substream (criterio de #180), con degradación a substream si el main no está listo.
+- **Liberación:** la sesión se libera sólo cuando no quedan espectadores vivos. El lease del backend se libera tras la salida real de FFmpeg (invariante 3).
 
-- El timeline sigue construyéndose con el **proveedor NVR** (`nvrRecordingProvider`, #184).
-- Los eventos se dibujan como **marcas sobre el timeline del NVR** (cámara + ventana alineada). Al
-  hacer clic se pide al proveedor el archivo **del NVR** en `startedAt − preRoll`, no el clip local.
-- El clip local se ofrece aparte como **"Clip del evento"**, rotulado como evidencia derivada, con su
-  propia expiración visible.
-- No se asume que el clip local equivale al archivo del NVR. Si el NVR no tiene grabación en esa
-  ventana (hueco, disco lleno), el timeline lo muestra como hueco aunque exista el clip local.
+El reproductor de eventos usa el **mismo** controlador:
+- "Ver en el archivo" abre el NVR en `startedAt − preRoll`;
+- "Clip del evento" reproduce el medio local rotulado como evidencia derivada.
 
-## 6. Etapas (PR Draft pequeños) y criterios de aceptación
+## 6. Timeline y eventos
 
-Cada etapa es un PR Draft independiente, con CI 11/11 y sin cambios de producción.
+- **Una sola línea de tiempo por cámara:**
+  - bloques de grabación del NVR (fuente del archivo);
+  - marcas de eventos de VisionCore (detección);
+  - huecos del NVR visibles.
+- **Reloj:**
+  - offset medido por NVR (ISAPI `/System/time` contra el reloj del servidor), guardado en la base;
+  - los overlays se desplazan por ese offset;
+  - con desvío por encima del umbral → aviso "alineación no fiable".
+- **Modelo de datos (aditivo):**
+  - `AnalyticsEvent` + `source` (`native | detector`), `externalId` y `@@unique([source, externalId])`, `startedAt`/`endedAt`;
+  - nueva tabla `EventMedia` (`kind`: `snapshot | clip`, `bytes`, `sha256`, `expiresAt`, `deletedAt`).
+- **RBAC:** toda lectura de eventos y medios usa `canView`/`canPlayback` de la cámara. Las miniaturas también.
 
-**E0 — Esta propuesta y la referencia fijada** (sólo docs).
-- Aceptación: revisión de arquitectura aprobada; tag/SHA/licencia/marca registrados.
+## 7. Almacenamiento local: cuotas, caché temporal y retención completa de la ventana del evento
 
-**E0.5 — Autenticación interna de MediaMTX** (prerrequisito de E5).
-- Usuarios internos por rol en lugar de `user: any`; credenciales sólo por entorno; guard de CI.
-- Aceptación:
-  - una lectura RTSP o HLS interna sin credenciales es rechazada;
-  - vivo y playback de VisionCore siguen funcionando (e2e y smoke en staging);
-  - rollback documentado.
+**Qué se guarda.** Sólo para las cámaras y clases con detección configurada:
+- metadatos;
+- un snapshot;
+- un clip con la **ventana completa** del evento: `pre_capture` + duración + `post_capture`.
 
-**E1 — Proveedor NVR (#184) y criterios de #180/#181 sobre la interfaz.**
-- Portar a la interfaz del proveedor las pruebas de #181 (`recordings-continuity.spec.ts`: relevo sin
-  corte, timer basado en `currentTime` real, pausa y buffering no avanzan, seek rearma) y de #180 (1×1
-  en alta calidad) como **especificaciones** contra un controlador nuevo, sin cambiar el
-  comportamiento actual.
-- Aceptación: e2e Playwright de continuidad, buffering, seek, pausa, velocidad (0.5×/1×/2×/4×), cambio
-  de cámara, multicámara 2×2, revocación de permiso a mitad de sesión (la siguiente petición da 403 y
-  se libera la sesión) y límite de sesiones (cola/admisión visible, sin fugas). Todo verde con NVR
-  simulado.
+**Retención completa de la ventana.** En la configuración del motor:
+- `record.continuous.days: 0` y `record.motion.days: 0`: nada fuera de eventos;
+- `record.alerts.retain.mode: all` y `record.detections.retain.mode: all`;
+- `pre_capture`/`post_capture` configurables por cámara.
 
-**E2 — Almacén de eventos (sin Frigate).**
-- Migración aditiva (`source`, `externalId`, `startedAt/endedAt`, `EventMedia`), API de lectura con
-  RBAC, job de retención con cuota y fixtures.
-- Aceptación:
-  - pruebas IDOR (cámara ajena → 403 o lista vacía, también para medios);
-  - la cuota no se excede (cuando hace falta, se borra lo más viejo y queda registrado);
-  - la migración pasa contra PostgreSQL real en CI;
-  - rollback documentado.
+`mode: all` es obligatorio: `motion` o `active_objects` descartan los segmentos de la ventana sin movimiento u objetos activos, y el clip quedaría con cortes. La revisión 1 de esta propuesta usaba `active_objects`: **corregido**.
 
-**E3 — Ingestor endurecido.**
-- Idempotencia por `externalId`, mapeo por `cameraId`, descarga de medios con límite de tamaño y
-  timeout, verificación de tipo, sin seguir redirecciones, sólo hosts internos.
-- Aceptación:
-  - un evento duplicado no crea filas;
-  - un clip corrupto o vacío no se guarda;
-  - el ingestor caído no pierde eventos más allá del buffer documentado;
-  - pruebas con fixtures de MQTT de `v0.18.0`.
+**Caché temporal (dos niveles):**
+1. **Caché de segmentos del motor** (dentro del contenedor). Los segmentos se escriben primero en la caché y sólo se mueven a almacenamiento si caen dentro de la ventana de un evento.
+   - Dimensionarla para `max(pre_capture)` + margen por cámara analizada, y medirla en E8.
+   - **No es almacenamiento.**
+   - Volumen o `tmpfs` propio, con tamaño fijo.
+2. **Almacén del motor** (`frigate_media`): retención corta, por ejemplo 2 días. Es sólo un **área de tránsito**: el ingestor copia snapshot y clip al almacén de VisionCore y verifica `sha256` y tamaño.
 
-**E4 — UI: eventos y overlay en el timeline del NVR.**
-- Aceptación:
-  - clic en un evento → el reproductor del NVR busca la ventana correcta (±1 s con offset medido);
-  - el clip local se muestra rotulado;
-  - un usuario sin permiso no ve el evento ni su miniatura.
+**Almacén de VisionCore (evidencia de eventos):**
+- volumen dedicado de tamaño fijo;
+- cuota global y por cámara (`SUM(EventMedia.bytes)`);
+- retención por `expiresAt`, configurable por cámara y clase.
+- **Política de cuota llena:**
+  - borrar primero lo más viejo **ya expirado**;
+  - si no alcanza, rechazar el medio nuevo y alertar;
+  - nunca borrar en silencio evidencia no expirada (invariante 1);
+  - todo borrado deja fila en `EventMedia.deletedAt` y en la auditoría.
 
-**E5 — Servicio Frigate en el hardware nuevo (staging aislado).**
-- `0.18.0` fijado por digest, profile `frigate`, detector OpenVINO (NPU para detección y GPU/VA-API
-  para decodificar), lectura desde MediaMTX y notificaciones de Frigate apagadas.
-- Aceptación: arranca sin acceso externo; consumo de CPU, GPU y NPU medido con N cámaras de prueba.
+## 8. Etapas (PR Draft pequeños) y criterios de aceptación
 
-**E6 — Medición con NVR reales (piloto).**
-- Mismo rango y cámaras antes/después: sesiones RTSP por NVR, latencia de vivo, tiempo al primer
-  frame del playback, uso de recursos y falsos positivos por cámara.
-- Aceptación: no se declara mejora sin estas cifras. Las reglas de alerta se habilitan cámara por
-  cámara.
+Cada etapa es un PR Draft con CI en verde. El detalle de pruebas de cada etapa está en `PLAYER_TEST_PLAN.md`.
 
-**Port de componentes** (opcional, después de E6): sólo con una justificación medida, con atribución
-MIT y una etapa propia.
+| Etapa | Contenido | Criterio de aceptación (resumen) |
+|---|---|---|
+| **E0** | Esta propuesta, la referencia fijada, el plan de pruebas y el runbook | Revisión aprobada |
+| **E0.5** | Autenticación de MediaMTX por consumidor (§4) | Lectura anónima rechazada; vivo, transcode, sondas y analítica OK con sus usuarios; guard de CI |
+| **E1** | Controlador de reproducción NVR sobre #184 + pruebas simuladas | Suite simulada **S1–S9** verde (continuidad, seek, pausa, velocidades, multicámara, calidad automática, liberación, revocación, límites) |
+| **E2** | Almacén de eventos y medios (sin motor) | Pruebas IDOR; cuota y retención con fixtures; migración aditiva contra PostgreSQL real; rollback documentado |
+| **E3** | Timeline unificado (port de `ReviewTimeline` y afines) | NVR + eventos + huecos con un NVR simulado; offset de reloj; snapshot visual |
+| **E4** | Vista de eventos y "Ver en el archivo" / "Clip del evento" | Clic en un evento → seek del NVR a ±1 s; sin permiso no hay evento ni miniatura |
+| **E5** | Configuración de detección (zonas, máscaras, objetos, ventana, retención) + generación de `config.yml` | Config generada válida contra el esquema de `v0.18.0` en CI; decisión React 18/19 tomada |
+| **E6** | Ingestor endurecido | Idempotencia, mapeo por `cameraId`, copia con `sha256` y límites de tamaño |
+| **E7** | Motor en staging, hardware nuevo (OpenVINO NPU/GPU) | Arranca aislado (#187), lee de MediaMTX con el usuario `detector`, sin acceso externo |
+| **E8** | Mediciones con NVR reales (piloto) | Plan de pruebas, parte **M**: no se declara mejora sin cifras |
 
-## 7. Riesgos
+## 9. Decisiones pendientes
 
-| Riesgo | Mitigación |
-|---|---|
-| Límite de sesiones RTSP del NVR | MediaMTX como único puller; medir en E6; substream |
-| Desalineación del reloj NVR/servidor | Offset medido por NVR; aviso en la UI |
-| Llenado de disco por clips | Volumen dedicado con cuota, retención por `expiresAt`, alertas al 80/90 % |
-| MediaMTX con `user: any` | E0.5 antes de E5 |
-| Exposición de la UI o API de Frigate | Sin puertos publicados; red interna; test en CI que verifica que compose no publica 5000/8971 |
-| Divergencia con upstream | Imagen oficial por digest; actualización deliberada con pruebas de E3 |
-| Eventos duplicados o perdidos (MQTT) | Idempotencia por `externalId`; métricas de ingesta |
+1. Editor de zonas: `react-konva` 18 vs React 19 en VisionCore vs canvas propio (E5).
+2. `127.0.0.1:8554` en el host: quitarlo o dejarlo con usuario de diagnóstico.
+3. Retención por defecto de los clips de eventos y cuota total del volumen.
+4. Si se adoptan *review segments* (alert/detection) como en Frigate, o sólo eventos.
 
-## 8. Fuera de alcance de esta propuesta
+## 10. Fuera de alcance
 
-Reconocimiento facial, LPR de Frigate, búsqueda semántica y GenAI. Si se quieren, cada uno lleva su
-propia evaluación de privacidad, hardware y consentimiento.
+Reconocimiento facial, LPR del motor, búsqueda semántica y GenAI. Cada uno requiere evaluación propia de privacidad, consentimiento y hardware.
