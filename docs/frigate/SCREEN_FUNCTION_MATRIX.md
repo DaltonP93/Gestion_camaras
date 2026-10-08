@@ -16,7 +16,7 @@
 - **Permisos por rol:** lo que **la API** permite (`authorize([...])` y chequeos por recurso), no lo que
   muestra la UI: `rw` lectura y escritura, `r` sólo lectura, `—` sin acceso; entre paréntesis el filtro
   por recurso (`canView`, `canPlayback`, `canPtz`, propiedad). Las diferencias UI/API van en **Nota**.
-  La adaptación **no amplía** ningún permiso.
+  La adaptación **no amplía** permisos salvo lo que apruebe la política única (`docs/security/PERMISSIONS_POLICY.md`: visores personales para todos dentro de sus cámaras autorizadas; exportación con permiso propio, D5).
 - **Fuente de datos:** modelo Prisma/tabla, ISAPI del NVR, MediaMTX, Redis, variables de entorno o
   almacenamiento del navegador.
 - Las filas describen `main`; las correcciones en PR Draft se anotan en **Nota** y en los hallazgos.

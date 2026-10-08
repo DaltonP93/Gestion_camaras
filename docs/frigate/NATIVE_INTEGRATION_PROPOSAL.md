@@ -28,7 +28,7 @@ Pantallas y funciones cubiertas (detalle por función, permisos y fuente de dato
 
 Se mantienen sin cambios de dueño:
 
-- **Login, roles y permisos por cámara de VisionCore.** Nada de la UI ni de la autenticación de Frigate queda expuesto al usuario. La adaptación **no amplía** ningún permiso: cada sección aplica los `authorize([...])` actuales de la API (§2.3).
+- **Login, roles y permisos por cámara de VisionCore.** Nada de la UI ni de la autenticación de Frigate queda expuesto al usuario. La adaptación **no amplía** permisos salvo lo que apruebe la política única (`docs/security/PERMISSIONS_POLICY.md`): por indicación del dueño, visores personales para todos los roles dentro de sus cámaras autorizadas; y la exportación pasa a exigir un permiso propio (D5). Mientras tanto, cada sección aplica los `authorize([...])` actuales de la API (§2.3).
 - **NVR y visores de VisionCore.**
 - **El archivo completo existe exclusivamente en los NVR.** Vivo, búsqueda y reproducción del archivo salen siempre del NVR.
 - **Almacenamiento local limitado a los eventos configurados**: metadatos, snapshots y clips de la ventana de cada evento, con cuota y retención. Sin grabación continua en el servidor.
@@ -325,6 +325,8 @@ Cada etapa es un PR Draft con CI en verde. El detalle de pruebas de cada etapa e
 
 ## 9. Decisiones pendientes
 
+> Los puntos 5–9 pasan a la política única de permisos (`docs/security/PERMISSIONS_POLICY.md` §8: 5 → D1, 6 → D3 y R-H, 7 → D4, 8 → D5, 9 → D2). El 10 y el 11 los **resolvió el dueño** (2026-10-08).
+
 1. ~~Editor de zonas: React 18 vs 19~~ → **resuelto** en §2.4 (React 18 + react-konva 18.2.16 + konva 10.2.3).
 2. `127.0.0.1:8554` en el host: quitarlo o dejarlo con usuario de diagnóstico.
 3. Retención por defecto de los clips de eventos y cuota total del volumen.
@@ -341,9 +343,10 @@ Cada etapa es un PR Draft con CI en verde. El detalle de pruebas de cada etapa e
    cuenta como descarga.
 9. **AUDITOR y el vivo:** algunas rutas lo excluyen (`/stream`, `/snapshot`) y otras no
    (`start-stream`, `hls-auth`); el default `canViewLive=false` no se aplica.
-10. **Visores personales para OPERATOR/AUDITOR:** hoy sólo ADMIN/SUPERVISOR crean visores.
-11. **Política de reloj común en grabaciones:** sincronía estricta (el reloj espera) vs resincronizar
-    la celda que carga (el prototipo ofrece ambas).
+10. ~~**Visores personales para OPERATOR/AUDITOR**~~ → **resuelto por el dueño:** se permiten dentro de las cámaras autorizadas (política §6; lo pendiente de visores es D7).
+11. ~~**Política de reloj común en grabaciones**~~ → **resuelto por el dueño:** una cámara bloqueada o
+    cargando **no** detiene a las demás por defecto; reloj común con resincronización por celda; "esperar
+    a todas" queda como opción explícita, apagada (prototipo #188).
 
 ## 10. Fuera de alcance
 

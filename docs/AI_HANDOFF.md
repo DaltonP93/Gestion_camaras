@@ -35,29 +35,36 @@ sólo para eventos configurados. Ver `docs/frigate/NATIVE_INTEGRATION_PROPOSAL.m
 | #186 | `fix/recordings-playbackuri-channel-scope` | `45ebda5` | #182 | **Seguridad**: `playbackURI` ligada al canal (playback, preview, diagnóstico); tabla de reglas `Map` (sin propiedades heredadas: `constructor`/`__proto__` ⇒ 400, antes 500) | CI 11/11; API 1686/1686 |
 | #189 | `fix/live-heartbeat-rbac` | `a65c7db` | #182 | **Seguridad P0**: RBAC por cámara en `POST /api/live-view/heartbeat` (iniciaba streams de cámaras ajenas); la revocación cierra sub, main y main_h264 (FFmpeg incluido) | Reproducido con prueba; revisión adversarial aplicada |
 | #190 | `fix/auth-access-token-only` | `abd2734` | #182 | **Seguridad crítica**: sólo access tokens como credencial (2fa/enroll/step-up sin rol abrían grabaciones de todas las cámaras; refresh servía 7 días) | CI 11/11; reproducido con prueba |
+| #191 | `fix/nvr-audio-block-only` | `9169828` | #182 | **NVR**: el audio se escribe/lee sólo dentro de `<Audio>` (antes apagar el audio deshabilitaba el canal); UI con "Sin cambios/Habilitar/Deshabilitar" | CI 11/11 |
+| #192 | `fix/branding-upload-xss` | `6d68d1d` | #182 | **Seguridad**: XSS almacenado de branding **reproducido** en Chromium aislado (`.js` + `.html` del mismo origen saltean la CSP); firma mágica, extensión del tipo detectado, `/uploads/` acotado con CSP `sandbox`, nginx re-declara cabeceras, guard de CI | CI 11/11 |
+| #193 | `fix/profile-diagnostics-minimal` | `62d70e0` | #182 | **Seguridad**: `/auth/me` con allowlist y migración del store del navegador (borra credenciales del NVR guardadas); diagnósticos sin usuario/IP del NVR y sólo ADMIN/SUPERVISOR; usuario del NVR sólo a ADMIN; `lastRtspError` redactado | CI 11/11 |
+| #194 | `review/security-joint-oct2026` | `ccc5db4` | #182 | **Revisión conjunta** #182+#186+#189+#190 (merges + suite e2e con `server.ts` real, PG/Redis efímeros; 34 pruebas; 6/6 mutaciones; 23 defectos previos como pruebas opt-in). **No se fusiona** | ver PR |
 | #187 | `feat/staging-isolation` | `036171f` | #182 | `STAGING_ISOLATION` y flags; ausente = actual, presente vacía/con espacios ⇒ aborta; prueba de arranque real de `server.ts` | CI 11/11; API 1563/1563 |
 | #184 | `refactor/nvr-recording-provider-standalone` | `f32cd75` | #182 | Proveedor NVR de grabaciones (web) sin la continuidad de #181 | CI 11/11 |
-| #188 | `feat/frigate-ux-prototype` | `aab226e` | #182 | Prototipo navegable con datos simulados (vivo, visores, grabaciones multicámara, eventos, configuración completa, **editor de zonas de Frigate en React 18**) | CI 11/11; e2e PC+tablet 83 ok |
-| #185 | `docs/frigate-native-plan` | (ver PR) | #182 | Propuesta rev. 3, matriz de pantallas/funciones, plan de pruebas rev. 2, runbook, este traspaso | Sólo docs; base #182 para que CI (sobre el merge) no herede el `npm audit` rojo de `main` |
+| #188 | `feat/frigate-ux-prototype` | (ver PR) | #182 | Prototipo navegable con datos simulados (vivo, visores, grabaciones multicámara, eventos, configuración completa, **editor de zonas de Frigate en React 18**). Ajustes del dueño (2026-10-08): selector plegado en tablet vertical y video 16:9; timeline con horas, zoom y huecos; reloj común sin detener a las demás cámaras, con resincronización por celda; marcas de simulado/existente por control; aviso de que **no** demuestra la eliminación de pausas | ver PR |
+| #185 | `docs/frigate-native-plan` | (ver PR) | #182 | Propuesta rev. 3, matriz de pantallas/funciones, plan de pruebas rev. 2, runbook, **política única de permisos** (`docs/security/PERMISSIONS_POLICY.md`), este traspaso | Sólo docs; base #182 para que CI (sobre el merge) no herede el `npm audit` rojo de `main` |
 | #183 | `refactor/nvr-recording-provider` | `ff6f3ff` | #181 | Proveedor apilado sobre #181 | Conservado; reemplazado por #184 |
 | #181 | `feat/nvr-playback-probe` | `3fce40f` | #182 (`7b9ef37`) | Relevo seguro y continuidad por video real | **Pospuesto** (no fusionar ni cerrar) |
 | #180 | `fix/live-1x1-high-quality` | `cd251c7` | `main` viejo | Vivo 1×1 en alta calidad automática | **Pospuesto** |
 
-Orden sugerido de revisión: #182 → #190 → #189 → #186 → #187 → #184 → #188 → #185. Cada uno se
-re-valida tras fusionar el anterior.
+Orden sugerido de revisión: #182 → #190 → #189 → #186 (revisados juntos en #194; **sin restricción de
+orden**, pero #190 cierra un salto del 2.º factor que ya existe en `main`) → #193 → #192 → #191 → #187 →
+#184 → #188 → #185. Cada uno se re-valida tras fusionar el anterior.
 
 **Seguridad — hallazgos vigentes en `main`** (lista completa, priorizada y con evidencia en
 `docs/frigate/SCREEN_FUNCTION_MATRIX.md`, sección de hallazgos):
 1. Tokens intermedios y refresh aceptados como credencial → **#190** (reproducido).
 2. Heartbeat del vivo sin RBAC → **#189** (reproducido).
 3. Acceso cruzado por `playbackURI` → **#186**.
-4. Pendientes **Alto** sin PR: `GET /api/auth/me` devuelve a no-ADMIN la fila del NVR (usuario,
-   contraseña cifrada, IP) y la web la guarda en `localStorage`; `GET /cameras/:id/diagnostics`
-   expone usuario/IP del NVR a quien tiene `canView` y dispara sondas RTSP; subida de branding con
-   extensión del cliente (XSS almacenado en `/uploads/`); `canDownload` no se aplica a la descarga
-   de grabaciones; el rol se toma del JWT sin consultar la base (degradar/desactivar no corta hasta
-   el vencimiento).
-5. MediaMTX `authInternalUsers: user: any` → etapa **E0.5**.
+4. `/auth/me` y diagnósticos con credenciales/IP del NVR → **#193**; XSS de branding → **#192**;
+   audio que deshabilitaba el canal → **#191**.
+5. Sin PR (verificados en #194, `docs/security/JOINT_REVIEW_182_186_189_190.md` §4): rate-limit sin
+   `trustProxy` detrás de nginx (**alto**, disponibilidad; el arreglo exige pasar los guardas de IP de
+   `hls-auth`/`mediamtxAuth` a la IP del socket); access JWT que sobrevive a logout/desactivación/cambio
+   de rol (hasta 24 h); `JWT_SECRET` público de compose/`.env.example` aceptado; `canDownload` no
+   aplicado; tokens de grabación que sobreviven a la revocación; TOTP/tempToken reutilizables; residuo
+   `name`/`size` de #186 (incierto: requiere NVR real autorizado).
+6. MediaMTX `authInternalUsers: user: any` → etapa **E0.5**.
 
 **Decisiones técnicas tomadas:** editor de zonas con **React 18 + react-konva 18.2.16 + konva 10.2.3**
 (prueba de compatibilidad con controles negativos y mutantes; propuesta §2.4). Grabaciones en grilla:
@@ -68,9 +75,15 @@ re-valida tras fusionar el anterior.
 con **0 cámaras activas y 0 eventos**; 144 cámaras / 4 NVR; 36/36 migraciones; VM de 4 vCPU sin GPU ni
 acelerador. No verificados: errores de logs 24 h, `visioncore-backup.timer`, vencimiento del certificado.
 
-**Pendientes:** decisiones de la propuesta §9 (política de SUPERVISOR por recurso, permisos por NVR,
-`UserFeaturePermissions` no aplicados, descarga, AUDITOR en vivo, visores personales para OPERATOR/
-AUDITOR, reloj común); PR para los hallazgos **Alto** sin PR; dependencias sólo de desarrollo con
+**Política única de permisos** (`docs/security/PERMISSIONS_POLICY.md`, propuesta en #185): rol = techo,
+filas = alcance, herencia NVR→cámara única (R-H), reproducir ≠ exportar, visores personales para todos
+dentro de sus cámaras (indicado por el dueño), tabla de conformidad de 187 rutas y prueba de contrato.
+**Decisiones del dueño pendientes: D1–D12** (SUPERVISOR global o acotado, techos de OPERATOR/AUDITOR,
+exportación, compatibilidad `main_h264`, visores, alertas sin cámara, revocación del access, step-up…).
+Resueltas por el dueño: visores personales para todos dentro de sus cámaras; reloj común sin detener a
+las demás cámaras, con resincronización por celda.
+
+**Pendientes:** D1–D12 de la política; PR para los hallazgos sin PR (punto 5); dependencias sólo de desarrollo con
 avisos (`vitest`, `source-map-js`) y `react-router` 6 (moderado, prod); confirmar con NVR reales la
 gramática de `playbackURI` (#186) y el inventario de pistas archivadas (M9); `.gitignore` de `main`
 contiene marcadores de conflicto sin resolver (`<<<<<<<`/`>>>>>>>`, líneas 14–18).
