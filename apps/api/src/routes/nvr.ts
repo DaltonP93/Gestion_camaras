@@ -20,7 +20,7 @@ import {
   isMaskedPassword,
 } from '../services/credentials'
 import { assertSafeNvrHost, isNvrHostError } from '../services/net/nvr-host-guard'
-import { maskIp, maskUser, redactError } from '../lib/log-redact'
+import { maskIp, maskUser, redactError, redactDiagnosticText } from '../lib/log-redact'
 import {
   userCanAccessNvr,
   userCanAccessNvrWide,
@@ -39,6 +39,39 @@ function nvrHostError(host: string): { errorCode: string; message: string } | nu
     if (isNvrHostError(e)) return { errorCode: e.code, message: 'Host de NVR no permitido (SSRF): usa una IP de la LAN.' }
     throw e
   }
+}
+
+// ─── Proyección de una fila de NVR para responder ────────────
+// Credenciales del modelo NVR (prisma/schema.prisma): `username` y `password`
+// (cifrada); el modelo no tiene otras claves, tokens ni secretos de integración (si
+// se agregan, se excluyen acá). La clave NO sale nunca, ni cifrada. El usuario sólo
+// a ADMIN: lo usa el formulario de edición de NVRsPage, y crear/editar/probar
+// conexión ya son ADMIN. SUPERVISOR y OPERATOR/AUDITOR NVR-scoped reciben el resto
+// del contrato igual que antes.
+// Fuera de alcance A PROPÓSITO: IP y puertos (ipAddress, port, rtspPort, sdkPort)
+// siguen saliendo a quien hoy los recibe; eso se decide en la política de permisos
+// (proyección por rol), no en esta función.
+// Las cámaras anidadas de GET /:id (`include: { cameras: true }`) y las de
+// GET /:id/cameras son filas completas: `rtspUrl` (columna legado que pudo guardarse
+// como rtsp://<usuario>:<clave>@<ip>, la clave EN CLARO) no sale a nadie (el web no
+// la usa), y a no-ADMIN se les redacta `lastRtspError` (las filas viejas traen
+// `rtsp://<usuario>:***@<ip>` del NVR), igual que GET /api/cameras.
+type NvrCredentialSource = { username?: unknown; ipAddress?: unknown }
+
+function projectCameraRowForRole<C extends Record<string, any>>(cam: C, nvr: NvrCredentialSource, role: string) {
+  const { rtspUrl: _rtspUrl, ...rest } = cam
+  if (role === 'ADMIN' || !('lastRtspError' in rest)) return rest
+  return {
+    ...rest,
+    lastRtspError: redactDiagnosticText(rest.lastRtspError, [nvr.username as string, nvr.ipAddress as string, cam.ipAddress]),
+  }
+}
+
+function projectNvrForRole<T extends NvrCredentialSource & { password?: unknown; cameras?: unknown }>(nvr: T, role: string) {
+  const { password: _password, username, ...rest } = nvr
+  const base = role === 'ADMIN' ? { ...rest, username } : rest
+  if (!Array.isArray(rest.cameras)) return base
+  return { ...base, cameras: rest.cameras.map((c: Record<string, any>) => projectCameraRowForRole(c, nvr, role)) }
 }
 
 // Strip debug/non-schema fields before passing a HikStorageDisk to Prisma
@@ -291,7 +324,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
         include: nvrInclude,
         orderBy: { name: 'asc' },
       })
-      return reply.send(nvrs.map((nvr: any) => ({ ...nvr, password: undefined })))
+      return reply.send(nvrs.map((nvr) => projectNvrForRole(nvr, user.role)))
     }
 
     // No-privilegiado: RBAC por recurso. Antes se listaba cualquier NVR con una
@@ -316,7 +349,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
     const filtered = nvrs.map((nvr: any) => {
       const scope = visible.get(nvr.id)
       if (scope?.all) {
-        return { ...nvr, password: undefined } // NVR-scoped: contrato completo
+        return projectNvrForRole(nvr, user.role) // NVR-scoped: contrato completo (sin credenciales)
       }
       const cameras = (nvr.cameras ?? []).filter((c: any) => scope?.cameraIds.includes(c.id))
       return { id: nvr.id, name: nvr.name, cameras } // camera-scoped: mínimo
@@ -341,7 +374,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       include: { cameras: true, hdds: { orderBy: { diskNumber: 'asc' } } },
     })
     if (!nvr) return reply.status(404).send({ message: 'NVR no encontrado' })
-    return reply.send({ ...nvr, password: undefined })
+    return reply.send(projectNvrForRole(nvr, u.role))
   })
 
   // GET /api/nvrs/:id/status — Estado en tiempo real
@@ -520,7 +553,7 @@ export const nvrRoutes: FastifyPluginAsync = async (server) => {
       }
     })
 
-    return reply.send({ fromNvr: ipCams, fromDb: dbCamsWithStatus })
+    return reply.send({ fromNvr: ipCams, fromDb: dbCamsWithStatus.map((c) => projectCameraRowForRole(c, nvr, u.role)) })
   })
 
   // POST /api/nvrs/:id/sync — Sincronización completa del NVR
