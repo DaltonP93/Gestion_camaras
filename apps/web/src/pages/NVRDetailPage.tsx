@@ -16,6 +16,7 @@ import type { NVR, Camera as CameraType, NvrHdd, IpCamera, CameraDiagnostics, Ch
 import { clsx } from 'clsx'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
+import { buildStreamPayload, type AudioChoice, type StreamEditForm } from '@/lib/streamConfigPayload'
 
 type Tab = 'summary' | 'cameras' | 'video' | 'recordings' | 'storage' | 'users' | 'maintenance' | 'diagnostics'
 
@@ -1414,17 +1415,6 @@ interface ChannelCaps {
   sub:  StreamCapabilities
 }
 
-interface StreamEditForm {
-  videoCodecType: string
-  width:          number
-  height:         number
-  fps:            number
-  bitrateMax:     number
-  bitrateType:    string
-  audioEnabled:   boolean
-  audioCodecType: string
-  audioBitrate:   number
-}
 
 function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
   nvrId: string
@@ -1477,9 +1467,8 @@ function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
       fps:      (selected.main?.fps ?? 0) > 0 ? selected.main!.fps : 25,
       bitrateMax: (selected.main?.bitrate ?? 0) > 0 ? selected.main!.bitrate : 4096,
       bitrateType: 'CBR',
-      audioEnabled: false,
-      audioCodecType: '',
-      audioBitrate: 64,
+      // El estado real del audio no se lee aquí: por defecto NO se toca.
+      audio: 'keep',
     })
     setSubForm({
       videoCodecType: selected.sub?.codec ?? '',
@@ -1488,9 +1477,8 @@ function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
       fps:      (selected.sub?.fps ?? 0) > 0 ? selected.sub!.fps : 10,
       bitrateMax: (selected.sub?.bitrate ?? 0) > 0 ? selected.sub!.bitrate : 1024,
       bitrateType: 'CBR',
-      audioEnabled: false,
-      audioCodecType: '',
-      audioBitrate: 64,
+      // El estado real del audio no se lee aquí: por defecto NO se toca.
+      audio: 'keep',
     })
     loadCaps(selected.channel)
     setEditMode(true)
@@ -1506,8 +1494,8 @@ function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
     if (!selected || !isFormValid()) return
     setSaving(true)
     try {
-      const mainPayload = { streamType: 'main', ...mainForm }
-      const subPayload  = { streamType: 'sub',  ...subForm }
+      const mainPayload = buildStreamPayload('main', mainForm)
+      const subPayload  = buildStreamPayload('sub', subForm)
       await apiPut(`/nvrs/${nvrId}/video-audio/${selected.channel}`, mainPayload)
       if (caps?.sub.exists && selected.sub) {
         await apiPut(`/nvrs/${nvrId}/video-audio/${selected.channel}`, subPayload)
@@ -1738,15 +1726,17 @@ function VideoAudioTab({ nvrId, configs, loading, onRefresh, isAdmin }: {
                               {/* Audio */}
                               <div>
                                 <label className="text-[10px] text-surface-500">Audio</label>
-                                <div className="flex items-center gap-2 mt-1">
-                                  <input
-                                    type="checkbox"
-                                    checked={form.audioEnabled ?? false}
-                                    onChange={e => setForm(f => ({ ...f, audioEnabled: e.target.checked }))}
-                                    className="accent-brand-500"
-                                  />
-                                  <span className="text-xs text-surface-300">{form.audioEnabled ? 'Habilitado' : 'Deshabilitado'}</span>
-                                </div>
+                                {/* Tres estados: el estado actual del audio no se lee en esta pantalla,
+                                    así que por defecto no se envía nada de audio al NVR. */}
+                                <select
+                                  className="input text-xs mt-0.5"
+                                  value={form.audio ?? 'keep'}
+                                  onChange={e => setForm(f => ({ ...f, audio: e.target.value as AudioChoice }))}
+                                >
+                                  <option value="keep">Sin cambios</option>
+                                  <option value="on">Habilitar</option>
+                                  <option value="off">Deshabilitar</option>
+                                </select>
                               </div>
                             </div>
                           ) : (

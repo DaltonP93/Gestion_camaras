@@ -7,6 +7,7 @@ import {
   getAllChannelsVideoConfig,
   putChannelVideoConfig,
   getChannelCapabilities,
+  AUDIO_UPDATE_REJECTED,
 } from '../services/nvr-config/hikvision'
 import { AuditAction } from '../services/audit'
 import { decryptNvrPasswordOrNull as decryptPass } from '../services/credentials'
@@ -149,7 +150,9 @@ export const nvrConfigRoutes: FastifyPluginAsync = async (server) => {
       // Apply update
       const result = await putChannelVideoConfig(nvrId, nvrCreds, channel, streamType, update)
       if (!result.success) {
-        return reply.status(502).send({ message: result.error ?? 'Error al escribir configuración en NVR' })
+        // Rechazo local del cambio de audio (sin PUT al NVR) ⇒ 422, no 502.
+        const status = result.code === AUDIO_UPDATE_REJECTED ? 422 : 502
+        return reply.status(status).send({ message: result.error ?? 'Error al escribir configuración en NVR' })
       }
 
       await AuditAction(server.prisma, (request.user as any).sub, 'NVR_CHANNEL_CONFIG_UPDATED', nvrId, request)
@@ -239,14 +242,22 @@ export const nvrConfigRoutes: FastifyPluginAsync = async (server) => {
         bitrateType:    streamConfig.bitrateType,
         bitrateMax:     streamConfig.bitrateMax,
         qualityLevel:   streamConfig.qualityLevel,
-        audioEnabled:   streamConfig.audioEnabled,
-        audioCodecType: streamConfig.audioCodecType,
-        audioBitrate:   streamConfig.audioBitrate,
+      }
+      // Audio: sólo si el backup lo leyó del bloque <Audio>. Los backups anteriores
+      // guardaban en audioEnabled el <enabled> del CANAL (casi siempre true):
+      // restaurarlo encendería el audio por error. Y sólo los tags que el backup
+      // encontró (codec vacío o bitrate 0 = el tag no existía; mandarlos haría
+      // fallar la restauración en canales sin <audioBitRate>, p.ej. G.711).
+      if (streamConfig.audioBlockPresent === true) {
+        updatePayload.audioEnabled = streamConfig.audioEnabled
+        if (streamConfig.audioCodecType) updatePayload.audioCodecType = streamConfig.audioCodecType
+        if (streamConfig.audioBitrate > 0) updatePayload.audioBitrate = streamConfig.audioBitrate
       }
 
       const result = await putChannelVideoConfig(nvrId, nvrCreds, channel, streamType, updatePayload)
       if (!result.success) {
-        return reply.status(502).send({ message: result.error ?? 'Error al restaurar configuración en NVR' })
+        const status = result.code === AUDIO_UPDATE_REJECTED ? 422 : 502
+        return reply.status(status).send({ message: result.error ?? 'Error al restaurar configuración en NVR' })
       }
 
       await AuditAction(server.prisma, (request.user as any).sub, 'NVR_CHANNEL_CONFIG_RESTORED', nvrId, request)
