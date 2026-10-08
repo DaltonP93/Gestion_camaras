@@ -34,6 +34,25 @@ const clientCapabilitiesSchema = z.object({
   viewId: z.string().min(1).max(128).optional(),
 })
 
+// RBAC por cámara del heartbeat (invariante 2). MISMO criterio que
+// POST /cameras/:id/start-stream (`userCanAccessCamera` en routes/cameras.ts):
+// ADMIN y SUPERVISOR sin restricción por recurso; el resto necesita una fila
+// UserPermission con `canView` sobre ESA cámara. Una consulta por heartbeat.
+const HEARTBEAT_FORBIDDEN = { code: 'FORBIDDEN', message: 'Sin permiso para esta cámara' } as const
+
+async function viewableCameraIds(
+  prisma: any, user: { sub: string; role: string }, cameraIds: string[],
+): Promise<Set<string>> {
+  const unique = [...new Set(cameraIds)]
+  if (user.role === 'ADMIN' || user.role === 'SUPERVISOR') return new Set(unique)
+  if (unique.length === 0) return new Set()
+  const perms = await prisma.userPermission.findMany({
+    where: { userId: user.sub, cameraId: { in: unique }, canView: true },
+    select: { cameraId: true },
+  })
+  return new Set(perms.map((p: { cameraId: string | null }) => p.cameraId).filter(Boolean) as string[])
+}
+
 export const liveViewRoutes: FastifyPluginAsync = async (server) => {
   // POST /api/live-view/heartbeat
   // Reconcilia el estado de las cámaras visibles para un view dado.
@@ -45,18 +64,29 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
     const user = request.user
     const body = heartbeatSchema.parse(request.body)
 
+    // Sólo se reconcilian las cámaras permitidas: las demás no se buscan, no se
+    // inician ni se tocan. Si una ya tenía sesión en esta vista (permiso revocado
+    // entre heartbeats), queda fuera del conjunto visible y reconcileView la detiene.
+    const allowed = await viewableCameraIds(server.prisma, user, body.visibleCameraIds)
+    const deniedIds = [...new Set(body.visibleCameraIds.filter(id => !allowed.has(id)))]
+    if (deniedIds.length > 0) {
+      server.log.warn(`[live-view] heartbeat_forbidden userId=${user.sub.slice(0, 8)} role=${user.role} denied=${deniedIds.length}`)
+    }
+
     const result = await reconcileView(
       server,
       user.sub,
       body.viewId,
-      body.visibleCameraIds,
-      body.suppressStartCameraIds ?? [],
+      body.visibleCameraIds.filter(id => allowed.has(id)),
+      (body.suppressStartCameraIds ?? []).filter(id => allowed.has(id)),
       // Ticket estampado por el hook `onRequest`, antes de la autenticación:
       // tomarlo dentro de reconcileView sería posterior a `jwtVerify` y a la
       // validación del cuerpo, con lo que una petición vieja reanudada tras un
       // cierre parecería nueva (revisión de #148).
       request.requestTicket,
     )
+
+    for (const id of deniedIds) result.errors[id] = { ...HEARTBEAT_FORBIDDEN }
 
     // Log estructurado para diagnosticar producción
     const errCount  = Object.keys(result.errors).length
