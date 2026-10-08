@@ -41,12 +41,15 @@ const ALLOWED_CHARS = /^[\x21-\x7e]+$/
 const FORBIDDEN_CHARS = /[%\\#@]/
 const TRACK_PATH = /^\/Streaming\/tracks\/(\d{1,7})\/?$/i
 const TS_VALUE = /^\d{8}T\d{6}Z$/
-const QUERY_RULES: Record<string, RegExp> = {
-  starttime: TS_VALUE,
-  endtime:   TS_VALUE,
-  name:      /^[A-Za-z0-9_.-]{1,128}$/,
-  size:      /^\d{1,20}$/,
-}
+// Tabla de reglas como `Map`: sólo devuelve las claves propias. Un objeto literal
+// heredaría de Object.prototype y `constructor` / `__proto__` resolverían a una
+// función o al prototipo (la validación lanzaba en vez de rechazar ⇒ 500).
+const QUERY_RULES: ReadonlyMap<string, RegExp> = new Map([
+  ['starttime', TS_VALUE],
+  ['endtime',   TS_VALUE],
+  ['name',      /^[A-Za-z0-9_.-]{1,128}$/],
+  ['size',      /^\d{1,20}$/],
+])
 
 /** Validación puramente sintáctica (sin canal). */
 export function parsePlaybackUri(raw: unknown): PlaybackUriCheck {
@@ -70,7 +73,7 @@ export function parsePlaybackUri(raw: unknown): PlaybackUriCheck {
     if (eq <= 0) return { ok: false, reason: 'bad_query' }
     const key = pair.slice(0, eq).toLowerCase()
     const value = pair.slice(eq + 1)
-    const rule = QUERY_RULES[key]
+    const rule = QUERY_RULES.get(key)
     if (!rule || seen.has(key) || !rule.test(value)) return { ok: false, reason: 'bad_query' }
     seen.add(key)
   }

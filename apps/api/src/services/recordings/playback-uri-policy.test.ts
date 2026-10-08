@@ -104,3 +104,50 @@ describe('parsePlaybackUri / respuesta de error', () => {
     }
   })
 })
+
+// Las claves de la query se buscan en la tabla de reglas. Una tabla `Record`
+// normal hereda de Object.prototype: `constructor` y `__proto__` devolvían una
+// función / el prototipo, `rule.test` no existía y la validación LANZABA
+// (TypeError ⇒ 500) en lugar de rechazar. La tabla sólo debe ver sus propias
+// claves, con cualquier mayúscula/minúscula y en cualquier posición.
+describe('claves heredadas de Object.prototype en la query', () => {
+  const START = 'starttime=20260716T170000Z'
+  const inherited = [
+    ...Object.getOwnPropertyNames(Object.prototype),
+    'Constructor', 'CONSTRUCTOR', '__PROTO__', '__Proto__', 'prototype',
+  ]
+  const placements: Array<[string, (k: string) => string]> = [
+    ['después de starttime', k => `/Streaming/tracks/301?${START}&${k}=x`],
+    ['antes de starttime', k => `/Streaming/tracks/301?${k}=x&${START}`],
+    ['única clave', k => `/Streaming/tracks/301?${k}=20260716T170000Z`],
+    ['valor vacío', k => `/Streaming/tracks/301?${START}&${k}=`],
+  ]
+  for (const key of inherited) {
+    for (const [where, build] of placements) {
+      it(`${key} (${where}) ⇒ rechazo sin excepción`, () => {
+        const uri = build(key)
+        let r: ReturnType<typeof validatePlaybackUriForChannel> | undefined
+        expect(() => { r = validatePlaybackUriForChannel(uri, 3) }).not.toThrow()
+        expect(r?.ok).toBe(false)
+        if (r && !r.ok) expect(['bad_query', 'missing_starttime']).toContain(r.reason)
+        expect(() => parsePlaybackUri(uri)).not.toThrow()
+      })
+    }
+  }
+
+  it('constructor / __proto__ ⇒ bad_query (no se confunden con una regla)', () => {
+    for (const k of ['constructor', '__proto__']) {
+      expect(validatePlaybackUriForChannel(`/Streaming/tracks/301?${START}&${k}=x`, 3)).toEqual({ ok: false, reason: 'bad_query' })
+    }
+  })
+
+  it('no contamina el prototipo global al validar', () => {
+    validatePlaybackUriForChannel(`/Streaming/tracks/301?${START}&__proto__=polluted`, 3)
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'polluted')).toBe(false)
+  })
+
+  it('las claves legítimas siguen aceptándose en cualquier mayúscula', () => {
+    expect(validatePlaybackUriForChannel(`/Streaming/tracks/301?StartTime=20260716T170000Z&ENDTIME=20260716T172206Z&Name=a&SIZE=1`, 3).ok).toBe(true)
+  })
+})

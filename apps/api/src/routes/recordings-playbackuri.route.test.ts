@@ -6,7 +6,9 @@
 //     codificadas (400);
 //   - lo hacen ANTES de descifrar credenciales, buscar en el NVR, sondear RTSP o
 //     iniciar FFmpeg (espías en cero);
-//   - mantienen los controles de permiso (OPERATOR / AUDITOR sin canPlayback).
+//   - mantienen los controles de permiso (OPERATOR / AUDITOR sin canPlayback);
+//   - con claves heredadas (`constructor`, `__proto__`) responden 400 sin que
+//     ninguna excepción llegue al manejador de errores de Fastify.
 // Una URI válida del propio canal sí llega a descifrar credenciales: el mock
 // devuelve '' ⇒ 422, sin red ni procesos.
 //
@@ -20,6 +22,7 @@ const spies = vi.hoisted(() => ({
   search: vi.fn(async () => []),
   nvrTime: vi.fn(async () => null),
   probe: vi.fn(async () => ({ ok: false })),
+  routeError: vi.fn((_err: unknown) => {}),
 }))
 
 vi.mock('../services/credentials', async (importOriginal) => {
@@ -76,6 +79,7 @@ async function build(user: { sub: string; role: Role }, grants: Grant[] = []): P
   })
   app.decorate('requireStepUp', async () => {})
   app.decorate('prisma', makePrisma(grants))
+  app.addHook('onError', async (_req, _reply, err) => { spies.routeError(err) })
   await app.register(recordingRoutes, { prefix: '/api/recordings' })
   await app.ready()
   return app
@@ -86,6 +90,14 @@ const OWN = `/Streaming/tracks/301/?${WINDOW}&name=00010000027000300&size=290893
 const OTHER_CHANNEL = `/Streaming/tracks/901?${WINDOW}`
 const TIMES = { startTime: '2026-07-16T17:00:00.000Z', endTime: '2026-07-16T17:22:06.000Z' }
 
+// Claves que una tabla `Record` normal resuelve vía Object.prototype.
+const INHERITED_KEY_URIS: Array<[string, string]> = [
+  ['constructor', `/Streaming/tracks/301?${WINDOW}&constructor=x`],
+  ['__proto__', `/Streaming/tracks/301?${WINDOW}&__proto__=x`],
+  ['Constructor (mayúsculas)', `/Streaming/tracks/301?Constructor=20260716T170000Z&${WINDOW}`],
+  ['__PROTO__ (mayúsculas)', `/Streaming/tracks/301?__PROTO__=&${WINDOW}`],
+]
+
 type Route = { name: string; url: string; body: (uri?: string, cameraId?: string) => Record<string, unknown> }
 const ROUTES: Route[] = [
   { name: 'POST /playback', url: '/api/recordings/playback',
@@ -95,6 +107,7 @@ const ROUTES: Route[] = [
 ]
 
 function noBackendContact() {
+  expect(spies.routeError).not.toHaveBeenCalled()
   expect(spies.decrypt).not.toHaveBeenCalled()
   expect(spies.spawn).not.toHaveBeenCalled()
   expect(spies.search).not.toHaveBeenCalled()
@@ -139,6 +152,17 @@ for (const route of ROUTES) {
         expect(res.statusCode).toBe(400)
         expect(res.json().code).toBe('PLAYBACK_URI_INVALID')
         expect(res.body).not.toContain(uri)
+        noBackendContact()
+        await app.close()
+      })
+    }
+
+    for (const [label, uri] of INHERITED_KEY_URIS) {
+      it(`clave heredada ${label} ⇒ 400 sin excepción ni contacto con NVR/FFmpeg`, async () => {
+        const app = await build({ sub: 'adm', role: 'ADMIN' })
+        const res = await app.inject({ method: 'POST', url: route.url, payload: route.body(uri) })
+        expect(res.statusCode).toBe(400)
+        expect(res.json().code).toBe('PLAYBACK_URI_INVALID')
         noBackendContact()
         await app.close()
       })
@@ -207,6 +231,17 @@ describe('POST /diagnostics/playback (ADMIN) — mismo mecanismo', () => {
     noBackendContact()
     await app.close()
   })
+
+  for (const [label, uri] of INHERITED_KEY_URIS) {
+    it(`clave heredada ${label} ⇒ 400 sin excepción ni contacto con el NVR`, async () => {
+      const app = await build({ sub: 'adm', role: 'ADMIN' })
+      const res = await app.inject({ method: 'POST', url, payload: { cameraId: 'cam-3', playbackURI: uri } })
+      expect(res.statusCode).toBe(400)
+      expect(res.json().code).toBe('PLAYBACK_URI_INVALID')
+      noBackendContact()
+      await app.close()
+    })
+  }
 
   it('URI válida del propio canal llega a descifrar credenciales', async () => {
     const app = await build({ sub: 'adm', role: 'ADMIN' })
