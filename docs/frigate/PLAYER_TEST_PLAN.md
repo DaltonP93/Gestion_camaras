@@ -1,6 +1,7 @@
 # Plan de pruebas — reproductor, timeline y sesiones (NVR simulado → NVR real)
 
-> Estado: **PLAN**. Acompaña a `NATIVE_INTEGRATION_PROPOSAL.md` (etapas E1–E8). 2026-10-07.
+> Estado: **PLAN**. Acompaña a `NATIVE_INTEGRATION_PROPOSAL.md` (etapas E1–E8). Revisión 2 — 2026-10-08:
+> corrige el criterio de grabaciones en grilla (no se asume subflujo grabado; ver §1.1).
 > Regla: **simulado** prueba lógica y contratos; **no** se usa para declarar rendimiento. Toda afirmación
 > de rendimiento, latencia o capacidad requiere la parte **M** con hardware y NVR reales.
 
@@ -18,6 +19,45 @@ se ignoran en el RTSP); sirve para el ciclo de vida de FFmpeg, leases, admisión
 para validar tiempos del archivo.
 
 ## 1. Suite simulada S1–S9
+
+### 1.1 Criterio de pistas en grabaciones (corrección)
+
+La revisión 1 asumía "grabaciones en grilla ⇒ substream". **No se puede asumir** que el NVR grabó
+el subflujo: muchos sólo graban la pista principal, otros graban ambas sólo en parte del día.
+En el código no hay una regla "grilla ⇒ substream" (el layout no viaja a `/preview/start`; 1×1 y
+grilla usan el mismo plan de intentos). El supuesto estaba en la documentación. Lo que sí hace el
+código es **usar el subflujo sin saber si existe**:
+- la búsqueda ISAPI y `dailyDistribution` consultan sólo `trackID = canal*100+1`
+  (`apps/api/src/services/hikvision.ts:1760`, `:1929`): timeline y calendario sólo muestran la
+  cobertura de la principal, y los resultados no guardan la pista;
+- el subflujo `canal*100+2` se **deriva** sumando 1 (`toSubstreamTrackUrl`,
+  `apps/api/src/services/recordings/rtsp-url.ts:174-182`) y se agrega al final del plan de intentos
+  en modo `auto` (`buildPlaybackAttemptPlan`, `rtsp-url.ts:349`, `:388-397`; ruta heredada
+  `buildVariantChain`, `:202-225`);
+- **se generaliza por NVR**: si un intento de subflujo funciona en una cámara, todo el NVR pasa a
+  preferir `sub_full` (`apps/api/src/routes/recordings.ts:2884-2893`); un 400 en la pista `+2`
+  marca a todo el NVR "sin subflujo" durante 6 h (`recordings.ts:3058-3067`, `:487-493`). Ambas
+  confunden "esta cámara o este instante no tiene la pista" con "el NVR no la soporta".
+- el reloj maestro avanza aunque una celda esté cargando y el re-buffering a mitad de reproducción
+  no se detecta (no hay listeners `waiting`/`stalled`; `apps/web/src/pages/RecordingsPage.tsx:424-470`,
+  `:1835-1840`).
+
+Las líneas son de `main` (`94305f3`); se verificaron por lectura, sin ejecutar contra un NVR.
+
+Criterio nuevo (el prototipo #188 lo implementa con datos simulados):
+1. **Descubrir** las pistas archivadas por cámara y ventana: búsqueda por `canal*100+1` y
+   `canal*100+2`; guardar la cobertura de cada pista.
+2. **Elegir por celda y por instante del reloj común** una pista **con grabación en ese instante**:
+   grilla ⇒ subflujo si está archivado, si no principal (con aviso); 1×1 ⇒ principal, si no
+   subflujo (con aviso).
+3. **Huecos:** sin grabación en ninguna pista ⇒ la celda lo muestra, ofrece "ir al próximo tramo"
+   y no abre sesión.
+4. **Buffering:** "cargando" por celda; política de reloj común configurable (sincronía estricta:
+   el reloj espera; si no, la celda se resincroniza).
+5. **Límites:** las sesiones se admiten por NVR hasta `maxConcurrentPlaybackSessions`; el
+   excedente queda **en cola con posición visible**. Una celda con la principal porque no hay
+   subflujo cuesta más ancho de banda del NVR: se informa, no se oculta.
+
 
 Notación: **[existe]** = prueba ya escrita (repo o PR pospuesto, a portar al controlador), **[nueva]**.
 
@@ -56,18 +96,21 @@ Notación: **[existe]** = prueba ya escrita (repo o PR pospuesto, a portar al co
 ### S5 — Multicámara y cambio de cámara
 | ID | Nivel | Escenario | Aserción |
 |---|---|---|---|
-| S5.1 | E | 2×2 con 4 cámaras | 4 sesiones substream; reloj común; huecos por celda |
+| S5.1 | E | 2×2 con 4 cámaras | 4 sesiones, cada una con la pista **archivada** que elige §1.1 (no se asume subflujo); reloj común; huecos por celda |
 | S5.2 | E | cambiar una celda de cámara | la sesión de esa celda se cierra por identidad; las otras 3 no se tocan |
 | S5.3 | E | cambiar layout 2×2 → 1×1 | quedan las sesiones de la celda visible; el resto se cierran; respuestas viejas descartadas (invariante 4) |
 | S5.4 | E | cambiar de NVR/página durante carga | ninguna respuesta vieja inicia ni publica un stream |
 
-### S6 — Calidad automática
+### S6 — Calidad automática y pistas archivadas
 | ID | Nivel | Escenario | Aserción | Origen |
 |---|---|---|---|---|
-| S6.0 | U | **vivo** 1×1: plan de layout pide foco HD y vuelve a sub al salir | transiciones 3×3→1×1→2×2 sin reiniciar HD de más | [existe] #180 (`liveLayoutQuality.test.ts`, `live1x1HdWiring.test.ts`, unitarias) |
-| S6.1 | E | **grabaciones** 1×1 | pide main (alta calidad) automáticamente | [nueva] (criterio de #180 llevado al reproductor de grabaciones) |
-| S6.2 | E | grabaciones en grilla | substream | [nueva] |
-| S6.3 | E | main no listo o HEVC sin soporte | degrada a substream o `main_h264` sin error visible; vuelve a main al estar listo | [existe parcial] `fullscreen-fast-release` (HEVC ⇒ `main_h264`) |
+| S6.0 | U | **vivo** 1×1: plan de layout pide foco HD y vuelve a sub al salir | transiciones 3×3→1×1→2×2 sin reiniciar HD de más | [existe en la rama de #180, pospuesto; **no** en `main`] (`liveLayoutQuality.test.ts`, `live1x1HdWiring.test.ts`, unitarias) |
+| S6.1 | U/E | **grabaciones** 1×1 | pide la pista principal si está archivada en el instante pedido; si sólo hay subflujo en ese instante, lo usa y lo indica | [nueva] |
+| S6.2 | U/E | **grabaciones** en grilla, cámara con subflujo archivado | usa el subflujo (`canal*100+2`) sólo donde la búsqueda lo devuelve | [nueva] |
+| S6.2b | U/E | grilla, cámara **sin** subflujo archivado (sólo principal) | usa la principal con aviso visible ("el NVR no grabó subflujo"); cuenta como sesión principal en la admisión; **nunca** pide una pista sin grabación | [nueva] — prototipo #188 la cubre con datos simulados |
+| S6.2c | U/E | subflujo archivado sólo en parte de la ventana | al cruzar el límite cambia de pista sin saltar video y la celda muestra "cargando" | [nueva] |
+| S6.3 | E | principal no lista o HEVC sin soporte | degrada a `main_h264` o a la pista archivada disponible sin error visible; vuelve al estar lista | [existe parcial] `fullscreen-fast-release` (HEVC ⇒ `main_h264`) |
+| S6.4 | I | descubrimiento de pistas | la búsqueda ISAPI se hace por `trackID` principal y subflujo; el resultado guarda la cobertura **por pista**; un 0 de subflujo no es error | [nueva] (hoy sólo se busca `canal*100+1`, ver §1.1) |
 
 ### S7 — Liberación de sesiones
 | ID | Nivel | Escenario | Aserción | Origen |
@@ -91,9 +134,18 @@ Notación: **[existe]** = prueba ya escrita (repo o PR pospuesto, a portar al co
 | S9.1 | I | más previews que el presupuesto por NVR | los excedentes quedan en cola con posición visible; nunca se superan las sesiones RTSP configuradas |
 | S9.2 | I | continuidad con prioridad | un sucesor de continuidad entra antes que una sesión normal sólo si el predecesor consumió su lease (contrato `continuityOfSessionId`) |
 | S9.3 | I | `MAX_STREAMS_PER_USER` | el usuario no supera su límite; cerrar libera cupo |
-| S9.4 | E | UI en cola | muestra "en cola" y arranca sola al liberarse cupo |
+| S9.4 | E | UI en cola | muestra "en cola · posición N · el NVR acepta L sesiones" y arranca sola al liberarse cupo |
+| S9.5 | E | indicador por NVR | barra de controles muestra `activas/límite` y `en cola` por NVR; nunca `activas > límite` |
+| S9.6 | E | hueco en una celda | la celda muestra "sin grabación hh:mm" y "ir al próximo tramo"; no consume sesión; las demás siguen |
+| S9.7 | E | carga (buffering) | la celda muestra "cargando"; con sincronía estricta el reloj común espera; sin ella, la celda se resincroniza al recuperar |
 
 **Criterio de E1:** S1–S9 en verde en CI (niveles U/E/I), sin pruebas omitidas ni deshabilitadas.
+
+**Prototipo #188 (datos simulados):** su lógica pura (`prototype/model/playback.ts`) y sus pruebas
+Playwright en PC y tablet ya ejercitan el **criterio** de S5.1, S6.1–S6.2c y S9.4–S9.7 (pista
+archivada por instante, huecos con "ir al próximo tramo", carga con sincronía estricta, cola por
+límite del NVR, velocidades medidas contra el tiempo real). Valida la experiencia y el contrato; **no**
+reemplaza las pruebas E/I del controlador real de E1.
 
 ## 2. Mediciones con hardware y NVR reales (parte M) — **PENDIENTES**
 
@@ -107,7 +159,8 @@ staging. Se registran método, cámaras (ids, no IPs), firmware del NVR, fecha y
 | M3 | Seek real | 20 seeks fuera de bloque | p95 al primer frame tras seek |
 | M4 | Sesiones RTSP por NVR | contador del NVR (ISAPI) + `ss`/MediaMTX | nunca supera el límite del modelo de NVR |
 | M5 | Liberación real | cerrar vistas/pestañas y medir FFmpeg vivos y leases | 0 FFmpeg huérfanos tras TTL |
-| M6 | Calidad automática | 1×1 vs grilla con cámaras H.264 y HEVC | main en 1×1, sub en grilla, degradación correcta |
+| M6 | Calidad automática | 1×1 vs grilla con cámaras H.264 y HEVC | pista elegida según §1.1 (principal en 1×1; subflujo en grilla **sólo si está archivado**); degradación correcta |
+| M9 | Inventario de pistas archivadas | búsqueda ISAPI de **sólo lectura** por `canal*100+1` y `+2` en cada NVR, una ventana de 24 h | tabla por NVR/cámara: principal sí/no, subflujo sí/no, cobertura %; requiere autorización porque contacta NVR reales |
 | M7 | Carga del servidor con detección | CPU/RAM/GPU/NPU con N cámaras analizadas (E7) | margen definido para crecer |
 | M8 | Alineación de reloj NVR↔servidor | offset por NVR durante 7 días | desvío bajo el umbral, o aviso visible |
 

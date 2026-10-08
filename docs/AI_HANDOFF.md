@@ -1,6 +1,6 @@
 # Handoff operativo para IA — VisionCore (ENTRADA CANÓNICA)
 
-> Actualizado: 2026-10-07 (estado vigente en la sección «Estado vigente» de abajo). Las secciones
+> Actualizado: 2026-10-08 (estado vigente en la sección «Estado vigente» de abajo). Las secciones
 > §0–§15 conservan la reconstrucción del ciclo C23 (2026-09-06) como **histórico**: donde contradigan
 > la sección vigente, manda la sección vigente.
 > Alcance: contexto del código versionado. NO describe ni autoriza cambios en producción.
@@ -9,7 +9,7 @@
 
 ---
 
-## Estado vigente (2026-10-07) — leer primero
+## Estado vigente (2026-10-08) — leer primero
 
 **Línea base.** `main` = `94305f32ddba17b697b8f28b5fe3ef5108b0bc2c` (merge #179). Desde `0f9d1f5` se
 fusionaron, entre otros: #170–#175 (docs C23, SSRF + RBAC centralizado, deps web, plano de grants,
@@ -20,43 +20,60 @@ ESLint, `migration_lock.toml`, revocación WS cross-worker, #176 (linaje de cert
 (continuidad de grabaciones). Se verificó por inspección de sólo lectura (2026-09-23) que producción
 corría `94305f3`; **re-verificar antes de concluir nada sobre el servidor**.
 
-**PR abiertos (todos Draft; ninguno fusionado; ninguno desplegado):**
+**Alcance definitivo de la integración (2026-10-08):** adaptar la **interfaz y organización de
+configuración de Frigate** dentro de VisionCore con **todas** sus funciones (administración,
+seguridad, NVR) además de eventos y detección; no limitar la configuración nueva a detección. Se
+mantienen login, roles, NVR y visores de VisionCore; archivo completo sólo en NVR; almacenamiento local
+sólo para eventos configurados. Ver `docs/frigate/NATIVE_INTEGRATION_PROPOSAL.md` (rev. 3) y
+`docs/frigate/SCREEN_FUNCTION_MATRIX.md`.
+
+**PR abiertos (todos Draft; ninguno fusionado; ninguno desplegado). Base apilada: #182.**
 
 | PR | Rama | Head | Base | Contenido | Estado |
 |---|---|---|---|---|---|
-| #182 | `fix/api-audit-oct2026` | `ceab82e` | `main` | fastify 5.12.5, nodemailer 10 (tipos propios), pruebas SMTP loopback incl. AUTH | CI #265 11/11; API 1532/1532 con PG/Redis reales; 0 vulns prod |
-| #184 | `refactor/nvr-recording-provider-standalone` | `f32cd75` | #182 | Proveedor NVR de grabaciones (web) sin la continuidad de #181 | CI #266 11/11; sustituye a #183 |
-| #186 | `fix/recordings-playbackuri-channel-scope` | `c9f86bc` | #182 | **P1**: `playbackURI` ligada al canal de la cámara (playback, preview, diagnóstico) | 71 pruebas nuevas; API 1603/1603 |
-| #187 | `feat/staging-isolation` | `77ed1d3` | #182 | `STAGING_ISOLATION` y flags: sin sondeo/sync/registro de streams/avisos externos | 20 pruebas nuevas; API 1552/1552 |
-| #185 | `docs/frigate-native-plan` | (ver PR) | `main` | Propuesta de adaptación nativa (Frigate v0.18.0 `77a66e7`), plan de pruebas, runbook de migración, este traspaso | Sólo docs; `npm audit` rojo por `main` (lo resuelve #182) |
+| #182 | `fix/api-audit-oct2026` | `ceab82e` | `main` | fastify 5.12.5, nodemailer 10, pruebas SMTP loopback incl. AUTH | CI 11/11 |
+| #186 | `fix/recordings-playbackuri-channel-scope` | `45ebda5` | #182 | **Seguridad**: `playbackURI` ligada al canal (playback, preview, diagnóstico); tabla de reglas `Map` (sin propiedades heredadas: `constructor`/`__proto__` ⇒ 400, antes 500) | CI 11/11; API 1686/1686 |
+| #189 | `fix/live-heartbeat-rbac` | `7d705e4` | #182 | **Seguridad P0**: RBAC por cámara en `POST /api/live-view/heartbeat` (iniciaba streams de cámaras ajenas) + revocación entre heartbeats | CI 11/11; reproducido con prueba |
+| #190 | `fix/auth-access-token-only` | `abd2734` | #182 | **Seguridad crítica**: sólo access tokens como credencial (2fa/enroll/step-up sin rol abrían grabaciones de todas las cámaras; refresh servía 7 días) | CI 11/11; reproducido con prueba |
+| #187 | `feat/staging-isolation` | `036171f` | #182 | `STAGING_ISOLATION` y flags; ausente = actual, presente vacía/con espacios ⇒ aborta; prueba de arranque real de `server.ts` | CI 11/11; API 1563/1563 |
+| #184 | `refactor/nvr-recording-provider-standalone` | `f32cd75` | #182 | Proveedor NVR de grabaciones (web) sin la continuidad de #181 | CI 11/11 |
+| #188 | `feat/frigate-ux-prototype` | `aab226e` | #182 | Prototipo navegable con datos simulados (vivo, visores, grabaciones multicámara, eventos, configuración completa, **editor de zonas de Frigate en React 18**) | CI 11/11; e2e PC+tablet 83 ok |
+| #185 | `docs/frigate-native-plan` | (ver PR) | `main` | Propuesta rev. 3, matriz de pantallas/funciones, plan de pruebas rev. 2, runbook, este traspaso | Sólo docs; `npm audit` rojo por `main` (lo resuelve #182) |
 | #183 | `refactor/nvr-recording-provider` | `ff6f3ff` | #181 | Proveedor apilado sobre #181 | Conservado; reemplazado por #184 |
-| #181 | `feat/nvr-playback-probe` | `3fce40f` | #182 (`7b9ef37`) | Relevo seguro y continuidad por video real | **Pospuesto** (no fusionar ni cerrar); sus pruebas son criterios de aceptación |
-| #180 | `fix/live-1x1-high-quality` | `cd251c7` | `main` viejo (`94e3f37`) | Vivo 1×1 en alta calidad automática | **Pospuesto**; criterio de aceptación |
+| #181 | `feat/nvr-playback-probe` | `3fce40f` | #182 (`7b9ef37`) | Relevo seguro y continuidad por video real | **Pospuesto** (no fusionar ni cerrar) |
+| #180 | `fix/live-1x1-high-quality` | `cd251c7` | `main` viejo | Vivo 1×1 en alta calidad automática | **Pospuesto** |
 
-Orden sugerido de revisión: #182 → #186 → #187 → #184 → #185. Cada uno se re-valida tras fusionar
-el anterior (las bases apiladas cambian).
+Orden sugerido de revisión: #182 → #190 → #189 → #186 → #187 → #184 → #188 → #185. Cada uno se
+re-valida tras fusionar el anterior.
 
-**Hallazgos de seguridad vigentes en `main`:**
-1. *Acceso cruzado por `playbackURI`* (AUDITOR con permiso en una cámara podía abrir otra pista del
-   mismo NVR con credenciales del NVR) → corregido en **#186**, sin fusionar.
-2. *MediaMTX `authInternalUsers: user: any`* (read/publish/api/playback sin credenciales; el borde
-   está protegido por nginx `auth_request` para `/hls/`, pero dentro de la red docker no) → etapa
-   **E0.5** de la propuesta (usuarios por consumidor real).
-3. Comentario de WebRTC por `/webrtc/` en `services/stream.ts` sin `location` en nginx: no expuesto.
+**Seguridad — hallazgos vigentes en `main`** (lista completa, priorizada y con evidencia en
+`docs/frigate/SCREEN_FUNCTION_MATRIX.md`, sección de hallazgos):
+1. Tokens intermedios y refresh aceptados como credencial → **#190** (reproducido).
+2. Heartbeat del vivo sin RBAC → **#189** (reproducido).
+3. Acceso cruzado por `playbackURI` → **#186**.
+4. Pendientes **Alto** sin PR: `GET /api/auth/me` devuelve a no-ADMIN la fila del NVR (usuario,
+   contraseña cifrada, IP) y la web la guarda en `localStorage`; `GET /cameras/:id/diagnostics`
+   expone usuario/IP del NVR a quien tiene `canView` y dispara sondas RTSP; subida de branding con
+   extensión del cliente (XSS almacenado en `/uploads/`); `canDownload` no se aplica a la descarga
+   de grabaciones; el rol se toma del JWT sin consultar la base (degradar/desactivar no corta hasta
+   el vencimiento).
+5. MediaMTX `authInternalUsers: user: any` → etapa **E0.5**.
 
-**Producción observada (2026-09-23, sólo lectura):** stack de 8 servicios sano; analítica
-habilitada con **0 cámaras activas y 0 eventos**; 144 cámaras / 4 NVR; 36/36 migraciones; VM de
-4 vCPU sin GPU ni acelerador (no apta para detección con Frigate). No verificados: errores de logs
-24 h, `visioncore-backup.timer`, vencimiento del certificado.
+**Decisiones técnicas tomadas:** editor de zonas con **React 18 + react-konva 18.2.16 + konva 10.2.3**
+(prueba de compatibilidad con controles negativos y mutantes; propuesta §2.4). Grabaciones en grilla:
+**no se asume subflujo grabado**; pista archivada por instante, huecos, carga y límites visibles
+(plan de pruebas §1.1).
 
-**Planificación (en #185):** `docs/frigate/NATIVE_INTEGRATION_PROPOSAL.md` (etapas E0–E8),
-`docs/frigate/PLAYER_TEST_PLAN.md` (S1–S9 simulado; M1–M8 pendientes con hardware),
-`docs/runbooks/migration-dell-pro-slim.md` (un solo primario, backup con escritores detenidos,
-rollback que preserva datos, inventario PostgreSQL/Redis).
+**Producción observada (2026-09-23, sólo lectura):** stack de 8 servicios sano; analítica habilitada
+con **0 cámaras activas y 0 eventos**; 144 cámaras / 4 NVR; 36/36 migraciones; VM de 4 vCPU sin GPU ni
+acelerador. No verificados: errores de logs 24 h, `visioncore-backup.timer`, vencimiento del certificado.
 
-**Pendientes:** dependencias **sólo de desarrollo** con avisos (`vitest`, `source-map-js`) — PR
-aparte; confirmar con NVR reales la gramática de `playbackURI` de #186; decisiones abiertas de la
-propuesta (§9: React 18/19 para el editor de zonas, puerto `127.0.0.1:8554`, retención/cuota).
+**Pendientes:** decisiones de la propuesta §9 (política de SUPERVISOR por recurso, permisos por NVR,
+`UserFeaturePermissions` no aplicados, descarga, AUDITOR en vivo, visores personales para OPERATOR/
+AUDITOR, reloj común); PR para los hallazgos **Alto** sin PR; dependencias sólo de desarrollo con
+avisos (`vitest`, `source-map-js`) y `react-router` 6 (moderado, prod); confirmar con NVR reales la
+gramática de `playbackURI` (#186) y el inventario de pistas archivadas (M9); `.gitignore` de `main`
+contiene marcadores de conflicto sin resolver (`<<<<<<<`/`>>>>>>>`, líneas 14–18).
 
 **Prohibido sin autorización expresa:** merge, Ready, deploy, migración, activar Frigate o flags en
 producción, borrar ramas, force-push.
