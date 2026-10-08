@@ -99,6 +99,10 @@ async function main() {
   if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
     server.log.warn('[startup] JWT_SECRET parece muy corto (< 32 chars). Usa un secreto de al menos 32 caracteres aleatorios.')
   }
+  // Aislamiento de staging (services/staging-isolation.ts). Se resuelve ANTES de
+  // conectar a PostgreSQL/Redis o registrar nada: una variable presente pero
+  // vacía o inválida lanza y main().catch aborta el arranque (exit 1).
+  const isolation = resolveIsolationConfig()
 
   // ─── Ticket de llegada — PRIMER hook onRequest de todos ────
   //
@@ -352,9 +356,8 @@ async function main() {
   })
 
   // ─── Jobs en background ───────────────────────────────────
-  // Aislamiento de staging (services/staging-isolation.ts): sin variables, todo
-  // queda ON como siempre. Valores inválidos abortan el arranque.
-  const isolation = resolveIsolationConfig()
+  // `isolation` se resolvió al principio de main(): sin variables, todo queda ON
+  // como siempre.
   server.log.info(describeIsolation(isolation))
   for (const w of isolationWarnings()) server.log.warn(w)
   startHealthWorker(server, isolation)

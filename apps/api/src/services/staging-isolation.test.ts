@@ -43,8 +43,31 @@ describe('resolveIsolationConfig', () => {
     }
   })
 
-  it('cadena vacía = no definida', () => {
-    expect(resolveIsolationConfig({ STAGING_ISOLATION: '  ' }).stagingIsolation).toBe(false)
+  it('variable ausente ⇒ default de esa flag (comportamiento actual), aunque otras estén definidas', () => {
+    expect(resolveIsolationConfig({ NVR_POLLING_ENABLED: 'false' }).stagingIsolation).toBe(false)
+    expect(resolveIsolationConfig({ STAGING_ISOLATION: 'false' })).toEqual(resolveIsolationConfig({}))
+  })
+
+  it('variable presente pero vacía, sólo espacios o con espacios alrededor ⇒ aborta (no se asume el default)', () => {
+    const flags = ['STAGING_ISOLATION', 'NVR_POLLING_ENABLED', 'NVR_SYNC_ENABLED', 'STREAM_AUTO_REGISTER_ENABLED', 'OUTBOUND_NOTIFICATIONS_ENABLED']
+    for (const name of flags) {
+      for (const bad of ['', ' ', '   ', '\t', '\n', ' true', 'true ', ' false ', '\ttrue']) {
+        expect(() => resolveIsolationConfig({ [name]: bad }), `${name}=${JSON.stringify(bad)}`).toThrow(new RegExp(`${name} presente pero inválida`))
+      }
+    }
+  })
+
+  it('el mensaje distingue la variable vacía y no ecoa valores largos', () => {
+    expect(() => resolveIsolationConfig({ STAGING_ISOLATION: '  ' })).toThrow(/vacía \(" {2}"\)/)
+    let msg = ''
+    try { resolveIsolationConfig({ STAGING_ISOLATION: 'x'.repeat(200) }) } catch (e) { msg = (e as Error).message }
+    expect(msg).toContain('x'.repeat(32))
+    expect(msg).not.toContain('x'.repeat(33))
+  })
+
+  it('outboundNotificationsAllowed y isolationWarnings aplican la misma regla estricta', () => {
+    expect(() => outboundNotificationsAllowed({ OUTBOUND_NOTIFICATIONS_ENABLED: '' })).toThrow()
+    expect(() => isolationWarnings({ STAGING_ISOLATION: ' ' })).toThrow()
   })
 
   it('describeIsolation resume el estado efectivo sin secretos', () => {

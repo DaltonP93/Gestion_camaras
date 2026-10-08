@@ -12,9 +12,13 @@
 // NO toca autenticación, sesiones, revocación de permisos ni de medios, limpiezas
 // internas ni WebSocket hacia navegadores: esos siguen activos en staging.
 //
-// Por defecto (sin variables) el comportamiento es IDÉNTICO al actual (todo ON).
+// Variable AUSENTE ⇒ comportamiento IDÉNTICO al actual (todo ON).
+// Variable PRESENTE ⇒ debe ser exactamente `true` o `false` (sin distinguir
+// mayúsculas). Vacía, sólo espacios, con espacios alrededor o cualquier otro valor
+// ⇒ error de arranque: una línea `STAGING_ISOLATION=` o `STAGING_ISOLATION= true`
+// en el .env de la copia de staging no puede degradar en silencio a "todo ON".
 // STAGING_ISOLATION=true apaga los cuatro y NO puede ser re-habilitado por las
-// flags individuales (fail-closed). Valores inválidos ⇒ error de arranque.
+// flags individuales (fail-closed).
 
 export interface IsolationConfig {
   stagingIsolation: boolean
@@ -34,11 +38,12 @@ export const ISOLATION_FLAGS = {
 
 function parseFlag(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
   const raw = env[name]
-  if (raw === undefined || raw.trim() === '') return fallback
-  const v = raw.trim().toLowerCase()
+  if (raw === undefined) return fallback
+  const v = raw.toLowerCase()
   if (v === 'true') return true
   if (v === 'false') return false
-  throw new Error(`[startup] ${name}="${raw}" inválido: usar true o false`)
+  const shown = raw.trim() === '' ? `vacía (${JSON.stringify(raw)})` : JSON.stringify(raw.slice(0, 32))
+  throw new Error(`[startup] ${name} presente pero inválida: ${shown}. Usar exactamente true o false, o quitar la variable`)
 }
 
 /** Resuelve la configuración. Lanza ante valores inválidos (fail-fast). */
@@ -59,7 +64,7 @@ export function isolationWarnings(env: NodeJS.ProcessEnv = process.env): string[
   const cfg = resolveIsolationConfig(env)
   if (!cfg.stagingIsolation) return []
   const ignored = (['nvrPolling', 'nvrSync', 'streamAutoRegister', 'outboundNotifications'] as const)
-    .filter(k => env[ISOLATION_FLAGS[k]]?.trim().toLowerCase() === 'true')
+    .filter(k => env[ISOLATION_FLAGS[k]]?.toLowerCase() === 'true')
     .map(k => ISOLATION_FLAGS[k])
   return ignored.length
     ? [`[startup] STAGING_ISOLATION=true ignora ${ignored.join(', ')}=true (el aislamiento no se puede re-habilitar por flag)`]
