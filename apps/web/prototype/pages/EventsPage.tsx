@@ -4,6 +4,8 @@ import { CAMERAS, EVENTS, cameraById, fmtClock, type DetectionEvent } from '../s
 import { canPlayback, canSeeCameraEvents } from '../model/permissions'
 import { useSession } from '../session'
 import { Badge } from '../components/CameraTile'
+import { BackendMark } from '../components/BackendMark'
+import { EVENTS_BACKEND } from '../model/backend'
 
 const LABELS: Array<DetectionEvent['label'] | ''> = ['', 'persona', 'vehículo', 'animal']
 
@@ -36,6 +38,7 @@ export function EventsPage() {
         <p className="text-xs text-surface-400">
           Las ventanas de evento retenidas se guardan completas en el servidor; el archivo continuo sigue en el NVR.
         </p>
+        <BackendMark status={EVENTS_BACKEND.list} testId="events-backend" />
       </div>
       {user.role !== 'ADMIN' && (
         <p className="text-xs text-amber-300" data-testid="events-scope-note">

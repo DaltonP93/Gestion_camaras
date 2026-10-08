@@ -7,8 +7,14 @@ import { canCreateViewer, canEditViewer, canPtz, canUseHighQuality, canViewLive,
 import { LAYOUT_CELLS, ViewerError, fitSlots, slotState } from '../model/viewers'
 import { useSession } from '../session'
 import { Badge, CameraTile, GRID_CLASS } from '../components/CameraTile'
+import { SidePanel } from '../components/SidePanel'
+import { BackendMark } from '../components/BackendMark'
+import { LIVE_BACKEND, notAppliedText } from '../model/backend'
 
 const LAYOUTS: Layout[] = ['1x1', '2x2', '3x3', '4x4']
+
+/** Guardar, compartir o borrar un visor no llega a /api/views: lo dice explícitamente. */
+const viewerDone = (what: string) => `${what} sólo en este navegador. ${notAppliedText(LIVE_BACKEND.viewers)}`
 
 type Mode =
   | { kind: 'view' }
@@ -24,7 +30,10 @@ export function LivePage() {
   const [mode, setMode] = useState<Mode>({ kind: 'view' })
   const [focusCell, setFocusCell] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const [ptzFor, setPtzFor] = useState<string | null>(null)
+  // Selector de visores: plegado por defecto en tablet vertical (en ≥ lg siempre visible).
+  const [panelOpen, setPanelOpen] = useState(false)
 
   // Restaura la última selección del usuario (o el primer visor visible).
   useEffect(() => {
@@ -36,6 +45,7 @@ export function LivePage() {
     setMode({ kind: 'view' })
     setFocusCell(null)
     setError(null)
+    setNotice(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user.id])
 
@@ -47,10 +57,13 @@ export function LivePage() {
     setMode({ kind: 'view' })
     setFocusCell(null)
     setError(null)
+    setNotice(null)
+    setPanelOpen(false) // en vertical, elegir un visor pliega el selector y muestra la grilla
   }
 
-  const run = (fn: () => void) => {
-    try { fn(); setError(null); refresh() } catch (e) {
+  const run = (fn: () => void, done?: string) => {
+    try { fn(); setError(null); setNotice(done ?? null); refresh() } catch (e) {
+      setNotice(null)
       setError(e instanceof ViewerError ? e.message : String(e))
     }
   }
@@ -64,7 +77,7 @@ export function LivePage() {
 
   return (
     <div className="flex h-full flex-col gap-3 p-3 lg:flex-row">
-      <aside className="card shrink-0 p-3 lg:w-60" data-testid="viewer-panel">
+      <SidePanel testId="viewer-panel" title="Visores" summary={selected?.name} open={panelOpen} onOpenChange={setPanelOpen} ariaLabel="Selector de visores">
         <div className="mb-2 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-surface-50">Visores</h2>
           {canCreateViewer(user) && (
@@ -72,7 +85,7 @@ export function LivePage() {
               type="button"
               data-testid="new-viewer"
               className="btn-ghost min-h-[44px]"
-              onClick={() => setMode({ kind: 'edit', isNew: true, draft: { name: '', layout: '2x2', cameraSlots: fitSlots([], '2x2') } })}
+              onClick={() => { setPanelOpen(false); setNotice(null); setMode({ kind: 'edit', isNew: true, draft: { name: '', layout: '2x2', cameraSlots: fitSlots([], '2x2') } }) }}
             >
               <Plus className="h-4 w-4" /> Nuevo
             </button>
@@ -83,7 +96,8 @@ export function LivePage() {
         {lists.others.length > 0 && (
           <ViewerGroup title="De otros usuarios (administración)" testId="other-viewers" items={lists.others} selectedId={selectedId} onSelect={select} empty="" />
         )}
-      </aside>
+        <BackendMark status={LIVE_BACKEND.viewers} testId="viewers-backend" />
+      </SidePanel>
 
       <section className="flex min-w-0 flex-1 flex-col gap-2">
         <div className="flex flex-wrap items-center gap-2" data-testid="live-toolbar">
@@ -129,11 +143,11 @@ export function LivePage() {
             {!editing && selected && canEditViewer(user, selected) && (
               <>
                 <button type="button" data-testid="edit-viewer" className="btn-secondary min-h-[44px]"
-                  onClick={() => setMode({ kind: 'edit', isNew: false, draft: { name: selected.name, layout: selected.layout, cameraSlots: fitSlots(selected.cameraSlots, selected.layout) } })}>
+                  onClick={() => { setNotice(null); setMode({ kind: 'edit', isNew: false, draft: { name: selected.name, layout: selected.layout, cameraSlots: fitSlots(selected.cameraSlots, selected.layout) } }) }}>
                   <Pencil className="h-4 w-4" /> Editar
                 </button>
                 <button type="button" data-testid="share-viewer" className="btn-secondary min-h-[44px]"
-                  onClick={() => setMode({ kind: 'share', isPublic: selected.isPublic, accessUserIds: [...selected.accessUserIds] })}>
+                  onClick={() => { setNotice(null); setMode({ kind: 'share', isPublic: selected.isPublic, accessUserIds: [...selected.accessUserIds] }) }}>
                   <Share2 className="h-4 w-4" /> Compartir
                 </button>
                 <button type="button" data-testid="delete-viewer" className="btn-secondary min-h-[44px]"
@@ -141,7 +155,7 @@ export function LivePage() {
                     viewers.remove(user, selected.id)
                     const rest = viewers.list(user)
                     setSelectedId([...rest.personal, ...rest.shared, ...rest.others][0]?.id ?? null)
-                  })}>
+                  }, viewerDone('Visor borrado'))}>
                   <Trash2 className="h-4 w-4" /> Borrar
                 </button>
               </>
@@ -156,7 +170,7 @@ export function LivePage() {
                     setSelectedId(saved.id)
                     viewers.rememberSelection(user, saved.id)
                     setMode({ kind: 'view' })
-                  })}>
+                  }, viewerDone('Visor guardado'))}>
                   Guardar
                 </button>
                 <button type="button" data-testid="cancel-edit" className="btn-secondary min-h-[44px]" onClick={() => { setMode({ kind: 'view' }); setError(null) }}>
@@ -168,6 +182,9 @@ export function LivePage() {
         </div>
 
         {error && <p role="alert" data-testid="viewer-error" className="text-sm text-red-300">{error}</p>}
+        {notice && <p role="status" data-testid="viewer-notice" className="text-xs text-amber-200">{notice}</p>}
+        {/* Al editar o compartir, la marca queda a la vista (en vertical el selector está plegado). */}
+        {mode.kind !== 'view' && <BackendMark status={LIVE_BACKEND.viewers} testId="viewer-edit-backend" className="self-start" />}
 
         {mode.kind === 'share' && selected && (
           <div className="card p-3" data-testid="share-dialog" role="dialog" aria-label="Compartir visor">
@@ -191,7 +208,7 @@ export function LivePage() {
             </p>
             <div className="mt-3 flex gap-2">
               <button type="button" data-testid="share-save" className="btn-primary min-h-[44px]"
-                onClick={() => run(() => { viewers.update(user, selected.id, { isPublic: mode.isPublic, accessUserIds: mode.accessUserIds }); setMode({ kind: 'view' }) })}>
+                onClick={() => run(() => { viewers.update(user, selected.id, { isPublic: mode.isPublic, accessUserIds: mode.accessUserIds }); setMode({ kind: 'view' }) }, viewerDone('Acceso guardado'))}>
                 Guardar acceso
               </button>
               <button type="button" className="btn-secondary min-h-[44px]" onClick={() => setMode({ kind: 'view' })}>Cancelar</button>
@@ -200,7 +217,7 @@ export function LivePage() {
         )}
 
         {selected || editing ? (
-          <div className={clsx('grid flex-1 auto-rows-fr gap-2', GRID_CLASS[cellCount])} data-testid="live-grid" data-cells={cellCount}>
+          <div className={clsx('grid content-start gap-2', GRID_CLASS[cellCount])} data-testid="live-grid" data-cells={cellCount}>
             {visibleCells.map(i => {
               const camId = slots[i]
               if (editing) {
@@ -263,13 +280,16 @@ export function LivePage() {
           <p className="text-sm text-surface-300" data-testid="no-viewer">No tenés visores disponibles.</p>
         )}
         {ptzFor && (
-          <div className="card p-3 text-sm text-surface-200" data-testid="ptz-pad">
-            PTZ simulado de {cameraById(ptzFor)?.name}: los comandos no se envían a ningún equipo.
+          <div className="card flex flex-col items-start gap-2 p-3 text-sm text-surface-200" data-testid="ptz-pad">
+            <span>PTZ simulado de {cameraById(ptzFor)?.name}: los comandos no se envían a ningún equipo.</span>
+            <BackendMark status={LIVE_BACKEND.ptz} testId="ptz-backend" />
           </div>
         )}
         <p className="text-xs text-surface-400">
           Calidad automática: grilla en subflujo; al ampliar a 1×1 se pide alta calidad sólo si tenés permiso de alta calidad para esa cámara.
+          Cada celda conserva la proporción 16:9 del video (sin estirar).
         </p>
+        <BackendMark status={LIVE_BACKEND.video} testId="live-video-backend" className="self-start" />
       </section>
     </div>
   )

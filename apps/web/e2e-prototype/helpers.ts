@@ -43,3 +43,39 @@ export async function seekTo(page: Page, seconds: number) {
 }
 
 export const H = 3600
+
+/**
+ * Selector lateral (visores, cámaras, secciones): en tablet vertical está plegado
+ * detrás de un botón; en PC y tablet horizontal siempre visible. Lo abre si hace falta.
+ */
+export async function openPanel(page: Page, testId: 'viewer-panel' | 'camera-picker' | 'settings-nav') {
+  // Esperar a que la pantalla lo haya montado antes de decidir (el botón sólo existe visible en vertical).
+  await expect(page.getByTestId(testId)).toBeAttached()
+  const toggle = page.getByTestId(`${testId}-toggle`)
+  if ((await toggle.isVisible()) && (await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click()
+  await expect(page.getByTestId(`${testId}-content`)).toBeVisible()
+}
+
+export async function selectViewer(page: Page, viewerId: string) {
+  await openPanel(page, 'viewer-panel')
+  await page.getByTestId(`viewer-${viewerId}`).click()
+}
+
+export async function pickCamera(page: Page, cameraId: string, checked = true) {
+  await openPanel(page, 'camera-picker')
+  await page.getByTestId(`pick-${cameraId}`).setChecked(checked)
+}
+
+export async function goSection(page: Page, sectionId: string) {
+  await openPanel(page, 'settings-nav')
+  await page.getByTestId(`settings-link-${sectionId}`).click()
+  await expect(page.getByTestId(`settings-section-${sectionId}`)).toBeVisible()
+}
+
+/** Errores y advertencias de consola de la página (deben quedar vacíos). */
+export function trackConsole(page: Page): string[] {
+  const problems: string[] = []
+  page.on('console', m => { if (m.type() === 'error' || m.type() === 'warning') problems.push(`${m.type()}: ${m.text()}`) })
+  page.on('pageerror', e => problems.push(`pageerror: ${e.message}`))
+  return problems
+}

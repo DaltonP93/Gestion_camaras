@@ -11,6 +11,10 @@ import { CAMERAS, ZONES, type ZoneDef } from '../sim/mock'
 import { canViewLive } from '../model/permissions'
 import { useSession } from '../session'
 import { legendColor, newPolygon, rescale, resetPolygon, toCanvasPolygons, toZoneDefs, undoLastPoint } from './editOps'
+import { notAppliedText } from '../model/backend'
+import { ALL_SECTIONS } from '../settings/sections'
+
+const ZONES_BACKEND = ALL_SECTIONS.find(s => s.id === 'zonas')!.backend
 
 const ASPECT = 16 / 9
 
@@ -79,7 +83,7 @@ export default function ZoneEditor({ readOnly }: { readOnly: boolean }) {
     setSaved(s => ({ ...s, [cameraId]: defs }))
     setActive(undefined)
     setPolygons(toCanvasPolygons(cameraId, defs, w, h))
-    setNotice(`Guardado (sólo en esta pestaña): ${defs.length} polígono(s) en coordenadas 0–1.`)
+    setNotice(`Guardado (sólo en esta pestaña): ${defs.length} polígono(s) en coordenadas 0–1. ${notAppliedText(ZONES_BACKEND)}`)
   }
   const cancel = () => {
     setPolygons(toCanvasPolygons(cameraId, saved[cameraId] ?? [], w, h))

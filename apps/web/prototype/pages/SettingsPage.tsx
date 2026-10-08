@@ -1,13 +1,18 @@
 // Configuración organizada por secciones (patrón de ajustes de Frigate) con todas
-// las funciones de VisionCore. Guardar sólo afecta a esta pestaña (datos simulados).
+// las funciones de VisionCore. Guardar sólo afecta a esta pestaña (datos simulados):
+// cada sección y control muestra si es SIMULADO o si EXISTE en el backend (sin
+// conectar), y guardar o ejecutar dice explícitamente que no se aplicó.
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, useParams } from 'react-router-dom'
 import { clsx } from 'clsx'
 import { CAMERAS, NVRS, USERS, CAMERA_PERMISSIONS, nvrById } from '../sim/mock'
 import { settingsAccess, canEditViewer, isSharedViewer, type Access, type SettingsSection } from '../model/permissions'
-import { ALL_SECTIONS, SETTINGS_GROUPS, type Field, type SectionDef } from '../settings/sections'
+import { ALL_SECTIONS, SECTION_ACTIONS, SETTINGS_GROUPS, fieldBackend, type Field, type SectionDef } from '../settings/sections'
+import { backendText, notAppliedGroups, notExecutedText, type BackendStatus, type NotAppliedGroup } from '../model/backend'
 import { useSession, ROLE_LABEL } from '../session'
 import { Badge } from '../components/CameraTile'
+import { BackendMark } from '../components/BackendMark'
+import { SidePanel } from '../components/SidePanel'
 import { ZoneEditorSection } from '../settings/ZoneEditorSection'
 
 type Values = Record<string, string | number | boolean>
@@ -15,6 +20,9 @@ type Values = Record<string, string | number | boolean>
 export function SettingsPage() {
   const { section } = useParams<{ section: string }>()
   const { user } = useSession()
+  // Selector de secciones: plegado por defecto en tablet vertical; elegir una lo pliega.
+  const [navOpen, setNavOpen] = useState(false)
+  useEffect(() => { setNavOpen(false) }, [section])
   const visible = ALL_SECTIONS.filter(s => settingsAccess(user, s.id) !== 'none')
   const current = visible.find(s => s.id === section)
   if (!current) return visible.length ? <Navigate to={`/configuracion/${visible[0].id}`} replace /> : null
@@ -22,7 +30,7 @@ export function SettingsPage() {
 
   return (
     <div className="flex h-full flex-col gap-3 p-3 lg:flex-row">
-      <nav className="card shrink-0 p-2 lg:w-60" aria-label="Secciones de configuración" data-testid="settings-nav">
+      <SidePanel as="nav" testId="settings-nav" title="Secciones" summary={current.title} open={navOpen} onOpenChange={setNavOpen} ariaLabel="Secciones de configuración">
         {SETTINGS_GROUPS.map(g => {
           const items = g.sections.filter(s => settingsAccess(user, s.id) !== 'none')
           if (!items.length) return null
@@ -43,12 +51,13 @@ export function SettingsPage() {
             </div>
           )
         })}
-      </nav>
-      <section className="card min-w-0 flex-1 p-4" data-testid={`settings-section-${current.id}`} data-access={access}>
-        <div className="mb-3 flex flex-wrap items-center gap-2">
+      </SidePanel>
+      <section className="card min-w-0 flex-1 p-4" data-testid={`settings-section-${current.id}`} data-access={access} data-backend={current.backend.kind}>
+        <div className="mb-2 flex flex-wrap items-center gap-2">
           <h1 className="text-base font-semibold text-surface-50">{current.title}</h1>
           {access === 'read' && <Badge tone="warn" testId="read-only">Sólo lectura para {ROLE_LABEL[user.role]}</Badge>}
         </div>
+        <BackendMark status={current.backend} className="mb-2" />
         <p className="mb-4 text-xs text-surface-400" data-testid="section-source">Fuente: {current.source}</p>
         <SectionBody key={`${user.id}:${current.id}`} def={current} access={access} />
       </section>
@@ -70,37 +79,67 @@ function SectionBody({ def, access }: { def: SectionDef; access: Access }) {
 function SectionForm({ def, access }: { def: SectionDef; access: Access }) {
   const [saved, setSaved] = useState<Values>(def.initial ?? {})
   const [draft, setDraft] = useState<Values>(def.initial ?? {})
-  const [notice, setNotice] = useState<string | null>(null)
+  const [notice, setNotice] = useState<NotAppliedGroup[] | null>(null)
   const dirty = useMemo(() => Object.keys(draft).some(k => draft[k] !== saved[k]), [draft, saved])
   const readOnly = access !== 'edit'
   useEffect(() => { if (dirty) setNotice(null) }, [dirty])
+  const save = () => {
+    // El aviso sale de la marca de cada control CAMBIADO, no de la de la sección.
+    const changed = def.fields!.filter(f => draft[f.key] !== saved[f.key]).map(f => ({ label: f.label, status: fieldBackend(def, f) }))
+    setSaved(draft)
+    setNotice(notAppliedGroups(changed))
+  }
 
   return (
-    <form className="flex flex-col gap-4" data-testid={`form-${def.id}`} onSubmit={e => { e.preventDefault(); if (!readOnly && dirty) { setSaved(draft); setNotice('Guardado (sólo en esta pestaña: datos simulados).') } }}>
+    <form className="flex flex-col gap-4" data-testid={`form-${def.id}`} onSubmit={e => { e.preventDefault(); if (!readOnly && dirty) save() }}>
       <div className="grid gap-4 md:grid-cols-2">
-        {def.fields!.map(f => <FieldInput key={f.key} field={f} value={draft[f.key]} disabled={readOnly} onChange={v => setDraft(d => ({ ...d, [f.key]: v }))} />)}
+        {def.fields!.map(f => {
+          const own = fieldBackend(def, f)
+          return <FieldInput key={f.key} field={f} value={draft[f.key]} disabled={readOnly} onChange={v => setDraft(d => ({ ...d, [f.key]: v }))}
+            backend={own !== def.backend ? own : undefined} />
+        })}
       </div>
       {!readOnly && (
         <div className={clsx('flex flex-wrap items-center gap-2 rounded-lg p-2', dirty && 'bg-amber-900/30')} data-testid="save-bar">
           <span className="text-xs text-surface-200" data-testid="dirty-state">{dirty ? 'Cambios sin guardar' : 'Sin cambios'}</span>
           <button type="submit" data-testid="save" className="btn-primary min-h-[44px]" disabled={!dirty}>Guardar</button>
           <button type="button" data-testid="undo" className="btn-secondary min-h-[44px]" disabled={!dirty} onClick={() => setDraft(saved)}>Deshacer</button>
-          {notice && <span className="text-xs text-green-300" data-testid="save-notice">{notice}</span>}
+          {notice && (
+            <div role="status" className="text-xs text-amber-200" data-testid="save-notice">
+              Guardado sólo en esta pestaña.{' '}
+              {/* Un solo estado: su texto. Varios: un renglón por grupo con los controles que abarca. */}
+              {notice.length === 1
+                ? <span data-testid="save-notice-group" data-backend={notice[0].kind}>{notice[0].text}</span>
+                : notice.map(g => (
+                  <span key={`${g.kind}:${g.text}`} className="block" data-testid="save-notice-group" data-backend={g.kind}>
+                    {g.labels.join(', ')} — {g.text}
+                  </span>
+                ))}
+            </div>
+          )}
         </div>
       )}
     </form>
   )
 }
 
-function FieldInput({ field, value, disabled, onChange }: { field: Field; value: string | number | boolean | undefined; disabled: boolean; onChange: (v: string | number | boolean) => void }) {
+function FieldInput({ field, value, disabled, onChange, backend }: {
+  field: Field; value: string | number | boolean | undefined; disabled: boolean; onChange: (v: string | number | boolean) => void
+  /** Sólo cuando el control difiere del estado de su sección. */
+  backend?: BackendStatus
+}) {
   const id = `f-${field.key}`
+  const mark = backend && <BackendMark status={backend} testId={`field-backend-${field.key}`} className="mt-1" />
   if (field.type === 'toggle') {
     return (
-      <label className="flex min-h-[44px] items-center gap-3 text-sm text-surface-100" htmlFor={id}>
-        <input id={id} type="checkbox" data-testid={id} checked={!!value} disabled={disabled} onChange={e => onChange(e.target.checked)} />
-        {field.label}
-        {field.help && <span className="text-xs text-surface-400">{field.help}</span>}
-      </label>
+      <div>
+        <label className="flex min-h-[44px] items-center gap-3 text-sm text-surface-100" htmlFor={id}>
+          <input id={id} type="checkbox" data-testid={id} checked={!!value} disabled={disabled} onChange={e => onChange(e.target.checked)} />
+          {field.label}
+          {field.help && <span className="text-xs text-surface-400">{field.help}</span>}
+        </label>
+        {mark}
+      </div>
     )
   }
   return (
@@ -119,6 +158,7 @@ function FieldInput({ field, value, disabled, onChange }: { field: Field; value:
           onChange={e => onChange(field.type === 'number' ? Number(e.target.value) : e.target.value)} />
       )}
       {field.help && <p className="mt-1 text-xs text-surface-400">{field.help}</p>}
+      {mark}
     </div>
   )
 }
@@ -136,10 +176,22 @@ function Table({ testId, head, rows }: { testId: string; head: string[]; rows: A
   )
 }
 
+/** Acción de una sección: existe en la API, pero el prototipo no la ejecuta (lo dice al tocarla). */
 function ActionButton({ access, need, testId, children }: { access: Access; need: Access; testId: string; children: ReactNode }) {
+  const [notice, setNotice] = useState<string | null>(null)
   const allowed = need === 'read' ? access !== 'none' : access === 'edit'
   if (!allowed) return null
-  return <button type="button" data-testid={testId} className="btn-secondary min-h-[44px]">{children}</button>
+  const action = SECTION_ACTIONS[testId]
+  const status: BackendStatus = action ? { kind: 'existente', endpoint: action.endpoint } : { kind: 'simulado' }
+  return (
+    <span className="inline-flex flex-wrap items-center gap-2">
+      <button type="button" data-testid={testId} className="btn-secondary min-h-[44px]" title={backendText(status)}
+        onClick={() => setNotice(notExecutedText(status))}>
+        {children}
+      </button>
+      {notice && <span role="status" className="text-xs text-amber-200" data-testid={`${testId}-notice`}>{notice}</span>}
+    </span>
+  )
 }
 
 function ViewersSection({ access }: { access: Access }) {

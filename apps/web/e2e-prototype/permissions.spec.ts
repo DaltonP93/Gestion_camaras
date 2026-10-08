@@ -1,6 +1,6 @@
 // Permisos por rol en navegación y configuración (mismas reglas que la API).
 import { test, expect } from '@playwright/test'
-import { USER, asUser, freshStart } from './helpers'
+import { USER, asUser, freshStart, goSection, openPanel } from './helpers'
 
 test.beforeEach(async ({ page }) => { await freshStart(page) })
 
@@ -25,10 +25,11 @@ test('módulos visibles por rol', async ({ page }) => {
 
 test('ADMIN: todas las secciones de configuración, editables salvo la auditoría', async ({ page }) => {
   await page.goto('/#/configuracion/general')
+  await openPanel(page, 'settings-nav')
   for (const id of ALL_SECTIONS) await expect(page.getByTestId(`settings-link-${id}`)).toBeVisible()
-  await page.getByTestId('settings-link-auditoria').click()
+  await goSection(page, 'auditoria')
   await expect(page.getByTestId('settings-section-auditoria')).toHaveAttribute('data-access', 'read')
-  await page.getByTestId('settings-link-nvr').click()
+  await goSection(page, 'nvr')
   await expect(page.getByTestId('action-add-nvr')).toBeVisible()
 })
 
@@ -42,9 +43,9 @@ test('SUPERVISOR: NVR en sólo lectura (con sync/salud), cámaras y detección e
   for (const id of ['seguridad', 'usuarios', 'permisos', 'auditoria', 'notificaciones', 'general']) {
     await expect(page.getByTestId(`settings-link-${id}`)).toHaveCount(0)
   }
-  await page.getByTestId('settings-link-camaras').click()
+  await goSection(page, 'camaras')
   await expect(page.getByTestId('settings-section-camaras')).toHaveAttribute('data-access', 'edit')
-  await page.getByTestId('settings-link-deteccion').click()
+  await goSection(page, 'deteccion')
   await expect(page.getByTestId('settings-section-deteccion')).toHaveAttribute('data-access', 'edit')
   await expect(page.getByTestId('f-minScore')).toBeEnabled()
 })
@@ -55,6 +56,7 @@ test('OPERATOR y AUDITOR: sólo consultan visores; una URL directa a otra secci�
     await page.goto('/#/configuracion/seguridad')
     await expect(page).toHaveURL(/#\/configuracion\/visores$/)
     await expect(page.getByTestId('settings-section-visores')).toHaveAttribute('data-access', 'read')
+    await openPanel(page, 'settings-nav')
     await expect(page.getByTestId('settings-nav').getByRole('link')).toHaveText(['Visores'])
   }
 })
@@ -72,7 +74,7 @@ test('formulario con cambios sin guardar: Guardar y Deshacer (patrón de seccion
   await expect(page.getByTestId('save-notice')).toContainText('Guardado')
   await expect(page.getByTestId('dirty-state')).toHaveText('Sin cambios')
   // La contraseña SMTP nunca se muestra precargada.
-  await page.getByTestId('settings-link-notificaciones').click()
+  await goSection(page, 'notificaciones')
   await expect(page.getByTestId('f-smtpPassword')).toHaveValue('')
 })
 

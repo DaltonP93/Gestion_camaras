@@ -87,8 +87,10 @@ export interface DetectionEvent {
 const H = 3600
 
 export const SIM_DAY = '2026-10-07'
-/** Ventana de reproducción simulada: 08:00–12:00. */
-export const WINDOW = { start: 8 * H, end: 12 * H }
+/** Ventana de reproducción simulada: el día completo (00:00–24:00), como la búsqueda por día del NVR. */
+export const WINDOW = { start: 0, end: 24 * H }
+/** Posición inicial del reloj común al abrir Grabaciones (08:00). */
+export const DEFAULT_START = 8 * H
 
 export const USERS: ProtoUser[] = [
   { id: 'u-admin', name: 'Administración (sim.)', role: 'ADMIN' },
@@ -113,20 +115,25 @@ export const CAMERAS: Camera[] = [
     archived: { main: full, sub: [] } },
   // Principal con hueco 09:30–09:45; subflujo sólo hasta las 10:00.
   { id: 'cam-a3', nvrId: 'nvr-a', channel: 3, name: 'Pasillo norte', mainCodec: 'H264', subCodec: 'H264', online: true, ptz: false,
-    archived: { main: [{ start: 8 * H, end: 9.5 * H }, { start: 9.75 * H, end: 12 * H }], sub: [{ start: 8 * H, end: 10 * H }] } },
+    archived: { main: [{ start: 0, end: 9.5 * H }, { start: 9.75 * H, end: 24 * H }], sub: [{ start: 0, end: 10 * H }] } },
   { id: 'cam-a4', nvrId: 'nvr-a', channel: 4, name: 'Estacionamiento', mainCodec: 'H265', subCodec: 'H265', online: true, ptz: true,
     archived: { main: full, sub: full } },
-  // Grabación por eventos: tramos cortos.
+  // Grabación por eventos: tramos cortos (horario de atención).
   { id: 'cam-a5', nvrId: 'nvr-a', channel: 5, name: 'Caja', mainCodec: 'H264', subCodec: 'H264', online: true, ptz: false,
     archived: { main: [{ start: 8 * H, end: 8.25 * H }, { start: 9 * H, end: 9.5 * H }, { start: 11 * H, end: 11.5 * H }], sub: [] } },
+  // Sin conexión desde las 10:30: no hay grabación posterior.
   { id: 'cam-a6', nvrId: 'nvr-a', channel: 6, name: 'Sala técnica', mainCodec: 'H264', subCodec: 'H264', online: false, ptz: false,
-    archived: { main: [{ start: 8 * H, end: 10.5 * H }], sub: [] } },
+    archived: { main: [{ start: 0, end: 10.5 * H }], sub: [] } },
   { id: 'cam-b1', nvrId: 'nvr-b', channel: 1, name: 'Muelle de carga', mainCodec: 'H264', subCodec: 'H264', online: true, ptz: false,
     archived: { main: full, sub: full } },
   { id: 'cam-b2', nvrId: 'nvr-b', channel: 2, name: 'Depósito interior', mainCodec: 'H265', subCodec: 'H264', online: true, ptz: false,
     archived: { main: full, sub: [] } },
+  // Corte de grabación de 02:10 a 02:40 (p. ej., reinicio del NVR) y fin a las 11:00.
   { id: 'cam-b3', nvrId: 'nvr-b', channel: 3, name: 'Portón', mainCodec: 'H264', subCodec: 'H264', online: true, ptz: true,
-    archived: { main: [{ start: 8 * H, end: 11 * H }], sub: [{ start: 8 * H, end: 11 * H }] } },
+    archived: {
+      main: [{ start: 0, end: 2 * H + 600 }, { start: 2 * H + 2400, end: 11 * H }],
+      sub: [{ start: 0, end: 2 * H + 600 }, { start: 2 * H + 2400, end: 11 * H }],
+    } },
 ]
 
 const perm = (cameraId: string, p: Partial<CameraPermission>): CameraPermission => ({

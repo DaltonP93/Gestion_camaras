@@ -136,8 +136,9 @@ describe('pistas archivadas — no se asume subflujo grabado', () => {
     // cam-a3: el subflujo cubre el hueco de la principal 09:30–09:45 ⇒ sin hueco visible
     expect(gaps(cam('cam-a3'))).toEqual([])
     expect(gaps(cam('cam-a5'))).toEqual([
-      { start: 8.25 * H, end: 9 * H }, { start: 9.5 * H, end: 11 * H }, { start: 11.5 * H, end: WINDOW.end },
+      { start: WINDOW.start, end: 8 * H }, { start: 8.25 * H, end: 9 * H }, { start: 9.5 * H, end: 11 * H }, { start: 11.5 * H, end: WINDOW.end },
     ])
+    expect(gaps(cam('cam-b3'))).toEqual([{ start: 2 * H + 600, end: 2 * H + 2400 }, { start: 11 * H, end: WINDOW.end }])
     expect(recordedUnion(cam('cam-a1'))).toEqual([{ start: WINDOW.start, end: WINDOW.end }])
   })
 })
@@ -176,8 +177,9 @@ describe('reloj común', () => {
     s = clockReducer(s, { type: 'speed', speed: 3 })
     expect(s.speed).toBe(4)
   })
-  it('sincronía estricta: no avanza mientras una celda carga; sin ella, sí', () => {
-    let s = clockReducer(initialClock(), { type: 'play' })
+  it('sincronía estricta (opcional, apagada por defecto): no avanza mientras una celda carga; sin ella, sí', () => {
+    expect(initialClock().strictSync).toBe(false)
+    let s = clockReducer(clockReducer(initialClock(), { type: 'strict', value: true }), { type: 'play' })
     expect(clockReducer(s, { type: 'tick', dtMs: 1000, anyBuffering: true }).t).toBe(WINDOW.start)
     s = clockReducer(s, { type: 'strict', value: false })
     expect(clockReducer(s, { type: 'tick', dtMs: 1000, anyBuffering: true }).t).toBe(WINDOW.start + 1)

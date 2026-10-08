@@ -1,7 +1,7 @@
 // Controles multicámara sincronizados: reloj común, pausa, velocidades, seek,
 // pistas archivadas, huecos, carga y límite de sesiones por NVR (datos simulados).
 import { test, expect, type Page } from '@playwright/test'
-import { H, USER, asUser, clockSeconds, freshStart, navTo, seekTo } from './helpers'
+import { H, USER, asUser, clockSeconds, freshStart, navTo, openPanel, pickCamera, seekTo } from './helpers'
 
 async function openPlayback(page: Page) {
   await navTo(page, 'Grabaciones')
@@ -70,9 +70,12 @@ test('seek: el deslizador y ±10 s mueven el reloj común y recargan las celdas'
   await expect(page.getByTestId('clock')).toHaveText('08:59:50')
 })
 
-test('sincronía estricta: el reloj espera a las celdas que cargan', async ({ page }) => {
+test('sincronía estricta (opcional): el reloj espera a las celdas que cargan', async ({ page }) => {
   await openPlayback(page)
   await waitAllLoaded(page)
+  // Apagada por defecto: hay que activarla explícitamente.
+  await expect(page.getByTestId('strict-sync')).not.toBeChecked()
+  await page.getByTestId('strict-sync').check()
   await page.getByTestId('play-pause').click()
   await seekTo(page, 9 * H)
   await expect(page.getByTestId('buffering-indicator')).toBeVisible()
@@ -95,7 +98,7 @@ test('grilla: usa el subflujo sólo si está archivado; si no, la principal con 
 
 test('huecos: la celda lo indica y permite saltar al próximo tramo', async ({ page }) => {
   await openPlayback(page)
-  await page.getByTestId('pick-cam-a5').check() // Caja: grabación por eventos
+  await pickCamera(page, 'cam-a5') // Caja: grabación por eventos
   await seekTo(page, 8.5 * H)
   await expect(page.getByTestId('pcell-4-state')).toHaveAttribute('data-state', 'hueco')
   await page.getByTestId('pcell-4-jump').click()
@@ -106,21 +109,22 @@ test('huecos: la celda lo indica y permite saltar al próximo tramo', async ({ p
 
 test('límite de sesiones por NVR: el excedente queda en cola con posición, sin superar el límite', async ({ page }) => {
   await openPlayback(page)
-  await page.getByTestId('pick-cam-a5').check()
-  await page.getByTestId('pick-cam-a6').check()
+  await pickCamera(page, 'cam-a5')
+  await pickCamera(page, 'cam-a6')
   await expect(page.getByTestId('playback-grid')).toHaveAttribute('data-cells', '9')
   await expect(page.getByTestId('usage-nvr-a')).toHaveText('NVR Recepción: 4/4 sesiones · 2 en cola')
   await expect(page.getByTestId('pcell-4-state')).toHaveAttribute('data-state', 'en-cola')
   await expect(page.getByTestId('pcell-4')).toContainText('posición 1')
   await expect(page.getByTestId('pcell-5')).toContainText('posición 2')
   // Quitar una cámara libera un cupo: la primera en cola pasa a activa.
-  await page.getByTestId('pick-cam-a2').uncheck()
+  await pickCamera(page, 'cam-a2', false)
   await expect(page.getByTestId('usage-nvr-a')).toHaveText('NVR Recepción: 4/4 sesiones · 1 en cola')
 })
 
 test('permisos: AUDITOR sólo elige cámaras con canPlayback; OPERATOR no accede', async ({ page }) => {
   await asUser(page, USER.AUDITOR)
   await openPlayback(page)
+  await openPanel(page, 'camera-picker')
   for (const id of ['cam-a1', 'cam-a2', 'cam-a5', 'cam-b1', 'cam-b2']) await expect(page.getByTestId(`pick-${id}`)).toBeVisible()
   for (const id of ['cam-a3', 'cam-a4', 'cam-a6', 'cam-b3']) await expect(page.getByTestId(`pick-${id}`)).toHaveCount(0)
   await asUser(page, USER.OPERATOR)
