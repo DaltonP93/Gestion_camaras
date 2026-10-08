@@ -33,7 +33,7 @@ sólo para eventos configurados. Ver `docs/frigate/NATIVE_INTEGRATION_PROPOSAL.m
 |---|---|---|---|---|---|
 | #182 | `fix/api-audit-oct2026` | `ceab82e` | `main` | fastify 5.12.5, nodemailer 10, pruebas SMTP loopback incl. AUTH | CI 11/11 |
 | #186 | `fix/recordings-playbackuri-channel-scope` | `45ebda5` | #182 | **Seguridad**: `playbackURI` ligada al canal (playback, preview, diagnóstico); tabla de reglas `Map` (sin propiedades heredadas: `constructor`/`__proto__` ⇒ 400, antes 500) | CI 11/11; API 1686/1686 |
-| #189 | `fix/live-heartbeat-rbac` | `7d705e4` | #182 | **Seguridad P0**: RBAC por cámara en `POST /api/live-view/heartbeat` (iniciaba streams de cámaras ajenas) + revocación entre heartbeats | CI 11/11; reproducido con prueba |
+| #189 | `fix/live-heartbeat-rbac` | `a65c7db` | #182 | **Seguridad P0**: RBAC por cámara en `POST /api/live-view/heartbeat` (iniciaba streams de cámaras ajenas); la revocación cierra sub, main y main_h264 (FFmpeg incluido) | Reproducido con prueba; revisión adversarial aplicada |
 | #190 | `fix/auth-access-token-only` | `abd2734` | #182 | **Seguridad crítica**: sólo access tokens como credencial (2fa/enroll/step-up sin rol abrían grabaciones de todas las cámaras; refresh servía 7 días) | CI 11/11; reproducido con prueba |
 | #187 | `feat/staging-isolation` | `036171f` | #182 | `STAGING_ISOLATION` y flags; ausente = actual, presente vacía/con espacios ⇒ aborta; prueba de arranque real de `server.ts` | CI 11/11; API 1563/1563 |
 | #184 | `refactor/nvr-recording-provider-standalone` | `f32cd75` | #182 | Proveedor NVR de grabaciones (web) sin la continuidad de #181 | CI 11/11 |
