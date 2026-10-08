@@ -38,7 +38,7 @@ sólo para eventos configurados. Ver `docs/frigate/NATIVE_INTEGRATION_PROPOSAL.m
 | #187 | `feat/staging-isolation` | `036171f` | #182 | `STAGING_ISOLATION` y flags; ausente = actual, presente vacía/con espacios ⇒ aborta; prueba de arranque real de `server.ts` | CI 11/11; API 1563/1563 |
 | #184 | `refactor/nvr-recording-provider-standalone` | `f32cd75` | #182 | Proveedor NVR de grabaciones (web) sin la continuidad de #181 | CI 11/11 |
 | #188 | `feat/frigate-ux-prototype` | `aab226e` | #182 | Prototipo navegable con datos simulados (vivo, visores, grabaciones multicámara, eventos, configuración completa, **editor de zonas de Frigate en React 18**) | CI 11/11; e2e PC+tablet 83 ok |
-| #185 | `docs/frigate-native-plan` | (ver PR) | `main` | Propuesta rev. 3, matriz de pantallas/funciones, plan de pruebas rev. 2, runbook, este traspaso | Sólo docs; `npm audit` rojo por `main` (lo resuelve #182) |
+| #185 | `docs/frigate-native-plan` | (ver PR) | #182 | Propuesta rev. 3, matriz de pantallas/funciones, plan de pruebas rev. 2, runbook, este traspaso | Sólo docs; base #182 para que CI (sobre el merge) no herede el `npm audit` rojo de `main` |
 | #183 | `refactor/nvr-recording-provider` | `ff6f3ff` | #181 | Proveedor apilado sobre #181 | Conservado; reemplazado por #184 |
 | #181 | `feat/nvr-playback-probe` | `3fce40f` | #182 (`7b9ef37`) | Relevo seguro y continuidad por video real | **Pospuesto** (no fusionar ni cerrar) |
 | #180 | `fix/live-1x1-high-quality` | `cd251c7` | `main` viejo | Vivo 1×1 en alta calidad automática | **Pospuesto** |
