@@ -10,7 +10,7 @@
 //   - ninguna pista en ese instante ⇒ hueco visible (no se abre sesión).
 // Las sesiones se admiten por NVR hasta su límite (maxConcurrentPlaybackSessions);
 // el resto queda "en cola" con su posición, nunca se supera el límite.
-import { NVRS, WINDOW, cameraById, type Camera, type ProtoUser, type Segment } from '../data/mock'
+import { NVRS, WINDOW, cameraById, type Camera, type ProtoUser, type Segment } from '../sim/mock'
 import { canPlayback } from './permissions'
 
 export type TrackId = 'main' | 'sub'

@@ -4,7 +4,7 @@
 // CameraViewAccess, /api/views) y la última selección es una preferencia del
 // usuario. Aquí un repositorio en localStorage SIMULA esa API con las mismas reglas
 // (model/permissions.ts), para revisar la experiencia sin servidor.
-import { INITIAL_VIEWERS, cameraById, type Layout, type ProtoUser, type Viewer } from '../data/mock'
+import { INITIAL_VIEWERS, cameraById, type Layout, type ProtoUser, type Viewer } from '../sim/mock'
 import { canCreateViewer, canEditViewer, canSeeViewer, canViewLive, isSharedViewer } from './permissions'
 
 export const STORAGE_KEY = 'vc-proto:viewers:v1'

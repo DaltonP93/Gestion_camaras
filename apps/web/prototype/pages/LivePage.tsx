@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { clsx } from 'clsx'
 import { Maximize2, Minimize2, Move, Pencil, Plus, Share2, Trash2 } from 'lucide-react'
-import { CAMERAS, USERS, cameraById, type Layout, type Viewer } from '../data/mock'
+import { CAMERAS, USERS, cameraById, type Layout, type Viewer } from '../sim/mock'
 import { canCreateViewer, canEditViewer, canPtz, canUseHighQuality, canViewLive, isSharedViewer } from '../model/permissions'
 import { LAYOUT_CELLS, ViewerError, fitSlots, slotState } from '../model/viewers'
 import { useSession } from '../session'

@@ -1,7 +1,7 @@
 // Usuario simulado del prototipo. No hay login: un selector de rol permite revisar
 // la experiencia de cada perfil con las MISMAS reglas que aplica la API.
 import { createContext, useContext, useMemo, useState, type ReactNode } from 'react'
-import { USERS, type ProtoUser } from './data/mock'
+import { USERS, type ProtoUser } from './sim/mock'
 import { ViewerRepo, browserStorage } from './model/viewers'
 
 const USER_KEY = 'vc-proto:user:v1'

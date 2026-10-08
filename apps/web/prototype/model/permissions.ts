@@ -15,7 +15,7 @@
 //   - configuración de detección: PUT /api/analytics/config/:cameraId (ADMIN y
 //     SUPERVISOR); seguridad, usuarios, alertas/SMTP y auditoría: sólo ADMIN.
 // La configuración (sección → rol) sigue la matriz de docs/frigate/NATIVE_INTEGRATION_PROPOSAL.md.
-import { CAMERA_PERMISSIONS, type Camera, type CameraPermission, type ProtoUser, type Role, type Viewer } from '../data/mock'
+import { CAMERA_PERMISSIONS, type Camera, type CameraPermission, type ProtoUser, type Role, type Viewer } from '../sim/mock'
 
 const UNRESTRICTED: ReadonlySet<Role> = new Set(['ADMIN', 'SUPERVISOR'])
 

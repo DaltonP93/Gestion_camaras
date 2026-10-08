@@ -1,6 +1,6 @@
 // Eventos de detección (simulados). Sólo cámaras permitidas; retención visible.
 import { useMemo, useState } from 'react'
-import { CAMERAS, EVENTS, cameraById, fmtClock, type DetectionEvent } from '../data/mock'
+import { CAMERAS, EVENTS, cameraById, fmtClock, type DetectionEvent } from '../sim/mock'
 import { canPlayback, canSeeCameraEvents } from '../model/permissions'
 import { useSession } from '../session'
 import { Badge } from '../components/CameraTile'

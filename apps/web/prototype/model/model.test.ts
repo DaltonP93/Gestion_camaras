@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { CAMERAS, USERS, WINDOW, cameraById, type ProtoUser } from '../data/mock'
+import { CAMERAS, USERS, WINDOW, cameraById, type ProtoUser } from '../sim/mock'
 import {
   canCreateViewer, canEditViewer, canPlayback, canPtz, canSeeCameraEvents, canSeeSettings, canViewLive,
   settingsAccess, SETTINGS_ACCESS, type SettingsSection,

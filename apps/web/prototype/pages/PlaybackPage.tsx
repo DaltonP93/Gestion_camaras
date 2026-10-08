@@ -4,7 +4,7 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { clsx } from 'clsx'
 import { FastForward, Pause, Play, Rewind } from 'lucide-react'
-import { CAMERAS, SIM_DAY, WINDOW, cameraById, fmtClock, nvrById } from '../data/mock'
+import { CAMERAS, SIM_DAY, WINDOW, cameraById, fmtClock, nvrById } from '../sim/mock'
 import { canDownload, canPlayback } from '../model/permissions'
 import {
   SPEEDS, chooseTrack, clockReducer, initialClock, planCells, simulatedLoadMs,

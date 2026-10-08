@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, useParams } from 'react-router-dom'
 import { clsx } from 'clsx'
-import { CAMERAS, NVRS, USERS, CAMERA_PERMISSIONS, nvrById } from '../data/mock'
+import { CAMERAS, NVRS, USERS, CAMERA_PERMISSIONS, nvrById } from '../sim/mock'
 import { settingsAccess, canEditViewer, isSharedViewer, type Access, type SettingsSection } from '../model/permissions'
 import { ALL_SECTIONS, SETTINGS_GROUPS, type Field, type SectionDef } from '../settings/sections'
 import { useSession, ROLE_LABEL } from '../session'
