@@ -162,6 +162,16 @@ jobs:
         run: bash scripts/check-hls-auth-nginx.sh
       - name: Sintaxis del guard (bash -n)
         run: bash -n scripts/check-hls-auth-nginx.sh
+      # Cabeceras de /uploads/: un add_header local ANULA los heredados del
+      # server, así que nosniff/XFO/HSTS + CSP sandbox deben re-declararse en el
+      # location (defensa anti-XSS almacenado de branding).
+      - name: Guard cabeceras de /uploads/ (nosniff + CSP sandbox)
+        run: bash scripts/check-uploads-nginx.sh
+      - name: Pruebas negativas del guard de /uploads/
+        run: |
+          bash -n scripts/check-uploads-nginx.sh
+          bash -n scripts/check-uploads-nginx.test.sh
+          bash scripts/check-uploads-nginx.test.sh
       # Runbook de deploy HLS: sintaxis + pruebas negativas de sus compuertas
       # (cada compuerta crítica debe abortar con exit != 0). No toca producción.
       - name: Sintaxis runbook deploy HLS (bash -n)
