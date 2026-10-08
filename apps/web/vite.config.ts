@@ -20,6 +20,6 @@ export default defineConfig({
     // Los specs bajo e2e/ los ejecuta Playwright (usan @playwright/test), no
     // vitest: sin esta exclusión vitest los descubre por el glob `*.spec.ts` y
     // falla al cargar `test.describe` de Playwright.
-    exclude: [...configDefaults.exclude, 'e2e/**'],
+    exclude: [...configDefaults.exclude, 'e2e/**', 'e2e-prototype/**'],
   },
 })

@@ -5,12 +5,14 @@ apps/api/node_modules/
 
 # Build output
 apps/web/dist/
+apps/web/dist-prototype/
 apps/api/dist/
 apps/api/build/
 
 # Playwright (E2E) artifacts
 apps/web/test-results/
 apps/web/playwright-report/
+apps/web/playwright-report-prototype/
 <<<<<<< HEAD
 =======
 apps/web/blob-report/

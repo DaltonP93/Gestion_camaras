@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noUnusedLocals": true },
+  "include": ["prototype", "e2e-prototype", "src/vite-env.d.ts"]
+}
