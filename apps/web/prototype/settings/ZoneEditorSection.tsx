@@ -1,5 +1,14 @@
-// Marcador provisional: se reemplaza por el editor de polígonos (react-konva) tras
-// la prueba de compatibilidad con React 18.
+// Sección "Zonas y máscaras": el editor (konva + react-konva) se carga de forma
+// diferida para no sumar su peso al resto del prototipo (ni, en la integración
+// real, a la vista en vivo).
+import { lazy, Suspense } from 'react'
+
+const ZoneEditor = lazy(() => import('../zones/ZoneEditor'))
+
 export function ZoneEditorSection({ readOnly }: { readOnly: boolean }) {
-  return <p className="text-sm text-surface-300" data-testid="zone-editor-pending">Editor de zonas {readOnly ? '(sólo lectura)' : ''}</p>
+  return (
+    <Suspense fallback={<p className="text-sm text-surface-300" data-testid="zone-editor-loading">Cargando editor…</p>}>
+      <ZoneEditor readOnly={readOnly} />
+    </Suspense>
+  )
 }

@@ -87,6 +87,11 @@ jobs:
       - name: Build (incluye typecheck)
         working-directory: apps/web
         run: npm run build
+      - name: Árbol de dependencias íntegro (npm ls --all)
+        # `npm ls` simple no detecta react-konva 18 sobre React 19 (peer `react >=18`);
+        # `--all` sí (react-reconciler 0.29 pide react ^18.3.1). Ver #185 §2.4.
+        working-directory: apps/web
+        run: npm ls --all > /dev/null
       - name: Prototipo navegable — typecheck y build (datos simulados)
         working-directory: apps/web
         run: npm run typecheck:prototype && npm run prototype:build

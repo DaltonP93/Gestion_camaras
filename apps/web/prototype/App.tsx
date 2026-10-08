@@ -13,7 +13,7 @@ import { SettingsPage } from './pages/SettingsPage'
 export function App() {
   return (
     <SessionProvider>
-      <HashRouter>
+      <HashRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Shell />
       </HashRouter>
     </SessionProvider>

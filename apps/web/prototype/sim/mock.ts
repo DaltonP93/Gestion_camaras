@@ -174,6 +174,28 @@ export const EVENTS: DetectionEvent[] = [
   { id: 'e7', cameraId: 'cam-b2', label: 'persona', zone: null, score: 0.82, start: 11.2 * H, end: 11.2 * H + 40, retained: true },
 ]
 
+/** Zona o máscara de detección, coordenadas NORMALIZADAS 0–1 (formato de CameraAnalyticsConfig.zones). */
+export interface ZoneDef {
+  name: string
+  type: 'zone' | 'motion_mask'
+  points: Array<[number, number]>
+  objects: string[]
+  enabled: boolean
+}
+
+export const ZONES: Record<string, ZoneDef[]> = {
+  'cam-a1': [
+    { name: 'puerta', type: 'zone', points: [[0.3, 0.2], [0.55, 0.2], [0.55, 0.85], [0.3, 0.85]], objects: ['persona'], enabled: true },
+  ],
+  'cam-a4': [
+    { name: 'entrada_vehicular', type: 'zone', points: [[0.05, 0.5], [0.6, 0.45], [0.7, 0.95], [0.05, 0.95]], objects: ['vehículo'], enabled: true },
+    { name: 'arboles', type: 'motion_mask', points: [[0.75, 0.0], [1.0, 0.0], [1.0, 0.4], [0.75, 0.4]], objects: [], enabled: true },
+  ],
+  'cam-b1': [
+    { name: 'muelle', type: 'zone', points: [[0.1, 0.3], [0.9, 0.3], [0.9, 0.9], [0.1, 0.9]], objects: ['vehículo', 'persona'], enabled: false },
+  ],
+}
+
 export function cameraById(id: string): Camera | undefined {
   return CAMERAS.find(c => c.id === id)
 }

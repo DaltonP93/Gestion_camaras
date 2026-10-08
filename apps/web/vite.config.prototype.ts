@@ -18,7 +18,18 @@ export default defineConfig({
   base: './',
   plugins: [react()],
   resolve: {
-    alias: [{ find: /^@\//, replacement: path.resolve(root, 'src') + '/' }],
+    alias: [
+      // Editor de zonas portado de Frigate v0.18.0 (prototype/vendor/frigate, MIT):
+      // sus imports `@/…` apuntan a los archivos portados o a sustitutos de
+      // VisionCore. Deben ir ANTES del alias genérico `@` → src.
+      { find: /^@\/types\/canvas$/, replacement: path.resolve(root, 'prototype/vendor/frigate/types/canvas.ts') },
+      { find: /^@\/utils\/canvasUtil$/, replacement: path.resolve(root, 'prototype/vendor/frigate/utils/canvasUtil.ts') },
+      { find: /^@\/hooks\/use-polygon-states$/, replacement: path.resolve(root, 'prototype/vendor/frigate/hooks/use-polygon-states.ts') },
+      { find: /^@\/api$/, replacement: path.resolve(root, 'prototype/vendor/frigate/api/index.tsx') },
+      { find: /^@\/api\/ws$/, replacement: path.resolve(root, 'prototype/zones/shims/ws.ts') },
+      { find: /^@\/components\/indicators\/activity-indicator$/, replacement: path.resolve(root, 'prototype/zones/shims/activity-indicator.tsx') },
+      { find: /^@\//, replacement: path.resolve(root, 'src') + '/' },
+    ],
   },
   css: {
     postcss: {

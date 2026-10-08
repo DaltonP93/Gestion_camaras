@@ -6,7 +6,9 @@ import tseslint from 'typescript-eslint'
 import reactHooks from 'eslint-plugin-react-hooks'
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**', 'e2e/**', 'public/**', '**/*.js', '**/*.mjs', '**/*.cjs'] },
+  // prototype/vendor/**: código de terceros portado literalmente (Frigate, MIT);
+  // se verifica contra el original por hash (prototype/vendor/vendor.test.ts), no se re-estiliza.
+  { ignores: ['dist/**', 'dist-prototype/**', 'node_modules/**', 'e2e/**', 'public/**', 'prototype/vendor/**', '**/*.js', '**/*.mjs', '**/*.cjs'] },
   { linterOptions: { reportUnusedDisableDirectives: 'off' } },
   js.configs.recommended,
   ...tseslint.configs.recommended,
