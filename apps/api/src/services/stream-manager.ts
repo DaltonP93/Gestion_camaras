@@ -109,6 +109,10 @@ export const TRANSCODE_KILL_REASONS = new Set([
   'force_stop', 'logout', 'session_cleanup', 'viewport_change',
   'layout_change', 'nvr_change', 'page_change', 'stop_all',
   'exit_fullscreen', 'stale_response',
+  // RBAC del heartbeat: el usuario perdió el permiso sobre la cámara. Terminante,
+  // pero el FFmpeg sólo se mata si ningún otro espectador lo comparte
+  // (decideStopTermination).
+  'permission_revoked',
 ])
 
 // Desglose de cupos de transcodificación: activos (sesiones main_h264 registradas),
@@ -3110,6 +3114,35 @@ export interface ReconcileResult {
   errors: Record<string, { code: string; message: string }>
   startedIds: string[]  // cámaras que se iniciaron ahora (necesitan nuevo player)
   stoppedIds: string[]  // cámaras que se detuvieron
+}
+
+/**
+ * Revocación de permiso dentro de una vista (heartbeat con cámaras ya no
+ * permitidas). Cierra TODAS las sesiones de este usuario+vista sobre esas
+ * cámaras —la de grilla aunque el backend la haya redirigido a `main`/`main_h264`
+ * (sub HEVC o USING_MAIN_STREAM) y el HD de foco— con una razón terminante. El
+ * cierre normal de reconcileView sólo busca la clave `sub` y dejaba esas sesiones
+ * (y su FFmpeg) vivas hasta el TTL. Devuelve las cámaras con al menos una sesión
+ * efectivamente cerrada.
+ */
+export async function revokeCameraSessionsForView(
+  server: FastifyInstance,
+  userId: string,
+  viewId: string,
+  cameraIds: string[],
+  ticket: RequestTicket = beginRequest(),
+): Promise<string[]> {
+  const closed: string[] = []
+  for (const cameraId of new Set(cameraIds)) {
+    let any = false
+    for (const streamType of ['sub', 'main', 'main_h264'] as const) {
+      if (!sessions.has(sessionKey({ userId, viewId, cameraId, streamType }))) continue
+      const res = await stopStream(server, userId, cameraId, streamType, 'permission_revoked', viewId, ticket)
+      if (res.outcome === 'session_closed') any = true
+    }
+    if (any) closed.push(cameraId)
+  }
+  return closed
 }
 
 export async function reconcileView(
