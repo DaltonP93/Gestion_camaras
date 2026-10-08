@@ -467,6 +467,9 @@ export function LiveViewPage() {
         CAMERA_OFFLINE:         'CAMERA_OFFLINE',
         MEDIA_SERVER_ERROR:     'MEDIAMTX_NOT_READY',
         CAMERA_NOT_FOUND:       'UNKNOWN',
+        // RBAC del heartbeat (mismo código que el 403 de start-stream): error
+        // permanente, no se reintenta en cada ciclo.
+        NO_PERMISSION:          'NO_PERMISSION',
         CAMERA_DISABLED:        'UNKNOWN',
         TRANSCODING_DISABLED:    'CODEC_UNSUPPORTED',
         TRANSCODE_LIMIT_REACHED: 'TRANSCODE_LIMIT_REACHED',

@@ -2,7 +2,7 @@
 // Endpoint de viewport heartbeat: reconcilia cámaras visibles sin N llamadas individuales
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
-import { reconcileView, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTranscodesDiagnostic, getStreamCounts, getSessionsDiagnostic, getStreamIdleTimeoutMs, getStreamHdIdleTimeoutMs, getTranscodeSlots } from '../services/stream-manager'
+import { reconcileView, revokeCameraSessionsForView, recordStreamOutcome, MAX_TRANSCODE_SESSIONS, getAdminSessionsSummary, getTranscodesDiagnostic, getStreamCounts, getSessionsDiagnostic, getStreamIdleTimeoutMs, getStreamHdIdleTimeoutMs, getTranscodeSlots } from '../services/stream-manager'
 import { getFfmpegCapabilities, isTranscodingEnabled } from '../services/stream'
 import { negotiateLivePlaybackCapabilities } from '../services/live-playback-capabilities'
 import { decideLivePlayback } from '../services/live-playback-decision'
@@ -34,6 +34,26 @@ const clientCapabilitiesSchema = z.object({
   viewId: z.string().min(1).max(128).optional(),
 })
 
+// RBAC por cámara del heartbeat (invariante 2). MISMO criterio que
+// POST /cameras/:id/start-stream (`userCanAccessCamera` en routes/cameras.ts):
+// ADMIN y SUPERVISOR sin restricción por recurso; el resto necesita una fila
+// UserPermission con `canView` sobre ESA cámara. Una consulta por heartbeat.
+// Mismo código y mensaje que el 403 de start-stream (contrato único para la web).
+const HEARTBEAT_FORBIDDEN = { code: 'NO_PERMISSION', message: 'Sin permiso para ver esta cámara' } as const
+
+async function viewableCameraIds(
+  prisma: any, user: { sub: string; role: string }, cameraIds: string[],
+): Promise<Set<string>> {
+  const unique = [...new Set(cameraIds)]
+  if (user.role === 'ADMIN' || user.role === 'SUPERVISOR') return new Set(unique)
+  if (unique.length === 0) return new Set()
+  const perms = await prisma.userPermission.findMany({
+    where: { userId: user.sub, cameraId: { in: unique }, canView: true },
+    select: { cameraId: true },
+  })
+  return new Set(perms.map((p: { cameraId: string | null }) => p.cameraId).filter(Boolean) as string[])
+}
+
 export const liveViewRoutes: FastifyPluginAsync = async (server) => {
   // POST /api/live-view/heartbeat
   // Reconcilia el estado de las cámaras visibles para un view dado.
@@ -45,18 +65,37 @@ export const liveViewRoutes: FastifyPluginAsync = async (server) => {
     const user = request.user
     const body = heartbeatSchema.parse(request.body)
 
+    // Sólo se reconcilian las cámaras permitidas: las demás no se buscan, no se
+    // inician ni se tocan. Si una ya tenía sesiones en esta vista (permiso
+    // revocado entre heartbeats) se cierran TODAS —sub, main y main_h264—, no sólo
+    // la `sub` que cerraría reconcileView.
+    const allowed = await viewableCameraIds(server.prisma, user, body.visibleCameraIds)
+    const deniedIds = [...new Set(body.visibleCameraIds.filter(id => !allowed.has(id)))]
+    let revokedIds: string[] = []
+    if (deniedIds.length > 0) {
+      for (let i = 0; i < deniedIds.length; i++) recordStreamOutcome(user.sub, 'rejected_permission', 'NO_PERMISSION')
+      revokedIds = await revokeCameraSessionsForView(server, user.sub, body.viewId, deniedIds, request.requestTicket)
+      server.log.warn(
+        `[live-view] heartbeat_forbidden userId=${user.sub.slice(0, 8)} role=${user.role}` +
+        ` denied=${deniedIds.length} revoked=${revokedIds.length}`,
+      )
+    }
+
     const result = await reconcileView(
       server,
       user.sub,
       body.viewId,
-      body.visibleCameraIds,
-      body.suppressStartCameraIds ?? [],
+      body.visibleCameraIds.filter(id => allowed.has(id)),
+      (body.suppressStartCameraIds ?? []).filter(id => allowed.has(id)),
       // Ticket estampado por el hook `onRequest`, antes de la autenticación:
       // tomarlo dentro de reconcileView sería posterior a `jwtVerify` y a la
       // validación del cuerpo, con lo que una petición vieja reanudada tras un
       // cierre parecería nueva (revisión de #148).
       request.requestTicket,
     )
+
+    for (const id of deniedIds) result.errors[id] = { ...HEARTBEAT_FORBIDDEN }
+    if (revokedIds.length > 0) result.stoppedIds = [...new Set([...revokedIds, ...result.stoppedIds])]
 
     // Log estructurado para diagnosticar producción
     const errCount  = Object.keys(result.errors).length
