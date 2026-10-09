@@ -4,6 +4,7 @@ import { persist } from 'zustand/middleware'
 import { apiGet, apiPost } from '@/lib/api'
 import { connectWebSocket, disconnectWebSocket } from '@/lib/websocket'
 import type { User, LoginResponse, UserFeaturePermissions } from '@/types'
+import { AUTH_PERSIST_VERSION, migrateAuthState, partializeAuth } from './authPersist'
 
 interface TwoFactorChallenge {
   tempToken: string
@@ -222,10 +223,11 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: 'visioncore-auth',
-      partialize: (state) => ({
-        user: state.user,
-        isAuthenticated: state.isAuthenticated,
-      }),
+      // v1: sólo la allowlist del usuario (sin permissions→nvr/camera). migrate limpia
+      // lo que v0 dejó guardado (credenciales del NVR incluidas). Ver authPersist.ts.
+      version: AUTH_PERSIST_VERSION,
+      migrate: migrateAuthState,
+      partialize: (state) => partializeAuth(state),
     }
   )
 )

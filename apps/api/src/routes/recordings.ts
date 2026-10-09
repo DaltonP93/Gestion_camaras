@@ -39,6 +39,7 @@ import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/reco
 import { PreviewProcessRegistry, type AttemptRecord } from '../services/recordings/preview-process-registry'
 import { buildPreviewInputArgs, resolvePreviewProbeOptions } from '../services/recordings/preview-input-options'
 import { getNvrSystemTime } from '../services/hikvision'
+import { redactDiagnosticText } from '../lib/log-redact'
 
 // ─── VOD configuration ────────────────────────────────────────────
 const RECORDING_SESSION_TTL_MS  = 30 * 60 * 1000
@@ -560,14 +561,41 @@ interface FailedPreviewInfo {
 const failedPreviewSessions = new Map<string, FailedPreviewInfo>()
 const FAILED_PREVIEW_TTL_MS = 60_000
 
+// ─── Diagnóstico de reproducción en RESPUESTAS ───────────────────────────────
+// detail/stderrTail del preview los ve el DUEÑO de la sesión (SUPERVISOR, o AUDITOR
+// con canPlayback) en GET /preview/:id/status y en el cuerpo de error de
+// /preview/:id/stream; sanitizedUri/stderrSample los ve ADMIN en
+// POST /diagnostics/playback. Todos salen del stderr de FFmpeg/ffprobe o de la URL
+// "enmascarada", y maskUrlCredentials sólo tapa la clave: quedaba
+// `rtsp://<usuario>:***@<ip>:<puerto>/...` del NVR. Criterio (igual que el
+// diagnóstico de cámaras): ni usuario ni IP/host del NVR en NINGUNA forma; se
+// conserva path, query (track/starttime/endtime) y el texto del error.
+// Se redacta SÓLO en el borde de la respuesta: la clasificación, la cadena de
+// reintentos y los logs siguen usando el texto original, así que la reproducción no
+// cambia.
+/** Usuario, clave e IP/host del NVR tomados de la URL RTSP real de la sesión. */
+function rtspUrlSecrets(rtspUrl: string | undefined): string[] {
+  try {
+    const u = new URL(rtspUrl ?? '')
+    return [decodeURIComponent(u.username), decodeURIComponent(u.password), u.hostname]
+  } catch {
+    return [] // sin literales quedan las reglas genéricas (autoridad de URL, IPv4/IPv6)
+  }
+}
+const redactPlaybackText = (text: string | null | undefined, rtspUrl: string | undefined): string | null =>
+  redactDiagnosticText(text, rtspUrlSecrets(rtspUrl))
+const redactStderrTail = (session: Pick<PreviewSession, 'stderrTail' | 'rtspUrl'>): string =>
+  redactPlaybackText((session.stderrTail ?? []).slice(-10).join(' | '), session.rtspUrl)?.slice(0, 600) ?? ''
+
 function retainFailedPreview(sessionId: string, session: PreviewSession, log: (msg: string) => void) {
   if (!session.errorCategory) return
+  // Lo retenido sólo se usa para responder GET /preview/:id/status ⇒ se guarda redactado.
   failedPreviewSessions.set(sessionId, {
     userId:       session.userId,
     slotIndex:    session.slotIndex,
     category:     session.errorCategory,
-    detail:       session.errorDetail ?? '',
-    stderrTail:   (session.stderrTail ?? []).slice(-10).join(' | ').slice(0, 600),
+    detail:       redactPlaybackText(session.errorDetail ?? '', session.rtspUrl) ?? '',
+    stderrTail:   redactStderrTail(session),
     hadFirstByte: session.hadFirstByte ?? false,
     expiresAt:    Date.now() + FAILED_PREVIEW_TTL_MS,
   })
@@ -2524,7 +2552,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       const status = errorStatusForCategory(category)
       try {
         res.writeHead(status, { 'Content-Type': 'application/json', 'X-Session-Id': sessionId })
-        res.end(JSON.stringify({ code: category, message: 'El origen no entregó video', detail: detail.slice(0, 300) }))
+        res.end(JSON.stringify({ code: category, message: 'El origen no entregó video', detail: (redactPlaybackText(detail, rtspUrl) ?? '').slice(0, 300) }))
       } catch { /* conexión ya cerrada */ }
     }
 
@@ -3304,19 +3332,20 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           },
         })
       }
+      const detail = redactPlaybackText(session.errorDetail, session.rtspUrl)
       return reply.send({
         ok:            !session.errorCategory,
         status:        session.errorCategory ? 'error' : 'active',
         category:      session.errorCategory ?? null,
         message:       session.errorCategory ?? null,
-        detail:        session.errorDetail ?? null,
-        stderrTail:    (session.stderrTail ?? []).slice(-10).join(' | ').slice(0, 600) || null,
+        detail,
+        stderrTail:    redactStderrTail(session) || null,
         hadFirstByte:  session.hadFirstByte ?? null,
         videoOnly:     session.videoOnly ?? null,
         effectiveAudioMode: session.effectiveAudioMode ?? null,
         // legacy fields
         errorCategory: session.errorCategory ?? null,
-        errorDetail:   session.errorDetail ?? null,
+        errorDetail:   detail,
         strategy:      session.strategy,
         detectedCodec: session.detectedCodec,
       })
@@ -3509,6 +3538,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     )
     const releaseNvrSlot = () => releasePlaybackLease(camera.nvr.id, diagSessionId, 'diagnostics_done')
 
+    // URL "sanitizada" y stderr de cada etapa: sin usuario ni IP/host del NVR (ver
+    // redactPlaybackText); el plan, las sondas y los logs usan las URLs originales.
+    const redactDiag = (s: string) =>
+      redactDiagnosticText(s, [camera.nvr.username, plainPass, camera.nvr.ipAddress, camera.ipAddress]) ?? ''
     const timeoutMs   = body.perStrategyTimeoutMs ?? 25000
     const transports: RtspTransport[] = body.transports ?? ['tcp']
     const primaryTransport = transports[0]
@@ -3556,7 +3589,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
         results.push({
           strategy: attempt.strategy, track: attempt.track, respectsPlayhead: attempt.respectsPlayhead,
           transport: primaryTransport,
-          sanitizedUri: attempt.masked, urlFingerprint: urlFingerprint(attempt.masked),
+          sanitizedUri: redactDiag(attempt.masked), urlFingerprint: urlFingerprint(attempt.masked),
           rtspStart: rtspTimes.starttime, rtspEnd: rtspTimes.endtime,
           timeoutMs,
           // ── Evidencia por ETAPAS ──
@@ -3572,7 +3605,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           exitCode: mux.exitCode, signal: mux.signal, timedOut: mux.timedOut, durationMs: mux.elapsedMs,
           stopPoint: stageResult,            // categoría GRANULAR (TASK 11)
           result: ok ? 'success' : 'error',
-          stderrSample: mux.stderrSample.slice(0, 800),
+          stderrSample: redactDiag(mux.stderrSample).slice(0, 800),
         })
         server.log.info(
           `[recordings-diag] staged_result cameraId=${body.cameraId} strategy=${attempt.strategy}` +
