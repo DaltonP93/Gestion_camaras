@@ -10,6 +10,7 @@ import {
   normalizeUploadUrl,
   toPublishableAppearance,
 } from '../services/appearance-policy'
+import { isActorCheckUnavailable } from '../plugins/auth'
 
 const hexColor = z.string().regex(/^#[0-9a-fA-F]{6}$/)
 
@@ -69,6 +70,13 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
     try {
       await request.jwtVerify()
     } catch {
+      // Base caída al verificar el actor vigente ⇒ 503 (no 401: no es la sesión).
+      if (isActorCheckUnavailable(request)) {
+        return reply.status(503).send({
+          statusCode: 503, error: 'Service Unavailable', code: 'AUTH_UNAVAILABLE',
+          message: 'No se pudo verificar la sesión. Reintentá en unos segundos.',
+        })
+      }
       return reply.status(401).send({
         statusCode: 401, error: 'Unauthorized', message: 'Token inválido o expirado',
       })
