@@ -2,8 +2,9 @@
 // Controlador real + FakeRedis (cross-process atómico). SIN red ni MediaMTX vivo.
 // Env fijado antes del import (la ruta lee las flags en import-time).
 import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest'
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify'
 import { FakeRedis } from '../services/media/redis-fake'
+import { resolveTrustedProxies } from '../lib/trusted-proxy'
 
 let mediamtxAuthRoutes: any
 let getMgr: any
@@ -13,8 +14,8 @@ const RELAY_SECRET = 'relaysecret'
 const STREAM = 'nvr_nvr1_ch09_main'
 const relayHdr = { 'x-media-relay-secret': RELAY_SECRET }
 
-async function buildApp(redis: FakeRedis): Promise<FastifyInstance> {
-  const app = Fastify()
+async function buildApp(redis: FakeRedis, trustProxy?: FastifyServerOptions['trustProxy']): Promise<FastifyInstance> {
+  const app = Fastify({ trustProxy })
   app.decorate('redis', redis as any)
   reset()
   await app.register(mediamtxAuthRoutes, { prefix: '/internal/mediamtx' })
@@ -220,5 +221,31 @@ describe('POST /internal/mediamtx/auth — deny (fail-closed)', () => {
     const res = await post(app, { user: g.grantId, password: g.secret, action: 'read', path: STREAM })
     expect(res.statusCode).toBe(403)
     await app.close()
+  })
+})
+
+// C03 — el origen del hook se decide por el PAR TCP, no por request.ip ni cabeceras.
+describe('POST /internal/mediamtx/auth — origen interno por el par TCP (C03)', () => {
+  const trust = resolveTrustedProxies(undefined).trustProxy
+
+  it('par interno con X-Forwarded-For de una IP pública (server.ts con trustProxy) ⇒ 200', async () => {
+    const app = await buildApp(new FakeRedis(), trust)
+    const g = await seedSession(app)
+    const res = await post(app, { user: g.grantId, password: g.secret, action: 'read', path: STREAM },
+      { ...relayHdr, 'x-forwarded-for': '203.0.113.9', 'x-real-ip': '203.0.113.9' }, '172.18.0.7')
+    expect(res.statusCode).toBe(200)
+    await app.close()
+  })
+
+  it('par externo con X-Forwarded-For: 127.0.0.1 ⇒ 403 ORIGIN_NOT_ALLOWED, aun con trustProxy=true', async () => {
+    for (const tp of [trust, true] as const) {
+      const app = await buildApp(new FakeRedis(), tp)
+      const g = await seedSession(app)
+      const res = await post(app, { user: g.grantId, password: g.secret, action: 'read', path: STREAM },
+        { ...relayHdr, 'x-forwarded-for': '127.0.0.1', 'x-real-ip': '127.0.0.1' }, '203.0.113.9')
+      expect(res.statusCode, String(tp === true)).toBe(403)
+      expect(res.json().code).toBe('ORIGIN_NOT_ALLOWED')
+      await app.close()
+    }
   })
 })

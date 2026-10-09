@@ -31,7 +31,7 @@ VisionCore usa **Bearer Tokens JWT** almacenados en `localStorage` del navegador
 | Algoritmo | HS256 | — |
 | Expiración access token | 60 minutos | `JWT_EXPIRES_IN` |
 | Expiración refresh token | 7 días | `JWT_REFRESH_EXPIRES_IN` |
-| Clave de firma | — | `JWT_SECRET` (mín. 32 chars) |
+| Clave de firma | — (obligatoria, sin default) | `JWT_SECRET` (mín. 32 chars; se rechazan al arrancar los valores públicos conocidos y los no aleatorios — `apps/api/src/lib/jwt-secret-policy.ts`) |
 
 Los refresh tokens se almacenan en la tabla `sessions` con IP, User-Agent y fecha de expiración. Al hacer logout se elimina la sesión de la DB, invalidando el refresh token.
 

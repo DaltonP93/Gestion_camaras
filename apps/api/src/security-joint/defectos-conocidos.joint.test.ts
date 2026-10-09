@@ -2,19 +2,39 @@
 //
 // Cada prueba está escrita esperando el COMPORTAMIENTO SEGURO y hoy FALLA a
 // propósito: documenta un defecto real reproducido en la rama integrada
-// (#182 + #186 + #189 + #190). Ninguno es introducido por la combinación: son
-// pendientes previos que la combinación deja a la vista (ver hallazgos citados).
-// NO se deben debilitar ni marcar como `fails`: se ponen en verde corrigiendo el
-// código. Se agrupan en este archivo para que las cinco suites temáticas
-// (mfa, cookies-csrf, hls, revocation, playback) sigan siendo una regresión verde
-// de la combinación.
+// (#182 + #186 + #187 + #189 + #190 + #191 + #192 + #193 + #195 + #196 + #197).
+// Ninguno es introducido por la combinación: son pendientes previos que la
+// combinación deja a la vista. NO se deben debilitar ni marcar como `fails`: se
+// ponen en verde corrigiendo el código. Se agrupan en este archivo para que las
+// suites temáticas sigan siendo una regresión verde de la combinación.
 //
 // Corren SÓLO con RUN_KNOWN_DEFECTS=1 (`npm run test:known-defects`): son evidencia
-// ejecutable de defectos PREVIOS, fuera del alcance de estos PRs, y no deben poner
-// en rojo el job de la combinación. El estado de cada uno (y el PR que lo corrige,
-// si existe) está en docs/security/JOINT_REVIEW_182_186_189_190.md. Al corregir un
-// defecto, su prueba se mueve a la suite temática correspondiente. El defecto de configuración de arranque (CHW-09) vive en
-// arranque.joint.test.ts porque necesita su propio server.ts.
+// ejecutable de defectos PREVIOS y no deben poner en rojo el job de la combinación.
+// Al corregir un defecto, su prueba sale de este archivo y la cubre la suite del PR
+// que lo corrige (informe: docs/security/JOINT_REVIEW_182_186_189_190.md, en #194).
+//
+// Corregidos y retirados de aquí (cubiertos por la suite del PR que los corrige):
+//   - MFA-03/CHW-06/CHW-11 (rate-limit detrás de nginx) y CHW-08 validate (origen
+//     interno): #195, proxy-confiable.joint.test.ts.
+//   - CHW-09 (JWT_SECRET público): #196, jwt-secret-publico.joint.test.ts.
+//   - MFA-02/CHW-08, CHW-05, CHW-05/REV-08/PB-03, CHW-07, CHW-08 (sesiones,
+//     contraseña, 2FA) y REV-01/PB-02/CHW-14 (×3, medios de grabación): #197,
+//     revocation-effective.joint.test.ts.
+//   - MFA-05 y PB-05: #193, profile-diag.joint.test.ts.
+// Siguen abiertos (aquí o en su suite):
+//   - CHW-08/CHW-10: grants del relay nativo (flags NO-GO); #197 lo declara fuera de
+//     alcance.
+//   - MFA-04, PB-01/REV-02 (decisión D5), PB-04 (requiere NVR real), PB-06, PB-10,
+//     REV-03, REV-04/CHW-03, REV-05, CHW-04 (decisión D2).
+//   - LOG-01 (abajo): previo; el console.info con `rtsp=rtsp://<usuario>:***@<ip>`
+//     de stream-manager.ts ya está en origin/main (invariante 6).
+//   - En su propia suite (necesitan su server.ts o dobles propios):
+//       · STG-01 en staging.joint.test.ts: NO es un defecto de #187 sino una
+//         DECISIÓN PENDIENTE de alcance (aislar o no el contacto con el NVR que
+//         inician los USUARIOS en staging);
+//       · AUD-BK-01 en nvr-audio.joint.test.ts: previo; el backup que deja la UI en
+//         PUT /video-audio no guarda el audio y …/video-config/restore no lo
+//         interpreta (responde OK y el audio queda como estaba).
 //
 // Las aserciones usan `expect.soft` cuando un mismo defecto se ve en varias rutas,
 // para que el reporte liste TODAS las violaciones de una vez.
@@ -33,18 +53,16 @@ vi.mock('../services/rtsp-probe', async (orig) => (await import('./infra-doubles
 vi.mock('../services/credentials', async (orig) => (await import('./infra-doubles')).credentialsModuleDouble(await orig() as any))
 vi.mock('child_process', async (orig) => (await import('./infra-doubles')).childProcessModuleDouble(await orig() as any))
 
-import WebSocket from 'ws'
 import { infra } from './infra-doubles'
+import { settle } from './joint-helpers'
 import {
-  jointInfraAvailable, startJointServer, totpNow, waitFor, decodeJwt, JOINT_PASSWORD, NVR_FAKE_USER, NVR_FAKE_PASS,
-  JOINT_HOST, JOINT_ORIGIN, NGINX_INTERNAL_IP,
+  jointInfraAvailable, startJointServer, totpNow, waitFor, JOINT_PASSWORD, NVR_FAKE_USER, NVR_FAKE_PASS,
   type JointEnv, type SimBrowser, type JointResponse,
 } from './harness'
 
 const RUN_KNOWN_DEFECTS = process.env.RUN_KNOWN_DEFECTS === '1'
 
 const NVR_IP = '192.0.2.60'
-const DENIED = [401, 403, 404, 410]
 const win = (fromMin: number) => {
   const pad = (n: number) => String(n).padStart(2, '0')
   const s = `2026-10-01T11:${pad(fromMin)}:00.000Z`
@@ -56,7 +74,6 @@ const win = (fromMin: number) => {
 describe.runIf(jointInfraAvailable() && RUN_KNOWN_DEFECTS)('conjunta · DEFECTOS conocidos (esperan el comportamiento seguro)', { timeout: 60_000 }, () => {
   let env: JointEnv
   let sm: typeof import('../services/stream-manager')
-  let wsMod: typeof import('../routes/websocket')
   let gs: typeof import('../services/media/grant-service')
   let nvrId = ''
   let camA = ''
@@ -88,14 +105,10 @@ describe.runIf(jointInfraAvailable() && RUN_KNOWN_DEFECTS)('conjunta · DEFECTOS
     expect(su.status).toBe(200)
     return { 'x-step-up-token': su.json().stepUpToken }
   }
-  /** GET del stream de preview (hijack): se espera con tope y nunca se deja colgado. */
-  const getPreviewStream = async (b: SimBrowser, url: string, ms = 15_000): Promise<JointResponse | null> =>
-    Promise.race([b.get(url), new Promise<null>(r => setTimeout(() => r(null), ms))])
 
   beforeAll(async () => {
     env = await startJointServer({ label: 'def', nativeRelay: true })
     sm = await import('../services/stream-manager')
-    wsMod = await import('../routes/websocket')
     gs = await import('../services/media/grant-service')
     nvrId = (await env.createNvr('NVR conjunto defectos', NVR_IP)).id
     camA = (await env.createCamera(nvrId, 1)).id
@@ -110,39 +123,6 @@ describe.runIf(jointInfraAvailable() && RUN_KNOWN_DEFECTS)('conjunta · DEFECTOS
     await env?.stop()
   })
 
-  it('REV-01/PB-02/CHW-14 — revocar canPlayback corta el MP4 (fileToken), la descarga (24 h), el status y el stream de preview ya emitidos', async () => {
-    const { id, b } = await newUser('aud_rev_def', 'AUDITOR', [[camA, { canView: false, canPlayback: true, canDownload: true }]])
-    const ready = await playUntilReady(b, camA, win(0))
-    expect(ready.downloadUrl).toMatch(/^\/api\/recordings\/download\?t=/)
-    const pv = await b.post('/api/recordings/preview/start', { cameraId: camA, slotIndex: 0, ...win(0) })
-    expect(pv.json().status).toBe('ready')
-
-    const rev = await admin.put(`/api/users/${id}/permissions`, { cameraPermissions: [{ cameraId: camA, canView: false, canPlayback: false, canDownload: false }] })
-    expect(rev.status).toBe(200)
-    expect((await b.post('/api/recordings/playback', { cameraId: camA, ...win(0) })).status).toBe(403)   // esto ya funciona
-
-    // DEFECTO: los tokens opacos (file.mp4 30 min, download 24 h, stream de preview)
-    // no se atan al usuario ni se revalidan: siguen sirviendo tras la revocación.
-    const mark = infra.mark()
-    expect.soft(DENIED, 'file.mp4 tras revocar').toContain((await b.get(ready.url)).status)
-    expect.soft(DENIED, 'download tras revocar').toContain((await env.browser('cualquiera').get(ready.downloadUrl)).status)
-    const st = await b.get(`/api/recordings/playback/${ready.sessionId}/status`)
-    expect.soft(st.status === 200 ? (st.json().url ?? st.json().downloadUrl ?? null) : null, 'status re-expone url/downloadUrl').toBeNull()
-    const stream = await getPreviewStream(b, pv.json().streamUrl)
-    expect.soft(infra.of('proc.spawn', mark).length, 'FFmpeg relanzado contra el NVR tras revocar').toBe(0)
-    expect.soft(stream ? DENIED.includes(stream.status) : false, 'stream de preview tras revocar').toBe(true)
-    await admin.del(`/api/recordings/preview/${pv.json().sessionId}`)
-  })
-
-  it('REV-01/PB-02 — tras el logout del titular, la descarga y el MP4 ya emitidos dejan de servir', async () => {
-    const { b } = await newUser('aud_logout_def', 'AUDITOR', [[camA, { canView: false, canPlayback: true, canDownload: true }]])
-    const ready = await playUntilReady(b, camA, win(10))
-    expect((await b.post('/api/auth/logout', {})).status).toBe(200)
-    // DEFECTO: el token de descarga (24 h) y el fileToken no se revocan en el logout.
-    expect.soft(DENIED, 'download tras logout').toContain((await env.browser('tercero').get(ready.downloadUrl)).status)
-    expect.soft(DENIED, 'file.mp4 tras logout').toContain((await env.browser('tercero2').get(ready.url)).status)
-  })
-
   it('PB-01/REV-02 — sin canDownload (cámara) ni canDownloadRecordings (función) no se emite exportación MP4', async () => {
     const { id, b } = await newUser('aud_nodl_def', 'AUDITOR', [[camA, { canView: false, canPlayback: true, canDownload: false }]])
     await env.prisma.userFeaturePermissions.create({ data: { userId: id, canViewRecordings: true, canDownloadRecordings: false } })
@@ -155,65 +135,6 @@ describe.runIf(jointInfraAvailable() && RUN_KNOWN_DEFECTS)('conjunta · DEFECTOS
       const dl = await b.get(ready.downloadUrl)
       expect.soft(dl.status, 'descarga servida sin canDownload').not.toBe(200)
     }
-  })
-
-  it('MFA-02/CHW-08 — tras el logout, el access copiado ya no abre /me, el heartbeat ni hls-auth', async () => {
-    const { b } = await newUser('op_logout_def', 'OPERATOR', [[camA, { canView: true }]])
-    const copied = b.accessToken!
-    expect((await b.post('/api/auth/logout', {})).status).toBe(200)
-    const mark = infra.mark()
-    const thief = env.browser('ladron-logout')
-    // DEFECTO: el access JWT es stateless (sin sid/epoch) y vive hasta su exp.
-    expect.soft((await thief.get('/api/auth/me', { headers: { authorization: `Bearer ${copied}` } })).status, '/me con access post-logout').toBe(401)
-    expect.soft((await thief.heartbeat('v-ladron', [camA], { headers: { authorization: `Bearer ${copied}` } })).status, 'heartbeat con access post-logout').toBe(401)
-    expect.soft(infra.of('mediamtx.publish', mark), 'stream iniciado con access post-logout').toEqual([])
-    expect.soft((await env.hlsAuth(hlsUri(1), { cookie: copied })).status, 'hls-auth con access post-logout').toBe(401)
-    expect((await thief.post('/api/auth/ws-ticket', undefined, { headers: { authorization: `Bearer ${copied}` } })).status).toBe(401) // ya funciona
-  })
-
-  it('CHW-05 — desactivar al usuario corta hls-auth y el heartbeat del access vigente (no sólo el WS)', async () => {
-    const { id, b } = await newUser('op_baja_def', 'OPERATOR', [[camA, { canView: true }]])
-    const ws = await b.openAlerts()
-    expect((await admin.put(`/api/users/${id}`, { active: false })).status).toBe(200)
-    expect(await ws.closed).toBe(4003)                                   // ya funciona
-    expect((await b.post('/api/auth/ws-ticket')).status).toBe(403)       // ya funciona
-    const mark = infra.mark()
-    // DEFECTO: hls-auth y heartbeat no consultan `active` ni la sesión.
-    expect.soft(DENIED, 'hls-auth de usuario desactivado').toContain((await env.hlsAuth(hlsUri(1), { browser: b })).status)
-    const hb = await b.heartbeat('v-baja', [camA])
-    expect.soft(hb.status === 200 ? Object.keys(hb.json().streams) : [], 'heartbeat de usuario desactivado').toEqual([])
-    expect.soft(infra.of('mediamtx.publish', mark), 'stream iniciado por usuario desactivado').toEqual([])
-    expect((await b.post('/api/auth/refresh', {})).status).toBe(401)     // ya funciona
-  })
-
-  it('CHW-05/REV-08/PB-03 — degradar SUPERVISOR→OPERATOR o ADMIN→OPERATOR y borrar al usuario surte efecto en la siguiente petición', async () => {
-    const sup = await newUser('sup_deg_def', 'SUPERVISOR')
-    expect((await admin.put(`/api/users/${sup.id}`, { role: 'OPERATOR' })).status).toBe(200)
-    const mark = infra.mark()
-    // DEFECTO: el rol sale del claim del JWT, no de la DB.
-    expect.soft((await env.hlsAuth(hlsUri(2), { browser: sup.b })).status, 'hls-auth con rol degradado').toBe(403)
-    const hb = await sup.b.heartbeat('v-deg', [camB])
-    expect.soft(Object.keys(hb.json().streams ?? {}), 'heartbeat con rol degradado').toEqual([])
-    const search = await sup.b.get(`/api/recordings/search?cameraId=${camB}&startTime=2026-10-01T11:00:00.000Z&endTime=2026-10-01T11:05:00.000Z`)
-    expect.soft(search.status, 'grabaciones con rol degradado').toBe(403)
-    expect.soft(infra.of('credentials.decrypt', mark), 'credenciales NVR descifradas para un rol degradado').toEqual([])
-
-    // Lo que YA corta: el refresh relee rol/activo de la DB y emite un access OPERATOR,
-    // con el que el borde deniega. La ventana es la del access viejo (sessionTimeoutMinutes).
-    const refreshed = env.browser('sup_deg_refresh')
-    refreshed.plantCookie('refresh_token', sup.b.refreshToken!, '/api/auth')
-    expect((await refreshed.post('/api/auth/refresh', {})).status).toBe(200)
-    expect(decodeJwt(refreshed.accessToken!).role).toBe('OPERATOR')
-    expect((await env.hlsAuth(hlsUri(2), { browser: refreshed })).status).toBe(403)
-
-    const adm2 = await newUser('admin_deg_def', 'ADMIN')
-    expect((await admin.put(`/api/users/${adm2.id}`, { role: 'OPERATOR' })).status).toBe(200)
-    expect.soft((await adm2.b.get('/api/users')).status, 'ADMIN degradado sigue administrando').toBe(403)
-
-    const del = await newUser('sup_borrado_def', 'SUPERVISOR')
-    const su = await admin.post('/api/auth/step-up', { password: JOINT_PASSWORD })
-    expect((await admin.del(`/api/users/${del.id}`, { headers: { 'x-step-up-token': su.json().stepUpToken } })).status).toBe(200)
-    expect.soft(DENIED, 'hls-auth de usuario borrado').toContain((await env.hlsAuth(hlsUri(2), { browser: del.b })).status)
   })
 
   it('MFA-04 — el tempToken y el código TOTP son de un solo uso', async () => {
@@ -267,37 +188,6 @@ describe.runIf(jointInfraAvailable() && RUN_KNOWN_DEFECTS)('conjunta · DEFECTOS
     expect((await env.hlsAuth(hlsUri(2), { browser: b })).status).toBe(403)   // el borde sí corta
   })
 
-  it('CHW-07 — un ticket WS emitido antes de desactivar al usuario no abre un WS para el inactivo', async () => {
-    const { id, b } = await newUser('op_ticket_def', 'OPERATOR', [[camA, { canView: true }]])
-    const t = await b.post('/api/auth/ws-ticket')
-    expect(t.status).toBe(200)
-    expect((await admin.put(`/api/users/${id}`, { active: false })).status).toBe(200)
-    const h = await env.openWs(t.json().ticket)
-    await h.opened
-    await new Promise(r => setTimeout(r, 150))
-    wsMod.broadcastAlert({ type: 'alert', alert: { id: 'alerta-carrera-def', title: 'NVR sin disco' } })
-    await new Promise(r => setTimeout(r, 150))
-    // DEFECTO: el canje del ticket no revalida `active` ni la sesión.
-    expect.soft(h.ws.readyState, 'WS abierto para un usuario desactivado').not.toBe(WebSocket.OPEN)
-    expect.soft(h.messages.some(m => m.includes('alerta-carrera-def')), 'alerta entregada a un usuario desactivado').toBe(false)
-    h.ws.terminate()
-  })
-
-  it('MFA-05 — /api/auth/me no expone credenciales del NVR (ni cifradas) ni datos internos de la cámara', async () => {
-    const { b } = await newUser('op_me_def', 'OPERATOR', [[camA, { canView: true }]])
-    const me = await b.get('/api/auth/me')
-    expect(me.status).toBe(200)
-    const nvr = await env.prisma.nVR.findUniqueOrThrow({ where: { id: nvrId } })
-    const cam = await env.prisma.camera.findUniqueOrThrow({ where: { id: camA } })
-    // DEFECTO: userMeSelect incluye `permissions: { include: { nvr: true, camera: true } }`
-    // y el web persiste /me en localStorage ('visioncore-auth').
-    expect.soft(me.text, 'usuario del NVR').not.toContain(NVR_FAKE_USER)
-    expect.soft(me.text, 'contraseña cifrada del NVR').not.toContain(nvr.password)
-    expect.soft(me.text, 'IP del NVR').not.toContain(NVR_IP)
-    expect.soft(me.text, 'rtspUrl de la cámara').not.toContain(cam.rtspUrl!)
-    expect.soft(me.text, 'IP de la cámara').not.toContain(cam.ipAddress!)
-  })
-
   it('REV-03 — el modal granular guarda permisos NVR-scoped (PUT con nvrPermissions) y aplica la revocación de cámara en el mismo guardado', async () => {
     const u = await env.createUser('op_modal_def', 'OPERATOR')
     const body = { featurePermissions: {}, nvrPermissions: [{ nvrId, canView: true }], cameraPermissions: [] as Array<Record<string, unknown>> }
@@ -309,28 +199,6 @@ describe.runIf(jointInfraAvailable() && RUN_KNOWN_DEFECTS)('conjunta · DEFECTOS
     expect.soft(withRevoke.status, 'guardado del modal que además revoca una cámara').toBe(200)
     const rowA = await env.prisma.userPermission.findFirst({ where: { userId: u.id, cameraId: camA } })
     expect.soft(rowA?.canView ?? null, 'revocación de A aplicada').toBe(false)
-  })
-
-  it('PB-05 — el diagnóstico de una reproducción fallida no entrega usuario ni IP del NVR a un no-ADMIN', async () => {
-    const { b } = await newUser('aud_diag_def', 'AUDITOR', [[camA, { canView: false, canPlayback: true }]])
-    infra.ffmpegMode = 'fail-404'
-    try {
-      const pv = await b.post('/api/recordings/preview/start', { cameraId: camA, slotIndex: 2, ...win(30) })
-      expect(pv.json().status).toBe('ready')
-      const stream = await getPreviewStream(b, pv.json().streamUrl, 20_000)
-      const status = await waitFor(async () => {
-        const st = await b.get(`/api/recordings/preview/${pv.json().sessionId}/status`)
-        return st.json().status === 'error' ? st : null
-      }, 'preview en error', 20_000, 100)
-      const visible = status.text + (stream ? stream.text : '')
-      expect(visible).not.toContain(NVR_FAKE_PASS)   // la contraseña sí se enmascara
-      // DEFECTO: maskUrlCredentials sólo oculta la contraseña; usuario e IP llegan al AUDITOR.
-      expect.soft(visible, 'usuario del NVR en el diagnóstico').not.toContain(NVR_FAKE_USER)
-      expect.soft(visible, 'IP del NVR en el diagnóstico').not.toContain(NVR_IP)
-      await b.del(`/api/recordings/preview/${pv.json().sessionId}`)
-    } finally {
-      infra.ffmpegMode = 'vod-ok'
-    }
   })
 
   it('PB-10 (HTTP) — Range en file.mp4 según RFC 9110: sufijo "bytes=-N", fin más allá del tamaño y multirango', async () => {
@@ -360,46 +228,12 @@ describe.runIf(jointInfraAvailable() && RUN_KNOWN_DEFECTS)('conjunta · DEFECTOS
     const hit = await second.b.post('/api/recordings/playback', { cameraId: camA, ...win(50) })
     expect(hit.json().status).toBe('ready')   // acierto de caché inmediato
     // DEFECTO: el camino de caché retorna antes de AuditAction('VIEW_RECORDING').
-    expect.soft(await env.prisma.auditLog.count({ where: { userId: second.id, action: 'VIEW_RECORDING' } }), 'VIEW_RECORDING en acierto de caché').toBe(1)
-  })
-
-  it('CHW-08 — revocar las sesiones (admin), cambiar la contraseña o resetear el 2FA invalida el access ya emitido', async () => {
-    const cases: Array<[string, string, (id: string, b: SimBrowser) => Promise<JointResponse>]> = [
-      ['DELETE /users/:id/sessions', 'op_sesiones_def', (id) => admin.del(`/api/users/${id}/sessions`)],
-      ['change-password', 'op_clave_def', (_id, b) => b.post('/api/auth/change-password', { currentPassword: JOINT_PASSWORD, newPassword: 'Otra-Clave-Distinta-2026!' })],
-      ['reset-2fa (admin)', 'op_reset2fa_def', async (id) => admin.post(`/api/users/${id}/reset-2fa`, {}, { headers: await adminStepUp() })],
-    ]
-    for (const [label, username, action] of cases) {
-      const { id, b } = await newUser(username, 'OPERATOR', [[camA, { canView: true }]])
-      const copied = b.accessToken!
-      expect((await action(id, b)).status, label).toBe(200)
-      expect(await env.prisma.session.count({ where: { userId: id } }), `${label}: sesiones en DB`).toBe(0)   // ya funciona
-      expect((await b.post('/api/auth/refresh', {})).status, `${label}: refresh`).toBe(401)                  // ya funciona
-      const mark = infra.mark()
-      // DEFECTO: el access no está ligado a la sesión (sin sid/epoch) y sigue hasta su exp.
-      const thief = env.browser(`ladron-${username}`)
-      expect.soft((await thief.get('/api/auth/me', { headers: { authorization: `Bearer ${copied}` } })).status, `${label}: /me con el access copiado`).toBe(401)
-      expect.soft((await env.hlsAuth(hlsUri(1), { cookie: copied })).status, `${label}: hls-auth con el access copiado`).toBe(401)
-      const hb = await thief.heartbeat(`v-${username}`, [camA], { headers: { authorization: `Bearer ${copied}` } })
-      expect.soft(hb.status === 200 ? Object.keys(hb.json().streams) : [], `${label}: heartbeat con el access copiado`).toEqual([])
-      expect.soft(infra.of('mediamtx.publish', mark), `${label}: stream iniciado con el access copiado`).toEqual([])
-    }
-  })
-
-  it('REV-01/PB-02 — desactivar y después borrar al titular corta el MP4 y la descarga ya emitidos', async () => {
-    const { id, b } = await newUser('aud_baja_dl_def', 'AUDITOR', [[camA, { canView: false, canPlayback: true, canDownload: true }]])
-    const ready = await playUntilReady(b, camA, win(5))
-    expect((await admin.put(`/api/users/${id}`, { active: false })).status).toBe(200)
-    // DEFECTO (CHW-05/PB-03): el access vigente de un usuario desactivado sigue reproduciendo.
-    expect.soft(DENIED, 'POST /playback con el access vigente tras desactivar').toContain((await b.post('/api/recordings/playback', { cameraId: camA, ...win(5) })).status)
-    // DEFECTO: los tokens opacos no consultan `active`.
-    expect.soft(DENIED, 'file.mp4 tras desactivar').toContain((await b.get(ready.url)).status)
-    expect.soft(DENIED, 'download tras desactivar').toContain((await env.browser('tercero-baja').get(ready.downloadUrl)).status)
-    expect((await admin.del(`/api/users/${id}`, { headers: await adminStepUp() })).status).toBe(200)
-    expect(await env.prisma.user.count({ where: { id } })).toBe(0)
-    // DEFECTO: ni siquiera el borrado del usuario invalida los tokens ya emitidos.
-    expect.soft(DENIED, 'file.mp4 tras borrar al usuario').toContain((await env.browser('tercero-borrado-1').get(ready.url)).status)
-    expect.soft(DENIED, 'download tras borrar al usuario').toContain((await env.browser('tercero-borrado-2').get(ready.downloadUrl)).status)
+    // El camino normal la escribe SIN await: se espera con tope para que un arreglo
+    // que siga ese patrón no dé un falso rojo por la carrera con el INSERT.
+    const viewAudits = await settle(
+      () => env.prisma.auditLog.count({ where: { userId: second.id, action: 'VIEW_RECORDING' } }), n => n >= 1, 3_000,
+    )
+    expect.soft(viewAudits, 'VIEW_RECORDING en acierto de caché').toBe(1)
   })
 
   it('PB-04 — #186 residual: la pista propia con el `name` de un archivo de OTRO canal no llega al NVR con ese name', async () => {
@@ -496,54 +330,24 @@ describe.runIf(jointInfraAvailable() && RUN_KNOWN_DEFECTS)('conjunta · DEFECTOS
     }
   })
 
-  it('CHW-08 — POST /api/live-view/internal/media-grant/validate (alcanzable por la location /api/ de nginx) exige además origen interno', async () => {
-    const { b } = await newUser('op_validate_def', 'OPERATOR', [[camA, { canView: true }]])
-    const mgr = gs.getMediaGrantManager(env.server)
-    const sp = `nvr_${nvrId}_ch01_sub`
-    if (!(await mgr.currentInstance(sp))) await mgr.registerSource(sp, 300_000)
-    const g = await b.post('/api/live-view/media-grant', { viewId: 'v-validate', cameraId: camA, transport: 'rtsps', device: 'navegador-simulado' })
-    expect(g.status).toBe(200)
-    const r = await env.server.inject({
-      method: 'POST', url: '/api/live-view/internal/media-grant/validate', remoteAddress: '198.51.100.240',
-      headers: { host: JOINT_HOST, 'x-media-relay-secret': env.relaySecret! },
-      payload: { grantId: g.json().grantId, secret: g.json().secret, streamPath: g.json().streamPath, transport: 'rtsps', cameraId: camA },
-    })
-    // DEFECTO (defensa en profundidad): sólo lo protege el secreto compartido; desde
-    // una IP externa valida (y consume) el grant. Debe ser 403/404 por origen.
-    expect.soft([403, 404], `validate desde IP externa ⇒ ${r.statusCode}`).toContain(r.statusCode)
-  })
-
-  it('MFA-03/CHW-06/CHW-11 — detrás de nginx (socket interno + X-Forwarded-For/X-Real-IP) el cupo de login y de 2FA es por cliente; el borde HLS sigue decidiendo por la IP del socket', async () => {
-    const u = await env.createMfaUser('op_proxy_def', 'OPERATOR')
-    await env.grant(u.id, nvrId, camA, { canView: true })
-    // tempToken legítimo obtenido antes, desde la IP propia del cliente.
-    const temp = (await env.browser('cliente-legitimo').login('op_proxy_def')).json().tempToken as string
-    const viaNginx = async (clientIp: string, url: string, payload: unknown) => (await env.server.inject({
-      method: 'POST', url, remoteAddress: NGINX_INTERNAL_IP, payload: payload as any,
-      headers: { host: JOINT_HOST, origin: JOINT_ORIGIN, 'x-forwarded-for': clientIp, 'x-real-ip': clientIp },
-    })).statusCode
-    const fails: number[] = []
-    for (let i = 1; i <= 8; i++) fails.push(await viaNginx(`198.51.100.${150 + i}`, '/api/auth/login', { username: `no-existe-${i}`, password: 'clave-falsa-123' }))
-    expect(fails).toEqual(Array(8).fill(401))
-    // DEFECTO: Fastify sin trustProxy ⇒ request.ip es la de nginx para TODOS: el 9.º
-    // cliente (otro, con la contraseña correcta) recibe 429. Lo mismo con el 2FA.
-    expect.soft(await viaNginx('198.51.100.159', '/api/auth/login', { username: 'op_proxy_def', password: JOINT_PASSWORD }), 'login de un 9.º cliente distinto').not.toBe(429)
-    for (let i = 1; i <= 10; i++) await viaNginx(`198.51.100.${170 + i}`, '/api/auth/2fa/verify', { tempToken: 'basura', code: '000000' })
-    expect.soft(await viaNginx('198.51.100.181', '/api/auth/2fa/verify', { tempToken: temp, code: await totpNow(u.secret) }), '2FA legítimo de otro cliente').toBe(200)
-
-    // Lo que debe seguir valiendo cuando se corrija (trustProxy acotado): el borde
-    // HLS decide "interno" por la IP del SOCKET, no por X-Forwarded-For.
-    const cookie = admin.cookieHeaderFor('/hls/x/index.m3u8')!
-    const viaProxy = await env.server.inject({
-      method: 'GET', url: '/internal/hls-auth', remoteAddress: NGINX_INTERNAL_IP,
-      headers: { host: JOINT_HOST, cookie, 'x-original-uri': hlsUri(1), 'x-forwarded-for': '203.0.113.9', 'x-real-ip': '203.0.113.9' },
-    })
-    expect(viaProxy.statusCode).toBe(200)
-    const forged = await env.server.inject({
-      method: 'GET', url: '/internal/hls-auth', remoteAddress: '203.0.113.9',
-      headers: { host: JOINT_HOST, cookie, 'x-original-uri': hlsUri(1), 'x-forwarded-for': '127.0.0.1', 'x-real-ip': '127.0.0.1' },
-    })
-    expect(forged.statusCode).toBe(403)
+  it('LOG-01 — arrancar un stream en vivo no escribe en los logs el usuario ni la IP del NVR (invariante 6)', async () => {
+    const { b } = await newUser('op_log_def', 'OPERATOR', [[camB, { canView: true }]])
+    const lines: string[] = []
+    const spies = (['log', 'info', 'warn', 'error'] as const).map(level =>
+      vi.spyOn(console, level).mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')) }))
+    try {
+      const hb = await b.heartbeat('v-log', [camB])
+      expect(hb.status).toBe(200)
+      expect(Object.keys(hb.json().streams)).toEqual([camB])
+    } finally {
+      for (const sp of spies) sp.mockRestore()
+    }
+    // DEFECTO: stream-manager.ts (startStream) hace console.info de
+    // `rtsp=rtsp://<usuario>:***@<ip>:<puerto>/...` del NVR en cada arranque de stream:
+    // la clave se tapa, pero el usuario y la IP completa quedan en el log del contenedor.
+    expect.soft(lines.filter(l => l.includes(NVR_FAKE_USER)), 'usuario del NVR en logs').toEqual([])
+    expect.soft(lines.filter(l => l.includes(NVR_IP)), 'IP completa del NVR en logs').toEqual([])
+    expect(lines.join('\n')).not.toContain(NVR_FAKE_PASS)   // la clave sí se enmascara
   })
 
   it('higiene: sin red saliente; todo contacto con el NVR fue a su IP TEST-NET', () => {

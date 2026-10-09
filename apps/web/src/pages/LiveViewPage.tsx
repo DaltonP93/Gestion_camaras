@@ -10,6 +10,7 @@ import { VideoPlayer, type CameraPlaybackError } from '@/components/cameras/Vide
 import { PTZControls } from '@/components/cameras/PTZControls'
 import { CameraDiagnosticModal } from '@/components/cameras/CameraDiagnosticModal'
 import { useAuthStore } from '@/stores/authStore'
+import { canRunCameraDiagnostics } from '@/lib/diagnosticsAccess'
 import { apiGet, apiPost } from '@/lib/api'
 import { parseStreamError, parseRetryAfterMs } from '@/lib/streamErrors'
 import { useViewportSessionLifecycle } from '@/lib/useViewportSessionLifecycle'
@@ -127,6 +128,9 @@ export function LiveViewPage() {
 
   const { nvrs, cameras, loadNVRs, loadCameras } = useCameraStore()
   const { user } = useAuthStore()
+  // El diagnóstico dispara sondas RTSP activas: la API sólo lo admite a
+  // ADMIN/SUPERVISOR. Sin handler, VideoPlayer no muestra el botón (evita un 403).
+  const canDiagnose = canRunCameraDiagnostics(user?.role)
 
   const [gridLayout, setGridLayout]   = useState<GridLayout>(() =>
     typeof window !== 'undefined' && window.innerWidth < 768 ? 4 : 9
@@ -1941,7 +1945,7 @@ export function LiveViewPage() {
                     cameraId={cam.id}
                     isRecording={cam.online}
                     onFullscreen={handleExitFocus}
-                    onDiagnostic={handleDiagnostic}
+                    onDiagnostic={canDiagnose ? handleDiagnostic : undefined}
                     onStreamError={handleStreamError}
                     onQualitySwitch={handleQualitySwitch}
                     onRetry={focusType === 'main_h264' ? () => {
@@ -2029,7 +2033,7 @@ export function LiveViewPage() {
                     cameraId={camera.id}
                     isRecording={camera.online}
                     onFullscreen={() => handleEnterFocus(camera)}
-                    onDiagnostic={handleDiagnostic}
+                    onDiagnostic={canDiagnose ? handleDiagnostic : undefined}
                     onStreamError={handleStreamError}
                     onPlaying={(cid) => setStreamErrors(prev => { const n = { ...prev }; delete n[cid]; return n })}
                     onRetry={handleGridCameraRetry}

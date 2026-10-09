@@ -18,7 +18,8 @@ export const api = axios.create({
 // ─── Refresh mutex: evita múltiples refreshes en paralelo ────
 let refreshPromise: Promise<void> | null = null
 
-async function refreshAccessToken(): Promise<void> {
+// Exportada para las llamadas que no pasan por axios (p. ej. el ticket del WS).
+export async function refreshAccessToken(): Promise<void> {
   if (refreshPromise) return refreshPromise
   refreshPromise = (async () => {
     try {

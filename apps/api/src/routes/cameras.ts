@@ -6,17 +6,37 @@ import { resolveGridProfile, deriveOutputResolution } from '../services/transcod
 import { startStream, stopStream, touchSession, cleanupUserSessions, getAdminSessionsSummary, recordStreamOutcome } from '../services/stream-manager'
 import { readStartAttemptId } from '../services/start-attempt'
 import { describeStartAttempt } from '../services/stream-manager'
-import { captureSnapshot, sendPTZCommand, buildRtspUrl, buildRtspUrlMasked, type PTZCommand } from '../services/hikvision'
+import { captureSnapshot, sendPTZCommand, buildRtspUrl, type PTZCommand } from '../services/hikvision'
 import { probeRtspStream, probeBothStreams } from '../services/rtsp-probe'
 import { validateAndUpdateCameraHealth } from '../services/stream-validator'
 import { resolveCameraStatus } from '../services/camera-status-truth'
 import { AuditAction } from '../services/audit'
 import { decryptNvrPassword as decryptPass } from '../services/credentials'
 import { getViewableCameraIds } from '../services/camera-scope'
+import { redactDiagnosticText } from '../lib/log-redact'
 
-const sanitizeRtsp = (s: string | null | undefined): string | null => {
-  if (!s) return s ?? null
-  return s.replace(/rtsp:\/\/([^:@]+):([^@]+)@/gi, 'rtsp://$1:***@')
+// Respuestas de diagnóstico de cámara (GET /:id/diagnostics, POST /:id/test-rtsp,
+// GET /:id/debug-stream, POST /:id/validate-stream): ni usuario ni IP/host del NVR
+// en NINGUNA forma, tampoco "enmascarados" (buildRtspUrlMasked y el sanitizeRtsp
+// anterior dejaban `rtsp://<usuario>:***@<ip>:<puerto>`; la máscara de MediaMTX deja
+// `a.b.x.x`). Del origen RTSP sólo sale el path del canal; errores y sources pasan por
+// redactDiagnosticText con los literales conocidos (IP y usuario del NVR, clave en
+// claro si se descifró, IP de la cámara). Los roles de cada ruta no cambian.
+const rtspPathLabel = (channel: number, sub: boolean) => `rtsp://***/Streaming/Channels/${channel}${sub ? '02' : '01'}`
+type DiagnosticSecretsSource = { ipAddress: string | null; nvr: { ipAddress: string; username: string } }
+const diagnosticRedactor = (camera: DiagnosticSecretsSource, plainPass?: string | null) =>
+  (s: string | null | undefined) => redactDiagnosticText(s, [camera.nvr.ipAddress, camera.nvr.username, plainPass, camera.ipAddress])
+
+// GET /api/cameras, /batch y /:id devuelven lastRtspError a todos los roles con
+// canView. stream-validator y el diagnóstico ya lo guardan redactado, pero las filas
+// escritas antes conservan `rtsp:***@<ip>` y `rtsp://<usuario>:***@<ip>` del NVR ⇒
+// también se redacta al leer (sin tocar la DB).
+// `rtspUrl` es una columna legado que pudo guardarse como rtsp://<usuario>:<clave>@<ip>
+// (credenciales del NVR, la clave EN CLARO); el web no la usa ⇒ no sale a ningún rol.
+type RtspErrorRow = { lastRtspError: string | null; ipAddress: string | null; nvr: { ipAddress: string } | null; rtspUrl?: string | null }
+const withRedactedRtspError = <T extends RtspErrorRow>(cam: T) => {
+  const { rtspUrl: _rtspUrl, ...rest } = cam
+  return { ...rest, lastRtspError: redactDiagnosticText(cam.lastRtspError, [cam.ipAddress, cam.nvr?.ipAddress]) }
 }
 
 const cameraUpdateSchema = z.object({
@@ -68,7 +88,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       })
     }
 
-    return reply.send(cameras)
+    return reply.send(cameras.map(withRedactedRtspError))
   })
 
   // POST /api/cameras/batch — cargar múltiples cámaras por IDs (máx. 50)
@@ -96,7 +116,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         include: { nvr: { select: { id: true, name: true, ipAddress: true } } },
       })
     }
-    return reply.send(cameras)
+    return reply.send(cameras.map(withRedactedRtspError))
   })
 
   // GET /api/cameras/:id — cámara individual con NVR
@@ -111,7 +131,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     if (!await userCanAccessCamera(server.prisma, user.sub, user.role, id)) {
       return reply.status(403).send({ message: 'Sin permiso para esta cámara' })
     }
-    return reply.send(camera)
+    return reply.send(withRedactedRtspError(camera))
   })
 
   // GET /api/cameras/:id/stream — Obtener URLs de streaming
@@ -159,7 +179,12 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
   })
 
   // GET /api/cameras/:id/diagnostics — Diagnóstico completo por capas
-  server.get('/:id/diagnostics', { preHandler: [server.authenticate] }, async (request, reply) => {
+  // Dispara sondas RTSP ACTIVAS contra el NVR (dos sesiones ffprobe, main+sub, que
+  // consumen cupo RTSP del equipo) y escribe el resultado en DB ⇒ sólo ADMIN y
+  // SUPERVISOR, igual que restart-stream/test-rtsp/debug-stream. En el web lo usan
+  // NVRDetailPage (ruta ADMIN/SUPERVISOR) y el modal de LiveView, cuyo botón sólo se
+  // muestra a esos roles (y cuyo "Reiniciar stream" ya exigía ADMIN/SUPERVISOR).
+  server.get('/:id/diagnostics', { preHandler: [server.authorize(['ADMIN', 'SUPERVISOR'])] }, async (request, reply) => {
     const { id } = request.params as { id: string }
     const user = request.user
 
@@ -172,6 +197,16 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const nvr = camera.nvr
     const plainPass = decryptPass(nvr.password)
     const nvrDecrypted = { ...nvr, password: plainPass }
+    // Exposición mínima: ni usuario ni IP/host del NVR en NINGUNA forma (tampoco
+    // "enmascarados" como user:***@ip o a.b.x.x), ni la IP de la cámara salvo ADMIN.
+    // Del origen RTSP sólo sale el path del canal; los errores del probe (que traen la
+    // URL con usuario+IP) se redactan antes de responder Y antes de persistirlos en
+    // lastRtspError (igual que stream-validator), que GET /api/cameras devuelve a
+    // todos los roles con canView.
+    // Ojo: la restricción de la IP de la cámara vale sólo para ESTA respuesta;
+    // GET /api/cameras* sigue devolviendo la IP de la cámara y la del NVR a todos los
+    // roles (pendiente de la proyección por rol de la política de permisos).
+    const redact = diagnosticRedactor(camera, plainPass)
 
     const streamPath = getStreamPath(nvr, camera)
     const hlsUrl     = getHlsUrl(streamPath)
@@ -192,7 +227,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         rtspMainOk:     rtsp.main.ok,
         rtspSubOk:      rtsp.sub.ok,
         lastRtspCheckAt: new Date(),
-        lastRtspError:  rtsp.sub.ok ? null : sanitizeRtsp(rtsp.sub.error || rtsp.main.error || null),
+        lastRtspError:  rtsp.sub.ok ? null : redact(rtsp.sub.error || rtsp.main.error || null),
         mainCodec:      rtsp.main.codec || camera.mainCodec,
         subCodec:       rtsp.sub.codec  || camera.subCodec,
         mainResolution: rtsp.main.width ? `${rtsp.main.width}x${rtsp.main.height}` : camera.mainResolution,
@@ -215,18 +250,18 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       camera: {
         channelNumber:    camera.channel,
         name:             camera.name,
-        ipAddress:        camera.ipAddress,
+        ...(user.role === 'ADMIN' ? { ipAddress: camera.ipAddress } : {}),
         protocol:         camera.protocol,
         onlineInNvr:      (camera as any).onlineInNvr ?? camera.online,
         preferredStream:  camera.preferredStream,
       },
       rtsp: {
-        mainUrlMasked:  buildRtspUrlMasked(nvrDecrypted, camera.channel, false),
-        subUrlMasked:   buildRtspUrlMasked(nvrDecrypted, camera.channel, true),
+        mainUrlMasked:  rtspPathLabel(camera.channel, false),
+        subUrlMasked:   rtspPathLabel(camera.channel, true),
         mainOk:         rtsp.main.ok,
         subOk:          rtsp.sub.ok,
-        mainError:      sanitizeRtsp(rtsp.main.error),
-        subError:       sanitizeRtsp(rtsp.sub.error),
+        mainError:      redact(rtsp.main.error),
+        subError:       redact(rtsp.sub.error),
         preferred:      camera.preferredStream || 'sub',
         mainCodec:      rtsp.main.codec,
         subCodec:       rtsp.sub.codec,
@@ -244,7 +279,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         ready:       mediamtxStatus.active,
         readers:     mediamtxStatus.readers,
         sourceType:  mediamtxStatus.sourceType,
-        sourceMasked: mediamtxStatus.sourceMasked,
+        sourceMasked: redact(mediamtxStatus.sourceMasked) ?? undefined,
       },
       frontend: {
         hlsUrl,
@@ -301,14 +336,18 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const camera = await server.prisma.camera.findUnique({ where: { id }, include: { nvr: true } })
     if (!camera) return reply.status(404).send({ message: 'Cámara no encontrada' })
 
-    const nvr = { ...camera.nvr, password: decryptPass(camera.nvr.password) }
+    const plainPass = decryptPass(camera.nvr.password)
+    const nvr = { ...camera.nvr, password: plainPass }
     const rtspUrl = buildRtspUrl(nvr as any, camera.channel, stream === 'sub')
     const result  = await probeRtspStream(rtspUrl)
 
+    // El error de rtsp-probe antepone la URL con IP y repite el comando con
+    // `rtsp://<usuario>:***@<ip>`: sale redactado (ver rtspPathLabel/diagnosticRedactor).
     return reply.send({
       ...result,
+      ...(result.error ? { error: diagnosticRedactor(camera, plainPass)(result.error) } : {}),
       stream,
-      urlMasked: buildRtspUrlMasked(nvr as any, camera.channel, stream === 'sub'),
+      urlMasked: rtspPathLabel(camera.channel, stream === 'sub'),
     })
   })
 
@@ -643,6 +682,10 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const healthStatus = await validateAndUpdateCameraHealth(server.prisma, camera.nvr as any, camera as any)
 
     const updated = await server.prisma.camera.findUnique({ where: { id } })
+    // stream-validator ya persiste el error redactado, pero la fila releída puede
+    // venir de otro escritor (código anterior en un despliegue escalonado) ⇒ se
+    // redacta también al responder, sin tocar la DB.
+    const redact = diagnosticRedactor(camera)
 
     return reply.send({
       cameraId: id,
@@ -651,7 +694,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       subCodec:     (updated as any)?.subCodec ?? null,
       subResolution:(updated as any)?.subResolution ?? null,
       lastRtspCheckAt: (updated as any)?.lastRtspCheckAt ?? null,
-      lastRtspError:   (updated as any)?.lastRtspError ?? null,
+      lastRtspError:   redact((updated as any)?.lastRtspError ?? null),
     })
   })
 
@@ -665,6 +708,7 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
     const nvr = camera.nvr
     const streamPath = getStreamPath(nvr, camera)
     const details = await getStreamDetails(streamPath)
+    const redact = diagnosticRedactor(camera)
 
     return reply.send({
       cameraId:           id,
@@ -685,10 +729,10 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
       mainFps:            (camera as any).mainFps ?? null,
       subFps:             (camera as any).subFps ?? null,
       lastRtspCheckAt:    (camera as any).lastRtspCheckAt ?? null,
-      lastRtspError:      sanitizeRtsp((camera as any).lastRtspError),
+      lastRtspError:      redact((camera as any).lastRtspError),
       consecutiveFailures:(camera as any).consecutiveFailures ?? 0,
-      subUrlMasked:       buildRtspUrlMasked({ ...nvr, password: '***' } as any, camera.channel, true),
-      mainUrlMasked:      buildRtspUrlMasked({ ...nvr, password: '***' } as any, camera.channel, false),
+      subUrlMasked:       rtspPathLabel(camera.channel, true),
+      mainUrlMasked:      rtspPathLabel(camera.channel, false),
       mediaServer: {
         streamPath,
         hlsUrl:       getHlsUrl(streamPath),
@@ -698,12 +742,12 @@ export const cameraRoutes: FastifyPluginAsync = async (server) => {
         readers:      details.readers,
         bytesReceived: details.bytesReceived,
         sourceType:   details.sourceType ?? null,
-        sourceMasked: details.sourceMasked ?? null,
+        sourceMasked: redact(details.sourceMasked),
       },
+      // Sin ipAddress del NVR (antes iba en claro): ver rtspPathLabel/diagnosticRedactor.
       nvr: {
         id:         nvr.id,
         name:       nvr.name,
-        ipAddress:  nvr.ipAddress,
         online:     nvr.online,
         lastSeen:   nvr.lastSeen,
       },

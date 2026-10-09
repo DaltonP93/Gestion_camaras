@@ -291,17 +291,32 @@ describe.skipIf(!jointInfraAvailable())('conjunta · MFA: tokens intermedios, 2F
     expect((await b.post('/api/auth/refresh', {})).status).toBe(401)
   })
 
-  it('compatibilidad de despliegue: un access con la forma previa a #190 {sub, username, role} sigue válido; con jti, step o rol desconocido ⇒ 401', async () => {
+  it('compatibilidad de despliegue (#190 + #197): {sub, username, role} sin sid ⇒ 401 y el navegador se recupera con /auth/refresh; con sid vivo vale; con jti, step, rol desconocido o vencido ⇒ 401', async () => {
+    // Antes de #197 la forma previa a #190 seguía valiendo como access. Con el actor
+    // vigente (#197) un access sin `sid` da 401 en las rutas (el puente del ws-ticket
+    // con cookie de refresh lo cubre revocation-effective.joint.test.ts) y el web se
+    // recupera solo por /auth/refresh, sin cerrar la sesión.
+    const b = env.browser('legacy')
+    await b.signIn('admin_mfa')
+    const sid = decodeJwt(b.accessToken!).sid
+    expect(typeof sid).toBe('string')
     const now = Math.floor(Date.now() / 1000)
     const base = { sub: users.admin.id, username: 'admin_mfa', role: 'ADMIN', iat: now, exp: now + 300 }
-    const call = (claims: Record<string, unknown>) => env.browser('legacy').get('/api/auth/me', {
+    const call = (claims: Record<string, unknown>) => env.browser('legacy-bearer').get('/api/auth/me', {
       headers: { authorization: `Bearer ${signHs256(claims, env.jwtSecret)}` },
     })
-    expect((await call(base)).status).toBe(200)
-    expect((await call({ ...base, jti: 'x' })).status).toBe(401)
-    expect((await call({ ...base, step: '2fa' })).status).toBe(401)
-    expect((await call({ ...base, role: 'ROOT' })).status).toBe(401)
-    expect((await call({ ...base, exp: now - 1 })).status).toBe(401)
+    expect((await call(base)).status).toBe(401)
+    expect((await call({ ...base, sid })).status).toBe(200)
+    expect((await call({ ...base, sid, jti: 'x' })).status).toBe(401)
+    expect((await call({ ...base, sid, step: '2fa' })).status).toBe(401)
+    expect((await call({ ...base, sid, role: 'ROOT' })).status).toBe(401)
+    expect((await call({ ...base, sid, exp: now - 1 })).status).toBe(401)
+    expect((await call({ ...base, sid: 'sesion-que-no-existe' })).status).toBe(401)
+    // Recuperación del navegador: refresh por cookie ⇒ access nuevo con la MISMA sesión.
+    const r = await b.post('/api/auth/refresh', {})
+    expect(r.status).toBe(200)
+    expect(decodeJwt(b.accessToken!)).toMatchObject({ sub: users.admin.id, sid })
+    expect((await b.get('/api/auth/me')).status).toBe(200)
   })
 
   it('higiene: sin red saliente, jobs simulados, re-registro diferido capturado y sin contacto con el NVR', () => {

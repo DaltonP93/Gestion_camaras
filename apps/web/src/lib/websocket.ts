@@ -1,5 +1,6 @@
 // src/lib/websocket.ts
 import { useAlertStore } from '@/stores/alertStore'
+import { refreshAccessToken } from '@/lib/api'
 
 let ws: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -21,10 +22,21 @@ export async function connectWebSocket() {
   connecting = true
   let ticket: string
   try {
-    const res = await fetch(`${window.location.origin}/api/auth/ws-ticket`, {
+    const requestTicket = () => fetch(`${window.location.origin}/api/auth/ws-ticket`, {
       method: 'POST',
       credentials: 'include',
     })
+    let res = await requestTicket()
+    // 401 con la cookie de acceso vencida, o emitida antes de que el access quedara
+    // ligado a su sesión (despliegue): renovarla UNA vez por cookie —el mismo mutex
+    // que usa el interceptor de axios— y reintentar. Si el refresh falla, no hay
+    // sesión: no se reconecta (el próximo login/refresh lo hará).
+    if (res.status === 401) {
+      try {
+        await refreshAccessToken()
+        res = await requestTicket()
+      } catch { /* sin sesión renovable */ }
+    }
     // 401 = sesión inválida/expirada: no reconectar en bucle (se reconectará tras
     // el próximo login/refresh). Otro error: reintentar con backoff.
     if (!res.ok) {

@@ -28,6 +28,7 @@ import {
   jointInfraAvailable, startJointServer, totpNow, waitFor, JOINT_PASSWORD,
   type JointEnv, type SimBrowser,
 } from './harness'
+import { auditRowsEventually } from './joint-helpers'
 
 const NVR_IP = '192.0.2.50'
 const T0 = '2026-10-01T10:00:00.000Z'
@@ -120,11 +121,16 @@ describe.skipIf(!jointInfraAvailable())('conjunta · reproducción de grabacione
     expect((await b.audAB.get(pollUrl)).status).toBe(403)
     expect((await b.admin.get(pollUrl)).status).toBe(200)
 
-    const audit = await env.prisma.auditLog.findMany({ where: { userId: ids.aud }, select: { action: true, resource: true } })
-    expect(audit).toEqual(expect.arrayContaining([
+    // POST /playback registra VIEW_RECORDING SIN await (recordings.ts, fire-and-forget):
+    // leer la tabla en el acto es una carrera con el INSERT. Bajo carga (o con 400 ms
+    // de latencia inyectada en auditLog.create) la lectura inmediata veía sólo LOGIN
+    // y SEARCH_RECORDINGS. Se exige la MISMA fila, esperándola con tope (sin sleeps).
+    const expectedAudit = [
       { action: 'SEARCH_RECORDINGS', resource: camA },
       { action: 'VIEW_RECORDING', resource: camA },
-    ]))
+    ]
+    const audit = await auditRowsEventually(env, ids.aud, expectedAudit)
+    expect(audit).toEqual(expect.arrayContaining(expectedAudit))
     expect((await b.aud.del(`/api/recordings/playback/${sessionId}`)).status).toBe(200)
   })
 

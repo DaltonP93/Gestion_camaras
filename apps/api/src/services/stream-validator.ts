@@ -3,6 +3,7 @@ import type { PrismaClient } from '@prisma/client'
 import type { NVR, Camera } from '@prisma/client'
 import { probeBothStreams } from './rtsp-probe'
 import { decryptNvrPassword as decryptPass } from './credentials'
+import { redactDiagnosticText } from '../lib/log-redact'
 
 // Posibles valores de streamHealthStatus
 export type StreamHealthStatus =
@@ -110,6 +111,12 @@ export async function validateAndUpdateCameraHealth(
     healthStatus = 'UNKNOWN'
   }
 
+  // lastRtspError lo devuelven GET /api/cameras, /batch y /:id a todos los roles con
+  // canView, y healthWorker lo copia al detalle de las alertas. El error de rtsp-probe
+  // trae la URL del NVR con IP (`rtsp:***@<ip>`) y usuario (`rtsp://<usuario>:***@<ip>`)
+  // ⇒ se redacta al persistir. La clasificación de arriba usa el texto original.
+  const storedRtspError = redactDiagnosticText(lastRtspError, [nvr.ipAddress, nvr.username, plainPassword, camera.ipAddress])
+
   // Camera is reachable if any RTSP stream responded — regardless of codec/browser-compatibility
   const rtspReachable = rtspSubOk || rtspMainOk
   const hardOffline = healthStatus === 'OFFLINE' || healthStatus === 'AUTH_FAILED'
@@ -126,7 +133,7 @@ export async function validateAndUpdateCameraHealth(
       ...(subResolution ? { subResolution } : {}),
       ...(mainResolution ? { mainResolution } : {}),
       lastRtspCheckAt: new Date(),
-      lastRtspError,
+      lastRtspError: storedRtspError,
       preferredStream,
       // online is RTSP-truth: true when any stream responds, false only when confirmed unreachable
       ...(rtspReachable ? { online: true } : hardOffline ? { online: false } : {}),
