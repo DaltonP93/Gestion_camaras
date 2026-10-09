@@ -49,6 +49,7 @@ import { startWsRevokeSubscriber } from './services/ws-revoke-bus'
 import { metricsRoutes } from './routes/metrics'
 import { startHealthWorker } from './jobs/healthWorker'
 import { startSyncWorker } from './jobs/syncWorker'
+import { resolveIsolationConfig, describeIsolation, isolationWarnings } from './services/staging-isolation'
 import { publishStream, getActiveTranscodesList, stopTranscodeProcess } from './services/stream'
 import { reRegisterStreams } from './services/stream-reregister'
 import { decryptNvrPasswordOrNull as decryptPass, validateNvrCredentialKey } from './services/credentials'
@@ -98,6 +99,10 @@ async function main() {
   if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) {
     server.log.warn('[startup] JWT_SECRET parece muy corto (< 32 chars). Usa un secreto de al menos 32 caracteres aleatorios.')
   }
+  // Aislamiento de staging (services/staging-isolation.ts). Se resuelve ANTES de
+  // conectar a PostgreSQL/Redis o registrar nada: una variable presente pero
+  // vacía o inválida lanza y main().catch aborta el arranque (exit 1).
+  const isolation = resolveIsolationConfig()
 
   // ─── Ticket de llegada — PRIMER hook onRequest de todos ────
   //
@@ -351,8 +356,12 @@ async function main() {
   })
 
   // ─── Jobs en background ───────────────────────────────────
-  startHealthWorker(server)
-  startSyncWorker(server)
+  // `isolation` se resolvió al principio de main(): sin variables, todo queda ON
+  // como siempre.
+  server.log.info(describeIsolation(isolation))
+  for (const w of isolationWarnings()) server.log.warn(w)
+  startHealthWorker(server, isolation)
+  startSyncWorker(server, isolation)
 
   // C23·H2·P1 — FAIL-CLOSED de arranque: exige el outbox durable de revocación
   // (delegate Prisma `mediaRevokeOutbox` + `$transaction`). Si falta, ABORTA el
@@ -437,8 +446,9 @@ async function main() {
   logPreviewStartupConfig((m) => server.log.info(m), COMMIT_SHA)
 
   // Re-registrar todos los streams en MediaMTX al arrancar
-  // MediaMTX pierde los paths dinámicos al reiniciarse; este bloque los restaura
-  setTimeout(async () => {
+  // MediaMTX pierde los paths dinámicos al reiniciarse; este bloque los restaura.
+  // Apagado con STREAM_AUTO_REGISTER_ENABLED=false o STAGING_ISOLATION=true.
+  if (isolation.streamAutoRegister) setTimeout(async () => {
     try {
       const nvrs = await server.prisma.nVR.findMany({
         where: { active: true },

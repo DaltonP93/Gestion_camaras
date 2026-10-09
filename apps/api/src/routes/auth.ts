@@ -1,5 +1,6 @@
 // apps/api/src/routes/auth.ts
 import type { FastifyPluginAsync } from 'fastify'
+import { outboundNotificationsAllowed } from '../services/staging-isolation'
 import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
 import { z } from 'zod'
@@ -775,7 +776,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     // Get SMTP config from DB
     const alertSettings = await server.prisma.alertSettings.findUnique({ where: { id: 'singleton' } })
 
-    if (alertSettings?.emailEnabled && alertSettings.smtpHost) {
+    // Aislamiento de staging: el token se genera igual (flujo idéntico, respuesta
+    // genérica sin enumeración de usuarios), pero no se contacta SMTP.
+    if (!outboundNotificationsAllowed()) {
+      server.log.info('[forgot-password] email_skipped reason=outbound_disabled')
+    } else if (alertSettings?.emailEnabled && alertSettings.smtpHost) {
       const appUrl = process.env.APP_URL || 'http://localhost:4000'
       const resetLink = `${appUrl}/reset-password?token=${rawToken}`
 

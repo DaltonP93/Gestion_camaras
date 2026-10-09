@@ -1,6 +1,7 @@
 // Email provider — reutiliza configuración SMTP de AlertSettings
 import nodemailer from 'nodemailer'
 import type { PrismaClient } from '@prisma/client'
+import { outboundNotificationsAllowed, OUTBOUND_DISABLED_CODE, OUTBOUND_DISABLED_MESSAGE } from '../staging-isolation'
 
 export interface EmailPayload {
   subject: string
@@ -52,6 +53,9 @@ function isTlsMismatchError(err: any): boolean {
 }
 
 export async function sendAlertEmail(prisma: PrismaClient, payload: EmailPayload): Promise<EmailResult> {
+  if (!outboundNotificationsAllowed()) {
+    return { success: false, recipient: payload.to ?? '', error: OUTBOUND_DISABLED_MESSAGE, errorCode: OUTBOUND_DISABLED_CODE }
+  }
   const settings = await prisma.alertSettings.findUnique({ where: { id: 'singleton' } })
 
   if (!settings) return { success: false, recipient: '', error: 'Configuración SMTP no encontrada' }

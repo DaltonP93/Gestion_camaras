@@ -1,5 +1,6 @@
 // apps/api/src/jobs/healthWorker.ts
 // Verifica el estado de todos los NVRs y cámaras cada 60 segundos
+import { resolveIsolationConfig, type IsolationConfig } from '../services/staging-isolation'
 import cron from 'node-cron'
 import type { FastifyInstance } from 'fastify'
 import { getNVRStatus, getNvrChannelHealth } from '../services/hikvision'
@@ -83,14 +84,15 @@ function logDecryptError(server: FastifyInstance, nvrId: string, nvrName: string
   }
 }
 
-export function startHealthWorker(server: FastifyInstance) {
+export function startHealthWorker(server: FastifyInstance, isolation: IsolationConfig = resolveIsolationConfig()) {
   // Guard de reentrancia: un ciclo puede superar los 60s (ISAPI lentos + sondas
   // HLS). Si el anterior sigue corriendo, saltar este tick — solapar ciclos
   // duplicaría observaciones del debounce y sondas contra los mismos NVRs.
   let healthCycleRunning = false
 
-  // Verificar estado de NVRs cada 60 segundos
-  cron.schedule('*/60 * * * * *', async () => {
+  // Verificar estado de NVRs cada 60 segundos. Contacta NVRs y genera alertas:
+  // apagado con NVR_POLLING_ENABLED=false o STAGING_ISOLATION=true.
+  if (isolation.nvrPolling) cron.schedule('*/60 * * * * *', async () => {
     if (healthCycleRunning) {
       server.log.warn('[camera-health] health_cycle_skipped reason=previous_cycle_still_running')
       return
@@ -534,7 +536,9 @@ export function startHealthWorker(server: FastifyInstance) {
   // Re-registrar paths en MediaMTX cada 5 minutos (recupera reinicios de mediamtx)
   // Solo registra paths que faltan en MediaMTX — evita spam "path already exists" /
   // "reloading configuration" cuando los paths ya existen con la config correcta.
-  cron.schedule('*/5 * * * *', async () => {
+  // Le entrega a MediaMTX las URLs RTSP de los NVR: apagado con
+  // STREAM_AUTO_REGISTER_ENABLED=false o STAGING_ISOLATION=true.
+  if (isolation.streamAutoRegister) cron.schedule('*/5 * * * *', async () => {
     try {
       // Obtener qué paths tiene MediaMTX configurados actualmente.
       // Si la API no responde (null), saltar este ciclo sin hacer nada.

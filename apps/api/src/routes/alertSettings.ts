@@ -2,6 +2,7 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import nodemailer from 'nodemailer'
+import { outboundNotificationsAllowed, OUTBOUND_DISABLED_CODE, OUTBOUND_DISABLED_MESSAGE } from '../services/staging-isolation'
 
 const settingsSchema = z.object({
   emailEnabled: z.boolean().optional(),
@@ -99,6 +100,9 @@ const alertSettingsRoutes: FastifyPluginAsync = async (server) => {
   server.post('/settings/test-email', {
     preHandler: [server.authorize(['ADMIN'])],
   }, async (request, reply) => {
+    if (!outboundNotificationsAllowed()) {
+      return reply.status(409).send({ message: OUTBOUND_DISABLED_MESSAGE, code: OUTBOUND_DISABLED_CODE })
+    }
     const settings = await server.prisma.alertSettings.findUnique({ where: { id: 'singleton' } })
     if (!settings || !settings.smtpHost || !settings.smtpFromEmail) {
       return reply.status(400).send({ message: 'Configura el servidor SMTP primero' })
