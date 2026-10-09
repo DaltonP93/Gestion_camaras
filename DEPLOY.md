@@ -111,6 +111,29 @@ docker compose logs -f api --tail 50      # logs del backend
 
 Servicios esperados activos: `postgres`, `redis`, `mediamtx`, `api`, `web`, `nginx`, `certbot`.
 
+**IP del cliente detrás de nginx (`TRUSTED_PROXIES`, ver `.env.example`).** Al arrancar,
+el API registra `[startup] trust-proxy: sólo el salto inmediato; origen=…`. Si aparece
+`[trust-proxy] llegó X-Forwarded-For desde un par de red interna que NO está en
+TRUSTED_PROXIES`, nginx quedó en una subred no cubierta: los cupos de rate-limit
+vuelven a ser compartidos (comportamiento previo, el HLS no se afecta) hasta agregar la
+subred de `visioncore_net`. Comprobación de solo lectura: tras un login, la columna
+`ipAddress` de la sesión debe mostrar la IP del cliente y no la de nginx.
+
+Con los cupos por cliente, el 2.º factor ya no depende del cupo de una IP: `/2fa/verify`,
+`/step-up` (TOTP o contraseña), `/2fa/disable` y `/2fa/backup-codes/regenerate` comparten
+un contador de fallos **por usuario** en Redis (`auth:2fa-fail:<userId>`). Al llegar a
+`lockoutMaxAttempts` fallos la cuenta queda bloqueada `lockoutDurationMinutes` (los
+mismos ajustes y el mismo `lockedUntil` que el login): el login y el código correcto
+reciben `403 ACCOUNT_LOCKED` hasta que vence o hasta `POST /api/users/:id/unlock`, que
+también borra el contador. Si Redis no responde, esas cuatro rutas responden 500 sin
+verificar el código (fail-closed); el login de usuarios sin MFA no depende de Redis.
+El contador limita la adivinación, no la reutilización: sigue abierto MFA-04 (el
+tempToken y un código TOTP ya aceptado se pueden reusar mientras sigan vigentes).
+
+Los logs de request del API registran el `Host` y el par TCP (detrás de nginx, la IP
+de nginx), igual que antes: ni la IP del cliente ni `X-Forwarded-Host`. La IP del
+cliente queda en `Session.ipAddress` y en la auditoría (`AUDIT_RETENTION_DAYS`).
+
 ---
 
 ## 6. Rollback

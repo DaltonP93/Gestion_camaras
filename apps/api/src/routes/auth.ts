@@ -1,5 +1,5 @@
 // apps/api/src/routes/auth.ts
-import type { FastifyPluginAsync } from 'fastify'
+import type { FastifyPluginAsync, FastifyReply } from 'fastify'
 import { outboundNotificationsAllowed } from '../services/staging-isolation'
 import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
@@ -17,6 +17,7 @@ import { sessionsToPrune, accessTokenTtl, decideMfaGate } from '../services/secu
 import { issueWsTicket, WS_TICKET_TTL_MS } from '../services/ws-ticket'
 import { setAuthCookies, clearAuthCookies, REFRESH_COOKIE } from '../lib/auth-cookies'
 import { revokeUserWs } from '../services/ws-revoke-bus'
+import { beginSecondFactorAttempt } from '../services/second-factor-lockout'
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
 const TWO_FA_TOKEN_TTL_MS  = 5 * 60 * 1000             // 5 minutos
@@ -77,6 +78,26 @@ const userMeSelect = {
 }
 
 export const authRoutes: FastifyPluginAsync = async (server) => {
+
+  // C03 — Bloqueo por USUARIO del 2.º factor y de la re-autenticación (ver
+  // services/second-factor-lockout). Con los cupos de rate-limit por cliente, el
+  // tope ya no puede depender de cuántas IPs tenga el atacante. Mismos ajustes
+  // (lockoutMaxAttempts / lockoutDurationMinutes) y campo (lockedUntil) que el login.
+  const beginSecondFactor = async (user: { id: string; lockedUntil: Date | null }) =>
+    beginSecondFactorAttempt({
+      redis: server.redis,
+      lockAccount: (userId, until) => server.prisma.user.update({ where: { id: userId }, data: { lockedUntil: until } }),
+      onClearError: (err) => server.log.warn(`[auth] no se pudo reiniciar el contador del 2.º factor: ${(err as Error)?.message ?? 'error'}`),
+    }, user, await getSecuritySettings(server.prisma))
+
+  const sendAccountLocked = (reply: FastifyReply, minutes: number, lockedNow: boolean) => reply.status(403).send({
+    statusCode: 403,
+    error: 'Forbidden',
+    message: lockedNow
+      ? `Demasiados intentos. Cuenta bloqueada por ${minutes} minutos.`
+      : `Cuenta bloqueada. Intenta en ${minutes} minutos.`,
+    code: 'ACCOUNT_LOCKED',
+  })
 
   // ──────────────────────────────────────────────────────────
   // POST /api/auth/login
@@ -232,6 +253,14 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(401).send({ message: 'No autorizado' })
     }
 
+    // C03: cuenta bloqueada o intentos agotados ⇒ ACCOUNT_LOCKED sin verificar el
+    // código (ni siquiera el correcto); si no, el intento queda reservado.
+    const attempt = await beginSecondFactor(user)
+    if (!attempt.ok) {
+      await AuditAction(server.prisma, user.id, 'AUTH_2FA_FAILED', user.id, request, { reason: 'account_locked' })
+      return sendAccountLocked(reply, attempt.minutesLeft, false)
+    }
+
     // Check TOTP code
     const totpValid = verifyTotpToken(user.twoFactorSecret, code)
 
@@ -250,15 +279,21 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
             await AuditAction(server.prisma, user.id, 'LOGIN_BACKUP_CODE_USED', user.id, request, {
               codesRemaining: hashes.length,
             })
+            await attempt.succeed()
             return completeLogin(server, request, reply, user)
           }
         } catch {}
       }
 
-      await AuditAction(server.prisma, user.id, 'AUTH_2FA_FAILED', user.id, request)
+      const failed = await attempt.fail()
+      await AuditAction(server.prisma, user.id, 'AUTH_2FA_FAILED', user.id, request, {
+        attempt: attempt.attempt, ...(failed.locked ? { locked: true } : {}),
+      })
+      if (failed.locked) return sendAccountLocked(reply, failed.minutes, true)
       return reply.status(401).send({ message: 'Código 2FA incorrecto' })
     }
 
+    await attempt.succeed()
     return completeLogin(server, request, reply, user)
   })
 
@@ -409,20 +444,31 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     const user = await server.prisma.user.findUnique({ where: { id: request.user.sub } })
     if (!user || !user.active) return reply.status(401).send({ message: 'No autorizado' })
 
-    let verified = false
-    if (user.twoFactorEnabled && user.twoFactorSecret) {
-      if (!code) return reply.status(400).send({ message: 'Ingresa el código de tu app autenticadora', code: 'CODE_REQUIRED' })
-      // Sólo TOTP para step-up (los códigos de recuperación se reservan para el login).
-      verified = verifyTotpToken(user.twoFactorSecret, code)
-    } else {
-      if (!password) return reply.status(400).send({ message: 'Ingresa tu contraseña', code: 'PASSWORD_REQUIRED' })
-      verified = await bcrypt.compare(password, user.passwordHash)
+    const totpSecret = user.twoFactorEnabled ? user.twoFactorSecret : null
+    if (totpSecret && !code) return reply.status(400).send({ message: 'Ingresa el código de tu app autenticadora', code: 'CODE_REQUIRED' })
+    if (!totpSecret && !password) return reply.status(400).send({ message: 'Ingresa tu contraseña', code: 'PASSWORD_REQUIRED' })
+
+    // C03: mismo contador por usuario que /2fa/verify (TOTP o contraseña).
+    const attempt = await beginSecondFactor(user)
+    if (!attempt.ok) {
+      await AuditAction(server.prisma, user.id, 'STEP_UP_FAILED', user.id, request, { reason: 'account_locked' })
+      return sendAccountLocked(reply, attempt.minutesLeft, false)
     }
 
+    // Sólo TOTP para step-up (los códigos de recuperación se reservan para el login).
+    const verified = totpSecret
+      ? verifyTotpToken(totpSecret, code!)
+      : await bcrypt.compare(password!, user.passwordHash)
+
     if (!verified) {
-      await AuditAction(server.prisma, user.id, 'STEP_UP_FAILED', user.id, request)
+      const failed = await attempt.fail()
+      await AuditAction(server.prisma, user.id, 'STEP_UP_FAILED', user.id, request, {
+        attempt: attempt.attempt, ...(failed.locked ? { locked: true } : {}),
+      })
+      if (failed.locked) return sendAccountLocked(reply, failed.minutes, true)
       return reply.status(401).send({ message: 'Verificación incorrecta' })
     }
+    await attempt.succeed()
 
     const stepUpToken = (server.jwt as any).sign({ sub: user.id, step: 'elevated' }, { expiresIn: '5m' })
     await AuditAction(server.prisma, user.id, 'STEP_UP_GRANTED', user.id, request)
@@ -456,12 +502,18 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       })
     }
 
-    const passwordValid = await bcrypt.compare(password, user.passwordHash)
-    if (!passwordValid) return reply.status(400).send({ message: 'Contraseña incorrecta' })
+    // C03: contraseña y TOTP de una sesión ya abierta ⇒ mismo contador por usuario.
+    const attempt = await beginSecondFactor(user)
+    if (!attempt.ok) return sendAccountLocked(reply, attempt.minutesLeft, false)
 
-    if (!verifyTotpToken(user.twoFactorSecret!, code)) {
-      return reply.status(400).send({ message: 'Código 2FA incorrecto' })
+    const passwordValid = await bcrypt.compare(password, user.passwordHash)
+    const codeValid = passwordValid && verifyTotpToken(user.twoFactorSecret!, code)
+    if (!codeValid) {
+      const failed = await attempt.fail()
+      if (failed.locked) return sendAccountLocked(reply, failed.minutes, true)
+      return reply.status(400).send({ message: passwordValid ? 'Código 2FA incorrecto' : 'Contraseña incorrecta' })
     }
+    await attempt.succeed()
 
     await server.prisma.user.update({
       where: { id: user.id },
@@ -485,9 +537,15 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(400).send({ message: '2FA no está habilitado' })
     }
 
+    // C03: mismo contador por usuario que /2fa/verify y /step-up.
+    const attempt = await beginSecondFactor(user)
+    if (!attempt.ok) return sendAccountLocked(reply, attempt.minutesLeft, false)
     if (!verifyTotpToken(user.twoFactorSecret, code)) {
+      const failed = await attempt.fail()
+      if (failed.locked) return sendAccountLocked(reply, failed.minutes, true)
       return reply.status(400).send({ message: 'Código 2FA incorrecto' })
     }
+    await attempt.succeed()
 
     const plainCodes = generateBackupCodes()
     const hashedCodes = await hashBackupCodes(plainCodes)

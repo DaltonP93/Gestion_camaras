@@ -23,6 +23,7 @@ import { z } from 'zod'
 import { getMediaGrantManager } from '../services/media/grant-service'
 import { timingSafeEqualHex, sha256Hex } from '../services/media/media-grants'
 import type { GrantScopeQuery } from '../services/media/contracts'
+import { isInternalPeer } from '../lib/internal-origin'
 
 const NATIVE_MEDIA_RELAY_ENABLED = process.env.NATIVE_MEDIA_RELAY_ENABLED === 'true'
 const MEDIA_RELAY_SECRET = process.env.MEDIA_RELAY_SECRET || ''
@@ -43,17 +44,6 @@ const mtxSchema = z.object({
   // Campo alternativo para el secreto del LLAMADOR (además del header).
   relaySecret: z.string().max(1024).optional(),
 }).passthrough()
-
-/** ¿El origen es loopback/red interna? (defensa A-T4: sólo MediaMTX debería llegar.) */
-function isInternalIp(ip: string | undefined): boolean {
-  if (!ip) return false
-  const a = ip.replace(/^::ffff:/, '')
-  if (a === '127.0.0.1' || a === '::1' || a === 'localhost') return true
-  if (a.startsWith('10.') || a.startsWith('192.168.')) return true
-  const m = /^172\.(\d+)\./.exec(a)
-  if (m) { const o = Number(m[1]); if (o >= 16 && o <= 31) return true }
-  return false
-}
 
 /** streamPath del `path` de MediaMTX: sin barras iniciales ni query. */
 function resolveStreamPath(path: string | undefined): string {
@@ -78,8 +68,9 @@ export const mediamtxAuthRoutes: FastifyPluginAsync = async (server) => {
     if (!NATIVE_MEDIA_RELAY_ENABLED) return reply.status(404).send({ code: 'NATIVE_MEDIA_RELAY_DISABLED' })
     if (!MEDIA_RELAY_SECRET) return reply.status(503).send({ code: 'MEDIA_RELAY_SECRET_UNSET' })
 
-    // 2) Origen interno/loopback (sólo MediaMTX debería alcanzar el hook).
-    if (!isInternalIp(request.ip)) return reply.status(403).send({ code: 'ORIGIN_NOT_ALLOWED' })
+    // 2) Origen interno/loopback (defensa A-T4: sólo MediaMTX debería alcanzar el
+    //    hook). C03: por el PAR TCP, nunca por request.ip/X-Forwarded-For.
+    if (!isInternalPeer(request)) return reply.status(403).send({ code: 'ORIGIN_NOT_ALLOWED' })
 
     let body: z.infer<typeof mtxSchema>
     try { body = mtxSchema.parse(request.body) } catch { return reply.status(400).send({ code: 'BAD_REQUEST' }) }

@@ -1,8 +1,9 @@
 // Pruebas de RUTA vía fastify.inject (C22.2): controlador real + FakeRedis
 // (semántica atómica) + readiness/RBAC unificados. Env fijado antes del import.
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify'
 import { FakeRedis } from '../services/media/redis-fake'
+import { resolveTrustedProxies } from '../lib/trusted-proxy'
 
 let mediaGrantsRoutes: any
 let getMgr: any
@@ -12,8 +13,8 @@ const CAM_HEVC = { id: 'cam-1', channel: 9, mainCodec: 'HEVC', subCodec: 'H264',
 const CAM_H264 = { id: 'cam-2', channel: 3, mainCodec: 'H264', subCodec: 'H264', nvr: { id: 'nvr1' } }
 const path = (cam: any, type: 'sub' | 'main') => `nvr_${cam.nvr.id}_ch${String(cam.channel).padStart(2, '0')}_${type}`
 
-async function buildApp(opts: { user: any; camera?: any; perm?: any; redis: FakeRedis }): Promise<FastifyInstance> {
-  const app = Fastify()
+async function buildApp(opts: { user: any; camera?: any; perm?: any; redis: FakeRedis; trustProxy?: FastifyServerOptions['trustProxy'] }): Promise<FastifyInstance> {
+  const app = Fastify({ trustProxy: opts.trustProxy })
   app.decorate('authenticate', async (req: any) => { req.user = opts.user })
   app.decorate('prisma', {
     camera: { findUnique: async () => opts.camera ?? null },
@@ -167,6 +168,63 @@ describe('N2d · sesión única por usuario (inject)', () => {
     // g2 (sesión nueva) sigue válido — el epoch por usuario NO se tocó.
     const v2 = await app.inject({ method: 'POST', url: '/api/live-view/internal/media-grant/validate', headers: relayHdr, payload: { grantId: g2.grantId, secret: g2.secret, streamPath: g2.streamPath, transport: 'rtsps' } })
     expect(v2.statusCode).toBe(200); expect(v2.json().ok).toBe(true)
+    await app.close()
+  })
+})
+
+// C03/CHW-08 — validate es interno: además del secreto del relay exige origen interno
+// por el PAR TCP (no request.ip ni cabeceras) y que la petición NO venga reenviada por
+// un proxy (detrás de nginx el par es siempre interno: la location /api/ la reenvía
+// con X-Forwarded-For/X-Real-IP). Ni un par externo ni un cliente vía nginx consumen el grant.
+describe('validate — origen interno por el par TCP y sin reenvío de proxy (C03/CHW-08)', () => {
+  const relayHdr = { 'x-media-relay-secret': 'relaysecret' }
+  const trust = resolveTrustedProxies(undefined).trustProxy
+
+  it('par externo (aun con X-Forwarded-For: 127.0.0.1 y trustProxy=true) o reenvío de nginx ⇒ 403 ORIGIN_NOT_ALLOWED sin consumir; relay interno directo ⇒ 200', async () => {
+    for (const tp of [trust, true] as const) {
+      const redis = new FakeRedis()
+      const app = await buildApp({ user: { sub: 'userA', role: 'ADMIN' }, camera: CAM_HEVC, redis, trustProxy: tp })
+      await getMgr(app).registerSource(path(CAM_HEVC, 'main'))
+      const g = (await app.inject({ method: 'POST', url: '/api/live-view/media-grant', payload: { viewId: 'v1', cameraId: 'cam-1', transport: 'rtsps', device: 'win' } })).json()
+      const payload = { grantId: g.grantId, secret: g.secret, streamPath: g.streamPath, transport: 'rtsps', cameraId: 'cam-1' }
+
+      const ext = await app.inject({
+        method: 'POST', url: '/api/live-view/internal/media-grant/validate', remoteAddress: '203.0.113.9',
+        headers: { ...relayHdr, 'x-forwarded-for': '127.0.0.1', 'x-real-ip': '127.0.0.1' }, payload,
+      })
+      expect(ext.statusCode, String(tp === true)).toBe(403)
+      expect(ext.json().code).toBe('ORIGIN_NOT_ALLOWED')
+
+      // Vía nginx: par interno (nginx) con las cabeceras que pone la location /api/.
+      const viaNginx = await app.inject({
+        method: 'POST', url: '/api/live-view/internal/media-grant/validate', remoteAddress: '172.18.0.5',
+        headers: { ...relayHdr, 'x-forwarded-for': '203.0.113.9', 'x-real-ip': '203.0.113.9' }, payload,
+      })
+      expect(viaNginx.statusCode, String(tp === true)).toBe(403)
+      expect(viaNginx.json().code).toBe('ORIGIN_NOT_ALLOWED')
+      for (const h of ['x-forwarded-for', 'x-real-ip'] as const) {
+        const r = await app.inject({
+          method: 'POST', url: '/api/live-view/internal/media-grant/validate', remoteAddress: '172.18.0.5',
+          headers: { ...relayHdr, [h]: '203.0.113.9' }, payload,
+        })
+        expect(r.statusCode, `${h} sola`).toBe(403)
+      }
+
+      // El mismo grant sigue sin usar: el relay interno (directo, sin cabeceras de
+      // proxy) lo valida.
+      const int = await app.inject({
+        method: 'POST', url: '/api/live-view/internal/media-grant/validate', remoteAddress: '172.18.0.7',
+        headers: { ...relayHdr }, payload,
+      })
+      expect(int.statusCode, String(tp === true)).toBe(200)
+      await app.close()
+    }
+  })
+
+  it('par externo sin secreto ⇒ 403 por origen (no llega a probar el secreto)', async () => {
+    const app = await buildApp({ user: { sub: 'x', role: 'ADMIN' }, camera: CAM_HEVC, redis: new FakeRedis() })
+    const res = await app.inject({ method: 'POST', url: '/api/live-view/internal/media-grant/validate', remoteAddress: '198.51.100.240', headers: { 'x-media-relay-secret': 'wrong' }, payload: { grantId: 'g', secret: 's', streamPath: 'p', transport: 'rtsps' } })
+    expect(res.statusCode).toBe(403); expect(res.json().code).toBe('ORIGIN_NOT_ALLOWED')
     await app.close()
   })
 })

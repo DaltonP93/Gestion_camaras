@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 import { revokeUserMediaGrantsAtomic } from '../services/media/grant-service'
 import { revokeUserWs } from '../services/ws-revoke-bus'
+import { clearSecondFactorFailures } from '../services/second-factor-lockout'
 import { checkPasswordPolicy, addToPasswordHistory, resolveFeaturePermissions } from '../services/totp'
 import { getSecuritySettings } from '../services/security-settings'
 
@@ -540,6 +541,8 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
       where: { id },
       data: { failedLoginAttempts: 0, lockedUntil: null },
     })
+    // C03: también el contador del 2.º factor (si no, el próximo intento seguiría agotado).
+    await clearSecondFactorFailures(server.redis, id)
 
     await AuditAction(server.prisma, request.user.sub, 'USER_UNLOCKED', id, request)
     return reply.send({ message: 'Cuenta desbloqueada' })
