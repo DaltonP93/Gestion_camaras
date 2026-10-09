@@ -2,6 +2,7 @@
 import fp from 'fastify-plugin'
 import fastifyJwt from '@fastify/jwt'
 import fastifyCookie from '@fastify/cookie'
+import { assertJwtSecretAceptable } from '../lib/jwt-secret-policy'
 import { redactUrlSecrets } from '../lib/log-redact'
 import { ACCESS_COOKIE } from '../lib/auth-cookies'
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
@@ -69,13 +70,11 @@ export function isAccessTokenClaims(claims: unknown): boolean {
 }
 
 const authPlugin: FastifyPluginAsync = fp(async (server) => {
-  const jwtSecret = process.env.JWT_SECRET
-  if (!jwtSecret || jwtSecret.length < 32) {
-    throw new Error(
-      'JWT_SECRET no está definido o tiene menos de 32 caracteres. ' +
-      'Generá uno seguro: openssl rand -hex 64'
-    )
-  }
+  // Presencia, largo ≥ 32, valores públicos conocidos (por hash) y heurísticas
+  // mínimas: ver lib/jwt-secret-policy.ts. Lanza ANTES de registrar @fastify/jwt,
+  // con un mensaje que nunca contiene el valor. server.ts ya lo valida al arrancar;
+  // esto cubre a quien registre el plugin por su cuenta (pruebas, otros entrypoints).
+  const jwtSecret = assertJwtSecretAceptable(process.env.JWT_SECRET)
 
   // @fastify/cookie debe registrarse ANTES de jwt: habilita request.cookies, de
   // donde @fastify/jwt extrae el access_token cuando no viene en el header.
