@@ -23,6 +23,11 @@ async function registrar(secret: string | undefined): Promise<{ app: FastifyInst
   if (secret === undefined) delete process.env.JWT_SECRET
   else process.env.JWT_SECRET = secret
   const app = Fastify({ logger: false })
+  // Actor vigente (#197): cada jwtVerify consulta usuario activo + sesión viva.
+  // Doble mínimo con u1/s1 vivo, para que un 401 sólo pueda venir de la firma.
+  app.decorate('prisma', {
+    user: { findFirst: async ({ where }: any) => (where?.id === 'u1' && where?.sessions?.some?.id === 's1' ? { role: 'ADMIN', username: 'u1' } : null) },
+  } as any)
   try {
     await app.register(authPlugin)
     app.get('/privado', { preHandler: [app.authenticate] }, async () => ({ ok: true }))
@@ -72,11 +77,11 @@ describe('plugins/auth — JWT_SECRET al registrar', () => {
     const { app, error } = await registrar(randomBytes(64).toString('hex'))
     expect(error).toBeNull()
     try {
-      const propio = app!.jwt.sign({ sub: 'u1', username: 'u1', role: 'ADMIN' })
+      const propio = app!.jwt.sign({ sub: 'u1', username: 'u1', role: 'ADMIN', sid: 's1' } as any)
       expect((await app!.inject({ method: 'GET', url: '/privado', headers: { authorization: `Bearer ${propio}` } })).statusCode).toBe(200)
       const now = Math.floor(Date.now() / 1000)
       for (const p of publicados) {
-        const forjado = firmarConValor({ sub: 'u1', username: 'u1', role: 'ADMIN', iat: now, exp: now + 300 }, p.valor)
+        const forjado = firmarConValor({ sub: 'u1', username: 'u1', role: 'ADMIN', sid: 's1', iat: now, exp: now + 300 }, p.valor)
         const r = await app!.inject({ method: 'GET', url: '/privado', headers: { authorization: `Bearer ${forjado}` } })
         expect(r.statusCode, p.etiqueta).toBe(401)
       }

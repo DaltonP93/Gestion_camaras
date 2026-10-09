@@ -30,6 +30,17 @@ async function build(): Promise<FastifyInstance> {
     camera: { findUnique: async () => ({ id: 'cam-x', channel: 3, nvr: { id: 'n', password: 'enc', ipAddress: '192.0.2.1', rtspPort: 554, username: 'u' } }) },
     userPermission: { findFirst: async () => null, findMany: async () => [] },
     auditLog: { create: async () => ({}) },
+    // Actor vigente (#197): el access lleva `sid` y cada jwtVerify consulta usuario
+    // activo + sesión viva. Doble mínimo: u1/s1 (OPERATOR) y a1/s2 (ADMIN).
+    user: {
+      findFirst: async ({ where }: any) => {
+        const vivos: Record<string, { sid: string; role: string; username: string }> = {
+          u1: { sid: 's1', role: 'OPERATOR', username: 'op' }, a1: { sid: 's2', role: 'ADMIN', username: 'adm' },
+        }
+        const u = vivos[where?.id]
+        return u && where?.sessions?.some?.id === u.sid ? { role: u.role, username: u.username } : null
+      },
+    },
   } as any)
   await app.register(authPlugin)
   app.get('/who', { preHandler: [app.authenticate] }, async (req) => req.user)
@@ -49,8 +60,8 @@ describe('sólo access tokens como credencial de petición', () => {
   beforeAll(async () => {
     app = await build()
     tokens = {
-      access: app.jwt.sign({ sub: 'u1', username: 'op', role: 'OPERATOR' }),
-      admin: app.jwt.sign({ sub: 'a1', username: 'adm', role: 'ADMIN' }),
+      access: app.jwt.sign({ sub: 'u1', username: 'op', role: 'OPERATOR', sid: 's1' } as any),
+      admin: app.jwt.sign({ sub: 'a1', username: 'adm', role: 'ADMIN', sid: 's2' } as any),
       refresh: (app.jwt as any).sign({ sub: 'u1', username: 'op', role: 'OPERATOR', jti: 'j1', rememberMe: true }, { expiresIn: '7d' }),
       refreshAdmin: (app.jwt as any).sign({ sub: 'a1', username: 'adm', role: 'ADMIN', jti: 'j2', rememberMe: false }, { expiresIn: '7d' }),
       twoFa: (app.jwt as any).sign({ sub: 'u1', step: '2fa' }, { expiresIn: '5m' }),
