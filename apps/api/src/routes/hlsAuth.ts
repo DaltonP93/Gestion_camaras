@@ -19,19 +19,9 @@
 // Nunca loguea cookies, tokens ni el JWT; sólo razón + prefijos.
 
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
-import type { JWTPayload } from '../plugins/auth'
+import { isActorCheckUnavailable, type JWTPayload } from '../plugins/auth'
 import { userCanAccessNvrChannel } from '../services/access-policy'
-
-/** ¿origen loopback/red interna? (sólo nginx/servicios internos deberían llegar). */
-function isInternalIp(ip: string | undefined): boolean {
-  if (!ip) return false
-  const a = ip.replace(/^::ffff:/, '')
-  if (a === '127.0.0.1' || a === '::1' || a === 'localhost') return true
-  if (a.startsWith('10.') || a.startsWith('192.168.')) return true
-  const m = /^172\.(\d+)\./.exec(a)
-  if (m) { const o = Number(m[1]); if (o >= 16 && o <= 31) return true }
-  return false
-}
+import { isInternalPeer } from '../lib/internal-origin'
 
 /**
  * Deriva { nvrId, channel } del nombre de path de MediaMTX.
@@ -69,14 +59,23 @@ export const hlsAuthRoutes: FastifyPluginAsync = async (server) => {
   const handler = async (request: FastifyRequest, reply: FastifyReply) => {
     // Defensa en profundidad: sólo alcanzable desde la red interna (nginx). Además
     // nginx marca esta location como `internal;` (no accesible desde afuera).
-    if (!isInternalIp(request.ip)) return reply.status(403).send()
+    // C03: se decide por el PAR TCP, no por request.ip: con trustProxy request.ip es
+    // la IP del cliente (X-Forwarded-For) y el auth_request de nginx para clientes
+    // de Internet daría 403 a todo el HLS; y una cabecera nunca vuelve interno a un
+    // par externo.
+    if (!isInternalPeer(request)) return reply.status(403).send()
 
     // 1) Sesión válida por cookie (o header Bearer, que jwtVerify también acepta).
+    //    jwtVerify exige además el ACTOR VIGENTE (sesión viva, usuario activo, rol de
+    //    la base; plugins/auth.ts). Si la base no permitió verificarlo ⇒ 403
+    //    (fail-closed, como el resto de errores de este borde), no 401: un 401 haría
+    //    que el web lo trate como sesión vencida e intente renovarla.
     let user: JWTPayload
     try {
       await request.jwtVerify()
       user = request.user as JWTPayload
     } catch {
+      if (isActorCheckUnavailable(request)) return reply.status(403).send()
       return reply.status(401).send()
     }
 

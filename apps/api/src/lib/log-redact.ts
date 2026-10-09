@@ -3,8 +3,10 @@
 // (p.ej. /ws/alerts?token=..., /recordings/.../stream?token=...). Estos tokens no
 // deben quedar en logs, monitoreo ni capturas.
 
-// Parámetros de query cuyo valor se enmascara.
-const SECRET_QUERY_PARAMS = ['token', 'access_token', 'accessToken', 'refreshToken', 'password', 'pass', 'ticket']
+// Parámetros de query cuyo valor se enmascara. `t` = token de descarga de
+// grabaciones (/api/recordings/download?t=…); `retentionToken` = capability de
+// cierre que un cliente C19 todavía puede mandar por query (cameras.ts).
+const SECRET_QUERY_PARAMS = ['token', 'access_token', 'accessToken', 'refreshToken', 'password', 'pass', 'ticket', 't', 'retentionToken']
 
 /** Enmascara valores de parámetros sensibles en una URL o query string. */
 export function redactUrlSecrets(url: string): string {
@@ -124,4 +126,30 @@ export function redactDiagnosticText(
   out = out.replace(IPV6_RE, '***')                                                // IPv6 suelta
   out = out.replace(ANY_IPV4_RE, '***')                                            // IPv4 (y a.b.x.x)
   return out
+}
+
+/** Host sin puerto (misma regla que request.hostname de Fastify; IPv6 entre corchetes). */
+function hostWithoutPort(host: unknown): string | undefined {
+  if (typeof host !== 'string' || host === '') return undefined
+  if (host[0] === '[') return host.slice(0, host.indexOf(']') + 1)
+  return host.split(':', 1)[0]
+}
+
+/**
+ * Serializer de `req` del logger de Fastify (server.ts): método, URL sin secretos,
+ * Host y par TCP.
+ *
+ * C03: NO usa request.hostname ni request.ip. Con trustProxy, desde nginx saldrían
+ * de X-Forwarded-Host (lo elige el cliente: nginx no lo fija ni lo limpia) y de
+ * X-Forwarded-For (la IP del cliente: dato personal en cada línea de un log sin
+ * retención y, desde la LAN, una IP interna real — invariante #6). Se registra lo
+ * mismo que antes de C03; la IP del cliente queda en Session/AuditLog.
+ */
+export function requestLogSerializer(req: any) {
+  return {
+    method: req.method,
+    url: redactUrlSecrets(req.url ?? ''),
+    hostname: hostWithoutPort(req.headers?.host),
+    remoteAddress: req.raw?.socket?.remoteAddress ?? req.socket?.remoteAddress,
+  }
 }

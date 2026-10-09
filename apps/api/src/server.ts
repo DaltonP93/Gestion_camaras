@@ -10,11 +10,13 @@ import staticFiles from '@fastify/static'
 import multipart from '@fastify/multipart'
 import path from 'path'
 import fs from 'fs'
-import { redactUrlSecrets } from './lib/log-redact'
+import { redactUrlSecrets, requestLogSerializer } from './lib/log-redact'
+import { evaluarJwtSecret } from './lib/jwt-secret-policy'
 import { resolveCorsOptions } from './lib/cors-config'
 import { isCsrfSafe, requestHasAuthCookie } from './lib/csrf'
 import { cspDirectives } from './lib/security-headers'
 import { uploadsStaticOptions } from './lib/uploads-static'
+import { resolveTrustedProxies, DEFAULT_TRUSTED_PROXIES } from './lib/trusted-proxy'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -55,7 +57,24 @@ import { publishStream, getActiveTranscodesList, stopTranscodeProcess } from './
 import { reRegisterStreams } from './services/stream-reregister'
 import { decryptNvrPasswordOrNull as decryptPass, validateNvrCredentialKey } from './services/credentials'
 
+// C03 — Confianza en el proxy ACOTADA al salto inmediato (ver lib/trusted-proxy):
+// sólo si el par del socket es un proxy confiable (TRUSTED_PROXIES; default
+// loopback + pools bridge de Docker) request.ip pasa a ser la última entrada de
+// X-Forwarded-For (la que agrega nginx = IP real del cliente). Así los cupos de
+// @fastify/rate-limit (keyGenerator = req.ip), Session.ipAddress y la auditoría son
+// por CLIENTE y no por la IP de nginx. Las puertas de origen interno (hls-auth, hook
+// de MediaMTX, media-grant validate) NO usan request.ip: miran el socket (validate,
+// alcanzable por la location /api/, además rechaza lo que reenvía nginx). Como el
+// cupo de /2fa/verify y /step-up deja de ser global, el 2.º factor lleva un bloqueo
+// por usuario (services/second-factor-lockout). El log de request no usa request.ip
+// ni request.hostname (lib/log-redact: requestLogSerializer).
+const trustedProxies = resolveTrustedProxies(process.env.TRUSTED_PROXIES, () => {
+  // Sin la IP (puede ser una IP interna real): se diagnostica con `docker network inspect`.
+  server.log.warn('[trust-proxy] llegó X-Forwarded-For desde un par de red interna que NO está en TRUSTED_PROXIES: se ignora y los cupos de rate-limit quedan por IP de ese par. Si es el nginx, agregá su red a TRUSTED_PROXIES.')
+})
+
 const server = Fastify({
+  trustProxy: trustedProxies.trustProxy,
   logger: {
     level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
     transport: process.env.NODE_ENV !== 'production'
@@ -63,16 +82,7 @@ const server = Fastify({
       : undefined,
     // Redactar tokens del query en el log de request (p.ej. /ws/alerts?token=<JWT>,
     // /recordings/.../stream?token=...) y el header Authorization.
-    serializers: {
-      req(req: any) {
-        return {
-          method: req.method,
-          url: redactUrlSecrets(req.url ?? ''),
-          hostname: req.hostname,
-          remoteAddress: req.ip,
-        }
-      },
-    },
+    serializers: { req: requestLogSerializer },
     redact: {
       paths: ['req.headers.authorization', 'req.headers.cookie', 'headers.authorization', 'headers.cookie'],
       censor: '***',
@@ -82,9 +92,15 @@ const server = Fastify({
 
 async function main() {
   // ─── Validación de variables de entorno críticas ──────────
-  if (!process.env.JWT_SECRET) {
-    server.log.error('[startup] FATAL: JWT_SECRET no está definido. La autenticación no funcionará. Define JWT_SECRET en .env')
+  // JWT_SECRET: presencia, largo ≥ 32, NO un valor público conocido (default o
+  // ejemplo publicado: con él cualquiera firma un access ADMIN) y heurísticas
+  // mínimas (lib/jwt-secret-policy.ts). Antes de cualquier conexión o registro.
+  // El mensaje nunca contiene el valor.
+  const jwtSecretRechazo = evaluarJwtSecret(process.env.JWT_SECRET)
+  if (jwtSecretRechazo) {
+    server.log.error(`[startup] FATAL: ${jwtSecretRechazo.mensaje}`)
     process.exit(1)
+    return // process.exit puede estar interceptado (pruebas): no seguir arrancando.
   }
   // (P3) Se eliminó el aviso de JWT_REFRESH_SECRET: era engañoso. No existe tal
   // "fallback" — los refresh tokens SIEMPRE se firman/verifican con JWT_SECRET
@@ -104,6 +120,14 @@ async function main() {
   // conectar a PostgreSQL/Redis o registrar nada: una variable presente pero
   // vacía o inválida lanza y main().catch aborta el arranque (exit 1).
   const isolation = resolveIsolationConfig()
+
+  // C03 — config efectiva de proxies confiables. Sólo cantidades/origen: los valores
+  // de TRUSTED_PROXIES pueden ser IPs internas reales y no se registran.
+  if (trustedProxies.origin === 'invalid') {
+    server.log.error(`[startup] TRUSTED_PROXIES inválido (${trustedProxies.error}): se ignora X-Forwarded-For de todos los pares y los cupos de rate-limit quedan por IP del socket (comportamiento previo). Corregilo para que detrás de nginx sean por cliente.`)
+  } else {
+    server.log.info(`[startup] trust-proxy: sólo el salto inmediato; origen=${trustedProxies.origin} rangos=${trustedProxies.ranges}${trustedProxies.origin === 'default' ? ` (${DEFAULT_TRUSTED_PROXIES})` : ''}`)
+  }
 
   // ─── Ticket de llegada — PRIMER hook onRequest de todos ────
   //

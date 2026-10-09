@@ -588,7 +588,7 @@ De `.env.example`. **Toda flag C22/nativa/IA está OFF por defecto.**
 ### Núcleo / seguridad
 | Var | Default | Efecto |
 |---|---|---|
-| `JWT_SECRET` | — (requerido) | Firma JWT (mín. 32). Sin ella el API aborta (`server.ts:72`) |
+| `JWT_SECRET` | — (requerido, sin default en compose) | Firma JWT. El API aborta si falta, tiene menos de 32 caracteres, coincide con un valor público conocido o no es aleatorio (`lib/jwt-secret-policy.ts`). `setup.sh` la genera si está vacía; verificación previa: `scripts/check-public-secrets.sh` |
 | `JWT_EXPIRES_IN` / `JWT_REFRESH_EXPIRES_IN` | 60m / 7d | TTL access/refresh |
 | `NVR_CREDENTIAL_KEY` | fallback JWT_SECRET | Clave AES de credenciales NVR |
 | `CORS_ORIGINS` | vacío = refleja origin | Lista blanca de orígenes |

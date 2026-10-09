@@ -95,7 +95,15 @@ services:
       REDIS_URL: redis://redis:6379
       MEDIAMTX_URL: http://mediamtx:9997
       # Claves — generar con: openssl rand -hex 64 / openssl rand -hex 32
-      JWT_SECRET: ${JWT_SECRET:-visioncore_default_dev_secret_change_in_production_32c}
+      # JWT_SECRET SIN valor por defecto: un default versionado es PÚBLICO y con él
+      # cualquiera firma un access ADMIN válido. Si falta o está vacío, `docker compose`
+      # aborta ANTES de crear o recrear contenedores (a diferencia de POSTGRES_PASSWORD,
+      # aquí sí se usa ${VAR:?…}; CI valida la composición con un valor aleatorio
+      # efímero). Además el API rechaza al arrancar los valores públicos conocidos
+      # (apps/api/src/lib/jwt-secret-policy.ts). Verificación previa al despliegue,
+      # sin imprimir valores: bash scripts/check-public-secrets.sh --env-file .env --process-env
+      # Cambiar JWT_SECRET invalida todas las sesiones (re-login).
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET no definido - generalo con openssl rand -hex 64 y ponelo en .env}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-60m}
       JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
       NVR_CREDENTIAL_KEY: ${NVR_CREDENTIAL_KEY:-}

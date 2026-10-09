@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { AuditAction } from '../services/audit'
 import { revokeUserMediaGrantsAtomic } from '../services/media/grant-service'
 import { revokeUserWs } from '../services/ws-revoke-bus'
+import { clearSecondFactorFailures } from '../services/second-factor-lockout'
 import { checkPasswordPolicy, addToPasswordHistory, resolveFeaturePermissions } from '../services/totp'
 import { getSecuritySettings } from '../services/security-settings'
 
@@ -249,10 +250,23 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
       },
     })
 
+    // Contraseña fijada por el ADMIN ⇒ se cierran las sesiones del usuario, y con
+    // ellas sus access ya emitidos (actor vigente), sus medios y sus WS. Si el ADMIN
+    // fija la SUYA desde aquí, conserva la sesión desde la que lo hace.
+    const ownPassword = !!data.password && id === request.user.sub
+    if (data.password) {
+      await server.prisma.session.deleteMany({
+        where: { userId: id, ...(ownPassword && request.user.sid ? { id: { not: request.user.sid } } : {}) },
+      })
+    }
+
     await AuditAction(server.prisma, request.user.sub, 'USER_UPDATED', id, request)
 
-    // Desactivar un usuario debe cortar sus WS vivos (en todos los procesos).
-    if (data.active === false) await revokeUserWs(server, id)
+    // Desactivar un usuario debe cortar sus WS vivos (en todos los procesos). Sus
+    // access y medios ya emitidos dejan de valer por `active` (actor vigente). El
+    // cambio de rol no necesita cerrar el WS: el filtro de alertas relee rol y
+    // permisos de la base en cada envío (broadcastAlertScoped).
+    if (data.active === false || (data.password && !ownPassword)) await revokeUserWs(server, id)
 
     return reply.send(user)
   })
@@ -524,7 +538,9 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
       },
     })
     // Revocar sesiones activas para forzar el paso por la compuerta MFA al reingresar.
+    // Sin sesión, sus access ya emitidos dejan de valer (actor vigente); y sus WS.
     await server.prisma.session.deleteMany({ where: { userId: id } })
+    await revokeUserWs(server, id)
 
     await AuditAction(server.prisma, request.user.sub, 'TWO_FA_RESET_BY_ADMIN', id, request)
     return reply.send({ message: '2FA del usuario ha sido deshabilitado' })
@@ -540,6 +556,8 @@ export const userRoutes: FastifyPluginAsync = async (server) => {
       where: { id },
       data: { failedLoginAttempts: 0, lockedUntil: null },
     })
+    // C03: también el contador del 2.º factor (si no, el próximo intento seguiría agotado).
+    await clearSecondFactorFailures(server.redis, id)
 
     await AuditAction(server.prisma, request.user.sub, 'USER_UNLOCKED', id, request)
     return reply.send({ message: 'Cuenta desbloqueada' })

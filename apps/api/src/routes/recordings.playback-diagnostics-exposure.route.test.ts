@@ -106,7 +106,9 @@ function makePrisma() {
 }
 
 async function build(role: Role) {
-  const user = { sub: `u-${role}`, username: `fixture-${role.toLowerCase()}`, role }
+  // `sid`: el medio de grabación queda ligado a usuario + sesión + cámara y se
+  // revalida al servir (#197); el doble de `user.findFirst` mantiene vivo al titular.
+  const user = { sub: `u-${role}`, username: `fixture-${role.toLowerCase()}`, role, sid: `s-${role}` }
   const app: FastifyInstance = Fastify()
   app.decorate('authenticate', async (req: any) => { req.user = user })
   // Réplica del authorize real: 403 si el rol no está en la lista.
@@ -115,7 +117,10 @@ async function build(role: Role) {
     if (!roles.includes(user.role)) return reply.status(403).send({ statusCode: 403, message: 'No tienes permisos para realizar esta acción' })
   })
   app.decorate('requireStepUp', async () => {})
-  app.decorate('prisma', makePrisma() as any)
+  app.decorate('prisma', {
+    ...makePrisma(),
+    user: { findFirst: async ({ where }: any) => (where?.id === user.sub && where?.sessions?.some?.id === user.sid ? { role: user.role, username: user.username } : null) },
+  } as any)
   await app.register(recordingRoutes, { prefix: '/api/recordings' })
   await app.ready()
   return app

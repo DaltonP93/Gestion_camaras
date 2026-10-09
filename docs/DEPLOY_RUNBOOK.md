@@ -36,6 +36,18 @@ git log -1 --oneline            # confirmá el HEAD esperado
 - **`NVR_CREDENTIAL_KEY` DEBE ser la misma** que ya usa el servidor. Si cambia, las
   contraseñas de NVR guardadas quedan **ilegibles** y hay que re-ingresarlas.
 - `JWT_SECRET` ≥ 32 chars, `POSTGRES_PASSWORD`, `CORS_ORIGINS` reales, `REDIS_URL`.
+- Secretos con valor público conocido (sólo informa sí/no, nunca valores):
+  `bash scripts/check-public-secrets.sh --env-file .env --process-env`. Si `JWT_SECRET`
+  sale "sí", "no apto" o "no verificable" (exit 1), el API nuevo NO arrancará o no se
+  puede asegurar que arranque: rotarlo es un cambio operativo que requiere autorización.
+  Invalida todas las sesiones (re-login) y, si quedan contraseñas de NVR en formato legacy
+  (sin prefijo `gcm.v1.`) cifradas con el JWT_SECRET anterior, dejan de poder descifrarse:
+  re-guardarlas ANTES de rotar (con la versión vigente).
+- Las demás variables que salgan "sí" se **informan** con su "qué hacer" y no bloquean
+  (exit 0; `--strict` las vuelve bloqueantes). **No** reemplazarlas a ciegas: cambiar
+  `POSTGRES_PASSWORD` sólo en `.env` deja al API sin base (exige `ALTER USER` coordinado);
+  cambiar `NVR_CREDENTIAL_KEY` deja ilegibles las contraseñas de NVR (ver arriba: exige
+  re-cifrarlas antes). Ambas son cambios operativos aparte, con autorización.
 - Flags que deben quedar **OFF** en esta entrega (hay blockers P0 para lo nativo, ver
   `docs/AI_HANDOFF.md` §12): `NATIVE_PLAYBACK_ENABLED`, `NATIVE_MEDIA_RELAY_ENABLED`,
   `ONVIF_ENABLED`, `HIK_CONNECT_ENABLED`, `FRIGATE_ENABLED`, `ANALYTICS_ALPR_ENABLED`,
@@ -109,7 +121,8 @@ bash scripts/restore.sh <archivo_de_backup>   # aborta si el checksum no coincid
 ## 9. Post-deploy
 
 - Revisar logs: `docker compose logs -f api` (buscar errores de arranque; el arranque
-  hace fail-fast si falta `JWT_SECRET`/`NVR_CREDENTIAL_KEY`).
+  hace fail-fast si falta `JWT_SECRET`/`NVR_CREDENTIAL_KEY` o si `JWT_SECRET` es un valor
+  público conocido o no aleatorio; el log dice el motivo, nunca el valor).
 - `docker compose ps` — todos los servicios `healthy`.
 
 ---
