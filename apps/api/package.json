@@ -11,6 +11,7 @@
     "db:seed": "tsx src/seed.ts",
     "db:studio": "prisma studio",
     "test": "vitest run",
+    "test:known-defects": "RUN_KNOWN_DEFECTS=1 vitest run src/security-joint",
     "lint": "eslint \"src/**/*.ts\""
   },
   "dependencies": {
