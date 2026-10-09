@@ -194,6 +194,10 @@ export function ViewPlayerPage() {
   // correspondiera, y expiraba por `view_heartbeat_missing` — matando el FFmpeg
   // de una cámara que el usuario estaba mirando.
   const viewIdRef = useRef<string>(`vp_${Math.random().toString(36).slice(2)}`)
+  // Cámaras que el heartbeat devolvió como NO_PERMISSION (sin canView o permiso
+  // revocado): no se vuelven a pedir y su slot suelta el stream (deja de pedir HLS).
+  const forbiddenCamsRef = useRef<Set<string>>(new Set())
+  useEffect(() => { forbiddenCamsRef.current = new Set() }, [id])
 
   // CONTROLADOR ÚNICO del ciclo de vida de sesiones. Es el dueño del registro,
   // la cola de pendientes, los timers HLS, el heartbeat, el scope de sesión y de
@@ -526,12 +530,15 @@ export function ViewPlayerPage() {
       // El heartbeat pertenece al scope B vigente: si hay una transición, no
       // envía ni aplica (el controlador lo verifica antes de ambas cosas).
       scope: ctrl.currentScope(),
-      send: (signal) => apiPost('/live-view/heartbeat', {
-        viewId:           viewIdRef.current,
-        visibleCameraIds: visibleIds,
-        layout:           perPage,
-        page:             currentPage,
-      }, undefined, signal),
+      send: (signal) => {
+        const allowedIds = visibleIds.filter((c) => !forbiddenCamsRef.current.has(c))
+        return apiPost('/live-view/heartbeat', {
+          viewId:           viewIdRef.current,
+          visibleCameraIds: allowedIds,
+          layout:           perPage,
+          page:             currentPage,
+        }, undefined, signal)
+      },
       onResult: (result: any) => {
         if (!result?.streams) return
         if (tabIsHidden()) return
@@ -542,8 +549,12 @@ export function ViewPlayerPage() {
         // Se registra CADA arrendamiento vigente (`startAttemptIds`) por el mismo
         // helper compartido que LiveView; nunca un id sintético.
         registerHeartbeatIdentities(result.streams, (cid, tipo, aid) => ctrl.registerReconciled(cid, tipo, aid))
+        for (const [cid, err] of Object.entries(result.errors ?? {}) as Array<[string, any]>) {
+          if (err?.code === 'NO_PERMISSION') forbiddenCamsRef.current.add(cid)
+        }
         setSlots((prev) => prev.map((s) => {
           if (!s.cameraId) return s
+          if (forbiddenCamsRef.current.has(s.cameraId)) return s.stream ? { ...s, stream: undefined } : s
           const info = result.streams[s.cameraId]
           return info ? { ...s, stream: info } : s
         }))
