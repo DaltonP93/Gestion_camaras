@@ -1,6 +1,7 @@
 // Notification Service — orquesta canales de notificación para alertas VisionCore
 import type { PrismaClient } from '@prisma/client'
 import { sendAlertEmail } from './providers/email.provider'
+import { outboundNotificationsAllowed, OUTBOUND_DISABLED_CODE, OUTBOUND_DISABLED_MESSAGE } from './staging-isolation'
 import { sendToChannel, type ChannelKind, type ChannelAlert } from './providers/channel.provider'
 import { maskIp } from '../lib/log-redact'
 
@@ -179,6 +180,27 @@ export async function sendAlertNotification(
       where: { id },
       data: { status: ok ? 'sent' : 'failed', recipient, error: error || null, errorCode: errorCode ?? null, sentAt: ok ? now : null, failedAt: ok ? null : now } as any,
     })
+  }
+
+  // Aislamiento de staging: no se contacta SMTP ni webhooks. Cada canal que se
+  // habría usado queda registrado como 'skipped' (trazable, no 'failed').
+  if (!outboundNotificationsAllowed()) {
+    const skip = (channel: string, recipient: string) => prisma.notificationDelivery.create({
+      data: {
+        alertId: alert.id, channel, status: 'skipped', recipient, attemptedAt: new Date(),
+        subject, alertType: alert.type, cameraName: extra.cameraName ?? null, nvrName: extra.nvrName ?? null,
+        error: OUTBOUND_DISABLED_MESSAGE, errorCode: OUTBOUND_DISABLED_CODE,
+      } as any,
+    })
+    if (settings.emailEnabled) await skip('email', settings.recipientEmails)
+    for (const ch of [
+      { kind: 'slack' as ChannelKind, enabled: !!s.slackEnabled, url: s.slackWebhookUrl || '' },
+      { kind: 'teams' as ChannelKind, enabled: !!s.teamsEnabled, url: s.teamsWebhookUrl || '' },
+      { kind: 'webhook' as ChannelKind, enabled: !!s.webhookEnabled, url: s.webhookUrl || '' },
+    ]) {
+      if (ch.enabled && ch.url) await skip(ch.kind, channelRecipientLabel(ch.kind, ch.url))
+    }
+    return
   }
 
   // 5. EMAIL (comportamiento previo, intacto)
