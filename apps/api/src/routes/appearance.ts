@@ -7,6 +7,9 @@ import {
   canManageAppearance,
   isBlockedSvgUpload,
   BLOCKED_SVG_CODE,
+  isAllowedUploadMime,
+  resolveUploadAsset,
+  brandingFilesToDelete,
   normalizeUploadUrl,
   toPublishableAppearance,
 } from '../services/appearance-policy'
@@ -130,11 +133,6 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
 
   // POST /appearance/upload — carga multipart de assets de branding.
   server.post('/upload', { preHandler: [requireAppearanceManage] }, async (request, reply) => {
-    const ALLOWED_MIMES = new Set([
-      'image/png', 'image/jpeg', 'image/webp',
-      'image/x-icon', 'image/vnd.microsoft.icon',
-    ])
-
     const uploadsDir = process.env.UPLOADS_DIR || '/app/uploads'
     const brandingDir = path.join(uploadsDir, 'branding')
 
@@ -149,10 +147,10 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
       logoUrl: 'logoUrl',
     }
 
-    const updates: Record<string, string> = {}
-
-    // Load current settings to know previous file paths
-    const current = await server.prisma.appearanceSettings.findUnique({ where: { id: 'singleton' } })
+    // Partes ya validadas. El disco y la DB se tocan recién cuando TODAS pasaron:
+    // antes, un rechazo en la 2.ª parte llegaba con el archivo previo de la 1.ª ya
+    // borrado y la DB apuntando a él (branding roto).
+    const accepted: Array<{ dbKey: string; fileName: string; buf: Buffer }> = []
 
     const parts = request.parts()
     for await (const part of parts) {
@@ -172,7 +170,7 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
           message: 'La carga de SVG está deshabilitada temporalmente por seguridad. Usá PNG, JPG, WEBP o ICO.',
         })
       }
-      if (!ALLOWED_MIMES.has(part.mimetype)) {
+      if (!isAllowedUploadMime(part.mimetype)) {
         await part.toBuffer()
         return reply.status(400).send({ message: `Tipo de archivo no permitido: ${part.mimetype}` })
       }
@@ -180,26 +178,43 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
       const buf = await part.toBuffer()
       if (buf.length === 0) continue
 
-      // Sanitize filename, generate unique name
-      const ext = path.extname(part.filename || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 5) || '.png'
-      const uniqueName = `${part.fieldname}_${Date.now()}${ext}`
-      const destPath = path.join(brandingDir, uniqueName)
-
-      // Delete previous file for this field if it's a local upload
-      const dbKey = fieldToDbKey[part.fieldname]
-      const prevUrl: string | null = (current as any)?.[dbKey] ?? null
-      if (prevUrl && (prevUrl.startsWith('/uploads/branding/') || prevUrl.includes('/uploads/branding/'))) {
-        const prevFile = path.join(brandingDir, path.basename(prevUrl))
-        try { fs.unlinkSync(prevFile) } catch {}
+      // Anti-XSS almacenado: la extensión guardada se DERIVA del tipo de imagen
+      // detectado por FIRMA MÁGICA, nunca del nombre del cliente ni del MIME
+      // declarado. Un .html/.js/.xml con un Content-Type de imagen falso no
+      // coincide con ninguna firma raster ⇒ se rechaza, y @fastify/static nunca
+      // lo serviría con Content-Type ejecutable en el mismo origen. Una imagen
+      // real rotulada con otro MIME permitido (PNG llamado .ico) se acepta con
+      // su extensión REAL. (Repro aislada con Chromium: ver PR.)
+      const asset = resolveUploadAsset(part.mimetype, buf)
+      if (!asset.ok) {
+        return reply.status(400).send({
+          statusCode: 400,
+          error: 'Bad Request',
+          code: 'UNSAFE_UPLOAD_CONTENT',
+          message: 'El contenido del archivo no coincide con una imagen PNG/JPG/WEBP/ICO válida',
+        })
       }
-
-      fs.writeFileSync(destPath, buf)
-      // Save as relative path — frontend resolves to full URL using resolveAssetUrl
-      updates[dbKey] = `/uploads/branding/${uniqueName}`
+      const dbKey = fieldToDbKey[part.fieldname]
+      // Si dos campos apuntan a la misma columna (favicon/faviconUrl), gana el último.
+      const prevIdx = accepted.findIndex((a) => a.dbKey === dbKey)
+      if (prevIdx >= 0) accepted.splice(prevIdx, 1)
+      accepted.push({ dbKey, fileName: `${part.fieldname}_${Date.now()}${asset.ext}`, buf })
     }
 
-    if (Object.keys(updates).length === 0) {
+    if (accepted.length === 0) {
       return reply.status(400).send({ message: 'No se recibieron archivos válidos' })
+    }
+
+    // Load current settings to know previous file paths
+    const current = await server.prisma.appearanceSettings.findUnique({ where: { id: 'singleton' } })
+
+    // Orden: escribir los nuevos → actualizar la DB → borrar los anteriores. Así
+    // la DB nunca apunta a un archivo inexistente, ni siquiera si el upsert falla.
+    const updates: Record<string, string> = {}
+    for (const a of accepted) {
+      fs.writeFileSync(path.join(brandingDir, a.fileName), a.buf)
+      // Save as relative path — frontend resolves to full URL using resolveAssetUrl
+      updates[a.dbKey] = `/uploads/branding/${a.fileName}`
     }
 
     const settings = await server.prisma.appearanceSettings.upsert({
@@ -207,6 +222,14 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
       create: { id: 'singleton', ...updates },
       update: updates,
     })
+
+    // Borrar los archivos anteriores de los campos reemplazados sólo si eran
+    // nuestros (ruta relativa que escribió esta carga, no una URL absoluta) y
+    // ninguna columna los sigue usando: el mismo archivo puede estar en logo,
+    // sidebar y favicon a la vez (p. ej. reutilizado por PUT /appearance).
+    for (const file of brandingFilesToDelete(current as any, settings as any, Object.keys(updates))) {
+      try { fs.unlinkSync(path.join(brandingDir, file)) } catch {}
+    }
 
     return reply.send(toPublishableAppearance(settings as any))
   })

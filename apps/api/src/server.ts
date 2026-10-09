@@ -14,6 +14,7 @@ import { redactUrlSecrets } from './lib/log-redact'
 import { resolveCorsOptions } from './lib/cors-config'
 import { isCsrfSafe, requestHasAuthCookie } from './lib/csrf'
 import { cspDirectives } from './lib/security-headers'
+import { uploadsStaticOptions } from './lib/uploads-static'
 import { prismaPlugin } from './plugins/prisma'
 import { redisPlugin } from './plugins/redis'
 import { authPlugin } from './plugins/auth'
@@ -235,11 +236,15 @@ async function main() {
   const uploadsDir = process.env.UPLOADS_DIR || '/app/uploads'
   fs.mkdirSync(path.join(uploadsDir, 'branding'), { recursive: true })
 
-  await server.register(staticFiles, {
-    root: uploadsDir,
-    prefix: '/uploads/',
-    decorateReply: false,
-  })
+  // Defensa en profundidad anti-XSS almacenado de branding: sólo se sirven
+  // extensiones de imagen, raster o .svg ya configurado (404 para .html/.js/
+  // .xhtm/.svgz LEGADOS, sin borrarlos) y se refuerzan cabeceras por respuesta
+  // (nosniff + CSP sandbox + XFO). La carga ya valida firma mágica
+  // (routes/appearance.ts); esto cubre los archivos subidos antes del fix. Las
+  // opciones salen de lib/uploads-static.ts para que las pruebas de ruta
+  // ejerciten EXACTAMENTE este cableado (y una prueba sobre este fuente exige
+  // que se siga usando el helper).
+  await server.register(staticFiles, uploadsStaticOptions(uploadsDir))
 
   await server.register(multipart, {
     limits: { fileSize: 2 * 1024 * 1024, files: 4 },
