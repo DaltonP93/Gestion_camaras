@@ -87,6 +87,14 @@ jobs:
       - name: Build (incluye typecheck)
         working-directory: apps/web
         run: npm run build
+      - name: Árbol de dependencias íntegro (npm ls --all)
+        # `npm ls` simple no detecta react-konva 18 sobre React 19 (peer `react >=18`);
+        # `--all` sí (react-reconciler 0.29 pide react ^18.3.1). Ver #185 §2.4.
+        working-directory: apps/web
+        run: npm ls --all > /dev/null
+      - name: Prototipo navegable — typecheck y build (datos simulados)
+        working-directory: apps/web
+        run: npm run typecheck:prototype && npm run prototype:build
 
   web-e2e:
     name: Web integración navegador (Playwright — ciclo de vida pantalla completa)
@@ -107,12 +115,17 @@ jobs:
       - name: E2E (liberación rápida de pantalla completa)
         working-directory: apps/web
         run: npm run test:e2e
+      - name: E2E prototipo navegable (datos simulados; PC y tablet)
+        working-directory: apps/web
+        run: npm run test:e2e:prototype
       - name: Subir reporte en fallo
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
-          path: apps/web/playwright-report/
+          path: |
+            apps/web/playwright-report/
+            apps/web/playwright-report-prototype/
           retention-days: 7
 
   lint:

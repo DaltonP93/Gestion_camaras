@@ -1,0 +1,37 @@
+/* Estilos propios del prototipo (no forman parte de la app). */
+
+/* Hueco en el timeline: rayado rojo, distinto de "sin datos en la vista" y de las pistas. */
+.tl-gap {
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(248, 113, 113, 0.55) 0 3px,
+    rgba(69, 10, 10, 0.55) 3px 7px
+  );
+}
+
+/* Celda de video 16:9: contenedor de consulta por ancho. En celdas compactas (grilla
+   3×3/4×4 o tablet; < 300 px ⇒ < 169 px de alto) se oculta el subtítulo, los
+   detalles (.video-cell-detail) quedan sólo para lectores de pantalla (y en el
+   title), y mientras la celda pide atención (desfasada) se oculta el pie: así el
+   estado, el desfase y "Resincronizar" (44 px táctil) entran entre el encabezado y
+   el borde inferior sin superponerse con la insignia de pista ni con el pie. */
+.video-cell {
+  container-type: inline-size;
+}
+@container (max-width: 299px) {
+  .video-cell-subtitle,
+  .video-cell[data-attention] .video-cell-footer {
+    display: none;
+  }
+  .video-cell-detail {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noUnusedLocals": true,
+    "paths": {
+      "@/types/canvas": ["./prototype/vendor/frigate/types/canvas.ts"],
+      "@/utils/canvasUtil": ["./prototype/vendor/frigate/utils/canvasUtil.ts"],
+      "@/hooks/use-polygon-states": ["./prototype/vendor/frigate/hooks/use-polygon-states.ts"],
+      "@/api": ["./prototype/vendor/frigate/api/index.tsx"],
+      "@/api/ws": ["./prototype/zones/shims/ws.ts"],
+      "@/components/indicators/activity-indicator": ["./prototype/zones/shims/activity-indicator.tsx"],
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["prototype", "e2e-prototype", "src/vite-env.d.ts"]
+}

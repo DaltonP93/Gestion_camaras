@@ -1,0 +1,35 @@
+{
+  "upstream": "https://github.com/blakeblackshear/frigate",
+  "tag": "v0.18.0",
+  "commit": "77a66e75c61862b048a07c1295877f4b31343504",
+  "license": "MIT (LICENSE en este directorio)",
+  "identical": {
+    "components/settings/PolygonCanvas.tsx": {
+      "original": "web/src/components/settings/PolygonCanvas.tsx",
+      "sha256": "429f17c39c53e0d32b1720cae99572faf053ecf077358662b2c9e2cd9c2e243c"
+    },
+    "components/settings/PolygonDrawer.tsx": {
+      "original": "web/src/components/settings/PolygonDrawer.tsx",
+      "sha256": "8cb676207780a425884ec370253bc6e25918fcbb6c02cf510898ee11004acceb"
+    },
+    "utils/canvasUtil.ts": {
+      "original": "web/src/utils/canvasUtil.ts",
+      "sha256": "0ed650a1da914e5dc9b541391ba34ef9d592858f9f1c466dd0def1c7bddf260f"
+    },
+    "types/canvas.ts": {
+      "original": "web/src/types/canvas.ts",
+      "sha256": "967c7d401bcf12dc9ce2561358c904121deee0bbcb2324a29b644f02f12451bc"
+    },
+    "hooks/use-polygon-states.ts": {
+      "original": "web/src/hooks/use-polygon-states.ts",
+      "sha256": "6e2ba2529bbe27ae84e464374428ee674a7150950acadca678e009a7c25be428"
+    },
+    "api/baseUrl.ts": {
+      "original": "web/src/api/baseUrl.ts",
+      "sha256": "172285d7ae5a28fc195f18fd77b74e99bb8b6348340a9036675e110323786ce9"
+    }
+  },
+  "reduced": {
+    "api/index.tsx": "sólo useApiHost(); ver el registro de cambios en su encabezado"
+  }
+}
