@@ -19,7 +19,7 @@
 // Nunca loguea cookies, tokens ni el JWT; sólo razón + prefijos.
 
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
-import type { JWTPayload } from '../plugins/auth'
+import { isActorCheckUnavailable, type JWTPayload } from '../plugins/auth'
 import { userCanAccessNvrChannel } from '../services/access-policy'
 import { isInternalPeer } from '../lib/internal-origin'
 
@@ -66,11 +66,16 @@ export const hlsAuthRoutes: FastifyPluginAsync = async (server) => {
     if (!isInternalPeer(request)) return reply.status(403).send()
 
     // 1) Sesión válida por cookie (o header Bearer, que jwtVerify también acepta).
+    //    jwtVerify exige además el ACTOR VIGENTE (sesión viva, usuario activo, rol de
+    //    la base; plugins/auth.ts). Si la base no permitió verificarlo ⇒ 403
+    //    (fail-closed, como el resto de errores de este borde), no 401: un 401 haría
+    //    que el web lo trate como sesión vencida e intente renovarla.
     let user: JWTPayload
     try {
       await request.jwtVerify()
       user = request.user as JWTPayload
     } catch {
+      if (isActorCheckUnavailable(request)) return reply.status(403).send()
       return reply.status(401).send()
     }
 

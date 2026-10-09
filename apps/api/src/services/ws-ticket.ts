@@ -24,6 +24,12 @@ export interface WsTicketRedis {
 export interface WsTicketIdentity {
   userId: string
   username: string
+  /**
+   * Sesión (`Session.id`) del access que pidió el ticket. El canje la revalida
+   * (actor vigente): un ticket emitido antes de desactivar al usuario o de cerrar
+   * esa sesión no abre el WS. Un ticket sin sesión se rechaza al canjear.
+   */
+  sid?: string
 }
 
 const PREFIX = 'ws:ticket:'
@@ -33,7 +39,7 @@ const TICKET_RE = /^wst_[0-9a-f]{64}$/
 
 /** Emite un ticket de un solo uso para el usuario dado. Devuelve el ticket opaco. */
 export async function issueWsTicket(redis: WsTicketRedis, id: WsTicketIdentity): Promise<string> {
-  const value = JSON.stringify({ u: id.userId, n: id.username })
+  const value = JSON.stringify({ u: id.userId, n: id.username, ...(id.sid ? { s: id.sid } : {}) })
   // NX evita pisar un ticket homónimo. Ante una colisión (probabilidad ~2⁻¹²⁸, es
   // decir nunca en la práctica) SET NX devuelve null y NO se almacena: en ese caso
   // se regenera en vez de devolver un ticket muerto o de otra identidad. Se acota a
@@ -67,9 +73,13 @@ export async function consumeWsTicket(redis: WsTicketRedis, ticket: unknown): Pr
   }
   if (raw == null) return null
   try {
-    const parsed = JSON.parse(raw) as { u?: unknown; n?: unknown }
+    const parsed = JSON.parse(raw) as { u?: unknown; n?: unknown; s?: unknown }
     if (typeof parsed.u !== 'string' || !parsed.u) return null
-    return { userId: parsed.u, username: typeof parsed.n === 'string' ? parsed.n : '' }
+    return {
+      userId: parsed.u,
+      username: typeof parsed.n === 'string' ? parsed.n : '',
+      ...(typeof parsed.s === 'string' && parsed.s ? { sid: parsed.s } : {}),
+    }
   } catch {
     return null
   }

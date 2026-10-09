@@ -3,8 +3,10 @@
 // (p.ej. /ws/alerts?token=..., /recordings/.../stream?token=...). Estos tokens no
 // deben quedar en logs, monitoreo ni capturas.
 
-// Parámetros de query cuyo valor se enmascara.
-const SECRET_QUERY_PARAMS = ['token', 'access_token', 'accessToken', 'refreshToken', 'password', 'pass', 'ticket']
+// Parámetros de query cuyo valor se enmascara. `t` = token de descarga de
+// grabaciones (/api/recordings/download?t=…); `retentionToken` = capability de
+// cierre que un cliente C19 todavía puede mandar por query (cameras.ts).
+const SECRET_QUERY_PARAMS = ['token', 'access_token', 'accessToken', 'refreshToken', 'password', 'pass', 'ticket', 't', 'retentionToken']
 
 /** Enmascara valores de parámetros sensibles en una URL o query string. */
 export function redactUrlSecrets(url: string): string {

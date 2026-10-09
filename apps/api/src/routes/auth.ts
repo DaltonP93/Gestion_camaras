@@ -16,7 +16,7 @@ import { getSecuritySettings } from '../services/security-settings'
 import { sessionsToPrune, accessTokenTtl, decideMfaGate } from '../services/security-policy'
 import { issueWsTicket, WS_TICKET_TTL_MS } from '../services/ws-ticket'
 import { setAuthCookies, clearAuthCookies, REFRESH_COOKIE } from '../lib/auth-cookies'
-import { revokeUserWs } from '../services/ws-revoke-bus'
+import { revokeUserWs, revokeSessionWs } from '../services/ws-revoke-bus'
 import { beginSecondFactorAttempt } from '../services/second-factor-lockout'
 
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000   // 7 días
@@ -597,8 +597,10 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       },
     })
 
-    // Invalidate all sessions (force re-login)
+    // Invalidate all sessions (force re-login). Sin sesiones, los access ya emitidos
+    // dejan de valer en la petición siguiente (actor vigente); se cierran sus WS.
     await server.prisma.session.deleteMany({ where: { userId: user.id } })
+    await revokeUserWs(server, user.id)
 
     await AuditAction(server.prisma, user.id, 'PASSWORD_CHANGED', user.id, request)
     return reply.send({ message: 'Contraseña actualizada. Inicia sesión nuevamente.' })
@@ -732,7 +734,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
       if (won) {
         const sec = await getSecuritySettings(server.prisma)
-        const newAccessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
+        // El access queda ligado a ESTA sesión (`sid`): la rotación conserva el id.
+        const newAccessToken = server.jwt.sign({ ...payload, sid: session.id }, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
         setAuthCookies(reply, {
           accessToken: newAccessToken,
           refreshToken: newRefreshToken,
@@ -765,6 +768,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         server.prisma.usedRefreshToken.deleteMany({ where: { userId: used.userId } }),
       ])
       await AuditAction(server.prisma, used.userId, 'REFRESH_TOKEN_REUSE', null, request)
+      // Sin sesiones, sus access dejan de valer (actor vigente); también sus WS.
+      await revokeUserWs(server, used.userId)
       return reply.status(401).send({
         statusCode: 401, error: 'Unauthorized',
         message: 'Sesión revocada por reutilización de token. Inicia sesión nuevamente.',
@@ -802,6 +807,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         if (refreshToken) {
           await (tx as any).session.deleteMany({ where: { refreshToken: hashToken(refreshToken) } })
         }
+        // La sesión del access que pidió el logout (`sid`) se cierra aunque no haya
+        // llegado la cookie de refresh: así el access deja de valer de inmediato.
+        if (request.user.sid) {
+          await (tx as any).session.deleteMany({ where: { id: request.user.sid, userId: request.user.sub } })
+        }
       })
     } catch {
       server.log.error(`auth logout revoke_atomic_failed userId=${request.user.sub.slice(0, 8)} — rollback, no se cerró sesión`)
@@ -813,9 +823,11 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     // no-op (el mapa nunca se pobló) ⇒ comportamiento idéntico.
     getSessionPolicy(server).forgetUser(request.user.sub)
     await AuditAction(server.prisma, request.user.sub, 'LOGOUT', null, request, { mediaRevoke })
-    // Cerrar los WS del usuario (en todos los procesos): al desloguear no debe seguir
-    // recibiendo alertas por una conexión viva.
-    await revokeUserWs(server, request.user.sub)
+    // Cerrar los WS de ESTA sesión (en todos los procesos): al desloguear no debe
+    // seguir recibiendo alertas por una conexión viva. Los WS de las OTRAS sesiones
+    // del usuario (otros dispositivos) siguen: su sesión no se cerró. Si la cookie de
+    // refresh fuera de otra sesión suya, el WS de ésa lo corta el ping (≤30 s).
+    if (request.user.sid) await revokeSessionWs(server, request.user.sub, request.user.sid)
     return reply.send({ message: 'Sesión cerrada' })
   })
 
@@ -972,8 +984,9 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       },
     })
 
-    // Invalidate all sessions
+    // Invalidate all sessions (y sus access/WS: actor vigente)
     await server.prisma.session.deleteMany({ where: { userId: user.id } })
+    await revokeUserWs(server, user.id)
 
     await AuditAction(server.prisma, user.id, 'PASSWORD_RESET_COMPLETED', user.id, request)
     return reply.send({ message: 'Contraseña restablecida correctamente. Inicia sesión.' })
@@ -1012,9 +1025,10 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
   server.post('/ws-ticket', {
     preHandler: [server.authenticate],
   }, async (request, reply) => {
-    // Re-verificar LIVENESS al emitir el ticket (el access JWT es stateless y vive su
-    // TTL completo): así, tras desactivar al usuario o revocarle todas sus sesiones,
-    // el WS cerrado con 4003 NO se puede re-abrir aunque el navegador reintente.
+    // Re-verificar LIVENESS al emitir el ticket: así, tras desactivar al usuario o
+    // revocarle todas sus sesiones, el WS cerrado con 4003 NO se puede re-abrir aunque
+    // el navegador reintente. (authenticate ya exige el actor vigente; esto queda como
+    // defensa en profundidad.) El ticket lleva la sesión (`sid`): el canje la revalida.
     const now = new Date()
     const user = await server.prisma.user.findUnique({
       where: { id: request.user.sub }, select: { active: true },
@@ -1032,6 +1046,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     const ticket = await issueWsTicket(server.redis, {
       userId: request.user.sub,
       username: request.user.username,
+      sid: request.user.sid,
     })
     return reply.send({ ticket, expiresInSeconds: Math.round(WS_TICKET_TTL_MS / 1000) })
   })
@@ -1047,15 +1062,12 @@ async function completeLogin(server: any, request: any, reply: any, user: any, e
   // como claim del refresh JWT para propagar la persistencia en cada rotación.
   const rememberMe = ((request.body as any)?.rememberMe ?? true) === true
 
-  // TTL del access token = timeout de sesión configurado (hace REAL el ajuste que
-  // antes sólo vivía en la UI). El refresh conserva su ventana larga.
-  const accessToken = server.jwt.sign(payload, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
   const refreshToken = (server.jwt as any).sign(
     { ...payload, jti: crypto.randomUUID(), rememberMe },
     { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' },
   )
 
-  await server.prisma.session.create({
+  const session = await server.prisma.session.create({
     data: {
       userId:      user.id,
       refreshToken: hashToken(refreshToken),
@@ -1065,7 +1077,13 @@ async function completeLogin(server: any, request: any, reply: any, user: any, e
       lastUsedAt:  new Date(),
       expiresAt:   new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
     },
+    select: { id: true },
   })
+
+  // TTL del access token = timeout de sesión configurado (hace REAL el ajuste que
+  // antes sólo vivía en la UI). El refresh conserva su ventana larga. El access va
+  // ligado a la sesión recién creada (`sid`): cerrarla o revocarla lo invalida.
+  const accessToken = server.jwt.sign({ ...payload, sid: session.id }, { expiresIn: accessTokenTtl(sec.sessionTimeoutMinutes) })
 
   // Límite de sesiones concurrentes: revocar las MÁS ANTIGUAS que excedan el máximo.
   const userSessions = await server.prisma.session.findMany({
