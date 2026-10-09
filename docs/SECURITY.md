@@ -71,7 +71,7 @@ RESUELTO / PRESENTE / PARCIAL / N-A, con evidencia:
 | Sesión no vinculada a JWT `sub` | **RESUELTO** | Refresh embebe `sub`, guardado hasheado; access derivado de `session.user` (`auth.ts:607,884-905`) |
 | Asserts `or True`/permisivos | **N/A** | Idiom Python; repo TypeScript |
 | Credenciales demo conocidas | **RESUELTO** | Admin: `SEED_ADMIN_PASSWORD` o aleatorio fuerte (`seed.ts:82`); DEMO gateado por `SEED_DEMO_USERS` |
-| Secretos inseguros por defecto | **RESUELTO (residual dev)** | `JWT_SECRET` fail-fast <32; `NVR_CREDENTIAL_KEY` obligatoria en prod; fallback solo dev/test |
+| Secretos inseguros por defecto | **RESUELTO (residual dev)** | `JWT_SECRET` sin default en compose (`${JWT_SECRET:?…}`) y fail-fast si falta, <32, coincide con un valor público conocido (por SHA-256) o no es aleatorio (`lib/jwt-secret-policy.ts`, C08); `NVR_CREDENTIAL_KEY` obligatoria en prod; fallback solo dev/test; verificación previa: `scripts/check-public-secrets.sh` |
 | PIN en texto plano | **N/A** | No existe control de acceso/PIN |
 | JWT en localStorage | **PRESENTE** | Riesgo #5 |
 | Token WS en URL | **PRESENTE** | Riesgo #6 |

@@ -294,7 +294,9 @@ Detalle en `docs/TEST_EVIDENCE.md`.
 
 ## 10. Variables de entorno (SIN valores; de `.env.example`)
 
-**Obligatorias en producción:** `POSTGRES_PASSWORD`, `JWT_SECRET` (fail-fast si <32 chars),
+**Obligatorias en producción:** `POSTGRES_PASSWORD`, `JWT_SECRET` (sin default en compose; fail-fast si falta,
+<32 chars, valor público conocido o no aleatorio — `lib/jwt-secret-policy.ts`; verificación previa sin imprimir
+valores: `scripts/check-public-secrets.sh`),
 `NVR_CREDENTIAL_KEY` (obligatoria en prod; si cambia, las contraseñas NVR quedan ilegibles),
 `SEED_ADMIN_PASSWORD` (si no, se genera aleatoria fuerte), `CORS_ORIGINS` (sin ella solo se permite localhost).
 **Otras relevantes:** `REDIS_URL`, `JWT_EXPIRES_IN`, `JWT_REFRESH_EXPIRES_IN`, `COOKIE_SECURE`,

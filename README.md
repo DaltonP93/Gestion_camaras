@@ -56,8 +56,20 @@ NVR_4_IP=192.x.x.x
 
 ### 3. Levantar todo
 
+`JWT_SECRET` es obligatoria y no tiene valor por defecto: `docker compose` aborta si falta y el API no
+arranca con un valor público conocido o no aleatorio. `setup.sh` la genera si está vacía, verifica los
+secretos (`scripts/check-public-secrets.sh`, sin imprimir valores) y levanta todo:
+
 ```bash
-docker-compose up -d
+bash setup.sh
+```
+
+Para levantar a mano, primero generala (una sola línea, sin comillas):
+
+```bash
+sed -i "s|^JWT_SECRET=$|JWT_SECRET=$(openssl rand -hex 64)|" .env
+bash scripts/check-public-secrets.sh --env-file .env   # exit 0 = JWT_SECRET apto
+docker compose up -d
 ```
 
 ### 4. Acceder

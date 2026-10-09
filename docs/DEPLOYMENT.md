@@ -24,7 +24,7 @@
 | Variable | Rol | Nota |
 |---|---|---|
 | `POSTGRES_PASSWORD` | Password de Postgres | Sin default (ya corregido) |
-| `JWT_SECRET` | Firma JWT | Fail-fast si <32 chars (`server.ts:80-96`) |
+| `JWT_SECRET` | Firma JWT | Sin default (`${JWT_SECRET:?…}` en compose). Fail-fast si falta, <32 chars, coincide con un valor público conocido o no es aleatorio (`lib/jwt-secret-policy.ts`). `setup.sh` la genera si está vacía; verificación previa: `scripts/check-public-secrets.sh` |
 | `NVR_CREDENTIAL_KEY` | Clave AES-256-GCM de credenciales NVR | Obligatoria en prod (`credentials.ts:37-44`). Si cambia, las credenciales NVR quedan ilegibles |
 | `SEED_ADMIN_PASSWORD` | Password del admin sembrado | Si falta, se genera aleatorio fuerte (`seed.ts:82`) |
 | `CORS_ORIGINS` | Allowlist de orígenes | Sin ella, solo se permite localhost (no refleja origin arbitrario) |

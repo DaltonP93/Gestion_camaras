@@ -11,6 +11,7 @@ import multipart from '@fastify/multipart'
 import path from 'path'
 import fs from 'fs'
 import { redactUrlSecrets } from './lib/log-redact'
+import { evaluarJwtSecret } from './lib/jwt-secret-policy'
 import { resolveCorsOptions } from './lib/cors-config'
 import { isCsrfSafe, requestHasAuthCookie } from './lib/csrf'
 import { cspDirectives } from './lib/security-headers'
@@ -80,9 +81,15 @@ const server = Fastify({
 
 async function main() {
   // ─── Validación de variables de entorno críticas ──────────
-  if (!process.env.JWT_SECRET) {
-    server.log.error('[startup] FATAL: JWT_SECRET no está definido. La autenticación no funcionará. Define JWT_SECRET en .env')
+  // JWT_SECRET: presencia, largo ≥ 32, NO un valor público conocido (default o
+  // ejemplo publicado: con él cualquiera firma un access ADMIN) y heurísticas
+  // mínimas (lib/jwt-secret-policy.ts). Antes de cualquier conexión o registro.
+  // El mensaje nunca contiene el valor.
+  const jwtSecretRechazo = evaluarJwtSecret(process.env.JWT_SECRET)
+  if (jwtSecretRechazo) {
+    server.log.error(`[startup] FATAL: ${jwtSecretRechazo.mensaje}`)
     process.exit(1)
+    return // process.exit puede estar interceptado (pruebas): no seguir arrancando.
   }
   // (P3) Se eliminó el aviso de JWT_REFRESH_SECRET: era engañoso. No existe tal
   // "fallback" — los refresh tokens SIEMPRE se firman/verifican con JWT_SECRET
