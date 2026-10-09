@@ -51,6 +51,17 @@ git pull origin "$BRANCH" || fail "No se pudo hacer pull de origin/$BRANCH"
 COMMIT=$(git rev-parse --short HEAD)
 ok "Código actualizado. Commit: $COMMIT"
 
+# ── 2b. Secretos: JWT_SECRET apto y sin valor público conocido ──
+# ANTES de backup/build/up: el API ya no arranca con un JWT_SECRET público (default
+# o ejemplo publicado) y docker-compose.yml exige JWT_SECRET. Sólo JWT_SECRET
+# bloquea; las demás variables con valor público se informan con su remediación
+# (rotarlas a ciegas corta el servicio). Abortar aquí deja los contenedores como
+# estaban. No imprime valores. El entorno pisa al .env, como en compose.
+step "Verificando secretos (.env)"
+bash scripts/check-public-secrets.sh --env-file .env --process-env \
+  || fail "JWT_SECRET ausente, público, no apto o no verificable (ver arriba). Generá uno con openssl rand -hex 64 (una sola línea, sin comillas); cambiar JWT_SECRET invalida todas las sesiones (re-login). No se tocó ningún contenedor."
+ok "Secretos verificados"
+
 # ── 3. Backup de DB (opcional) ──────────────────────────────
 step "Backup de base de datos"
 

@@ -96,6 +96,27 @@ else
   log "Archivo .env encontrado ✓"
 fi
 
+# ─── JWT_SECRET vacío (.env copiado de .env.example) ──────────
+# .env.example trae `JWT_SECRET=` vacío a propósito (sin valor público). Sólo se
+# completa si la línea existe VACÍA: nunca se pisa un valor existente (rotarlo
+# invalida todas las sesiones y es una decisión operativa).
+if grep -q '^JWT_SECRET=$' .env; then
+  command -v openssl &>/dev/null \
+    || err "JWT_SECRET está vacío en .env y openssl no está disponible: generalo (openssl rand -hex 64) y volvé a ejecutar ./setup.sh"
+  JWT_SECRET_NUEVO=$(openssl rand -hex 64)
+  sed -i "s|^JWT_SECRET=$|JWT_SECRET=$JWT_SECRET_NUEVO|" .env
+  unset JWT_SECRET_NUEVO
+  log "JWT_SECRET estaba vacío en .env: se generó uno aleatorio ✓"
+fi
+
+# ─── Secretos: ninguno con valor público conocido ─────────────
+# El API no arranca con un JWT_SECRET público (default/ejemplo publicado), vacío o
+# no aleatorio: sólo eso bloquea. Las demás variables con valor público se informan
+# con su remediación (no se rotan a ciegas). Verificar antes de construir; no
+# imprime valores.
+bash scripts/check-public-secrets.sh --env-file .env --process-env \
+  || err "Revisá JWT_SECRET en .env (generalo con: openssl rand -hex 64, en una sola línea y sin comillas) y volvé a ejecutar ./setup.sh"
+
 # ─── Construir e iniciar servicios ────────────────────────────
 log "Construyendo contenedores Docker..."
 docker compose build --no-cache

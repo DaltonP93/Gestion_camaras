@@ -7,6 +7,18 @@ echo "Actualizando código..."
 git fetch origin
 git pull origin $(git branch --show-current)
 
+# Antes de build/up: el API ya no arranca con un JWT_SECRET de valor público
+# (default o ejemplo publicado) y docker-compose.yml exige JWT_SECRET. Si JWT_SECRET
+# no cumple, set -e aborta aquí y los contenedores quedan como estaban (las demás
+# variables con valor público sólo se informan). No imprime valores; el entorno
+# pisa al .env, como en la interpolación de compose.
+echo "Verificando secretos (valores públicos conocidos)..."
+if [ -f .env ]; then
+  bash scripts/check-public-secrets.sh --env-file .env --process-env
+else
+  bash scripts/check-public-secrets.sh --process-env
+fi
+
 echo "Rebuildeando contenedores modificados..."
 docker compose build web api
 

@@ -30,6 +30,9 @@ export interface VideoStreamConfig {
   audioCodecType:  string
   audioInputType:  string
   audioBitrate:    number
+  // true sólo si audioEnabled/codec/bitrate se leyeron del ÚNICO bloque <Audio>.
+  // Los backups anteriores no lo traen: su audioEnabled era el <enabled> del CANAL.
+  audioBlockPresent?: boolean
   raw?:            string     // raw XML snippet for debug
 }
 
@@ -117,6 +120,127 @@ function parseFps(raw: string): number {
   return n
 }
 
+// ─── Bloque <Audio> ──────────────────────────────────────────────────────────
+//
+// En /ISAPI/Streaming/channels/<NN><01|02> hay VARIOS <enabled>: el del CANAL
+// (el primero, antes de <Transport>), los de Transport (Unicast/Multicast/
+// Security), los de <Video> (y SVC/SmartCodec) y recién al final el de <Audio>.
+// Leer o escribir "el primer <enabled>" informa/apaga el CANAL, no el audio.
+// Por eso todo lo de audio se lee y se escribe SÓLO dentro del único bloque
+// <Audio>…</Audio>, y el resto del documento queda idéntico byte a byte.
+
+// Prefijo de namespace opcional (p.ej. <hik:Audio>); Hikvision suele usar el
+// namespace por defecto, pero no cuesta nada tolerarlo. Sin distinguir mayúsculas,
+// igual que xmlGet; el lookahead (?=[\s/>]) exige el nombre EXACTO (no confunde
+// <Audio> con <audioInputChannelID> ni <enabled> con <enabledX>).
+const XML_NS_PREFIX = '(?:[A-Za-z_][\\w.-]*:)?'
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+interface AudioBlock {
+  innerStart: number   // primer byte después de <Audio …>
+  innerEnd:   number   // índice donde empieza </Audio>
+}
+
+function findAudioBlock(xml: string): { block: AudioBlock } | { error: string } {
+  const opens = [...xml.matchAll(new RegExp(`<(${XML_NS_PREFIX}Audio)(?=[\\s/>])[^>]*>`, 'gi'))]
+  if (opens.length === 0) return { error: 'El stream no expone un bloque <Audio>; no se aplicó ningún cambio' }
+  if (opens.length > 1)   return { error: 'El stream tiene más de un bloque <Audio>; no se aplicó ningún cambio' }
+  const open = opens[0]
+  if (open[0].endsWith('/>')) return { error: 'El bloque <Audio> del stream está vacío; no se aplicó ningún cambio' }
+  const innerStart = (open.index ?? 0) + open[0].length
+  const closeRe = new RegExp(`</${escapeRegExp(open[1])}\\s*>`, 'gi')
+  closeRe.lastIndex = innerStart
+  const close = closeRe.exec(xml)
+  if (!close) return { error: 'El bloque <Audio> del stream no está cerrado; no se aplicó ningún cambio' }
+  return { block: { innerStart, innerEnd: close.index } }
+}
+
+interface AudioTag { open: string; value: string; close: string; index: number; length: number }
+
+/** Localiza el ÚNICO <tag>valor</tag> dentro del contenido del bloque <Audio>. */
+function findAudioTag(inner: string, tag: string): AudioTag | 'missing' | 'ambiguous' {
+  const count = (inner.match(new RegExp(`<${XML_NS_PREFIX}${tag}(?=[\\s/>])`, 'gi')) ?? []).length
+  if (count === 0) return 'missing'
+  if (count > 1)   return 'ambiguous'
+  // (?<!/)> descarta <tag/> autocerrado: no hay valor que reemplazar.
+  const m = new RegExp(`(<(${XML_NS_PREFIX}${tag})(?:\\s[^>]*)?(?<!/)>)([^<]*)(</\\2\\s*>)`, 'i').exec(inner)
+  if (!m) return 'missing'
+  return { open: m[1], value: m[3], close: m[4], index: m.index, length: m[0].length }
+}
+
+function escapeXmlText(v: string): string {
+  return v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function unescapeXmlText(v: string): string {
+  return v.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+}
+
+function parseAudioBlock(xml: string): Pick<VideoStreamConfig, 'audioBlockPresent' | 'audioEnabled' | 'audioCodecType' | 'audioBitrate'> {
+  const found = findAudioBlock(xml)
+  // Sin bloque (o ambiguo) no se puede afirmar que haya audio ⇒ se informa apagado.
+  if ('error' in found) return { audioBlockPresent: false, audioEnabled: false, audioCodecType: '', audioBitrate: 0 }
+  const inner = xml.slice(found.block.innerStart, found.block.innerEnd)
+  const read = (tag: string): string => {
+    const t = findAudioTag(inner, tag)
+    return typeof t === 'string' ? '' : unescapeXmlText(t.value.trim())
+  }
+  return {
+    audioBlockPresent: true,
+    audioEnabled:   parseBoolean(read('enabled') || '0'),
+    audioCodecType: read('audioCompressionType') || read('audioCodecType') || '',
+    audioBitrate:   parseInt(read('audioBitRate') || '0'),
+  }
+}
+
+/**
+ * Aplica los cambios de audio EXCLUSIVAMENTE dentro del bloque <Audio>. Si no hay
+ * un único bloque, o falta (o se repite) el tag a modificar, devuelve error y el
+ * llamador NO debe hacer el PUT: nunca se aplica a medias ni se toca otro <enabled>.
+ */
+function applyAudioUpdate(
+  xml: string,
+  update: Pick<VideoStreamUpdate, 'audioEnabled' | 'audioCodecType' | 'audioBitrate'>,
+): { xml: string } | { error: string } {
+  const changes: Array<{ tags: string[]; value: string }> = []
+  if (update.audioEnabled !== undefined) {
+    changes.push({ tags: ['enabled'], value: update.audioEnabled ? 'true' : 'false' })
+  }
+  if (update.audioCodecType !== undefined) {
+    changes.push({ tags: ['audioCompressionType', 'audioCodecType'], value: update.audioCodecType })
+  }
+  if (update.audioBitrate !== undefined) {
+    changes.push({ tags: ['audioBitRate'], value: String(update.audioBitrate) })
+  }
+  if (changes.length === 0) return { xml }
+
+  const found = findAudioBlock(xml)
+  if ('error' in found) return found
+  let inner = xml.slice(found.block.innerStart, found.block.innerEnd)
+
+  for (const { tags, value } of changes) {
+    let applied = false
+    for (const tag of tags) {
+      const t = findAudioTag(inner, tag)
+      if (t === 'missing') continue
+      if (t === 'ambiguous') return { error: `El bloque <Audio> tiene más de un <${tag}>; no se aplicó ningún cambio` }
+      // Conserva los espacios/saltos de línea que rodean al valor original. El valor
+      // se escapa: un "codec" con </Audio> no puede salirse del bloque.
+      const lead  = /^\s*/.exec(t.value)![0]
+      const trail = /\s*$/.exec(t.value.slice(lead.length))![0]
+      inner = inner.slice(0, t.index) + t.open + lead + escapeXmlText(value) + trail + t.close + inner.slice(t.index + t.length)
+      applied = true
+      break
+    }
+    if (!applied) return { error: `El bloque <Audio> no tiene <${tags[0]}>; no se aplicó ningún cambio` }
+  }
+
+  return { xml: xml.slice(0, found.block.innerStart) + inner + xml.slice(found.block.innerEnd) }
+}
+
 // ─── Parse one streaming channel XML ─────────────────────────────────────────
 
 function parseStreamXml(xml: string, streamType: 'main' | 'sub'): VideoStreamConfig {
@@ -134,11 +258,9 @@ function parseStreamXml(xml: string, streamType: 'main' | 'sub'): VideoStreamCon
   const qualityLevel = xmlGet(xml, 'fixedQuality') || xmlGet(xml, 'videoQuality') || ''
   const h265Plus     = codec.toLowerCase().includes('h.265+') || parseBoolean(xmlGet(xml, 'SmartEncode'))
 
-  // Audio
-  const audioEnabled   = parseBoolean(xmlGet(xml, 'enabled') || '0')
-  const audioCodec     = xmlGet(xml, 'audioCompressionType') || xmlGet(xml, 'audioCodecType') || ''
+  // Audio: SÓLO desde el bloque <Audio> (el primer <enabled> del XML es el del canal).
+  const audio          = parseAudioBlock(xml)
   const audioInputType = xmlGet(xml, 'audioInputType') || ''
-  const audioBitrate   = parseInt(xmlGet(xml, 'audioBitRate') || '0')
 
   return {
     streamType,
@@ -151,10 +273,11 @@ function parseStreamXml(xml: string, streamType: 'main' | 'sub'): VideoStreamCon
     bitrateMax,
     qualityLevel,
     h265Plus,
-    audioEnabled,
-    audioCodecType:  audioCodec,
+    audioEnabled:    audio.audioEnabled,
+    audioCodecType:  audio.audioCodecType,
     audioInputType,
-    audioBitrate,
+    audioBitrate:    audio.audioBitrate,
+    audioBlockPresent: audio.audioBlockPresent,
     raw: xml.length > 2000 ? xml.slice(0, 2000) + '…' : xml,
   }
 }
@@ -241,10 +364,19 @@ export interface VideoStreamUpdate {
 }
 
 /**
+ * Código del rechazo LOCAL de un cambio de audio (no se envió ningún PUT al NVR):
+ * falta el bloque <Audio>, es ambiguo, falta (o se repite) el tag, o el valor no es
+ * válido (tipo, codec vacío, bitrate no entero positivo). Las rutas lo responden
+ * como 422 (no es un fallo del NVR).
+ */
+export const AUDIO_UPDATE_REJECTED = 'AUDIO_UPDATE_REJECTED' as const
+
+/**
  * Writes video/audio configuration to NVR for one channel and stream (main=01, sub=02).
  * Strategy:
  *   1. GET current XML from ISAPI
  *   2. Replace only the fields present in `update` using simple XML tag replacement
+ *      (audio: SÓLO dentro del bloque <Audio>; si no se puede, no hay PUT)
  *   3. PUT modified XML back
  * Returns the updated config by re-reading from NVR after the write.
  */
@@ -254,7 +386,21 @@ export async function putChannelVideoConfig(
   channel: number,
   streamType: 'main' | 'sub',
   update: VideoStreamUpdate
-): Promise<{ success: boolean; error?: string; config?: ChannelVideoConfig }> {
+): Promise<{ success: boolean; error?: string; code?: typeof AUDIO_UPDATE_REJECTED; config?: ChannelVideoConfig }> {
+  // El body de PUT /nvrs/:id/video-audio/:channel no pasa por Zod: un "false"
+  // (string) es truthy y encendería el audio. Se valida antes de tocar el NVR.
+  // Codec vacío (o sólo espacios): es lo que manda NVRDetailPage aunque el usuario no
+  // toque el audio; escribirlo dejaba <audioCompressionType></audioCompressionType>.
+  // Bitrate: entero positivo (kbps); -5 o 64.5 se escribían tal cual en <audioBitRate>.
+  if ((update.audioEnabled   !== undefined && typeof update.audioEnabled !== 'boolean') ||
+      (update.audioCodecType !== undefined && (typeof update.audioCodecType !== 'string' || !update.audioCodecType.trim())) ||
+      (update.audioBitrate   !== undefined && !(Number.isInteger(update.audioBitrate) && update.audioBitrate > 0))) {
+    return {
+      success: false,
+      code: AUDIO_UPDATE_REJECTED,
+      error: 'Valores de audio inválidos (audioEnabled booleano, audioCodecType texto no vacío, audioBitrate entero positivo); no se aplicó ningún cambio',
+    }
+  }
   try {
     function replaceXmlTag(xml: string, tag: string, value: string): string {
       return xml.replace(
@@ -314,19 +460,14 @@ export async function putChannelVideoConfig(
         xml = replaceXmlTag(xml, 'videoQuality', update.qualityLevel)
       }
     }
-    if (update.audioEnabled !== undefined) {
-      xml = replaceXmlTag(xml, 'enabled', update.audioEnabled ? 'true' : 'false')
+    // Audio: sólo dentro del bloque <Audio>. Antes se reemplazaba el PRIMER
+    // <enabled> del documento, que es el del CANAL ⇒ apagar el audio deshabilitaba
+    // el stream. Si el cambio no se puede aplicar ahí, no se hace el PUT.
+    const audio = applyAudioUpdate(xml, update)
+    if ('error' in audio) {
+      return { success: false, code: AUDIO_UPDATE_REJECTED, error: audio.error }
     }
-    if (update.audioCodecType !== undefined) {
-      if (/<audioCompressionType[\s>]/i.test(xml)) {
-        xml = replaceXmlTag(xml, 'audioCompressionType', update.audioCodecType)
-      } else {
-        xml = replaceXmlTag(xml, 'audioCodecType', update.audioCodecType)
-      }
-    }
-    if (update.audioBitrate !== undefined) {
-      xml = replaceXmlTag(xml, 'audioBitRate', String(update.audioBitrate))
-    }
+    xml = audio.xml
 
     // 3. PUT modified XML back
     const putRes = await client.put(endpoint, xml, {

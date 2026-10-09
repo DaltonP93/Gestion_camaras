@@ -6,6 +6,7 @@ import path from 'path'
 import { pipeline } from 'stream/promises'
 import { z } from 'zod'
 import { checkPasswordPolicy, checkPasswordHistory, addToPasswordHistory } from '../services/totp'
+import { revokeUserWs } from '../services/ws-revoke-bus'
 
 const updateProfileSchema = z.object({
   fullName: z.string().min(2).max(100).optional(),
@@ -95,7 +96,9 @@ const profileRoutes: FastifyPluginAsync = async (server) => {
       },
     })
 
+    // Sin sesiones, los access ya emitidos dejan de valer (actor vigente); y sus WS.
     await server.prisma.session.deleteMany({ where: { userId: request.user.sub } })
+    await revokeUserWs(server, request.user.sub)
     return reply.send({ message: 'Contraseña actualizada. Inicia sesión nuevamente.' })
   })
 

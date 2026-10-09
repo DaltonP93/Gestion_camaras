@@ -11,6 +11,7 @@
 // `maxRedirects:0` evita que un 3xx redirija a un destino interno.
 
 import axios from 'axios'
+import { outboundNotificationsAllowed, OUTBOUND_DISABLED_CODE, OUTBOUND_DISABLED_MESSAGE } from '../staging-isolation'
 import { redactIps } from '../../lib/log-redact'
 
 export type ChannelKind = 'slack' | 'teams' | 'webhook'
@@ -89,6 +90,9 @@ export function buildChannelPayload(kind: ChannelKind, a: ChannelAlert): unknown
 /** POST del payload al webhook. Valida SSRF, timeout corto, sin redirecciones.
  *  Nunca propaga: devuelve un resultado con success/errorCode (redactado). */
 export async function sendToChannel(kind: ChannelKind, url: string, alert: ChannelAlert): Promise<ChannelSendResult> {
+  if (!outboundNotificationsAllowed()) {
+    return { success: false, error: OUTBOUND_DISABLED_MESSAGE, errorCode: OUTBOUND_DISABLED_CODE }
+  }
   let target: URL
   try {
     target = assertSafeWebhookUrl(url)

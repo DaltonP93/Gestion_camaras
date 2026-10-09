@@ -13,6 +13,7 @@ import { getMediaGrantManager, getNativeReadiness, getSessionPolicy, kickConnect
 import { decideGrantIssuance, timingSafeEqualHex, sha256Hex } from '../services/media/media-grants'
 import { deriveMediaRequest } from '../services/media/grant-derivation'
 import type { GrantScopeQuery, MediaTransport } from '../services/media/contracts'
+import { isInternalPeer, isProxyForwarded } from '../lib/internal-origin'
 
 const NATIVE_PLAYBACK_ENABLED = process.env.NATIVE_PLAYBACK_ENABLED === 'true'
 const NATIVE_MEDIA_RELAY_ENABLED = process.env.NATIVE_MEDIA_RELAY_ENABLED === 'true'
@@ -105,6 +106,14 @@ export const mediaGrantsRoutes: FastifyPluginAsync = async (server) => {
   server.post('/internal/media-grant/validate', async (request, reply) => {
     if (!NATIVE_MEDIA_RELAY_ENABLED) return reply.status(404).send({ code: 'NATIVE_MEDIA_RELAY_DISABLED' })
     if (!MEDIA_RELAY_SECRET) return reply.status(503).send({ code: 'MEDIA_RELAY_SECRET_UNSET' })
+    // C03/CHW-08: además del secreto, origen interno por el PAR TCP (como el hook de
+    // MediaMTX; nunca por request.ip) Y sin reenvío de proxy: la location /api/ de
+    // nginx alcanza esta ruta y para el API su par (nginx) es interno, así que la
+    // puerta por par sola sólo frenaría a un par externo directo. nginx siempre pone
+    // X-Forwarded-For/X-Real-IP; el relay llama directo y sin ellas. Antes del
+    // secreto: ni un par externo ni un cliente vía nginx prueban secretos ni
+    // consumen el grant.
+    if (!isInternalPeer(request) || isProxyForwarded(request)) return reply.status(403).send({ code: 'ORIGIN_NOT_ALLOWED' })
     const provided = request.headers['x-media-relay-secret']
     if (typeof provided !== 'string' || !timingSafeEqualHex(sha256Hex(provided), sha256Hex(MEDIA_RELAY_SECRET))) {
       return reply.status(401).send({ code: 'RELAY_SECRET_INVALID' })
