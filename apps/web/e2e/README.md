@@ -1,4 +1,48 @@
-# Test de integración en navegador — ciclo de vida de pantalla completa (ViewPlayerPage)
+# Pruebas de integración en navegador
+
+## Grabaciones: reproductor real y API simulada
+
+`recordings-continuity.spec.ts` monta **RecordingsPage de producción**. A diferencia
+del harness de pantalla completa descrito abajo, usa su `<video>` real, sin stub,
+y decodifica `fixtures/recording-synthetic.mp4` en Chromium. La API está interceptada
+por `fixtures/recordings-mock.ts`: rutas inesperadas fallan. No se conecta a cámaras,
+NVR ni servidores de producción.
+
+Prueba registro del sucesor antes de cerrar el predecesor, tres bloques completos,
+espera inicial de datos de 6 s (mayor que el bloque de 4 s), pausa, velocidad 2×,
+cierre con respuesta tardía, rechazo 403 y salto automático de un hueco de 6 s.
+La simulación de admisión sólo prueba el **orden HTTP**; no sustituye las pruebas
+del servidor que exigen salida real de FFmpeg antes de liberar un lease.
+
+El caso de tres bloques observa `requestVideoFrameCallback`, comprueba frames
+presentados hasta el final de cada bloque y adjunta `synthetic-frame-timings.json`
+al informe de Playwright. Los tiempos incluyen deliberadamente la espera inyectada
+en el relevo; **no son un benchmark del NVR ni una promesa de latencia**. Un 200,
+`loadedmetadata` o un `play()` resuelto no se cuentan como primer fotograma.
+
+```bash
+cd apps/web
+npm run test:e2e -- e2e/recordings-continuity.spec.ts
+```
+
+### Procedencia del video de prueba
+
+Patrón generado localmente, sin imágenes reales: VP9, fMP4, 160×90, 10 fps, 4 s,
+sin audio, 35 384 bytes. SHA-256:
+`83882c443945fc9b26ec7b130de9303222c74e3f0b31a2d32d32454aded0ed93`.
+VP9 permite ejecutar el mismo test en Chromium de CI sin códecs propietarios.
+**H.264/H.265 de los NVR, audio, GPU, Safari y dispositivos reales no quedan
+validados por este fixture.** El servidor sigue usando sus códecs actuales.
+
+Comando de generación (FFmpeg 6.1.1; no hace falta FFmpeg para correr los tests):
+
+```bash
+ffmpeg -f lavfi -i 'testsrc2=size=160x90:rate=10' -t 4 -an \
+  -c:v libvpx-vp9 -pix_fmt yuv420p -b:v 80k -g 10 \
+  -movflags frag_keyframe+empty_moov+default_base_moof recording-synthetic.mp4
+```
+
+## Pantalla completa (ViewPlayerPage)
 
 Test de **integración en navegador** (Playwright + **Chromium real**) del contrato
 de **liberación rápida** de sesiones de la vista `ViewPlayerPage` (Hito 5, C23).

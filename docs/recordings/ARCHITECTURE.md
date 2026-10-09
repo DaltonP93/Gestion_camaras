@@ -7,8 +7,9 @@ Reproducción remota estilo iVMS-4200 sin esperar a generar un MP4 completo.
 1. **Búsqueda** (ISAPI): `routes/recordings.ts` + `services/hikvision.ts`
    paginan resultados por cámara y rango (tag `searchResultPostion`, loop en
    `MORE`, fallback por time-chunks). Calendario de días con grabación.
-2. **Preview instantáneo** (fMP4 sobre HTTP): FFmpeg lee el RTSP de playback del
-   NVR y emite fMP4 vía `reply.hijack()`. Arranca en 1–3 s.
+2. **Preview por streaming** (fMP4 sobre HTTP): FFmpeg lee el RTSP de playback del
+   NVR y emite fMP4 vía `reply.hijack()`. El arranque depende del NVR, de la cola
+   y del decodificador: HTTP 200 / primer byte no equivalen a primer fotograma.
 3. **MP4 bajo demanda**: solo al pedir descarga/exportación se genera el MP4
    completo (cache en disco + token de descarga de 24 h en Redis).
 
@@ -34,12 +35,25 @@ idle → searching → loading → playing ⇄ paused
 
 ### Continuidad automática — se dispara por:
 - `ended` del `<video>`; o
-- **timer esperado** = `clipEnd − effectiveStart` (+margen), re-armado en
-  resume/seek/cambio de velocidad, cancelado en pausa/frame-step; o
+- **timer esperado** sobre tiempo de video restante y velocidad (+margen), armado
+  al reproducir realmente y revalidado contra `currentTime` antes de avanzar;
+  cancelado en espera de datos, seek, pausa y limpieza. La espera de red no
+  consume duración de grabación; o
 - **error cerca del final** (dentro de la cola del clip → fin natural).
 
 Considera: siguiente bloque por metadata, `sessionId` vigente, cámara
-desmarcada, seek manual del usuario, gap `> CONTINUITY_GAP_MS` → `no_recording`.
+desmarcada y seek manual. En 1×1 salta los huecos automáticamente; en multicámara
+espera el reloj compartido. El umbral `CONTINUITY_GAP_MS` ya no decide el salto.
+
+En relevo inmediato se registra el sucesor **antes** del DELETE del predecesor,
+para que admisión pueda comprobar la prioridad de continuidad. El backend sigue
+liberando capacidad sólo tras la salida real del proceso. Si no hay siguiente
+bloque o hay que esperar un hueco multicámara, el predecesor se cierra inmediatamente.
+
+La regresión del orden y del temporizador se ejerce con el reproductor real y
+video sintético en [`apps/web/e2e/README.md`](../../apps/web/e2e/README.md).
+La evolución hacia la experiencia integrada está en
+[`NVR_EXPERIENCE_ROADMAP.md`](../NVR_EXPERIENCE_ROADMAP.md).
 
 ## Compartición de streams
 
