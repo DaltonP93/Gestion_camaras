@@ -47,6 +47,27 @@ declare module 'fastify' {
   }
 }
 
+const ACCESS_ROLES: ReadonlySet<string> = new Set(['ADMIN', 'SUPERVISOR', 'OPERATOR', 'AUDITOR'])
+
+/**
+ * ¿Son estos claims los de un ACCESS token? Es la única forma de JWT válida como
+ * credencial de petición (header Bearer o cookie). El servidor firma con la misma
+ * clave otros tokens que NO deben abrir rutas:
+ *   - intermedios `{sub, step}` (2fa, mfa-enroll, elevated): sin rol; las rutas que
+ *     sólo excluyen OPERATOR o filtran AUDITOR los trataban como sin restricción;
+ *   - refresh `{…, jti, rememberMe}`: 7 días y sólo revocable vía /auth/refresh.
+ * Esos flujos los verifican explícitamente con `server.jwt.verify`, que no pasa por
+ * aquí; esta regla sólo rige `request.jwtVerify()` (authenticate, authorize,
+ * hls-auth, apariencia…).
+ */
+export function isAccessTokenClaims(claims: unknown): boolean {
+  if (!claims || typeof claims !== 'object') return false
+  const c = claims as Record<string, unknown>
+  return typeof c.sub === 'string' && c.sub.length > 0 &&
+    typeof c.role === 'string' && ACCESS_ROLES.has(c.role) &&
+    c.step === undefined && c.jti === undefined
+}
+
 const authPlugin: FastifyPluginAsync = fp(async (server) => {
   const jwtSecret = process.env.JWT_SECRET
   if (!jwtSecret || jwtSecret.length < 32) {
@@ -72,6 +93,9 @@ const authPlugin: FastifyPluginAsync = fp(async (server) => {
       cookieName: ACCESS_COOKIE,
       signed: false,
     },
+    // Sólo access tokens como credencial de petición (ver isAccessTokenClaims).
+    // Un token de otro tipo ⇒ 401 (FST_JWT_AUTHORIZATION_TOKEN_UNTRUSTED).
+    trusted: (_request, claims) => isAccessTokenClaims(claims),
   })
 
   // Decorator: verificar que el request tiene token válido (header o cookie)
