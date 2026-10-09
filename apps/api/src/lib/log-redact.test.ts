@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { redactLog, redactError, maskIp, maskUser } from './log-redact'
+import { Writable } from 'node:stream'
+import Fastify from 'fastify'
+import { redactLog, redactError, maskIp, maskUser, requestLogSerializer } from './log-redact'
+import { resolveTrustedProxies } from './trusted-proxy'
 
 describe('redactLog — invariante #6: ni host ni credenciales en el log', () => {
   it('colapsa IPv4, IPv6, userinfo y Authorization', () => {
@@ -48,5 +51,38 @@ describe('redactLog — invariante #6: ni host ni credenciales en el log', () =>
     expect(maskIp('fd12::1')).toBe('***')
     expect(maskUser('admin')).toBe('set')
     expect(maskUser('')).toBe('unset')
+  })
+})
+
+// C03 — Con trustProxy (server.ts), request.hostname sale de X-Forwarded-Host (lo elige
+// el cliente: nginx no lo fija) y request.ip de X-Forwarded-For. El log de cada request
+// registra el Host y el par TCP, como antes de C03: ni un hostname elegido por el
+// cliente ni su IP (dato personal en logs sin retención; desde la LAN, una IP interna).
+describe('requestLogSerializer — el log de request no toma X-Forwarded-Host ni X-Forwarded-For (C03)', () => {
+  async function logDe(headers: Record<string, string>, remoteAddress: string) {
+    const lines: string[] = []
+    const stream = new Writable({ write(chunk, _enc, cb) { lines.push(String(chunk)); cb() } })
+    const app = Fastify({
+      trustProxy: resolveTrustedProxies(undefined).trustProxy,
+      logger: { level: 'info', stream, serializers: { req: requestLogSerializer } },
+    })
+    app.get('/api/x', async () => ({ ok: true }))
+    await app.inject({ method: 'GET', url: '/api/x?token=abc', remoteAddress, headers })
+    await app.close()
+    const entry = lines.map((l) => JSON.parse(l)).find((l) => l.msg === 'incoming request')
+    return entry.req as { method: string; url: string; hostname?: string; remoteAddress?: string }
+  }
+
+  it('desde nginx (par confiable) con X-Forwarded-Host y X-Forwarded-For del cliente ⇒ Host y par TCP', async () => {
+    const req = await logDe({
+      host: 'vms.example.test', 'x-forwarded-host': 'atacante.example',
+      'x-forwarded-for': '203.0.113.77', 'x-real-ip': '203.0.113.77',
+    }, '172.18.0.5')
+    expect(req).toEqual({ method: 'GET', url: '/api/x?token=***', hostname: 'vms.example.test', remoteAddress: '172.18.0.5' })
+  })
+
+  it('Host con puerto ⇒ sin el puerto (como request.hostname); IPv6 entre corchetes', async () => {
+    expect((await logDe({ host: 'vms.example.test:8443' }, '127.0.0.1')).hostname).toBe('vms.example.test')
+    expect((await logDe({ host: '[::1]:4000' }, '127.0.0.1')).hostname).toBe('[::1]')
   })
 })
