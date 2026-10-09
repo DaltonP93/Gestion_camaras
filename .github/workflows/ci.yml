@@ -153,8 +153,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # JWT_SECRET no tiene default (${JWT_SECRET:?…}): se valida con un valor
+      # ALEATORIO efímero del job (no versionado; -q no vuelca la config resuelta).
       - name: Validar docker-compose.yml
-        run: docker compose -f docker-compose.yml config -q
+        run: JWT_SECRET="$(openssl rand -hex 64)" docker compose -f docker-compose.yml config -q
+      # Guard: sin JWT_SECRET la composición DEBE fallar (impide reintroducir un
+      # default público para la clave que firma los access).
+      - name: docker-compose.yml sin JWT_SECRET debe fallar
+        run: |
+          if env -u JWT_SECRET docker compose -f docker-compose.yml config -q >/dev/null 2>&1; then
+            echo "docker-compose.yml interpola JWT_SECRET sin que esté definido (¿default reintroducido?)" >&2
+            exit 1
+          fi
+      # Verificación previa al despliegue de secretos públicos (sus pruebas corren en
+      # el job api: src/lib/check-public-secrets.script.test.ts).
+      - name: Sintaxis de check-public-secrets.sh (bash -n)
+        run: bash -n scripts/check-public-secrets.sh
       # Contrato del cableado de auth_request del HLS: X-Original-URI debe llevar la
       # URI del request PADRE (set $hls_original_uri $uri en /hls/), no la del
       # subrequest. Evita reintroducir el incidente HLS (BAD_PATH/403).

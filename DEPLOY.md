@@ -22,12 +22,26 @@ Editar `.env` con valores reales:
 
 | Variable | Descripción | Cómo generar |
 |---|---|---|
-| `JWT_SECRET` | Clave JWT (mín. 32 chars) | `openssl rand -hex 64` |
+| `JWT_SECRET` | Clave JWT (obligatoria, mín. 32 chars; el API no arranca con un valor público conocido ni con uno no aleatorio) | `openssl rand -hex 64` |
 | `NVR_CREDENTIAL_KEY` | Clave AES para contraseñas NVR | `openssl rand -hex 32` |
 | `CORS_ORIGINS` | Orígenes permitidos (coma-separados) | `https://camaras.saa.com.py` |
 | `COOKIE_SECURE` | `true` solo con HTTPS activo | `false` (HTTP) / `true` (HTTPS) |
 
 > **IMPORTANTE:** Si `COOKIE_SECURE=true` y el sitio es HTTP, el login falla silenciosamente porque las cookies no se envían.
+
+> **JWT_SECRET:** `docker-compose.yml` ya no trae valor por defecto (`docker compose` aborta si falta) y el API
+> aborta al arrancar si coincide con un valor público conocido. `setup.sh` lo genera si la línea está vacía
+> (nunca pisa un valor existente). Escribilo en una sola línea, sin comillas ni `$` (ASCII, como produce
+> `openssl rand -hex 64`). Verificar sin imprimir valores:
+> `bash scripts/check-public-secrets.sh --env-file .env --process-env`. Exit 1 **sólo** por JWT_SECRET
+> (ausente, público, no apto o "no verificable": una línea que el script no puede leer igual que compose);
+> `setup.sh` y los `deploy.sh` abortan con eso antes de tocar contenedores. Las demás variables vigiladas se
+> **informan** con su "qué hacer" y no bloquean (`--strict` las vuelve bloqueantes): **no** las reemplaces a
+> ciegas en `.env`. `POSTGRES_PASSWORD` exige `ALTER USER` coordinado con `.env` (Postgres sólo la toma en
+> initdb), `NVR_CREDENTIAL_KEY` exige re-cifrar las contraseñas de NVR antes de rotarla y
+> `JWT_REFRESH_SECRET` se elimina porque el API no la usa. La lista de placeholders genéricos es de mejor
+> esfuerzo: lo que garantiza el secreto es generarlo con openssl. Cambiar `JWT_SECRET` invalida todas las
+> sesiones (re-login).
 
 Variables opcionales para ajustar límites de streaming:
 ```env
