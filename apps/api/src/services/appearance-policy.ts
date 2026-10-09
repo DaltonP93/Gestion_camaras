@@ -124,6 +124,69 @@ export function resolveUploadAsset(mimetype: string, buf: Uint8Array): UploadAss
   return { ok: true, ext: extensionForImageType(type), type }
 }
 
+// ─── Archivos de branding: referencias y borrado seguro ──────────────
+
+/** Columnas de AppearanceSettings que pueden apuntar a un archivo de branding. */
+export const BRANDING_URL_COLUMNS = ['logoUrl', 'sidebarLogoUrl', 'faviconUrl'] as const
+
+const BRANDING_SEGMENT = '/uploads/branding/'
+// Nombre plano: sin separadores ni "..", como los que genera la carga.
+const PLAIN_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/
+
+function stripQueryAndHash(v: string): string {
+  return v.split(/[?#]/, 1)[0]
+}
+
+/**
+ * Nombre del archivo de branding al que apunta una URL, sea relativa o absoluta
+ * (de cualquier host): sirve para CONTAR referencias, por eso es amplio. null si
+ * la URL no apunta a /uploads/branding/<archivo>.
+ */
+export function referencedBrandingFile(url: string | null | undefined): string | null {
+  if (!url) return null
+  const p = stripQueryAndHash(url)
+  const i = p.lastIndexOf(BRANDING_SEGMENT)
+  if (i < 0) return null
+  const name = p.slice(i + BRANDING_SEGMENT.length)
+  return PLAIN_FILE_NAME.test(name) && !name.includes('..') ? name : null
+}
+
+/**
+ * Nombre del archivo LOCAL que esta instancia escribió para una URL: sólo la ruta
+ * relativa /uploads/branding/<archivo> (la que guarda la carga; también la legacy
+ * http://localhost…, que normalizeUploadUrl vuelve relativa). Una URL absoluta de
+ * otro host —o cargada a mano por PUT— NO es un archivo nuestro: no se borra.
+ */
+export function ownedBrandingFile(url: string | null | undefined): string | null {
+  if (!url) return null
+  const p = stripQueryAndHash(normalizeUploadUrl(url))
+  if (!p.startsWith(BRANDING_SEGMENT)) return null
+  const name = p.slice(BRANDING_SEGMENT.length)
+  return PLAIN_FILE_NAME.test(name) && !name.includes('..') ? name : null
+}
+
+/**
+ * Archivos que se pueden borrar tras reemplazar campos: los anteriores que eran
+ * nuestros y que ya NINGUNA columna referencia (el mismo archivo puede estar en
+ * logo, sidebar y favicon a la vez; borrarlo dejaría a los otros en 404).
+ */
+export function brandingFilesToDelete(
+  previous: Partial<Record<(typeof BRANDING_URL_COLUMNS)[number], string | null>> | null | undefined,
+  next: Partial<Record<(typeof BRANDING_URL_COLUMNS)[number], string | null>>,
+  replacedColumns: readonly string[],
+): string[] {
+  const stillReferenced = new Set(
+    BRANDING_URL_COLUMNS.map((k) => referencedBrandingFile(next[k])).filter((v): v is string => !!v),
+  )
+  const out = new Set<string>()
+  for (const col of replacedColumns) {
+    const prev = (previous as Record<string, string | null | undefined> | null | undefined)?.[col]
+    const file = ownedBrandingFile(prev)
+    if (file && !stillReferenced.has(file)) out.add(file)
+  }
+  return [...out]
+}
+
 // ─── URLs de assets: normalización legacy localhost → relativa ────
 
 /** Convierte http(s)://localhost[:port]/uploads/... en /uploads/... (idempotente). */

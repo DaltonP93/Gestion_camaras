@@ -159,6 +159,70 @@ describe('POST /api/appearance/upload — varias partes', () => {
   })
 })
 
+// Archivo compartido: el mismo archivo puede estar referenciado por más de una
+// columna (logo, sidebar, favicon), p. ej. cargado una vez y reutilizado por
+// PUT /api/appearance. Reemplazar uno de los campos NO debe borrar un archivo que
+// otro campo sigue usando, ni un archivo local que coincide por nombre con una URL
+// absoluta (de otro host o cargada a mano).
+describe('POST /api/appearance/upload — archivo compartido entre campos', () => {
+  const brandingFile = (name: string) => path.join(uploadsDir, 'branding', name)
+  const seed = (name: string) => { fs.writeFileSync(brandingFile(name), REAL_PNG); return `/uploads/branding/${name}` }
+
+  it('logo y sidebar comparten archivo: reemplazar el logo conserva el archivo del sidebar (sigue sirviéndose)', async () => {
+    const shared = seed('compartido_1.png')
+    store.appearance = { id: 'singleton', logoUrl: shared, sidebarLogoUrl: shared, faviconUrl: null }
+
+    const res = await uploadPart('loginLogo', 'nuevo.png', 'image/png', REAL_PNG)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.json().logoUrl).not.toBe(shared)
+    expect(store.appearance.sidebarLogoUrl).toBe(shared)
+    expect(fs.existsSync(brandingFile('compartido_1.png'))).toBe(true)
+    expect((await app.inject({ method: 'GET', url: shared })).statusCode).toBe(200)
+  })
+
+  it('la referencia por URL absoluta del mismo archivo (cargada por PUT) también lo protege', async () => {
+    const shared = seed('compartido_2.png')
+    store.appearance = { id: 'singleton', logoUrl: shared, sidebarLogoUrl: 'https://vms.example.test/uploads/branding/compartido_2.png', faviconUrl: null }
+
+    const res = await uploadPart('loginLogo', 'nuevo.png', 'image/png', REAL_PNG)
+
+    expect(res.statusCode).toBe(200)
+    expect(fs.existsSync(brandingFile('compartido_2.png'))).toBe(true)
+  })
+
+  it('una URL absoluta de otro host con el mismo nombre que un archivo local no borra el archivo local', async () => {
+    seed('ajeno_1.png')
+    store.appearance = { id: 'singleton', logoUrl: 'https://cdn.example.org/uploads/branding/ajeno_1.png', sidebarLogoUrl: null, faviconUrl: null }
+
+    const res = await uploadPart('loginLogo', 'nuevo.png', 'image/png', REAL_PNG)
+
+    expect(res.statusCode).toBe(200)
+    expect(fs.existsSync(brandingFile('ajeno_1.png'))).toBe(true)
+  })
+
+  it('reemplazar dos campos que compartían archivo en la misma carga sí lo borra (ya nadie lo usa)', async () => {
+    const shared = seed('compartido_3.png')
+    store.appearance = { id: 'singleton', logoUrl: shared, sidebarLogoUrl: shared, faviconUrl: null }
+
+    const form = new FormData()
+    form.append('loginLogo', new Blob([REAL_PNG], { type: 'image/png' }), 'a.png')
+    form.append('sidebarLogo', new Blob([REAL_PNG], { type: 'image/png' }), 'b.png')
+    const encoded = new Response(form)
+    const res = await app.inject({
+      method: 'POST', url: '/api/appearance/upload',
+      headers: { authorization: `Bearer ${token}`, 'content-type': encoded.headers.get('content-type') ?? '' },
+      payload: Buffer.from(await encoded.arrayBuffer()),
+    })
+
+    expect(res.statusCode).toBe(200)
+    expect(fs.existsSync(brandingFile('compartido_3.png'))).toBe(false)
+    for (const url of [res.json().logoUrl, res.json().sidebarLogoUrl]) {
+      expect(fs.existsSync(brandingFile(path.basename(url)))).toBe(true)
+    }
+  })
+})
+
 describe('GET /uploads/ — política de servido (defensa en profundidad)', () => {
   it('404 para un .js LEGADO ya presente en disco (sin borrarlo)', async () => {
     const legacy = path.join(uploadsDir, 'branding', 'legacy_payload.js')

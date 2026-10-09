@@ -10,6 +10,9 @@ import {
   normalizeUploadUrl,
   toPublishableAppearance,
   PUBLISHABLE_APPEARANCE_FIELDS,
+  referencedBrandingFile,
+  ownedBrandingFile,
+  brandingFilesToDelete,
 } from './appearance-policy'
 
 // Firmas mágicas mínimas para las pruebas.
@@ -171,5 +174,35 @@ describe('resolveUploadAsset — MIME permitido + imagen real; extensión del ti
   it('RECHAZA MIME fuera de la whitelist (MIME_NOT_ALLOWED)', () => {
     expect(resolveUploadAsset('text/html', HTML)).toEqual({ ok: false, reason: 'MIME_NOT_ALLOWED' })
     expect(resolveUploadAsset('image/svg+xml', PNG)).toEqual({ ok: false, reason: 'MIME_NOT_ALLOWED' })
+  })
+})
+
+describe('archivos de branding: referencias y borrado seguro (archivo compartido)', () => {
+  it('referencedBrandingFile cuenta referencias relativas y absolutas, sin query ni hash', () => {
+    expect(referencedBrandingFile('/uploads/branding/logo_1.png')).toBe('logo_1.png')
+    expect(referencedBrandingFile('https://vms.example.test/uploads/branding/logo_1.png?v=2#x')).toBe('logo_1.png')
+    expect(referencedBrandingFile('https://cdn.example.org/otra/logo_1.png')).toBeNull()
+    expect(referencedBrandingFile(null)).toBeNull()
+  })
+
+  it('ownedBrandingFile sólo acepta la ruta relativa (o la legacy de localhost) con nombre plano', () => {
+    expect(ownedBrandingFile('/uploads/branding/logo_1.png')).toBe('logo_1.png')
+    expect(ownedBrandingFile('http://localhost:4000/uploads/branding/logo_1.png')).toBe('logo_1.png')
+    expect(ownedBrandingFile('https://cdn.example.org/uploads/branding/logo_1.png')).toBeNull()
+    for (const bad of ['/uploads/branding/../secreto.png', '/uploads/branding/a/b.png', '/uploads/branding/..', '/uploads/branding/', '/uploads/avatars/x.png']) {
+      expect(ownedBrandingFile(bad), bad).toBeNull()
+    }
+  })
+
+  it('brandingFilesToDelete no borra lo que otra columna sigue usando ni archivos que no son nuestros', () => {
+    const shared = '/uploads/branding/c.png'
+    // Logo y sidebar comparten: reemplazar sólo el logo ⇒ nada que borrar.
+    expect(brandingFilesToDelete({ logoUrl: shared, sidebarLogoUrl: shared }, { logoUrl: '/uploads/branding/n.png', sidebarLogoUrl: shared }, ['logoUrl'])).toEqual([])
+    // Referencia absoluta del mismo archivo en otra columna ⇒ también protege.
+    expect(brandingFilesToDelete({ logoUrl: shared }, { logoUrl: '/uploads/branding/n.png', faviconUrl: 'https://vms.example.test/uploads/branding/c.png' }, ['logoUrl'])).toEqual([])
+    // Reemplazar los dos campos que compartían ⇒ se borra una sola vez.
+    expect(brandingFilesToDelete({ logoUrl: shared, sidebarLogoUrl: shared }, { logoUrl: '/uploads/branding/n1.png', sidebarLogoUrl: '/uploads/branding/n2.png' }, ['logoUrl', 'sidebarLogoUrl'])).toEqual(['c.png'])
+    // URL absoluta de otro host ⇒ no es nuestro archivo.
+    expect(brandingFilesToDelete({ logoUrl: 'https://cdn.example.org/uploads/branding/c.png' }, { logoUrl: '/uploads/branding/n.png' }, ['logoUrl'])).toEqual([])
   })
 })

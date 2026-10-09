@@ -9,6 +9,7 @@ import {
   BLOCKED_SVG_CODE,
   isAllowedUploadMime,
   resolveUploadAsset,
+  brandingFilesToDelete,
   normalizeUploadUrl,
   toPublishableAppearance,
 } from '../services/appearance-policy'
@@ -222,13 +223,12 @@ const appearancePlugin: FastifyPluginAsync = async (server) => {
       update: updates,
     })
 
-    // Delete previous file for each updated field if it's a local upload
-    for (const [dbKey, newUrl] of Object.entries(updates)) {
-      const prevUrl: string | null = (current as any)?.[dbKey] ?? null
-      if (prevUrl && prevUrl !== newUrl && (prevUrl.startsWith('/uploads/branding/') || prevUrl.includes('/uploads/branding/'))) {
-        const prevFile = path.join(brandingDir, path.basename(prevUrl))
-        try { fs.unlinkSync(prevFile) } catch {}
-      }
+    // Borrar los archivos anteriores de los campos reemplazados sólo si eran
+    // nuestros (ruta relativa que escribió esta carga, no una URL absoluta) y
+    // ninguna columna los sigue usando: el mismo archivo puede estar en logo,
+    // sidebar y favicon a la vez (p. ej. reutilizado por PUT /appearance).
+    for (const file of brandingFilesToDelete(current as any, settings as any, Object.keys(updates))) {
+      try { fs.unlinkSync(path.join(brandingDir, file)) } catch {}
     }
 
     return reply.send(toPublishableAppearance(settings as any))
