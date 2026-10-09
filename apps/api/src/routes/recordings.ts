@@ -37,6 +37,7 @@ import { stageProbe, stageDecode, stageEncodeMux, type RtspTransport } from '../
 import { parseFfmpegProgress, parseStreamInfoFromStderr } from '../services/recordings/ffmpeg-progress'
 import { PreviewProcessRegistry, type AttemptRecord } from '../services/recordings/preview-process-registry'
 import { buildPreviewInputArgs, resolvePreviewProbeOptions } from '../services/recordings/preview-input-options'
+import { checkRecordingMediaAccess, type RecordingMediaBinding } from '../services/current-actor'
 import { getNvrSystemTime } from '../services/hikvision'
 
 // ─── VOD configuration ────────────────────────────────────────────
@@ -290,6 +291,11 @@ interface DownloadToken {
   expiresAt: number
   sessionId: string
   issuedAt:  number
+  // Ligadura al titular (actor vigente): se revalida al servir. Un token sin
+  // ligadura (emitido antes de este cambio) se rechaza.
+  userId?:   string
+  sid?:      string
+  cameraId?: string
 }
 // Store con TTL: Redis cuando está disponible (los links de descarga
 // sobreviven reinicios del API y funcionan con múltiples workers), memoria
@@ -300,6 +306,16 @@ let downloadTokenStore: SessionStore<DownloadToken> = new MemorySessionStore<Dow
 interface RecordingSession {
   expiresAt:   number
   userId:      string
+  // Sesión (Session.id) y cámara del titular: file.mp4, /download y /status
+  // revalidan actor vigente + permiso de reproducción al servir cada petición.
+  sid?:        string
+  cameraId?:   string
+  // ALIAS: sesión de OTRA sesión (`sid`) del mismo usuario que se sumó al trabajo
+  // (FFmpeg/archivo) de la sesión `jobOf`. Tiene sus propios tokens, ligados a su
+  // `sid`; el estado del trabajo se copia con `syncVodAlias`. No es dueña del
+  // archivo ni del proceso: su vencimiento o DELETE no los tocan.
+  jobOf?:      string
+  downloadFilename?: string
   startedAt:   number
   status:      'starting' | 'ready' | 'error'
   errorCode?:  string
@@ -336,13 +352,16 @@ function issueDownloadToken(opts: {
 }): string {
   const token    = crypto.randomBytes(24).toString('hex')
   const issuedAt = Date.now()
+  const sess = recordingSessions.get(opts.sessionId)
   void downloadTokenStore.set(token, {
     token, filePath: opts.filePath, filename: opts.filename,
     expiresAt: issuedAt + DOWNLOAD_TOKEN_TTL_MS,
     sessionId: opts.sessionId,
     issuedAt,
+    // Mismo titular que la sesión de reproducción (sin sesión ⇒ sin ligadura ⇒ se
+    // rechaza al servir: fail-closed).
+    userId: sess?.userId, sid: sess?.sid, cameraId: sess?.cameraId,
   }, DOWNLOAD_TOKEN_TTL_MS)
-  const sess = recordingSessions.get(opts.sessionId)
   if (sess) {
     sess.downloadToken = token
     sess.downloadUrl   = `/api/recordings/download?t=${token}`
@@ -351,6 +370,39 @@ function issueDownloadToken(opts: {
   opts.log(`[recordings] download_token_issued sessionId=${opts.sessionId} filename=${opts.filename}`)
   opts.log(`[recordings] download_strategy sessionId=${opts.sessionId} strategy=reuse_preview previewStrategy=${previewStrategy} filename=${opts.filename}`)
   return token
+}
+
+/**
+ * Copia en una sesión ALIAS el estado del trabajo VOD al que se sumó (la sesión
+ * `jobOf`, que corre FFmpeg). Al quedar listo, le da SU propia URL de archivo y SU
+ * propio token de descarga, ligados a la sesión del alias: cerrar la sesión que
+ * inició el trabajo no deja sin medios a este dispositivo. Idempotente.
+ */
+function syncVodAlias(aliasId: string, alias: RecordingSession, log: (msg: string) => void): void {
+  if (!alias.jobOf || alias.status !== 'starting') return
+  const job = recordingSessions.get(alias.jobOf)
+  if (!job) {
+    alias.status    = 'error'
+    alias.errorCode = 'VOD_JOB_GONE'
+    alias.errorMsg  = 'La generación del video se canceló. Volvé a intentarlo.'
+    return
+  }
+  alias.progress = job.progress
+  alias.strategy = job.strategy
+  alias.codec    = job.codec
+  if (job.status === 'error') {
+    alias.status    = 'error'
+    alias.errorCode = job.errorCode
+    alias.errorMsg  = job.errorMsg
+    return
+  }
+  if (job.status !== 'ready' || !job.vodFile) return
+  alias.vodFile       = job.vodFile
+  alias.vodFileCached = job.vodFileCached
+  alias.mimeType      = job.mimeType
+  alias.vodUrl        = `/api/recordings/playback/${aliasId}/file.mp4?token=${alias.fileToken}`
+  alias.status        = 'ready'
+  issueDownloadToken({ sessionId: aliasId, filePath: job.vodFile, filename: alias.downloadFilename ?? 'grabacion.mp4', log })
 }
 
 // Periodic cleanup of expired sessions and download tokens — does NOT delete cached files
@@ -363,8 +415,9 @@ setInterval(() => {
       if (session.vodProcess) {
         try { session.vodProcess.kill('SIGTERM') } catch {}
       }
-      // Only delete session-scoped temp files, not cache files
-      if (session.vodFile && !session.vodFileCached) {
+      // Only delete session-scoped temp files, not cache files (ni el archivo del
+      // trabajo al que un alias sólo se sumó: es de la sesión `jobOf`)
+      if (session.vodFile && !session.vodFileCached && !session.jobOf) {
         fs.unlink(session.vodFile, () => {})
       }
     }
@@ -378,6 +431,7 @@ type PreviewStrategy = 'preview_copy_h264' | 'preview_copy_hevc' | 'preview_tran
 interface PreviewSession {
   streamToken: string     // short-lived token for unauthenticated /stream URL
   userId:      string
+  sid?:        string     // Session.id del titular: cada GET /stream revalida el actor vigente
   createdAt:   number
   expiresAt:   number     // 30 min TTL
   rtspUrl:     string
@@ -401,6 +455,10 @@ interface PreviewSession {
   // Generación del stream: se incrementa en cada GET /stream. Identifica al dueño
   // actual; un GET más nuevo gana y el viejo cede sin tocar refs del nuevo (req 13).
   streamGeneration?: number
+  // Orden de LLEGADA de los GET /stream, tomado antes de la revalidación asíncrona
+  // del actor: un GET más viejo cuya revalidación termine después que la de uno más
+  // nuevo NO puede tomar la generación (invariante 4: lo más nuevo gana).
+  streamArrivals?: number
   // Cierre en curso: bloquea nuevos GET /stream y marca el teardown ordenado (12).
   closing?:        boolean
   // ¿Hay un consumidor (GET /stream) adjunto ahora? Para el reaper de sesiones sin
@@ -721,6 +779,12 @@ const PREVIEW_FIRST_BYTE_TIMEOUT_MS = Math.max(3_000, parseInt(process.env.RECOR
 // por un takeover, ya no es el proceso activo de la sesión). Red de seguridad
 // independiente del JWT y del ciclo de la request (req 15).
 const PREVIEW_ORPHAN_REAP_MS = Math.max(5_000, parseInt(process.env.RECORDINGS_PREVIEW_ORPHAN_REAP_MS || '30000', 10) || 30_000)
+// Cada cuánto se revalida el titular (actor vigente + permiso de reproducción) de
+// cada stream de preview YA ADJUNTO de este proceso. Es la cota del corte de un
+// stream abierto tras logout, baja, borrado, cambio de rol o de contraseña, reset de
+// 2FA, revocar sesiones o quitar canPlayback. Costo: ≤2 consultas por PK por stream
+// adjunto y ciclo (los streams adjuntos están acotados por el cupo de cada NVR).
+const PREVIEW_ACTOR_RECHECK_MS = 5_000
 // Presupuesto TOTAL de arranque (todas las variantes juntas). Si se supera, se
 // deja de intentar y se responde error — cota superior dura al peor caso.
 const PREVIEW_TOTAL_STARTUP_MS = Math.max(10_000, parseInt(process.env.RECORDINGS_PREVIEW_TOTAL_STARTUP_MS || '60000', 10) || 60_000)
@@ -1349,6 +1413,58 @@ const previewStartSchema = z.object({
 })
 
 export const recordingRoutes: FastifyPluginAsync = async (server) => {
+  /**
+   * Revalida un medio de grabación YA EMITIDO (fileToken, descarga, stream de
+   * preview, URLs re-entregadas por /status): el titular sigue siendo un actor
+   * vigente (usuario activo, sesión viva) y puede reproducir la cámara HOY (mismas
+   * reglas de rol que el alta). 'unavailable' ⇒ la base falló: no servir (503).
+   */
+  const recheckMedia = async (
+    binding: RecordingMediaBinding, what: string, sessionId: string,
+  ): Promise<'ok' | 'denied' | 'unavailable'> => {
+    try {
+      const r = await checkRecordingMediaAccess(server.prisma, binding)
+      if (r.ok) return 'ok'
+      server.log.warn(`[recordings] media_access_denied what=${what} sessionId=${sessionId} reason=${r.reason}`)
+      return 'denied'
+    } catch {
+      server.log.error(`[recordings] media_access_unavailable what=${what} sessionId=${sessionId}`)
+      return 'unavailable'
+    }
+  }
+  const MEDIA_DENIED = { message: 'Acceso a la grabación revocado' }
+  const MEDIA_UNAVAILABLE = { message: 'No se pudo verificar el acceso. Reintentá en unos segundos.' }
+
+  // ─── Streams de preview YA ADJUNTOS ─────────────────────────────────────────
+  // GET /preview/:id/stream revalida al abrir, pero un stream ya adjunto seguía
+  // entregando video (y FFmpeg tirando del NVR) hasta el fin del clip o el TTL de
+  // 30 min. Cada PREVIEW_ACTOR_RECHECK_MS se revalida el titular de cada stream
+  // adjunto de ESTE proceso contra la base: cubre toda revocación (logout, revocar
+  // sesiones, baja, borrado, rol, contraseña, 2FA, canPlayback), la haya atendido
+  // este proceso u otro. Revocado ⇒ cierre por la vía terminal (mata FFmpeg y
+  // libera el cupo del NVR). Base caída ⇒ no se corta: se reintenta en el ciclo
+  // siguiente (como el ping del WS; no se abren streams nuevos sin verificar).
+  const previewRechecks = new Set<string>()
+  const revalidateAttachedPreviews = async () => {
+    const attached = [...previewSessions.entries()]
+      .filter(([id, s]) => s.streamAttached && !s.closing && !previewRechecks.has(id))
+    await Promise.all(attached.map(async ([sessionId, session]) => {
+      previewRechecks.add(sessionId)
+      try {
+        const media = await recheckMedia(
+          { userId: session.userId, sid: session.sid, cameraId: session.cameraId }, 'preview_attached', sessionId,
+        )
+        if (media === 'denied' && previewSessions.get(sessionId) === session && !session.closing) {
+          terminatePreviewSession(sessionId, session, 'access_revoked', (m) => server.log.info(m))
+        }
+      } finally {
+        previewRechecks.delete(sessionId)
+      }
+    }))
+  }
+  const previewRecheckTimer = setInterval(() => { void revalidateAttachedPreviews() }, PREVIEW_ACTOR_RECHECK_MS)
+  previewRecheckTimer.unref?.()
+
   // Promocionar los download tokens a Redis: los links de "Descargar MP4"
   // sobreviven reinicios del API (los archivos viven en el volumen de cache)
   if ((server as any).redis) {
@@ -1366,6 +1482,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
   // borra de `previewSessions` durante el recorrido.
   server.addHook('onClose', async () => {
     const log = (m: string) => server.log.info(m)
+    clearInterval(previewRecheckTimer)
     for (const [sid, session] of [...previewSessions.entries()]) {
       try { terminatePreviewSession(sid, session, 'shutdown', log) } catch { /* noop */ }
     }
@@ -1684,6 +1801,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
           server.log.info(`[recordings] vod_cache_hit sessionId=${sessionId} cacheKey=${cacheKey} strategy=${sidecar?.strategy ?? 'unknown'} codec=${sidecar?.codec ?? 'unknown'} sizeBytes=${stat.size} cameraId=${body.cameraId} cacheFile=${cacheFile}`)
           recordingSessions.set(sessionId, {
             expiresAt, startedAt: Date.now(), userId: user.sub,
+            sid: user.sid, cameraId: body.cameraId,
             status: 'ready', fileToken,
             vodFile: cacheFile, vodFileCached: true,
             vodUrl: `/api/recordings/playback/${sessionId}/file.mp4?token=${fileToken}`,
@@ -1712,9 +1830,38 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     const existingSid = recordingJobKeys.get(jobKey)
     if (existingSid) {
       const existing = recordingSessions.get(existingSid)
+      // Mismo usuario: se reutiliza el trabajo (en curso o listo) para no lanzar un
+      // segundo FFmpeg sobre el MISMO archivo. Los tokens de esa sesión están ligados
+      // a la sesión (`sid`) que lo inició: sólo se entregan a ESA misma sesión.
       if (existing && existing.userId === user.sub && existing.status !== 'error') {
-        server.log.info(`[recordings] vod_reuse_session sessionId=${existingSid} jobKey=${jobKey} status=${existing.status}`)
         existing.expiresAt = Date.now() + RECORDING_SESSION_TTL_MS
+        if (existing.sid !== user.sid) {
+          // OTRA sesión del mismo usuario (otro dispositivo, o un re-login): alias con
+          // tokens PROPIOS ligados a su sesión, que sigue el trabajo existente. Así el
+          // logout del otro dispositivo no la deja en 403, y nunca se le entregan los
+          // tokens de una sesión ajena (viva o ya cerrada).
+          const aliasId = crypto.randomBytes(8).toString('hex')
+          const alias: RecordingSession = {
+            expiresAt: existing.expiresAt, startedAt: Date.now(), userId: user.sub,
+            sid: user.sid, cameraId: body.cameraId, jobOf: existingSid, downloadFilename,
+            status: 'starting', fileToken: crypto.randomBytes(24).toString('hex'),
+            expectedDurationSec: existing.expectedDurationSec,
+          }
+          recordingSessions.set(aliasId, alias)
+          syncVodAlias(aliasId, alias, (msg) => server.log.info(msg))
+          server.log.info(`[recordings] vod_reuse_job sessionId=${aliasId} jobSessionId=${existingSid} jobKey=${jobKey} status=${alias.status}`)
+          return reply.send({
+            status:              alias.status,
+            sessionId:           aliasId,
+            pollUrl:             `/api/recordings/playback/${aliasId}/status`,
+            expiresAt:           new Date(alias.expiresAt).toISOString(),
+            expectedDurationSec: alias.expectedDurationSec,
+            url:                 alias.vodUrl,
+            mimeType:            alias.mimeType,
+            downloadUrl:         alias.downloadUrl,
+          })
+        }
+        server.log.info(`[recordings] vod_reuse_session sessionId=${existingSid} jobKey=${jobKey} status=${existing.status}`)
         return reply.send({
           status:              existing.status,
           sessionId:           existingSid,
@@ -1750,6 +1897,8 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       expiresAt:  Date.now() + RECORDING_SESSION_TTL_MS,
       startedAt:  Date.now(),
       userId:     user.sub,
+      sid:        user.sid,
+      cameraId:   body.cameraId,
       status:     'starting',
       fileToken,
       jobKey,
@@ -1798,6 +1947,12 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
       return reply.status(403).send({ message: 'Sin permiso' })
     }
+    // No re-entregar url/downloadUrl de un titular revocado (C14).
+    const media = await recheckMedia(session, 'playback_status', sessionId)
+    if (media !== 'ok') return reply.status(media === 'denied' ? 403 : 503).send(media === 'denied' ? MEDIA_DENIED : MEDIA_UNAVAILABLE)
+    // Alias de un trabajo de otra sesión: traer su estado (y, si ya terminó, sus
+    // propios url/downloadUrl) recién ahora, con el titular ya revalidado.
+    syncVodAlias(sessionId, session, (msg) => server.log.info(msg))
 
     const outTimeSec      = session.progress?.outTimeSec ?? 0
     const progressPercent = session.expectedDurationSec && outTimeSec > 0
@@ -1842,6 +1997,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       server.log.warn(`[recordings] file_session_expired sessionId=${sessionId}`)
       return reply.status(401).send({ message: 'Sesión expirada' })
     }
+    // Revalidación en CADA petición (también cada Range del <video>): titular
+    // vigente + permiso de reproducción actual sobre la cámara.
+    const media = await recheckMedia(session, 'file', sessionId)
+    if (media !== 'ok') return reply.status(media === 'denied' ? 403 : 503).send(media === 'denied' ? MEDIA_DENIED : MEDIA_UNAVAILABLE)
 
     let fileSize: number
     try {
@@ -1894,8 +2053,9 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     if (session.vodProcess) {
       try { session.vodProcess.kill('SIGTERM') } catch {}
     }
-    // Only remove temp files, not cache files (cache is managed by runCacheCleanup)
-    if (session.vodFile && !session.vodFileCached) {
+    // Only remove temp files, not cache files (cache is managed by runCacheCleanup).
+    // Un alias no es dueño del archivo del trabajo al que se sumó.
+    if (session.vodFile && !session.vodFileCached && !session.jobOf) {
       fs.unlink(session.vodFile, () => {})
     }
     server.log.info(`[recordings] playback_stopped sessionId=${sessionId}`)
@@ -1923,6 +2083,10 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       server.log.warn(`[recordings] download_token_invalid reason=expired filename=${dt.filename}`)
       return reply.status(403).type('text/plain').send('Token expirado')
     }
+    // El token (24 h) ya no es al portador: titular vigente + permiso actual.
+    const media = await recheckMedia(dt, 'download', dt.sessionId)
+    if (media === 'unavailable') return reply.status(503).type('text/plain').send('Servicio no disponible')
+    if (media === 'denied') return reply.status(403).type('text/plain').send('Acceso denegado')
 
     // Path-traversal guard: the resolved path must live inside one of the
     // directories this module writes MP4s to (cache dir or temp dir)
@@ -2205,7 +2369,7 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     )
 
     previewSessions.set(sessionId, {
-      streamToken, userId: user.sub, createdAt: Date.now(), expiresAt,
+      streamToken, userId: user.sub, sid: user.sid, createdAt: Date.now(), expiresAt,
       rtspUrl, rtspMasked, cameraId: body.cameraId, nvrId: camera.nvr.id, slotIndex: body.slotIndex,
       startTime: body.startTime, endTime: body.endTime,
       forceTranscode, strategy, detectedCodec, canPlayHevcMp4,
@@ -2302,6 +2466,29 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
     if (session.closing) {
       server.log.warn(`[recordings-preview] stream_rejected_closing sessionId=${sessionId}`)
       return reply.status(409).send({ message: 'Sesión de preview en cierre' })
+    }
+    // Actor vigente + permiso de reproducción actual ANTES del takeover y del
+    // spawn: una sesión revocada no relanza FFmpeg contra el NVR. Revocación
+    // definitiva ⇒ cierre por la vía terminal (libera el cupo del NVR); base caída
+    // ⇒ 503 sin tocar la sesión ni su generación.
+    const myArrival = (session.streamArrivals = (session.streamArrivals ?? 0) + 1)
+    const media = await recheckMedia(
+      { userId: session.userId, sid: session.sid, cameraId: session.cameraId }, 'preview_stream', sessionId,
+    )
+    if (media === 'unavailable') return reply.status(503).send(MEDIA_UNAVAILABLE)
+    if (media === 'denied') {
+      if (previewSessions.get(sessionId) === session) {
+        terminatePreviewSession(sessionId, session, 'access_revoked', (m) => server.log.info(m))
+      }
+      return reply.status(403).send(MEDIA_DENIED)
+    }
+    // Llegó un GET más nuevo mientras se revalidaba: ceder sin tocar la generación.
+    if (session.streamArrivals !== myArrival) {
+      return reply.status(409).send({ message: 'Stream reemplazado por una solicitud más reciente' })
+    }
+    // La sesión pudo cerrarse (DELETE, TTL) durante la revalidación.
+    if (session.closing || !previewSessions.has(sessionId)) {
+      return reply.status(410).send({ message: 'Sesión de preview cancelada' })
     }
 
     // ── (10) UN SOLO consumidor / un solo FFmpeg por sesión ──────────────────
@@ -3237,6 +3424,11 @@ export const recordingRoutes: FastifyPluginAsync = async (server) => {
       if (session.userId !== request.user.sub && request.user.role !== 'ADMIN') {
         return reply.status(403).send({ message: 'Sin permiso' })
       }
+      // No re-entregar streamUrl de un titular revocado (C14).
+      const media = await recheckMedia(
+        { userId: session.userId, sid: session.sid, cameraId: session.cameraId }, 'preview_status', sessionId,
+      )
+      if (media !== 'ok') return reply.status(media === 'denied' ? 403 : 503).send(media === 'denied' ? MEDIA_DENIED : MEDIA_UNAVAILABLE)
       if (session.errorCategory) {
         server.log.info(`[recordings-preview] status_error sessionId=${sessionId} category=${session.errorCategory}`)
       }
