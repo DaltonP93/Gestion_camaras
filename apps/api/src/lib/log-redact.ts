@@ -90,3 +90,38 @@ export function redactError(e: unknown): string {
   if (parts.length === 0) parts.push(typeof e === 'string' ? e : 'error')
   return redactLog(parts.join(': ')) || 'error'
 }
+
+// Cualquier IPv4, también la ya enmascarada parcialmente (`a.b.x.x`).
+const ANY_IPV4_RE = /\b\d{1,3}\.\d{1,3}\.(?:\d{1,3}|x)\.(?:\d{1,3}|x)\b/g
+
+/**
+ * Redacción para RESPUESTAS de diagnóstico (no sólo logs). A diferencia de
+ * `redactLog`, no deja NINGÚN rastro del origen: ni usuario, ni host/IP (tampoco
+ * enmascarada `a.b.x.x`), ni puerto. Colapsa la autoridad completa de cualquier URL
+ * (`rtsp://user:pass@host:554/x` → `rtsp://***` + `/x`, también la variante sin `//`
+ * que arma rtsp-probe), toda IPv4/IPv6 suelta y cada valor literal conocido de
+ * `secrets` (IP/host y usuario del NVR, IP de la cámara, clave en claro). Conserva
+ * el path y el texto del error, que es lo útil para diagnosticar.
+ */
+export function redactDiagnosticText(
+  text: string | null | undefined,
+  secrets: Array<string | null | undefined> = [],
+): string | null {
+  if (!text) return text ?? null
+  let out = String(text)
+  // Literales conocidos primero (en claro y url-encoded, también la variante estricta
+  // RFC 3986 que codifica !'()*), del más largo al más corto. Se ignoran los de menos
+  // de 3 caracteres para no destrozar el texto.
+  const strictEncode = (v: string) =>
+    encodeURIComponent(v).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+  const literals = secrets
+    .flatMap((s) => (s ? [String(s), encodeURIComponent(String(s)), strictEncode(String(s))] : []))
+    .filter((s) => s.trim().length >= 3)
+    .sort((a, b) => b.length - a.length)
+  for (const lit of new Set(literals)) out = out.split(lit).join('***')
+  out = out.replace(/\b([a-z][a-z0-9+.-]*):\/\/[^\s/?#]+/gi, '$1://***')            // esquema://autoridad
+  out = out.replace(/\b([a-z][a-z0-9+.-]*):(?!\/\/)[^\s/@]*@[^\s/]+/gi, '$1://***')  // esquema:user@host
+  out = out.replace(IPV6_RE, '***')                                                // IPv6 suelta
+  out = out.replace(ANY_IPV4_RE, '***')                                            // IPv4 (y a.b.x.x)
+  return out
+}

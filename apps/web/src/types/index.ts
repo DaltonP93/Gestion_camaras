@@ -177,7 +177,9 @@ export interface NVR {
   port: number
   rtspPort: number
   sdkPort?: number
-  username: string
+  // Usuario del NVR: la API sólo lo manda a ADMIN (formulario de edición). Para el
+  // resto de los roles viene ausente; nunca se recibe la clave.
+  username?: string
   channels: number
   hddCount: number
   firmware?: string
@@ -337,12 +339,14 @@ export interface CameraDiagnostics {
   camera: {
     channelNumber: number
     name: string
-    ipAddress?: string
+    ipAddress?: string       // sólo para ADMIN
     protocol?: string
     onlineInNvr: boolean
     preferredStream: string
   }
   rtsp: {
+    // Sólo el path del canal (`rtsp://***/Streaming/Channels/101`): la API no expone
+    // usuario, IP ni puerto del NVR en ninguna forma; los errores vienen redactados.
     mainUrlMasked: string
     subUrlMasked: string
     mainOk: boolean

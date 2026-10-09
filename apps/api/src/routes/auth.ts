@@ -52,12 +52,27 @@ const changePasswordSchema = z.object({
 const hashToken = (t: string) => crypto.createHash('sha256').update(t).digest('hex')
 
 // ─── Select del usuario para /me ─────────────────────────────
+// ALLOWLIST explícita de lo que el web lee de /me (authStore, Sidebar, ProfilePage,
+// StepUpModal y guards de rol). Antes iba `permissions: { include: { nvr: true,
+// camera: true } }`: a CUALQUIER rol le llegaba la fila completa de cada NVR/cámara
+// asignados (usuario y clave cifrada del NVR, IP, puertos, rtspUrl legado) y el
+// navegador la persistía en localStorage. El web no usa `permissions` de acá; los
+// permisos granulares propios se piden a /api/users/:id/permissions (sin credenciales).
 const userMeSelect = {
   id: true, username: true, fullName: true, email: true,
-  role: true, active: true, avatarUrl: true, phone: true,
-  createdAt: true, twoFactorEnabled: true, forcePasswordChange: true,
-  permissions: { include: { nvr: true, camera: true } },
-  featurePermissions: true,
+  role: true, avatarUrl: true, phone: true, twoFactorEnabled: true,
+  // Sólo los flags (sin id/userId de la fila); resolveFeaturePermissions completa
+  // con los defaults del rol.
+  featurePermissions: {
+    select: {
+      canViewDashboard: true, canViewLive: true, canViewRecordings: true,
+      canViewAlerts: true, canViewDiagnostics: true,
+      canManageNVRs: true, canManageCameras: true, canManageUsers: true,
+      canManageAppearance: true, canResolveAlerts: true,
+      canRestartStreams: true, canTranscode: true,
+      canDownloadRecordings: true, canManageViews: true, canManageSettings: true,
+    },
+  },
 }
 
 export const authRoutes: FastifyPluginAsync = async (server) => {

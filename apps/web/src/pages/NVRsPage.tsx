@@ -77,7 +77,9 @@ export function NVRsPage() {
     setEditingNVR(nvr)
     setForm({
       name: nvr.name, model: nvr.model, ipAddress: nvr.ipAddress, port: nvr.port,
-      rtspPort: nvr.rtspPort, username: nvr.username || 'admin', password: '',
+      // username sólo llega a ADMIN; a otro rol se le muestra vacío (no un 'admin'
+      // inventado). Guardar/probar conexión siguen siendo sólo ADMIN en la API.
+      rtspPort: nvr.rtspPort, username: nvr.username ?? '', password: '',
       channels: nvr.channels, hddCount: nvr.hddCount, location: nvr.location || '',
       audioMode: nvr.audioMode ?? '',
     })
