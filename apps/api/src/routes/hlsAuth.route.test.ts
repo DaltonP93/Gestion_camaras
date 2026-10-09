@@ -2,10 +2,11 @@
 // el endpoint /internal/hls-auth con JWT real (cookie), @fastify/cookie y un prisma
 // stub para userPermission (RBAC por cámara).
 import { describe, it, expect, beforeEach } from 'vitest'
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify'
 import fastifyCookie from '@fastify/cookie'
 import fastifyJwt from '@fastify/jwt'
 import { hlsAuthRoutes, parseStreamName, streamNameFromUri } from './hlsAuth'
+import { resolveTrustedProxies } from '../lib/trusted-proxy'
 
 describe('parseStreamName', () => {
   it('deriva nvrId + canal de un path válido', () => {
@@ -57,8 +58,8 @@ function makePrisma(perms: Array<{ userId: string; nvrId?: string | null; camera
   } as any
 }
 
-async function buildApp(prisma: any): Promise<FastifyInstance> {
-  const app = Fastify()
+async function buildApp(prisma: any, trustProxy?: FastifyServerOptions['trustProxy']): Promise<FastifyInstance> {
+  const app = Fastify({ trustProxy })
   await app.register(fastifyCookie)
   await app.register(fastifyJwt, { secret: 'test_secret_at_least_32_chars_long_xxxxx', cookie: { cookieName: 'access_token', signed: false } })
   app.decorate('prisma', prisma)
@@ -189,5 +190,40 @@ describe('GET /internal/hls-auth', () => {
       headers: { 'x-original-uri': URI },
     })
     expect(res.statusCode).toBe(403)
+  })
+})
+
+// C03 — con trustProxy (server.ts) request.ip es la IP del CLIENTE que nginx pone en
+// X-Forwarded-For. La puerta "interna" debe mirar el PAR TCP: si mirara request.ip,
+// el auth_request que nginx hace desde su red interna para un cliente de Internet
+// daría 403 y cortaría todo el HLS.
+describe('GET /internal/hls-auth — origen interno por el par TCP (C03)', () => {
+  const trust = resolveTrustedProxies(undefined).trustProxy
+  const NGINX = '172.18.0.5'
+
+  it('auth_request de nginx (par interno) para un cliente de Internet ⇒ 200/403/401 según la sesión', async () => {
+    const app = await buildApp(makePrisma([{ userId: 'op1', nvrId: 'n1', cameraId: 'cam-x', channel: 3 }]), trust)
+    const viaNginx = (cookie?: string, uri = URI) => app.inject({
+      method: 'GET', url: '/internal/hls-auth', remoteAddress: NGINX,
+      ...(cookie ? { cookies: { access_token: cookie } } : {}),
+      headers: { 'x-original-uri': uri, 'x-forwarded-for': '203.0.113.9', 'x-real-ip': '203.0.113.9' },
+    })
+    expect((await viaNginx(tokenFor(app, 'op1', 'OPERATOR'))).statusCode).toBe(200)
+    expect((await viaNginx(tokenFor(app, 'op1', 'OPERATOR'), '/hls/nvr_n1_ch09_sub/index.m3u8')).statusCode).toBe(403)
+    expect((await viaNginx()).statusCode).toBe(401)
+    await app.close()
+  })
+
+  it('par externo que dice ser interno por cabecera ⇒ 403, aun con trustProxy=true (config errónea)', async () => {
+    for (const tp of [trust, true] as const) {
+      const app = await buildApp(makePrisma([]), tp)
+      const res = await app.inject({
+        method: 'GET', url: '/internal/hls-auth', remoteAddress: '203.0.113.9',
+        cookies: { access_token: tokenFor(app, 'admin1', 'ADMIN') },
+        headers: { 'x-original-uri': URI, 'x-forwarded-for': '127.0.0.1', 'x-real-ip': '127.0.0.1' },
+      })
+      expect(res.statusCode, String(tp === true)).toBe(403)
+      await app.close()
+    }
   })
 })
