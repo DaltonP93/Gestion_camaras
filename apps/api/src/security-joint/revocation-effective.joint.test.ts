@@ -479,7 +479,7 @@ describe.skipIf(!jointInfraAvailable())('conjunta · revocación efectiva (actor
     expect(pv.status).toBe('ready')
     const delegate = (env.server as any).prisma.user
     const realFindFirst = delegate.findFirst.bind(delegate)
-    let release: (() => void) | null = null
+    let release: () => void = () => undefined
     let entered: (() => void) | null = null
     const enteredP = new Promise<void>(r => { entered = r })
     let blocked = false
@@ -500,13 +500,13 @@ describe.skipIf(!jointInfraAvailable())('conjunta · revocación efectiva (actor
       newer = getPreviewStream(b, pv.streamUrl, 8_000)          // llega después y revalida antes
       await waitFor(() => infra.of('proc.spawn', mark).length > 0, 'FFmpeg del GET más nuevo', 5_000)
       const spawnedByNewer = infra.of('proc.spawn', mark).length
-      release!()
+      release()
       const res = await older
       expect(res?.status, 'el GET viejo cede').toBe(409)
       expect(infra.of('proc.spawn', mark).length, 'el GET viejo no relanzó FFmpeg').toBe(spawnedByNewer)
     } finally {
       spy.mockRestore()
-      release?.()
+      release()
       await b.del(`/api/recordings/preview/${pv.sessionId}`)
       await newer
     }
