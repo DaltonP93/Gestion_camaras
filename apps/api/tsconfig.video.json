@@ -1,0 +1,7 @@
+{
+  // Chequeo de tipos de la suite de video (excluida del build: no va a dist/).
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "rootDir": ".", "declaration": false, "declarationMap": false, "sourceMap": false },
+  "include": ["src/playback-video/**/*.ts", "vitest.video.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

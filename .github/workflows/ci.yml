@@ -52,6 +52,12 @@ jobs:
       - name: Typecheck (build)
         working-directory: apps/api
         run: npm run build
+      # La suite de video (src/playback-video) está excluida del build y vitest no
+      # chequea tipos: sin este paso, un error de tipos en la suite o en su uso de la
+      # API interna (getRecordingsMetrics, admission) pasaría CI.
+      - name: Typecheck de la suite de video real
+        working-directory: apps/api
+        run: npm run typecheck:video
       - name: Tests
         working-directory: apps/api
         # Redis y Postgres REALES obligatorios: REQUIRE_* hace FALLAR (no omitir en
@@ -114,6 +120,106 @@ jobs:
           name: playwright-report
           path: apps/web/playwright-report/
           retention-days: 7
+
+  playback-video:
+    # Reproducción con VIDEO REAL generado al correr (nada versionado): web REAL
+    # (bundle de producción) + server.ts REAL + FFmpeg REAL detrás de un NVR
+    # SIMULADO (ISAPI en loopback + shim de ffmpeg). Sólo loopback; IP del NVR
+    # ficticia. Ver apps/api/src/playback-video/README.md.
+    #  - chromium: Chromium de Playwright (no decodifica H.264 → la SALIDA del
+    #    FFmpeg se pasa a VP9 sólo para el navegador; desvío documentado). Bloquea.
+    #  - chrome: Google Chrome del runner, comando H.264 REAL de punta a punta.
+    #    No bloquea hasta confirmar en las primeras corridas que es estable.
+    name: Reproducción con video real (NVR simulado · ${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: ${{ matrix.browser == 'chrome' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, chrome]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            apps/api/package-lock.json
+            apps/web/package-lock.json
+      # ffmpeg/ffprobe REALES (sólo en el runner): generan las grabaciones sintéticas
+      # y son el FFmpeg que lanza la API detrás del shim del NVR simulado.
+      - name: Instalar ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+          ffmpeg -hide_banner -version | head -1
+      - name: Install API
+        working-directory: apps/api
+        run: npm ci
+      - name: Install Web
+        working-directory: apps/web
+        run: npm ci
+      - name: Prisma generate
+        working-directory: apps/api
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+        run: npx prisma generate --schema ../../prisma/schema.prisma
+      - name: Navegador (Chromium de Playwright)
+        if: matrix.browser == 'chromium'
+        working-directory: apps/web
+        run: npx playwright install --with-deps chromium
+      - name: Navegador (Google Chrome del runner)
+        if: matrix.browser == 'chrome'
+        working-directory: apps/web
+        run: |
+          if [ ! -x /opt/google/chrome/chrome ]; then npx playwright install --with-deps chrome; fi
+          /opt/google/chrome/chrome --version
+      - name: Suite de video (S0–S8, X1)
+        working-directory: apps/api
+        env:
+          REDIS_TEST_URL: redis://localhost:6379
+          DATABASE_URL_TEST: postgresql://ci:ci@localhost:5432/ci
+          REQUIRE_REAL_REDIS: '1'
+          REQUIRE_REAL_PG: '1'
+          REDIS_TEST_DISPOSABLE: '1'
+          PG_TEST_DISPOSABLE: '1'
+          VIDEO_BROWSER: ${{ matrix.browser }}
+          # Con Chrome se exige H.264 (sin desvío VP9): si no decodifica, falla.
+          VIDEO_REQUIRE_H264: ${{ matrix.browser == 'chrome' && '1' || '0' }}
+          VIDEO_REPORT_DIR: ${{ runner.temp }}/video-reports
+        run: npm run test:video
+      # Sólo reportes de medición (JSON/Markdown saneados): nunca video ni imágenes.
+      - name: Subir reportes de medición
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playback-video-reports-${{ matrix.browser }}
+          path: |
+            ${{ runner.temp }}/video-reports/**/*.json
+            ${{ runner.temp }}/video-reports/**/*.md
+            ${{ runner.temp }}/video-reports/**/*.txt
+          retention-days: 14
+          if-no-files-found: ignore
 
   lint:
     name: Lint (ESLint — errores bloquean)
