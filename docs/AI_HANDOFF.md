@@ -1,18 +1,111 @@
 # Handoff operativo para IA — VisionCore (ENTRADA CANÓNICA)
 
-> Actualizado: 2026-09-06 (ciclo C23). Reconstrucción de estado multi-agente.
+> Actualizado: 2026-10-08 (estado vigente en la sección «Estado vigente» de abajo). Las secciones
+> §0–§15 conservan la reconstrucción del ciclo C23 (2026-09-06) como **histórico**: donde contradigan
+> la sección vigente, manda la sección vigente.
 > Alcance: contexto del código versionado. NO describe ni autoriza cambios en producción.
 > **Criterio de aceptación de este documento:** otro agente (p. ej. Codex) debe poder
 > continuar el trabajo SOLO con la URL del repositorio + este archivo.
 
 ---
 
+## Estado vigente (2026-10-09) — leer primero
+
+**Línea base.** `main` = `94305f32ddba17b697b8f28b5fe3ef5108b0bc2c` (merge #179). Desde `0f9d1f5` se
+fusionaron, entre otros: #170–#175 (docs C23, SSRF + RBAC centralizado, deps web, plano de grants,
+ops/backup, e2e de pantalla completa), canales Slack/Teams/webhook, WebSocket por ticket, JWT en
+cookies HttpOnly + CSRF, **auth del HLS por espectador en el borde** (nginx `auth_request`), gate de
+ESLint, `migration_lock.toml`, revocación WS cross-worker, #176 (linaje de certificado `camaras-le`),
+#177 (X-Original-URI del request padre), #178 (validación de credenciales legacy) y #179
+(continuidad de grabaciones). Se verificó por inspección de sólo lectura (2026-09-23) que producción
+corría `94305f3`; **re-verificar antes de concluir nada sobre el servidor**.
+
+**Alcance definitivo de la integración (2026-10-08):** adaptar la **interfaz y organización de
+configuración de Frigate** dentro de VisionCore con **todas** sus funciones (administración,
+seguridad, NVR) además de eventos y detección; no limitar la configuración nueva a detección. Se
+mantienen login, roles, NVR y visores de VisionCore; archivo completo sólo en NVR; almacenamiento local
+sólo para eventos configurados. Ver `docs/frigate/NATIVE_INTEGRATION_PROPOSAL.md` (rev. 3) y
+`docs/frigate/SCREEN_FUNCTION_MATRIX.md`.
+
+**PR abiertos (todos Draft; ninguno fusionado; ninguno desplegado). Base apilada: #182.**
+
+| PR | Rama | Head | Base | Contenido | Estado |
+|---|---|---|---|---|---|
+| #182 | `fix/api-audit-oct2026` | `546dc63` | `main` | fastify 5.12.5, nodemailer 10, pruebas SMTP loopback incl. AUTH; fast-jwt 6.3.4 (avisos críticos/altos de ≤6.3.3) | CI 11/11 |
+| #186 | `fix/recordings-playbackuri-channel-scope` | `45ebda5` | #182 | **Seguridad**: `playbackURI` ligada al canal (playback, preview, diagnóstico); tabla de reglas `Map` (sin propiedades heredadas: `constructor`/`__proto__` ⇒ 400, antes 500) | CI 11/11; API 1686/1686 |
+| #189 | `fix/live-heartbeat-rbac` | `a65c7db` | #182 | **Seguridad P0**: RBAC por cámara en `POST /api/live-view/heartbeat` (iniciaba streams de cámaras ajenas); la revocación cierra sub, main y main_h264 (FFmpeg incluido) | Reproducido con prueba; revisión adversarial aplicada |
+| #190 | `fix/auth-access-token-only` | `abd2734` | #182 | **Seguridad crítica**: sólo access tokens como credencial (2fa/enroll/step-up sin rol abrían grabaciones de todas las cámaras; refresh servía 7 días) | CI 11/11; reproducido con prueba |
+| #191 | `fix/nvr-audio-block-only` | `9169828` | #182 | **NVR**: el audio se escribe/lee sólo dentro de `<Audio>` (antes apagar el audio deshabilitaba el canal); UI con "Sin cambios/Habilitar/Deshabilitar" | CI 11/11 |
+| #192 | `fix/branding-upload-xss` | `854f73f` | #182 | **Seguridad**: XSS almacenado de branding **reproducido** en Chromium aislado (`.js` + `.html` del mismo origen saltean la CSP); firma mágica, extensión del tipo detectado, `/uploads/` acotado con CSP `sandbox`, nginx re-declara cabeceras, guard de CI; no borra un archivo que otro campo sigue usando | CI 11/11 |
+| #193 | `fix/profile-diagnostics-minimal` | `62d70e0` | #182 | **Seguridad**: `/auth/me` con allowlist y migración del store del navegador (borra credenciales del NVR guardadas); diagnósticos sin usuario/IP del NVR y sólo ADMIN/SUPERVISOR; usuario del NVR sólo a ADMIN; `lastRtspError` redactado | CI 11/11 |
+| #195 | `fix/rate-limit-trust-proxy` | `f8c8f33` | #182 | **Seguridad alta (disponibilidad)**: rate limiting por cliente detrás de nginx (`trustProxy` sólo del salto inmediato y sólo si el par está en `TRUSTED_PROXIES`); puertas internas (`hls-auth`, MediaMTX, `media-grant/validate`) por el socket ⇒ **el HLS no se corta** (probado detrás de un proxy que replica nginx); bloqueo por usuario del 2.º factor | CI 11/11; API 1576/1576 |
+| #196 | `fix/jwt-known-secrets` | `95d9bef` | #182 | **Seguridad alta**: el API no arranca con un `JWT_SECRET` público conocido (por hash; mensaje sin el valor); compose sin default (`${JWT_SECRET:?}`); `scripts/check-public-secrets.sh` previo al deploy; barrido del historial completo sin valores aceptados. **No hay evidencia de que producción use una clave pública** | CI 11/11; API 1564/1564 |
+| #197 | `fix/effective-revocation` | `8c161e9` | #182 | **Seguridad alta**: actor vigente en cada `jwtVerify` (claim `sid`, usuario activo, sesión viva, rol de la base); `file.mp4`, descarga y preview ligados a usuario+sesión+cámara y revalidados; preview adjunto cortado ≤5 s; WS por sesión. Conflicto de una línea con #190 en `trusted` | CI 11/11; API 1571/1571 |
+| #194 | `review/security-joint-oct2026` | `e748150` | #182 | **Revisión conjunta extendida** (#182, #186–#193, #195–#197): suite e2e con `server.ts` real; 116 pruebas conjuntas; mutaciones detectadas; defectos opt-in 24 → 13; informe `docs/security/JOINT_REVIEW_182_186_189_190.md`. **No se fusiona** (evidencia) | ver PR |
+| #198 | `test/security-joint-suite` | `68bd1c0` | `review/security-joint-base` | **Pruebas permanentes** de #194 sin el informe (sólo `apps/api/src/security-joint/`); base temporal = integración; re-apuntar a #182 cuando se fusionen los PRs | ver PR |
+| #199 | `test/playback-real-video` | `62b1835` | #182 | **Pruebas de reproductor con video real** generado localmente (NVR simulado en loopback: shim de ffmpeg + ISAPI simulado; web real + `server.ts` real + FFmpeg real): continuidad, seek, ±10 s, velocidades, grilla con cámaras bloqueada/cortada/404, liberación, exportación, revocación. 74 invariantes (trinquetes y aislamiento de red del navegador) y 28 defectos medidos opt-in. CI con Chromium y Google Chrome (H.264 real de punta a punta en Chrome). **No reemplaza las mediciones autorizadas con NVR** | CI 13/13 |
+| #187 | `feat/staging-isolation` | `036171f` | #182 | `STAGING_ISOLATION` y flags; ausente = actual, presente vacía/con espacios ⇒ aborta; prueba de arranque real de `server.ts` | CI 11/11; API 1563/1563 |
+| #184 | `refactor/nvr-recording-provider-standalone` | `f32cd75` | #182 | Proveedor NVR de grabaciones (web) sin la continuidad de #181 | CI 11/11 |
+| #188 | `feat/frigate-ux-prototype` | (ver PR) | #182 | Prototipo navegable con datos simulados (vivo, visores, grabaciones multicámara, eventos, configuración completa, **editor de zonas de Frigate en React 18**). Ajustes del dueño (2026-10-08): selector plegado en tablet vertical y video 16:9; timeline con horas, zoom y huecos; reloj común sin detener a las demás cámaras, con resincronización por celda; marcas de simulado/existente por control; aviso de que **no** demuestra la eliminación de pausas | ver PR |
+| #185 | `docs/frigate-native-plan` | (ver PR) | #182 | Propuesta rev. 3, matriz de pantallas/funciones, plan de pruebas rev. 2, runbook, **política única de permisos** (`docs/security/PERMISSIONS_POLICY.md`), este traspaso | Sólo docs; base #182 para que CI (sobre el merge) no herede el `npm audit` rojo de `main` |
+| #183 | `refactor/nvr-recording-provider` | `ff6f3ff` | #181 | Proveedor apilado sobre #181 | Conservado; reemplazado por #184 |
+| #181 | `feat/nvr-playback-probe` | `3fce40f` | #182 (`7b9ef37`) | Relevo seguro y continuidad por video real | **Pospuesto** (no fusionar ni cerrar) |
+| #180 | `fix/live-1x1-high-quality` | `cd251c7` | `main` viejo | Vivo 1×1 en alta calidad automática | **Pospuesto** |
+
+Orden sugerido de revisión: #182 → #190 → #189 → #186 (sin restricción de orden entre ellos; #190 cierra
+un salto del 2.º factor que ya existe en `main`) → #196 → #197 (resolver `trusted` con #190 y adaptar los
+fixtures como `19e505e` de `review/security-joint-base`) → #195 → #193 → #192 → #191 → #187 → #198 →
+#199 → #184 → #188 → #185. Todo revisado junto en #194. Cada uno se re-valida tras fusionar el anterior.
+
+**Seguridad — hallazgos vigentes en `main`** (lista completa, priorizada y con evidencia en
+`docs/frigate/SCREEN_FUNCTION_MATRIX.md`, sección de hallazgos):
+1. Tokens intermedios y refresh aceptados como credencial → **#190** (reproducido).
+2. Heartbeat del vivo sin RBAC → **#189** (reproducido).
+3. Acceso cruzado por `playbackURI` → **#186**.
+4. `/auth/me` y diagnósticos con credenciales/IP del NVR → **#193**; XSS de branding → **#192**;
+   audio que deshabilitaba el canal → **#191**.
+5. Prioridad **alta** por impacto (que sean previos no lo reduce): rate-limit detrás de nginx → **#195**;
+   `JWT_SECRET` público → **#196**; access y medios de grabación que sobreviven a una revocación →
+   **#197**. Sin PR (verificados en #194, informe §4): `canDownload` no aplicado (D5); TOTP/tempToken
+   reutilizables (MFA-04); grants del relay nativo (flags NO-GO); **LOG-01** (usuario e IP del NVR en
+   logs al arrancar un stream: invariante 6); **STG-01** (decisión pendiente: staging contacta al NVR
+   por acciones de usuario); **AUD-BK-01** (restaurar el backup no re-enciende el audio); residuo
+   `name`/`size` de #186 (incierto: requiere NVR real autorizado).
+6. MediaMTX `authInternalUsers: user: any` → etapa **E0.5**.
+
+**Decisiones técnicas tomadas:** editor de zonas con **React 18 + react-konva 18.2.16 + konva 10.2.3**
+(prueba de compatibilidad con controles negativos y mutantes; propuesta §2.4). Grabaciones en grilla:
+**no se asume subflujo grabado**; pista archivada por instante, huecos, carga y límites visibles
+(plan de pruebas §1.1).
+
+**Producción observada (2026-09-23, sólo lectura):** stack de 8 servicios sano; analítica habilitada
+con **0 cámaras activas y 0 eventos**; 144 cámaras / 4 NVR; 36/36 migraciones; VM de 4 vCPU sin GPU ni
+acelerador. No verificados: errores de logs 24 h, `visioncore-backup.timer`, vencimiento del certificado.
+
+**Política única de permisos** (`docs/security/PERMISSIONS_POLICY.md`, propuesta en #185): rol = techo,
+filas = alcance, herencia NVR→cámara única (R-H), reproducir ≠ exportar, visores personales para todos
+dentro de sus cámaras (indicado por el dueño), tabla de conformidad de 187 rutas y prueba de contrato.
+**Decisiones del dueño pendientes: D1–D12** (SUPERVISOR global o acotado, techos de OPERATOR/AUDITOR,
+exportación, compatibilidad `main_h264`, visores, alertas sin cámara, revocación del access, step-up…).
+Resueltas por el dueño: visores personales para todos dentro de sus cámaras; reloj común sin detener a
+las demás cámaras, con resincronización por celda.
+
+**Pendientes:** D1–D12 de la política; decidir STG-01; confirmar con NVR reales (mediciones M, con autorización) los defectos del reproductor que #199 mide con NVR simulado (primer GOP perdido, pausa de ~5 s y ~3,9 s perdidos por borde, ±10 s roto, video salteado a 4×, celda cortada liberada a los 60 s, FFmpeg cerrado por SIGKILL); PR para LOG-01 y el resto del punto 5; antes de desplegar #195–#197 (con autorización): subred de `visioncore_net` en sólo lectura, `scripts/check-public-secrets.sh` en el servidor y el 401 único de los access previos; dependencias sólo de desarrollo con
+avisos (`vitest`, `source-map-js`) y `react-router` 6 (moderado, prod); confirmar con NVR reales la
+gramática de `playbackURI` (#186) y el inventario de pistas archivadas (M9); `.gitignore` de `main`
+contiene marcadores de conflicto sin resolver (`<<<<<<<`/`>>>>>>>`, líneas 14–18).
+
+**Prohibido sin autorización expresa:** merge, Ready, deploy, migración, activar Frigate o flags en
+producción, borrar ramas, force-push.
+
+---
+
 ## 0. Empezá por aquí (para el próximo agente)
 
 1. `git status --short` (debe estar limpio) y `git log -1` para confirmar el HEAD.
-2. Confirmar la línea base: `main` = `0f9d1f54c525f3959e75730689f943f4602ff921` (fusión del PR #168).
-   **Ciclo C23 (2026-09-06): `main` sigue INTACTO en este SHA — nada del C23 está fusionado.** Todo
-   el trabajo C23 vive en PRs **Draft** fuera de `main` (§5.1). No confundir "existe un PR" con "está en main".
+2. Confirmar la línea base con la sección «Estado vigente» (arriba). *Histórico C23 (2026-09-06):
+   `main` era `0f9d1f5` y el trabajo C23 estaba en PRs Draft; desde entonces se fusionó (ver arriba).*
+   No confundir "existe un PR" con "está en main".
 3. Leer, en este orden: esta sección, §1 (propósito), §4 (estado real por capa),
    `docs/IMPLEMENTATION_STATUS.md`, `docs/REQUIREMENTS_TRACEABILITY.md`, `docs/SECURITY.md`,
    `docs/DEPLOYMENT.md`.
