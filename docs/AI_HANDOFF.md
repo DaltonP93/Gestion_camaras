@@ -9,7 +9,7 @@
 
 ---
 
-## Estado vigente (2026-10-08) — leer primero
+## Estado vigente (2026-10-09) — leer primero
 
 **Línea base.** `main` = `94305f32ddba17b697b8f28b5fe3ef5108b0bc2c` (merge #179). Desde `0f9d1f5` se
 fusionaron, entre otros: #170–#175 (docs C23, SSRF + RBAC centralizado, deps web, plano de grants,
@@ -31,14 +31,19 @@ sólo para eventos configurados. Ver `docs/frigate/NATIVE_INTEGRATION_PROPOSAL.m
 
 | PR | Rama | Head | Base | Contenido | Estado |
 |---|---|---|---|---|---|
-| #182 | `fix/api-audit-oct2026` | `ceab82e` | `main` | fastify 5.12.5, nodemailer 10, pruebas SMTP loopback incl. AUTH | CI 11/11 |
+| #182 | `fix/api-audit-oct2026` | `546dc63` | `main` | fastify 5.12.5, nodemailer 10, pruebas SMTP loopback incl. AUTH; fast-jwt 6.3.4 (avisos críticos/altos de ≤6.3.3) | CI 11/11 |
 | #186 | `fix/recordings-playbackuri-channel-scope` | `45ebda5` | #182 | **Seguridad**: `playbackURI` ligada al canal (playback, preview, diagnóstico); tabla de reglas `Map` (sin propiedades heredadas: `constructor`/`__proto__` ⇒ 400, antes 500) | CI 11/11; API 1686/1686 |
 | #189 | `fix/live-heartbeat-rbac` | `a65c7db` | #182 | **Seguridad P0**: RBAC por cámara en `POST /api/live-view/heartbeat` (iniciaba streams de cámaras ajenas); la revocación cierra sub, main y main_h264 (FFmpeg incluido) | Reproducido con prueba; revisión adversarial aplicada |
 | #190 | `fix/auth-access-token-only` | `abd2734` | #182 | **Seguridad crítica**: sólo access tokens como credencial (2fa/enroll/step-up sin rol abrían grabaciones de todas las cámaras; refresh servía 7 días) | CI 11/11; reproducido con prueba |
 | #191 | `fix/nvr-audio-block-only` | `9169828` | #182 | **NVR**: el audio se escribe/lee sólo dentro de `<Audio>` (antes apagar el audio deshabilitaba el canal); UI con "Sin cambios/Habilitar/Deshabilitar" | CI 11/11 |
-| #192 | `fix/branding-upload-xss` | `6d68d1d` | #182 | **Seguridad**: XSS almacenado de branding **reproducido** en Chromium aislado (`.js` + `.html` del mismo origen saltean la CSP); firma mágica, extensión del tipo detectado, `/uploads/` acotado con CSP `sandbox`, nginx re-declara cabeceras, guard de CI | CI 11/11 |
+| #192 | `fix/branding-upload-xss` | `854f73f` | #182 | **Seguridad**: XSS almacenado de branding **reproducido** en Chromium aislado (`.js` + `.html` del mismo origen saltean la CSP); firma mágica, extensión del tipo detectado, `/uploads/` acotado con CSP `sandbox`, nginx re-declara cabeceras, guard de CI; no borra un archivo que otro campo sigue usando | CI 11/11 |
 | #193 | `fix/profile-diagnostics-minimal` | `62d70e0` | #182 | **Seguridad**: `/auth/me` con allowlist y migración del store del navegador (borra credenciales del NVR guardadas); diagnósticos sin usuario/IP del NVR y sólo ADMIN/SUPERVISOR; usuario del NVR sólo a ADMIN; `lastRtspError` redactado | CI 11/11 |
-| #194 | `review/security-joint-oct2026` | `ccc5db4` | #182 | **Revisión conjunta** #182+#186+#189+#190 (merges + suite e2e con `server.ts` real, PG/Redis efímeros; 34 pruebas; 6/6 mutaciones; 23 defectos previos como pruebas opt-in). **No se fusiona** | ver PR |
+| #195 | `fix/rate-limit-trust-proxy` | `f8c8f33` | #182 | **Seguridad alta (disponibilidad)**: rate limiting por cliente detrás de nginx (`trustProxy` sólo del salto inmediato y sólo si el par está en `TRUSTED_PROXIES`); puertas internas (`hls-auth`, MediaMTX, `media-grant/validate`) por el socket ⇒ **el HLS no se corta** (probado detrás de un proxy que replica nginx); bloqueo por usuario del 2.º factor | CI 11/11; API 1576/1576 |
+| #196 | `fix/jwt-known-secrets` | `95d9bef` | #182 | **Seguridad alta**: el API no arranca con un `JWT_SECRET` público conocido (por hash; mensaje sin el valor); compose sin default (`${JWT_SECRET:?}`); `scripts/check-public-secrets.sh` previo al deploy; barrido del historial completo sin valores aceptados. **No hay evidencia de que producción use una clave pública** | CI 11/11; API 1564/1564 |
+| #197 | `fix/effective-revocation` | `8c161e9` | #182 | **Seguridad alta**: actor vigente en cada `jwtVerify` (claim `sid`, usuario activo, sesión viva, rol de la base); `file.mp4`, descarga y preview ligados a usuario+sesión+cámara y revalidados; preview adjunto cortado ≤5 s; WS por sesión. Conflicto de una línea con #190 en `trusted` | CI 11/11; API 1571/1571 |
+| #194 | `review/security-joint-oct2026` | `e748150` | #182 | **Revisión conjunta extendida** (#182, #186–#193, #195–#197): suite e2e con `server.ts` real; 116 pruebas conjuntas; mutaciones detectadas; defectos opt-in 24 → 13; informe `docs/security/JOINT_REVIEW_182_186_189_190.md`. **No se fusiona** (evidencia) | ver PR |
+| #198 | `test/security-joint-suite` | `68bd1c0` | `review/security-joint-base` | **Pruebas permanentes** de #194 sin el informe (sólo `apps/api/src/security-joint/`); base temporal = integración; re-apuntar a #182 cuando se fusionen los PRs | ver PR |
+| #199 | `test/playback-real-video` | `8e79d82` | #182 | **Pruebas de reproductor con video real** generado localmente (NVR simulado en loopback: shim de ffmpeg + ISAPI simulado; web real + `server.ts` real + FFmpeg real): continuidad, seek, ±10 s, velocidades, grilla con cámaras bloqueada/cortada/404, liberación, exportación, revocación. 74 invariantes (trinquetes y aislamiento de red del navegador) y 28 defectos medidos opt-in. **No reemplaza las mediciones autorizadas con NVR** | ver PR |
 | #187 | `feat/staging-isolation` | `036171f` | #182 | `STAGING_ISOLATION` y flags; ausente = actual, presente vacía/con espacios ⇒ aborta; prueba de arranque real de `server.ts` | CI 11/11; API 1563/1563 |
 | #184 | `refactor/nvr-recording-provider-standalone` | `f32cd75` | #182 | Proveedor NVR de grabaciones (web) sin la continuidad de #181 | CI 11/11 |
 | #188 | `feat/frigate-ux-prototype` | (ver PR) | #182 | Prototipo navegable con datos simulados (vivo, visores, grabaciones multicámara, eventos, configuración completa, **editor de zonas de Frigate en React 18**). Ajustes del dueño (2026-10-08): selector plegado en tablet vertical y video 16:9; timeline con horas, zoom y huecos; reloj común sin detener a las demás cámaras, con resincronización por celda; marcas de simulado/existente por control; aviso de que **no** demuestra la eliminación de pausas | ver PR |
@@ -47,9 +52,10 @@ sólo para eventos configurados. Ver `docs/frigate/NATIVE_INTEGRATION_PROPOSAL.m
 | #181 | `feat/nvr-playback-probe` | `3fce40f` | #182 (`7b9ef37`) | Relevo seguro y continuidad por video real | **Pospuesto** (no fusionar ni cerrar) |
 | #180 | `fix/live-1x1-high-quality` | `cd251c7` | `main` viejo | Vivo 1×1 en alta calidad automática | **Pospuesto** |
 
-Orden sugerido de revisión: #182 → #190 → #189 → #186 (revisados juntos en #194; **sin restricción de
-orden**, pero #190 cierra un salto del 2.º factor que ya existe en `main`) → #193 → #192 → #191 → #187 →
-#184 → #188 → #185. Cada uno se re-valida tras fusionar el anterior.
+Orden sugerido de revisión: #182 → #190 → #189 → #186 (sin restricción de orden entre ellos; #190 cierra
+un salto del 2.º factor que ya existe en `main`) → #196 → #197 (resolver `trusted` con #190 y adaptar los
+fixtures como `19e505e` de `review/security-joint-base`) → #195 → #193 → #192 → #191 → #187 → #198 →
+#199 → #184 → #188 → #185. Todo revisado junto en #194. Cada uno se re-valida tras fusionar el anterior.
 
 **Seguridad — hallazgos vigentes en `main`** (lista completa, priorizada y con evidencia en
 `docs/frigate/SCREEN_FUNCTION_MATRIX.md`, sección de hallazgos):
@@ -58,11 +64,12 @@ orden**, pero #190 cierra un salto del 2.º factor que ya existe en `main`) → 
 3. Acceso cruzado por `playbackURI` → **#186**.
 4. `/auth/me` y diagnósticos con credenciales/IP del NVR → **#193**; XSS de branding → **#192**;
    audio que deshabilitaba el canal → **#191**.
-5. Sin PR (verificados en #194, `docs/security/JOINT_REVIEW_182_186_189_190.md` §4): rate-limit sin
-   `trustProxy` detrás de nginx (**alto**, disponibilidad; el arreglo exige pasar los guardas de IP de
-   `hls-auth`/`mediamtxAuth` a la IP del socket); access JWT que sobrevive a logout/desactivación/cambio
-   de rol (hasta 24 h); `JWT_SECRET` público de compose/`.env.example` aceptado; `canDownload` no
-   aplicado; tokens de grabación que sobreviven a la revocación; TOTP/tempToken reutilizables; residuo
+5. Prioridad **alta** por impacto (que sean previos no lo reduce): rate-limit detrás de nginx → **#195**;
+   `JWT_SECRET` público → **#196**; access y medios de grabación que sobreviven a una revocación →
+   **#197**. Sin PR (verificados en #194, informe §4): `canDownload` no aplicado (D5); TOTP/tempToken
+   reutilizables (MFA-04); grants del relay nativo (flags NO-GO); **LOG-01** (usuario e IP del NVR en
+   logs al arrancar un stream: invariante 6); **STG-01** (decisión pendiente: staging contacta al NVR
+   por acciones de usuario); **AUD-BK-01** (restaurar el backup no re-enciende el audio); residuo
    `name`/`size` de #186 (incierto: requiere NVR real autorizado).
 6. MediaMTX `authInternalUsers: user: any` → etapa **E0.5**.
 
@@ -83,7 +90,7 @@ exportación, compatibilidad `main_h264`, visores, alertas sin cámara, revocaci
 Resueltas por el dueño: visores personales para todos dentro de sus cámaras; reloj común sin detener a
 las demás cámaras, con resincronización por celda.
 
-**Pendientes:** D1–D12 de la política; PR para los hallazgos sin PR (punto 5); dependencias sólo de desarrollo con
+**Pendientes:** D1–D12 de la política; decidir STG-01; confirmar con NVR reales (mediciones M, con autorización) los defectos del reproductor que #199 mide con NVR simulado (primer GOP perdido, pausa de ~5 s y ~3,9 s perdidos por borde, ±10 s roto, video salteado a 4×, celda cortada liberada a los 60 s, FFmpeg cerrado por SIGKILL); PR para LOG-01 y el resto del punto 5; antes de desplegar #195–#197 (con autorización): subred de `visioncore_net` en sólo lectura, `scripts/check-public-secrets.sh` en el servidor y el 401 único de los access previos; dependencias sólo de desarrollo con
 avisos (`vitest`, `source-map-js`) y `react-router` 6 (moderado, prod); confirmar con NVR reales la
 gramática de `playbackURI` (#186) y el inventario de pistas archivadas (M9); `.gitignore` de `main`
 contiene marcadores de conflicto sin resolver (`<<<<<<<`/`>>>>>>>`, líneas 14–18).
