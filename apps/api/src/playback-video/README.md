@@ -161,8 +161,12 @@ más de 30 min sin escrituras y sin procesos que los usen (`preparacion.txt` los
 Además, cada archivo afirma el **aislamiento** (`afterAll`, reporte
 `<archivo>--aislamiento.json`): Node sin conexiones bloqueadas por la suite ni por el
 centinela (I-NET-1/2), netlog del navegador legible y con tráfico loopback (no es una
-prueba vacía, I-NET-3), **cero sockets del navegador fuera de loopback** (I-NET-4) y
-**cero consultas DNS-over-HTTPS** (I-NET-5).
+prueba vacía, I-NET-3), **cero tráfico del navegador fuera de loopback** (I-NET-4:
+conexiones TCP y sockets UDP que envían datos) y **cero consultas DNS-over-HTTPS**
+(I-NET-5). Un `connect()` UDP sin envío no emite paquetes (fija el destino y consulta la
+tabla de rutas): Chromium lo usa para sondear si hay IPv6 global
+(`[2001:4860:4860::8888]:443`, visto en el runner de CI). No cuenta como tráfico y se
+informa en `udpConnectSinEnvio`.
 Los intentos bloqueados por el resolvedor (Google Fonts, hora de red) se informan.
 
 DoH y QUIC van apagados en el navegador (`--disable-features=…,DnsOverHttpsUpgrade`

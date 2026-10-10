@@ -394,10 +394,12 @@ export function assertIsolation(file: string, net: IsolationResult): void {
   rep.record('I-NET-2', 'Node: ninguna conexión fuera de loopback', '0 bloqueadas por el centinela del harness', net.harnessBlocked, net.harnessBlocked.length === 0)
   rep.record('I-NET-3', 'navegador: el netlog se leyó y registró los sockets de la corrida', 'legible, con eventos y sockets loopback',
     b && { ok: b.ok, error: b.error, eventos: b.events, bytes: b.bytes, socketsLoopback: b.loopbackSockets }, !!b && b.ok && b.loopbackSockets > 0)
-  rep.record('I-NET-4', 'navegador: ningún socket fuera de loopback (páginas, DoH, servicios de fondo)', '0 sockets no loopback en el netlog',
+  rep.record('I-NET-4', 'navegador: ningún tráfico fuera de loopback (páginas, DoH, servicios de fondo)', '0 conexiones TCP ni envíos UDP no loopback en el netlog',
     b?.nonLoopback ?? null, !!b && b.ok && b.nonLoopback.length === 0)
   rep.record('I-NET-5', 'navegador: sin DNS-over-HTTPS (el DoH va por IP literal, fuera de la regla del resolvedor)', '0 consultas DOH_URL_REQUEST en el netlog',
     b?.dohRequests ?? null, !!b && b.ok && b.dohRequests === 0)
+  // UDP connect() sin envío (p. ej. la sonda de IPv6 de Chromium): no emite paquetes; se informa.
+  rep.metric('udpConnectSinEnvio', b?.udpConnectOnly ?? [])
   rep.metric('intentosBloqueadosPaginas', net.browserAttempts)
   rep.metric('intentosBloqueadosNetlog', b?.attemptedOrigins ?? [])
   rep.metric('redirigidasAlIsapiSimulado', net.redirected)

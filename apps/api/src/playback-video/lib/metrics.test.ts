@@ -146,8 +146,11 @@ describe('playback-video · métricas puras', () => {
   })
 
   it('netlog del navegador: separa sockets loopback de los de afuera y lista los orígenes intentados', () => {
-    const constants = { constants: { logEventTypes: { TCP_CONNECT: 48, TCP_CONNECT_ATTEMPT: 49, UDP_CONNECT: 90, URL_REQUEST_START_JOB: 2 } } }
-    const ev = (type: number, params: Record<string, unknown>) => `${JSON.stringify({ params, phase: 1, source: { id: 1, type: 1 }, time: '1', type })},`
+    const constants = { constants: {
+      logEventTypes: { TCP_CONNECT: 48, TCP_CONNECT_ATTEMPT: 49, UDP_CONNECT: 90, UDP_BYTES_SENT: 91, SOCKET_CONNECT: 92, URL_REQUEST_START_JOB: 2 },
+      logSourceType: { SOCKET: 1, UDP_SOCKET: 3, UDP_CLIENT_SOCKET: 4 },
+    } }
+    const ev = (type: number, params: Record<string, unknown>, source = { id: 1, type: 1 }) => `${JSON.stringify({ params, phase: 1, source, time: '1', type })},`
     const head = `${JSON.stringify(constants).slice(0, -1)},\n"events": [\n`
     const clean = head + [
       ev(2, { url: 'http://127.0.0.1:4173/recordings', method: 'GET' }),
@@ -155,9 +158,22 @@ describe('playback-video · métricas puras', () => {
       ev(2, { url: 'https://fonts.googleapis.com/css2?family=Inter', method: 'GET' }),
     ].join('\n') + '\n'
     expect(analyzeNetlog(clean)).toMatchObject({ ok: true, events: 3, loopbackSockets: 1, nonLoopback: [], attemptedOrigins: ['https://fonts.googleapis.com'] })
-    // Archivo truncado (navegador que no cerró bien) con DoH y DNS por UDP.
-    const leak = head + [ev(49, { address: '8.8.4.4:443' }), ev(90, { address: '8.8.8.8:53' }), ev(48, { address_list: ['[::1]:9'] })].join('\n')
-    expect(analyzeNetlog(leak)).toMatchObject({ ok: true, loopbackSockets: 1, nonLoopback: ['TCP_CONNECT_ATTEMPT 8.8.4.4:443', 'UDP_CONNECT 8.8.8.8:53'] })
+    // Archivo truncado (navegador que no cerró bien) con TCP a DoH y DNS por UDP que SÍ envió.
+    const udp = { id: 5, type: 3 }
+    const leak = head + [ev(49, { address: '8.8.4.4:443' }), ev(90, { address: '8.8.8.8:53' }, udp), ev(91, { byte_count: 40 }, udp), ev(48, { address_list: ['[::1]:9'] })].join('\n')
+    expect(analyzeNetlog(leak)).toMatchObject({ ok: true, loopbackSockets: 1, nonLoopback: ['TCP_CONNECT_ATTEMPT 8.8.4.4:443', 'UDP_SEND 8.8.8.8:53'], udpConnectOnly: [] })
+    // UDP connect() sin envío (sonda de IPv6 de Chromium, visto en el runner de CI): no
+    // emite paquetes ⇒ no es tráfico, se informa aparte. Igual con SendTo sin connect sí cuenta.
+    const probe = head + [
+      ev(92, { address: '[2001:4860:4860::8888]:443' }, { id: 6, type: 4 }), ev(90, { address: '[2001:4860:4860::8888]:443' }, { id: 7, type: 3 }),
+      ev(48, { address_list: ['127.0.0.1:4173'] }),
+    ].join('\n') + '\n'
+    expect(analyzeNetlog(probe)).toMatchObject({ ok: true, nonLoopback: [], udpConnectOnly: ['[2001:4860:4860::8888]:443'] })
+    const sendto = head + [ev(91, { byte_count: 40, address: '198.51.100.7:53' }, { id: 8, type: 3 }), ev(48, { address_list: ['127.0.0.1:4173'] })].join('\n') + '\n'
+    expect(analyzeNetlog(sendto)).toMatchObject({ ok: true, nonLoopback: ['UDP_BYTES_SENT 198.51.100.7:53'] })
+    // SOCKET_CONNECT que NO es de un socket UDP cuenta como tráfico (estricto).
+    const tcpSock = head + [ev(92, { address: '198.51.100.9:443' }, { id: 9, type: 1 })].join('\n') + '\n'
+    expect(analyzeNetlog(tcpSock).nonLoopback).toEqual(['SOCKET_CONNECT 198.51.100.9:443'])
     expect(analyzeNetlog('')).toMatchObject({ ok: false })
     // DoH: se cuenta aunque el socket no llegue a abrirse (sin ruta a la IP del servidor).
     const doh = `${JSON.stringify({ constants: { logEventTypes: { ...constants.constants.logEventTypes, DOH_URL_REQUEST: 7 } } }).slice(0, -1)},\n"events": [\n` +
