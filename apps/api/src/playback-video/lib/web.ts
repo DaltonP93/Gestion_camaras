@@ -6,8 +6,26 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { WEB_ROOT } from './run-config'
+
+/**
+ * `--disable-features` que playwright-core agrega por defecto, más `extra`.
+ * Chromium usa la ÚLTIMA aparición de `--disable-features`: pasar otra en `args`
+ * pisaría la lista de Playwright (PaintHolding, HttpsUpgrades…, que cambian el
+ * pintado y la navegación). Se lee de la misma versión instalada y se devuelve el
+ * valor por defecto exacto (para `ignoreDefaultArgs`) y el combinado. Si Playwright
+ * deja de traerla, falla en vez de pisar nada en silencio.
+ */
+export function playwrightDisableFeatures(extra: string[], channel?: string): { defaultArg: string; merged: string } {
+  const file = path.join(WEB_ROOT, 'node_modules', 'playwright-core', 'lib', 'server', 'chromium', 'chromiumSwitches.js')
+  const mod = createRequire(path.join(WEB_ROOT, 'package.json'))(file) as { chromiumSwitches?: (assistantMode?: boolean, channel?: string) => string[] }
+  const defaultArg = (mod.chromiumSwitches?.(false, channel) ?? []).find((a) => a.startsWith('--disable-features='))
+  if (!defaultArg) throw new Error('suite de video: playwright-core no trae --disable-features por defecto; revisar playwrightDisableFeatures')
+  const list = defaultArg.slice('--disable-features='.length).split(',').filter(Boolean)
+  return { defaultArg, merged: `--disable-features=${[...new Set([...list, ...extra])].join(',')}` }
+}
 
 type ExportEntry = string | { import?: ExportEntry; default?: ExportEntry; [k: string]: unknown } | undefined
 

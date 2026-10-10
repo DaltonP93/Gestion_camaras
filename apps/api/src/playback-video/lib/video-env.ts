@@ -35,7 +35,7 @@ import type { Segment } from './metrics'
 import { listSimProcs, totalSimProcs, type SimProcs } from './procs'
 import { SIM_BIN, WEB_ROOT, type VideoRun } from './run-config'
 import { sanitize, ScenarioReport } from './report'
-import { importFromWeb, webPostcss } from './web'
+import { importFromWeb, playwrightDisableFeatures, webPostcss } from './web'
 
 export { JOINT_PASSWORD }
 
@@ -151,14 +151,23 @@ export class VideoEnv {
     // VIDEO_HEADED=1 (bajo xvfb-run): sólo para mirar la corrida; no cambia lo que se mide.
     const headed = process.env.VIDEO_HEADED === '1'
     this.netlogPath = path.join(r.runDir, `netlog-${label}.json`)
+    const channel = process.env.VIDEO_BROWSER === 'chrome' ? 'chrome' : undefined
+    // DoH apagado: con un resolvedor del sistema "conocido" (p. ej. el de los runners
+    // de GitHub) Chromium/Chrome suben solos a DNS-over-HTTPS y se conectan al
+    // servidor DoH por IP literal, que `--host-resolver-rules` no cubre (CI de #199:
+    // 2001:4860:4860::8888:443 por TCP y QUIC). Se suma a la lista de Playwright sin
+    // pisarla; QUIC fuera por la misma razón (la web real va por HTTP/1.1 a loopback).
+    const features = playwrightDisableFeatures(['DnsOverHttpsUpgrade'], channel)
     const launch: Record<string, unknown> = {
       headless: !headed,
+      ignoreDefaultArgs: [features.defaultArg],
       args: [
         '--no-proxy-server', '--autoplay-policy=no-user-gesture-required',
         `--host-resolver-rules=${BROWSER_RESOLVER_RULES}`, `--log-net-log=${this.netlogPath}`,
+        features.merged, '--disable-quic',
       ],
     }
-    if (process.env.VIDEO_BROWSER === 'chrome') launch.channel = 'chrome'
+    if (channel) launch.channel = channel
     else {
       // Chromium COMPLETO (headless nuevo) en todos lados: el preinstalado del
       // entorno o, en CI, el que instala `playwright install chromium` (canal
@@ -387,6 +396,8 @@ export function assertIsolation(file: string, net: IsolationResult): void {
     b && { ok: b.ok, error: b.error, eventos: b.events, bytes: b.bytes, socketsLoopback: b.loopbackSockets }, !!b && b.ok && b.loopbackSockets > 0)
   rep.record('I-NET-4', 'navegador: ningún socket fuera de loopback (páginas, DoH, servicios de fondo)', '0 sockets no loopback en el netlog',
     b?.nonLoopback ?? null, !!b && b.ok && b.nonLoopback.length === 0)
+  rep.record('I-NET-5', 'navegador: sin DNS-over-HTTPS (el DoH va por IP literal, fuera de la regla del resolvedor)', '0 consultas DOH_URL_REQUEST en el netlog',
+    b?.dohRequests ?? null, !!b && b.ok && b.dohRequests === 0)
   rep.metric('intentosBloqueadosPaginas', net.browserAttempts)
   rep.metric('intentosBloqueadosNetlog', b?.attemptedOrigins ?? [])
   rep.metric('redirigidasAlIsapiSimulado', net.redirected)
@@ -397,6 +408,7 @@ export function assertIsolation(file: string, net: IsolationResult): void {
   expect(b, 'I-NET-3 netlog del navegador').not.toBeNull()
   expect({ ok: b?.ok, error: b?.error, conTraficoLoopback: (b?.loopbackSockets ?? 0) > 0 }, 'I-NET-3 netlog del navegador').toEqual({ ok: true, error: undefined, conTraficoLoopback: true })
   expect(b?.nonLoopback, 'I-NET-4 sockets del navegador fuera de loopback').toEqual([])
+  expect(b?.dohRequests, 'I-NET-5 consultas DNS-over-HTTPS del navegador').toBe(0)
 }
 
 export async function startVideoEnv(opts: VideoEnvOptions): Promise<VideoEnv> {

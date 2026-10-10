@@ -161,8 +161,17 @@ más de 30 min sin escrituras y sin procesos que los usen (`preparacion.txt` los
 Además, cada archivo afirma el **aislamiento** (`afterAll`, reporte
 `<archivo>--aislamiento.json`): Node sin conexiones bloqueadas por la suite ni por el
 centinela (I-NET-1/2), netlog del navegador legible y con tráfico loopback (no es una
-prueba vacía, I-NET-3) y **cero sockets del navegador fuera de loopback** (I-NET-4).
+prueba vacía, I-NET-3), **cero sockets del navegador fuera de loopback** (I-NET-4) y
+**cero consultas DNS-over-HTTPS** (I-NET-5).
 Los intentos bloqueados por el resolvedor (Google Fonts, hora de red) se informan.
+
+DoH y QUIC van apagados en el navegador (`--disable-features=…,DnsOverHttpsUpgrade`
+sumado a la lista de Playwright, y `--disable-quic`). Con un resolvedor del sistema
+"conocido" (como el de los runners de GitHub), Chromium/Chrome suben solos a DoH y se
+conectan al servidor por **IP literal**, que `--host-resolver-rules` no cubre: la
+primera corrida de CI de este PR lo detectó (I-NET-4: `2001:4860:4860::8888:443` por
+TCP y UDP). En este contenedor el intento no llegaba a abrir un socket (sin ruta), por
+eso I-NET-5 cuenta las consultas DoH del netlog y no depende de la red disponible.
 
 ### Invariantes (pruebas normales: deben cumplirse hoy)
 

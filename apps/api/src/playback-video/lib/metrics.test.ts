@@ -159,5 +159,10 @@ describe('playback-video · métricas puras', () => {
     const leak = head + [ev(49, { address: '8.8.4.4:443' }), ev(90, { address: '8.8.8.8:53' }), ev(48, { address_list: ['[::1]:9'] })].join('\n')
     expect(analyzeNetlog(leak)).toMatchObject({ ok: true, loopbackSockets: 1, nonLoopback: ['TCP_CONNECT_ATTEMPT 8.8.4.4:443', 'UDP_CONNECT 8.8.8.8:53'] })
     expect(analyzeNetlog('')).toMatchObject({ ok: false })
+    // DoH: se cuenta aunque el socket no llegue a abrirse (sin ruta a la IP del servidor).
+    const doh = `${JSON.stringify({ constants: { logEventTypes: { ...constants.constants.logEventTypes, DOH_URL_REQUEST: 7 } } }).slice(0, -1)},\n"events": [\n` +
+      [ev(7, { url: 'https://dns.google/dns-query?dns=AAAB' }), ev(48, { address_list: ['127.0.0.1:4173'] })].join('\n') + '\n'
+    expect(analyzeNetlog(doh)).toMatchObject({ ok: true, dohRequests: 1, nonLoopback: [] })
+    expect(analyzeNetlog(clean).dohRequests).toBe(0)
   })
 })

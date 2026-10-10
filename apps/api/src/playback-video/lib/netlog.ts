@@ -22,6 +22,13 @@ export interface BrowserNet {
   nonLoopback: string[]
   /** Pedidos de URL fuera de loopback que el navegador INTENTÓ (origen; bloqueados por el resolvedor). */
   attemptedOrigins: string[]
+  /**
+   * Consultas DNS-over-HTTPS (DOH_URL_REQUEST). Debe ser 0: el DoH se conecta al
+   * servidor por IP literal (p. ej. 2001:4860:4860::8888:443), que la regla del
+   * resolvedor NO cubre. Se cuenta aparte porque, sin ruta a esa IP (este
+   * contenedor), el intento no llega a abrir un socket y I-NET-4 no lo vería.
+   */
+  dohRequests: number
 }
 
 const isLoopbackAddr = (a: string) => /^(127\.\d+\.\d+\.\d+(:\d+)?|\[::1\](:\d+)?|::1)$/.test(a)
@@ -36,7 +43,7 @@ function originOf(u: string): string | null {
 
 /** Análisis PURO del texto de un netlog (se prueba en metrics.test.ts). */
 export function analyzeNetlog(text: string): BrowserNet {
-  const res: BrowserNet = { ok: false, bytes: text.length, events: 0, loopbackSockets: 0, nonLoopback: [], attemptedOrigins: [] }
+  const res: BrowserNet = { ok: false, bytes: text.length, events: 0, loopbackSockets: 0, nonLoopback: [], attemptedOrigins: [], dohRequests: 0 }
   const lines = text.split('\n')
   let types: Record<string, number>
   try {
@@ -59,6 +66,7 @@ export function analyzeNetlog(text: string): BrowserNet {
     res.events++
     const name = names.get(ev.type) ?? ''
     const p = ev.params ?? {}
+    if (name === 'DOH_URL_REQUEST') res.dohRequests++
     if (/CONNECT/.test(name)) {
       const addrs = [p.address, ...(Array.isArray(p.address_list) ? p.address_list : []), p.remote_address]
       for (const a of addrs) {
@@ -83,7 +91,7 @@ export function analyzeNetlog(text: string): BrowserNet {
 export function readNetlog(file: string): BrowserNet {
   let text = ''
   try { text = fs.readFileSync(file, 'utf8') } catch (e) {
-    return { ok: false, error: `no se pudo leer el netlog: ${(e as Error).message}`, bytes: 0, events: 0, loopbackSockets: 0, nonLoopback: [], attemptedOrigins: [] }
+    return { ok: false, error: `no se pudo leer el netlog: ${(e as Error).message}`, bytes: 0, events: 0, loopbackSockets: 0, nonLoopback: [], attemptedOrigins: [], dohRequests: 0 }
   }
   return analyzeNetlog(text)
 }
