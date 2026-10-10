@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# "ffmpeg" de PRUEBA del NVR simulado. Va PRIMERO en el PATH sólo del proceso de la
+# suite de video (nunca se instala ni se usa fuera de ella).
+#  - Sin entrada rtsp:// (p. ej. `-h demuxer=rtsp`, decodificación de reportes) →
+#    exec del ffmpeg real con los MISMOS argumentos.
+#  - Con entrada rtsp:// → plan.mjs la traduce a la grabación sintética de la pista
+#    y ventana pedidas; el ffmpeg real recibe los MISMOS argumentos salvo la entrada
+#    (socket UNIX privado con MPEG-TS a ritmo real, interrumpible por SIGTERM como el
+#    RTSP) y las opciones exclusivas del demuxer RTSP. Nunca ve una URL rtsp:// ni
+#    abre puertos: si la URL no es la del NVR simulado, falla cerrado.
+#  - `exec`: el PID que ve la API ES el ffmpeg real (señales, código de salida y
+#    cierre reales).
+set -uo pipefail
+REAL=${VC_SIM_REAL_FFMPEG:-/usr/bin/ffmpeg}
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+has_rtsp=0
+for a in "$@"; do case "$a" in rtsp://*|rtsps://*) has_rtsp=1;; esac; done
+[ "$has_rtsp" = 0 ] && exec "$REAL" "$@"
+root=${VC_SIM_WORK_ROOT:-${TMPDIR:-/tmp}}
+work=$(mktemp -d "$root/vc-sim.XXXXXX") || exit 1
+node "$HERE/plan.mjs" "$work" "$@" || { rc=$?; rm -rf "$work"; exit $rc; }
+mapfile -d '' args < "$work/argv"
+node "$HERE/producer.mjs" "$work" "$$" &     # hijo de este PID (que pasa a ser ffmpeg)
+for _ in $(seq 1 300); do [ -S "$work/nvr.sock" ] && break; sleep 0.01; done
+exec "$REAL" "${args[@]}"

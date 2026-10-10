@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# "ffprobe" de PRUEBA del NVR simulado: con URL rtsp:// del NVR simulado sondea el
+# PRIMER segmento de la ventana (mismo plan que el shim de ffmpeg); sin rtsp:// →
+# ffprobe real. Falla cerrado ante cualquier otra URL (plan.mjs).
+set -uo pipefail
+REAL=${VC_SIM_REAL_FFPROBE:-/usr/bin/ffprobe}
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+url=""; out=(); at=-1
+skip=0
+for a in "$@"; do
+  if [ $skip = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -rtsp_transport|-timeout|-rw_timeout|-stimeout|-reorder_queue_size) skip=1;;
+    rtsp://*|rtsps://*) url="$a"; at=${#out[@]}; out+=("__URL__");;
+    *) out+=("$a");;
+  esac
+done
+[ -z "$url" ] && exec "$REAL" "$@"
+file=$(node "$HERE/plan.mjs" --probe "$url") || exit 1
+out[$at]="$file"
+exec "$REAL" "${out[@]}"

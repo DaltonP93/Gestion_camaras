@@ -17,6 +17,10 @@ apps/web/blob-report/
 apps/web/.playwright/
 >>>>>>> origin/fix/web-fullscreen-e2e-c23
 
+# Suite de reproducción con video real (apps/api/src/playback-video): reportes de
+# medición por corrida. No se versionan; los videos se generan y borran al correr.
+apps/api/.video-reports/
+
 # Environment files — NEVER commit secrets
 .env
 .env.local
